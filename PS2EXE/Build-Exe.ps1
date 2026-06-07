@@ -102,6 +102,44 @@ function Assert-WmtPowerShellSyntax {
     }
 }
 
+function New-WmtBundledSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$EntryPoint,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][string]$OutputDirectory
+    )
+
+    $entryContent = [System.IO.File]::ReadAllText($EntryPoint)
+    $loaderPattern = '(?ms)^\s*# <WMT-MODULE-LOADER>\s*$.*?^\s*# </WMT-MODULE-LOADER>\s*$'
+    if (-not [regex]::IsMatch($entryContent, $loaderPattern)) {
+        return $EntryPoint
+    }
+
+    $sourceRoot = Join-Path $ProjectRoot "src"
+    $manifestPath = Join-Path $sourceRoot "WMT.SourceOrder.txt"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "Modular source manifest not found: $manifestPath"
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.AppendLine([regex]::Replace($entryContent, $loaderPattern, ""))
+    foreach ($relativeSourcePath in (Get-Content -LiteralPath $manifestPath)) {
+        if ([string]::IsNullOrWhiteSpace($relativeSourcePath) -or $relativeSourcePath.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $sourcePath = Join-Path $sourceRoot $relativeSourcePath
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+            throw "Modular source file not found: $sourcePath"
+        }
+        [void]$builder.AppendLine([System.IO.File]::ReadAllText($sourcePath))
+    }
+
+    $bundledPath = Join-Path $OutputDirectory ("WMT-GUI.bundled.{0}.ps1" -f ([Guid]::NewGuid().ToString("N")))
+    [System.IO.File]::WriteAllText($bundledPath, $builder.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+    return $bundledPath
+}
+
 function Get-WmtPS2EXECommand {
     param([switch]$Install)
 
@@ -168,6 +206,8 @@ if (-not (Test-Path -LiteralPath $outputDirectory)) {
 }
 
 Assert-WmtPowerShellSyntax -Path $resolvedInput
+$buildInput = New-WmtBundledSource -EntryPoint $resolvedInput -ProjectRoot $script:WmtProjectRoot -OutputDirectory $outputDirectory
+Assert-WmtPowerShellSyntax -Path $buildInput
 
 $appVersion = ConvertTo-WmtVersionText -Version (Get-WmtSourceVersion -Path $resolvedInput)
 $fileVersion = ConvertTo-WmtFileVersion -Version $appVersion
@@ -175,7 +215,7 @@ $ps2exe = Get-WmtPS2EXECommand -Install:$InstallPS2EXE
 $availableParameters = @($ps2exe.Parameters.Keys)
 
 $invokeArguments = @{
-    InputFile  = $resolvedInput
+    InputFile  = $buildInput
     OutputFile = $resolvedOutput
 }
 
@@ -195,9 +235,19 @@ Add-WmtPS2EXEValue -Arguments $invokeArguments -AvailableParameters $availablePa
 
 Write-Host "Building Windows Maintenance Tool v$appVersion..."
 Write-Host "Source: $resolvedInput"
+if ($buildInput -ne $resolvedInput) {
+    Write-Host "Bundled modular source: $buildInput"
+}
 Write-Host "Icon:   $resolvedIcon"
 Write-Host "Output: $resolvedOutput"
-Invoke-PS2EXE @invokeArguments
+try {
+    Invoke-PS2EXE @invokeArguments
+}
+finally {
+    if ($buildInput -ne $resolvedInput -and (Test-Path -LiteralPath $buildInput)) {
+        Remove-Item -LiteralPath $buildInput -Force -ErrorAction SilentlyContinue
+    }
+}
 
 if (-not (Test-Path -LiteralPath $resolvedOutput -PathType Leaf)) {
     throw "Build finished, but the EXE was not created: $resolvedOutput"

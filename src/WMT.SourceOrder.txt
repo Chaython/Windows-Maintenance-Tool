@@ -1,0 +1,17 @@
+﻿Functions/01-Core.ps1
+Functions/02-Logging.ps1
+Functions/03-SettingsStorage.ps1
+Functions/04-UI.Logic.ps1
+Functions/05-DeviceInfo.ps1
+Functions/06-PackageUpdater.ps1
+Functions/07-GameLauncherUpdater.ps1
+Functions/08-BackgroundUpdater.ps1
+Functions/09-Network.ps1
+Functions/10-Firewall.ps1
+Functions/11-Cleanup.ps1
+Functions/12-RegistryCleaner.ps1
+Functions/13-Drivers.ps1
+Functions/14-SystemMaintenance.ps1
+Functions/15-StartupManager.ps1
+Functions/16-Tweaks.ps1
+99-UI.Runtime.ps1

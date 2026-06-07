@@ -29,6 +29,11 @@ if "%ERRORLEVEL%"=="43" (
 )
 
 :: 2. Check for updates to the GUI Script (.ps1) by comparing $AppVersion
+if exist "%~dp0src\WMT.SourceOrder.txt" (
+  echo Modular WMT source detected. Skipping legacy single-file script update.
+  goto WMT_SCRIPT_UPDATE_COMPLETE
+)
+
 echo Checking for WMT-GUI.ps1 updates...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "function Convert-WmtVersion([string]$v) { $m=[regex]::Match(([string]$v).Trim(),'^\s*v?(\d+(?:\.\d+){0,3})\s*$'); if (-not $m.Success) { throw ('Invalid version: ' + $v) }; $p=@($m.Groups[1].Value.Split('.')); while ($p.Count -lt 4) { $p += '0' }; [version]::new([int]$p[0],[int]$p[1],[int]$p[2],[int]$p[3]) }; " ^
@@ -46,6 +51,8 @@ if "%PS_EXIT%"=="45" (
     "Add-Type -AssemblyName PresentationFramework; $msg='WMT-GUI.ps1 was not found and the download failed.' + [Environment]::NewLine + 'Please check your internet connection.'; [System.Windows.MessageBox]::Show($msg,'WMT Launcher Error',[System.Windows.MessageBoxButton]::OK,[System.Windows.MessageBoxImage]::Error) | Out-Null"
   exit /b 1
 )
+
+:WMT_SCRIPT_UPDATE_COMPLETE
 
 :: 3. Guard against accidentally downloaded HTML page
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^

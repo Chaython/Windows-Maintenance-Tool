@@ -184,6 +184,32 @@ Keep `Start_WMT_GUI.bat` and `WMT-GUI.ps1` in the same folder. The launcher vali
 powershell -NoProfile -ExecutionPolicy Bypass -File "WMT-GUI.ps1"
 ```
 
+## Source Layout
+
+`WMT-GUI.ps1` is the stable entry point. It handles startup, elevation, and then dot-sources the ordered functional blocks listed in `src/WMT.SourceOrder.txt`.
+
+| Source block | Responsibility |
+| --- | --- |
+| `src/Functions/01-Core.ps1` | Shared helpers and common infrastructure |
+| `src/Functions/02-Logging.ps1` | GUI logging, crash logging, and log-memory management |
+| `src/Functions/03-SettingsStorage.ps1` | Persistent settings and data-path handling |
+| `src/Functions/04-UI.Logic.ps1` | Reusable WPF, theme, dialog, and control helpers |
+| `src/Functions/05-DeviceInfo.ps1` | My Device collection and presentation helpers |
+| `src/Functions/06-PackageUpdater.ps1` | Package discovery, Winget helpers, and update-list logic |
+| `src/Functions/07-GameLauncherUpdater.ps1` | Steam, Legendary, GOGDL, and provider management |
+| `src/Functions/08-BackgroundUpdater.ps1` | Background scans, notifications, tray behavior, and auto-install |
+| `src/Functions/09-Network.ps1` | Network, DNS, DoH, and hosts-file tools |
+| `src/Functions/10-Firewall.ps1` | Firewall management |
+| `src/Functions/11-Cleanup.ps1` | File cleanup, CleanerML, Winapp2, and shortcut cleanup |
+| `src/Functions/12-RegistryCleaner.ps1` | Registry scanning, backup, and cleanup |
+| `src/Functions/13-Drivers.ps1` | Driver reporting, backup, restore, and cleanup |
+| `src/Functions/14-SystemMaintenance.ps1` | Repair, restore, storage, and system maintenance tasks |
+| `src/Functions/15-StartupManager.ps1` | Startup manager and scheduled-task management |
+| `src/Functions/16-Tweaks.ps1` | Windows and Explorer tweaks |
+| `src/99-UI.Runtime.ps1` | Application state, XAML, event wiring, and WPF message loop |
+
+The files are dot-sourced instead of imported as isolated PowerShell modules because WMT intentionally shares script-scoped UI and background-job state. `PS2EXE/Build-Exe.ps1` automatically bundles the ordered source blocks into a temporary single script before compiling.
+
 ## Requirements
 
 - Windows 10 or Windows 11
