@@ -9,7 +9,7 @@
 # ==========================================
 # 1. SETUP
 # ==========================================
-$AppVersion = "6.5"
+$AppVersion = "6.6"
 $ErrorActionPreference = "SilentlyContinue"
 $script:WmtDebug = [bool](Get-WmtSetting -Name "DebugMode" -Default $false -ErrorAction SilentlyContinue)
 # Preserve UTF-8 for web content, alt codes, and Unicode symbols.
@@ -2026,6 +2026,10 @@ $script:MyDeviceSectionJobs[$Name] = [pscustomobject]@{
 function Update-MyDeviceStats {
 param([switch]$ForceRefresh, [switch]$Preload)
 $script:MyDeviceStatsStarted = $true
+# Remember whether this load ran with background jobs disabled: the section
+# collector timer only starts when jobs are enabled, so a disabled-mode load
+# leaves "scanning is disabled" placeholders on screen (queue never drains).
+$script:MyDeviceStatsLastDisabled = [bool](Get-WmtDisableBackgroundJobs)
 $script:StatsStartedAt = Get-Date
 $script:MyDeviceStatsPreloadMode = [bool]$Preload
 $script:MyDeviceStatsMaxConcurrent = 4
@@ -4186,6 +4190,7 @@ try {
         ReduceRamInTray            = [bool](Get-WmtReduceRamInTray -Settings $Settings)
         DisableBackgroundJobs      = [bool](Get-WmtDisableBackgroundJobs -Settings $Settings)
         UpdateScansDisabled         = [bool](Get-WmtUpdateScansDisabled -Settings $Settings)
+        HideLegendaryUeAssets       = [bool](Get-WmtHideLegendaryUeAssets -Settings $Settings)
         SavedUpdateAutoScanMinutes  = (ConvertTo-Int (Get-WmtSavedUpdateAutoScanMinutes -Settings $Settings) 0)
         LoadWinapp2                = [bool]$Settings.LoadWinapp2
         LoadWinapp3                = [bool]$Settings.LoadWinapp3
@@ -4237,6 +4242,7 @@ $defaults = @{
     ReduceRamInTray            = $true
     DisableBackgroundJobs      = $false
     UpdateScansDisabled         = $false
+    HideLegendaryUeAssets      = $true
     SavedUpdateAutoScanMinutes = 0
     LoadWinapp2                = $false 
     LoadWinapp3                = $false
@@ -4288,6 +4294,7 @@ if (Test-Path $path) {
         if ($json.PSObject.Properties["ReduceRamInTray"]) { $defaults.ReduceRamInTray = [bool]$json.ReduceRamInTray }
         if ($json.PSObject.Properties["DisableBackgroundJobs"]) { $defaults.DisableBackgroundJobs = [bool]$json.DisableBackgroundJobs }
         if ($json.PSObject.Properties["UpdateScansDisabled"]) { $defaults.UpdateScansDisabled = [bool]$json.UpdateScansDisabled }
+        if ($json.PSObject.Properties["HideLegendaryUeAssets"]) { $defaults.HideLegendaryUeAssets = [bool]$json.HideLegendaryUeAssets }
         if ($json.PSObject.Properties["SavedUpdateAutoScanMinutes"]) {
             try { $defaults.SavedUpdateAutoScanMinutes = [int]$json.SavedUpdateAutoScanMinutes } catch { $defaults.SavedUpdateAutoScanMinutes = 0 }
             if ($defaults.SavedUpdateAutoScanMinutes -lt 0) { $defaults.SavedUpdateAutoScanMinutes = 0 }
@@ -4638,6 +4645,55 @@ try {
 catch {}
 
 return $false
+}
+
+function Get-WmtHideLegendaryUeAssets {
+param($Settings)
+
+if (-not $Settings) { $Settings = Get-WmtSettings }
+
+try {
+    if ($Settings -is [System.Collections.IDictionary] -and $Settings.Contains("HideLegendaryUeAssets")) {
+        return [bool]$Settings["HideLegendaryUeAssets"]
+    }
+    if ($Settings.PSObject.Properties["HideLegendaryUeAssets"]) {
+        return [bool]$Settings.HideLegendaryUeAssets
+    }
+}
+catch {}
+
+return $true
+}
+
+# --- Unreal Engine / Fab asset visibility (Your Library) ---
+# One live flag shared by every handler context: plain scriptblock handlers,
+# GetNewClosure handlers (library search debounce) and functions called from
+# them all resolve $global: the same way, so the filter never depends on
+# which scope a population path runs in.
+try { $global:WmtHideUeAssets = [bool](Get-WmtHideLegendaryUeAssets) } catch { $global:WmtHideUeAssets = $true }
+
+function Set-WmtFabAssetsButtonLabel {
+    if (-not $btnToggleFabAssets) { return }
+    $label = "Fab Assets: " + $(if ($global:WmtHideUeAssets) { "Hidden" } else { "Shown" })
+    if ($btnToggleFabAssets.Content -is [System.Windows.Controls.StackPanel]) {
+        foreach ($child in @($btnToggleFabAssets.Content.Children)) {
+            if ($child -is [System.Windows.Controls.TextBlock]) { $child.Text = $label }
+        }
+    }
+    else { $btnToggleFabAssets.Content = $label }
+}
+try { Set-WmtFabAssetsButtonLabel } catch {}
+
+function Test-WmtFabAssetHidden {
+param($Item)
+
+# Shared guard for every Your Library population path (list view, search,
+# scan collector, toggle re-apply). Returns $true only when UE/Fab assets
+# are hidden AND the row is tagged as UE.
+if (-not $global:WmtHideUeAssets) { return $false }
+if (-not $Item) { return $false }
+if (-not $Item.PSObject.Properties["IsUe"]) { return $false }
+return [bool]$Item.IsUe
 }
 
 function Get-WmtSavedUpdateAutoScanMinutes {
@@ -24191,7 +24247,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                 <!-- Library List (initially hidden) -->
                 <Border Name="brdLibraryList" Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0" Visibility="Collapsed">
                     <DockPanel>
-                        <Border DockPanel.Dock="Top" Style="{StaticResource ModernSearchBoxStyle}" Margin="8,8,8,0">
+                        <Border DockPanel.Dock="Top" Style="{StaticResource ModernSearchBoxStyle}" Margin="8,8,8,8">
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto"/>
@@ -24258,6 +24314,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left">
                             <Button Name="btnBackToCatalog" Content="Back to Catalog" Style="{StaticResource ActionBtn}" ToolTip="Return to the software catalog" Visibility="Collapsed"/>
                             <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
+                            <Button Name="btnToggleFabAssets" Content="Fab Assets: Hidden" Style="{StaticResource ActionBtn}" ToolTip="Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." Visibility="Collapsed"/>
                             <TextBlock Name="lblLibraryStatus" Text="" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" FontStyle="Italic" Margin="12,0,0,0"/>
                         </StackPanel>
                         <!-- Catalog actions (always visible) -->
@@ -26111,6 +26168,8 @@ $iconDeferTimer.Add_Tick({
     Set-ButtonIcon "btnBackToUpdates" "M20,11H7.83L13.42,5.41L12,4L4,12L12,20L13.41,18.59L7.83,13H20V11Z" "Back to Updates" "Return to the package updates view" 16
     Set-ButtonIcon "btnBackToCatalog" "M20,11H7.83L13.42,5.41L12,4L4,12L12,20L13.41,18.59L7.83,13H20V11Z" "Back to Catalog" "Return to the software catalog" 16
     Set-ButtonIcon "btnLibraryRefresh" "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z" "Refresh Library" "Re-scan Steam manifests and refresh Legendary/GOGDL caches" 16
+    Set-ButtonIcon "btnToggleFabAssets" "M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z" "Fab Assets: Hidden" "Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." 16
+    try { Set-WmtFabAssetsButtonLabel } catch {}
     $iconDeferTimer = $null
 })
 $iconDeferTimer.Start()
@@ -26614,10 +26673,6 @@ try {
     if ($script:TweakButtonStatesCache -and $script:TweakButtonStatesCache.Count -gt 0) {
         $regCache = $script:TweakButtonStatesCache
     }
-    $pathCheckCache = @{}
-    if ($script:TweakButtonStatesPathChecks -and $script:TweakButtonStatesPathChecks.Count -gt 0) {
-        $pathCheckCache = $script:TweakButtonStatesPathChecks
-    }
 
     # Load pre-fetched non-registry data (services, fsutil, powercfg, etc.)
     # so the UI thread makes ZERO blocking calls — everything is cached.
@@ -26645,15 +26700,6 @@ try {
         $item = $regCache[$Path]
         if ($item -and $item.PSObject.Properties[$Name]) { return $item.$Name }
         return $Default
-    }.GetNewClosure()
-
-    $getPathExists = {
-        param([string]$Path)
-        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-        if ($pathCheckCache.ContainsKey($Path)) { return $pathCheckCache[$Path] }
-        $exists = Get-WmtTweakPathExistsCached -Path $Path -Default $false
-        $pathCheckCache[$Path] = $exists
-        return $exists
     }.GetNewClosure()
 
     $setButtonEnabled = {
@@ -26747,12 +26793,12 @@ try {
     $classicContext = Get-WmtRegistryPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
     $btnToggleCtxMenu = Get-Ctrl "btnToggleCtxMenu"
     Update-WmtTweakToggle $btnToggleCtxMenu $classicContext "Classic Right-Click" "Modern Right-Click"
-    $takeOwnInstalled = Get-WmtRegistryPathExists "HKCU:\Software\Classes\Directory\shell\WMT_TakeOwnership"
+    $takeOwnInstalled = Get-WmtRegistryPathExists "HKCR:\Directory\shell\WMT_TakeOwnership"
     $btnToggleTakeOwnership = Get-Ctrl "btnToggleTakeOwnership"
-    Update-WmtTweakToggle $btnToggleTakeOwnership $takeOwnInstalled "Add Take Ownership" "Remove Take Ownership"
-    $psHereInstalled = Get-WmtRegistryPathExists "HKCU:\Software\Classes\Directory\Background\shell\WMT_OpenPowerShell"
+    Update-WmtTweakToggle $btnToggleTakeOwnership $takeOwnInstalled "Remove Take Ownership" "Add Take Ownership"
+    $psHereInstalled = Get-WmtRegistryPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
     $btnTogglePsHere = Get-Ctrl "btnTogglePsHere"
-    Update-WmtTweakToggle $btnTogglePsHere $psHereInstalled "Add PowerShell Here" "Remove PowerShell Here"
+    Update-WmtTweakToggle $btnTogglePsHere $psHereInstalled "Remove PowerShell Here" "Add PowerShell Here"
 
     # --- NEW TOGGLE STATE DETECTION ---
     $polAI = "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"
@@ -27529,6 +27575,7 @@ $lstCatalog = Get-Ctrl "lstCatalog"
 $lstLibrary = Get-Ctrl "lstLibrary"
 $txtLibrarySearch = Get-Ctrl "txtLibrarySearch"
 $btnLibraryClearSearch = Get-Ctrl "btnLibraryClearSearch"
+$btnToggleFabAssets = Get-Ctrl "btnToggleFabAssets"
 $brdCatalogList = Get-Ctrl "brdCatalogList"
 $brdLibraryList = Get-Ctrl "brdLibraryList"
 $pnlCatalogActions = Get-Ctrl "pnlCatalogActions"
@@ -27618,6 +27665,7 @@ function Reset-WmtLibraryToCatalog {
         if ($brdCatalogList) { $brdCatalogList.Visibility = "Visible" }
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Collapsed" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
+        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
         if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
     }
@@ -27686,11 +27734,29 @@ $tabButton.Add_Click({
             elseif (-not $script:TweakStatesReady) {
                 # Background jobs disabled — do a one-time synchronous load with error fallback
                 Set-TweakStatesLoadingOverlay -Visible $true
+                                # Explicitly set the initial state of the two loads
+                                $script:OptionalFeaturesReady = $false
+                $script:TweakStatesReady = $false
+                                # Allows the UI to render the overlay before the heavy work begins
+                                $window.Dispatcher.Invoke(
+                    [System.Action]{},
+                    [System.Windows.Threading.DispatcherPriority]::Render
+                )
+                $optionalFeaturesLoaded = $false
+                $tweakStatesLoaded = $false
                 try {
                     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                    Update-OptionalFeaturesSynchronously                                        
+                    $optionalFeaturesLoaded = $true                                     
+                                        $script:OptionalFeaturesReady = $true
+                    # Update the overlay immediately after the first load
+                    Sync-WmtTweakOverlayHide                                    
                     Update-TweakButtonStates
+                    $tweakStatesLoaded = $true
+                    $script:TweakStatesReady = $true                                    
+                                        # Update the overlay immediately after the second load
+                    Sync-WmtTweakOverlayHide
                     $sw.Stop()
-                    $script:TweakStatesReady = $true
                     if ($sw.ElapsedMilliseconds -gt 3000) {
                         try { Write-GuiLog "[Tweak States] Synchronous load completed slowly ($($sw.ElapsedMilliseconds)ms). Consider enabling background jobs in Settings." } catch {}
                     }
@@ -27698,11 +27764,14 @@ $tabButton.Add_Click({
                 catch {
                     $errMsg = $_.Exception.Message
                     try { Write-GuiLog "[Tweak States] ERROR: Failed to load tweak states: $errMsg" } catch {}
-                    $script:TweakStatesReady = $true
                     # Show error on overlay briefly before hiding
                     Show-TweakStatesLoadError -Message "Failed to load tweak states. Toggle buttons may show incorrect states. Click Retry or switch tabs and back. Error: $errMsg"
                 }
-                Sync-WmtTweakOverlayHide
+                finally {
+                    $script:OptionalFeaturesReady = $optionalFeaturesLoaded
+                    $script:TweakStatesReady = $tweakStatesLoaded
+                    Sync-WmtTweakOverlayHide
+                }
             }
         }
     })
@@ -29094,10 +29163,10 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnToggleTheme"       "Toggle Theme"                    "btnTabSupport"
     Add-SearchIndexEntry "btnDisableBgJobs"      "Background Jobs"                 "btnTabSupport"
     Add-SearchIndexAction "Disable Background Jobs" { Set-WmtDisableBackgroundJobs -Enabled $true; $btn = Get-Ctrl "btnDisableBgJobs"; if ($btn) { $btn.Content = "Background Jobs: Off" }; Write-GuiLog "Background jobs disabled." } "btnTabSupport"
-    Add-SearchIndexAction "Enable Background Jobs"  { Set-WmtDisableBackgroundJobs -Enabled $false; $btn = Get-Ctrl "btnDisableBgJobs"; if ($btn) { $btn.Content = "Background Jobs: On" }; Write-GuiLog "Background jobs enabled." } "btnTabSupport"
+    Add-SearchIndexAction "Enable Background Jobs"  { Set-WmtDisableBackgroundJobs -Enabled $false; $btn = Get-Ctrl "btnDisableBgJobs"; if ($btn) { $btn.Content = "Background Jobs: On" }; Write-GuiLog "Background jobs enabled."; try { Start-WmtBackgroundJobsNow } catch {} } "btnTabSupport"
     Add-SearchIndexEntry "btnDisableUpdateScans"  "Update Scans"                    "btnTabSupport"
     Add-SearchIndexAction "Disable Update Scans" { Set-WmtUpdateScansDisabled -Enabled $true; Update-WmtUpdateScansButton; Write-GuiLog "Update scans disabled." } "btnTabSupport"
-    Add-SearchIndexAction "Enable Update Scans"  { Set-WmtUpdateScansDisabled -Enabled $false; Update-WmtUpdateScansButton; Write-GuiLog "Update scans enabled." } "btnTabSupport"
+    Add-SearchIndexAction "Enable Update Scans"  { Set-WmtUpdateScansDisabled -Enabled $false; Update-WmtUpdateScansButton; Write-GuiLog "Update scans enabled."; try { if (-not (Get-WmtDisableBackgroundJobs)) { Start-WmtUpdateAutoScanTimer } } catch {} } "btnTabSupport"
     Add-SearchIndexEntry "btnStartWithWindows" "Start with Windows"              "btnTabSupport"
     Add-SearchIndexAction "Light Mode" { Set-WmtThemePreference -Theme "light" } "btnTabSupport"
     Add-SearchIndexAction "Dark Mode" { Set-WmtThemePreference -Theme "dark" }  "btnTabSupport"
@@ -29129,11 +29198,13 @@ $searchIndexDeferTimer.Add_Tick({
         if ($brdLibraryList) { $brdLibraryList.Visibility = "Visible" }
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
         if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
         # Display pre-loaded results if available.
         if ($script:WmtLibraryScanResults -and $script:WmtLibraryScanResults.Count -gt 0 -and $lstLibrary) {
             $lstLibrary.Items.Clear()
             foreach ($item in $script:WmtLibraryScanResults) {
+                if (Test-WmtFabAssetHidden $item) { continue }
                 [void]$lstLibrary.Items.Add($item)
             }
             if ($lblLibraryStatus) { $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library." }
@@ -29388,8 +29459,13 @@ $lstWinget.Add_PreviewMouseRightButtonDown({
         Set-WmtListViewRightClickSelection -ListView $s -OriginalSource $e.OriginalSource
     })
 
+# Suppress the menu only when no row is selected (rows are selected by the
+# PreviewMouseRightButtonDown handler above). The sender/event args must come
+# from param(); the previous version referenced undefined variables and threw
+# an exception on every right-click, which aborted the menu open.
 $lstWinget.Add_ContextMenuOpening({
-    if ($s.SelectedItems.Count -eq 0) { $_.Handled = $true }
+    param($s, $e)
+    if (@($s.SelectedItems).Count -eq 0) { $e.Handled = $true }
 })
 
 $lstWinget.Add_PreviewKeyDown({
@@ -33258,9 +33334,13 @@ catch {
 $script:WmtLegendaryLibraryCache = $result.ToArray()
 
 # Write to cache file for use by the search runspace.
+# Guard: never wipe an existing cache with an empty result (e.g. legendary
+# failed mid-scan on a network outage) — keep the last good list instead.
 try {
     $cacheFile = Join-Path (Get-DataPath) "legendary_library.json"
-    $script:WmtLegendaryLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+    if ($result.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
+        $script:WmtLegendaryLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+    }
 }
 catch {
     Write-GuiLog "Failed to write Legendary library cache: $($_.Exception.Message)"
@@ -37243,20 +37323,44 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
 
-                    $p = [System.Diagnostics.Process]::Start($pInfo)
-                    $outTask = $p.StandardOutput.ReadToEndAsync()
-                    $errTask = $p.StandardError.ReadToEndAsync()
-                    if (-not $p.WaitForExit(90000)) {
-                        Write-Output "LOG:Legendary scan timed out after 90 seconds."
-                        try { $p.Kill() } catch {}
-                        try { [void]$p.WaitForExit(2000) } catch {}
-                        return
+                    # Epic endpoints intermittently fail with transient read timeouts
+                    # (legendary's HTTP client uses a 10s read timeout). Retry once on
+                    # network-class failures so a momentary blip does not kill the scan.
+                    $out = ""
+                    $err = ""
+                    $exitCode = 0
+                    $maxAttempts = 2
+                    $attempt = 0
+                    while ($true) {
+                        $attempt++
+                        $p = [System.Diagnostics.Process]::Start($pInfo)
+                        $outTask = $p.StandardOutput.ReadToEndAsync()
+                        $errTask = $p.StandardError.ReadToEndAsync()
+                        if (-not $p.WaitForExit(90000)) {
+                            Write-Output "LOG:Legendary scan timed out after 90 seconds."
+                            try { $p.Kill() } catch {}
+                            try { [void]$p.WaitForExit(2000) } catch {}
+                            return
+                        }
+
+                        $out = $outTask.GetAwaiter().GetResult()
+                        $err = $errTask.GetAwaiter().GetResult()
+                        $exitCode = $p.ExitCode
+
+                        # Success = clean exit with a CSV payload
+                        if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($out)) { break }
+
+                        $networkFailure = (([string]$err) -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out')
+                        if ($networkFailure -and $attempt -lt $maxAttempts) {
+                            Write-Output "LOG:Legendary could not reach Epic servers (network timeout, attempt $attempt of $maxAttempts). Retrying in 3 seconds..."
+                            Start-Sleep -Seconds 3
+                            continue
+                        }
+                        break
                     }
 
-                    $out = $outTask.GetAwaiter().GetResult()
-                    $err = $errTask.GetAwaiter().GetResult()
-                    if ($p.ExitCode -ne 0) {
-                        Write-Output "LOG:Legendary scan exited with code $($p.ExitCode)."
+                    if ($exitCode -ne 0) {
+                        Write-Output "LOG:Legendary scan exited with code $exitCode."
                         if (-not [string]::IsNullOrWhiteSpace($err)) {
                             foreach ($errLine in ($err -split "`r?`n")) {
                                 if (-not [string]::IsNullOrWhiteSpace($errLine)) { Write-Output "LOG:Legendary: $errLine" }
@@ -37265,7 +37369,14 @@ $btnWingetScan.Add_Click({
                     }
 
                     if ([string]::IsNullOrWhiteSpace($out)) {
-                        if (-not [string]::IsNullOrWhiteSpace($err)) { Write-Output "LOG:Legendary returned no CSV output. Run 'legendary auth' if Epic login is not configured." }
+                        if (-not [string]::IsNullOrWhiteSpace($err)) {
+                            if (([string]$err) -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out') {
+                                Write-Output "LOG:Legendary could not reach Epic servers (network timeout). Check the connection and run the scan again."
+                            }
+                            else {
+                                Write-Output "LOG:Legendary returned no CSV output. Run 'legendary auth' if Epic login is not configured."
+                            }
+                        }
                         return
                     }
 
@@ -39183,6 +39294,51 @@ $script:InvokeWingetSearch = {
             Write-Output "PROVIDER_START:legendary"
             $script:provCount = 0
             Log "Searching Legendary library..."
+            # Respect the "Hide Unreal Engine / Fab assets" library toggle. This
+            # runspace cannot see script scope, so read it from settings.json
+            # (stored next to the Legendary library cache file).
+            $hideUe = $true
+            try {
+                if ($LegendaryCacheFile) {
+                    $wmtSettingsFile = Join-Path (Split-Path -Parent $LegendaryCacheFile) "settings.json"
+                    if (Test-Path -LiteralPath $wmtSettingsFile -PathType Leaf) {
+                        $wmtSettingsJson = [System.IO.File]::ReadAllText($wmtSettingsFile) | ConvertFrom-Json -ErrorAction Stop
+                        if ($wmtSettingsJson.PSObject.Properties["HideLegendaryUeAssets"]) { $hideUe = [bool]$wmtSettingsJson.HideLegendaryUeAssets }
+                    }
+                }
+            }
+            catch {}
+            # Legendary marks UE/Fab content with namespace 'ue' in its own assets.json.
+            # Use it as the authoritative filter (Fab app_names are arbitrary, e.g. "PlatformFunctionsPlugin_5.4").
+            $ueAppNames = @{}
+            $ueAssetsFiles = @()
+            try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+            try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+            foreach ($ueAssetsFile in $ueAssetsFiles) {
+                if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+                try {
+                    $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                    foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                        # Platform value can be an array of assets (legendary) or a map of
+                        # app_name -> asset (heroic-style assets.json). Handle both.
+                        $uePlatformAssets = @()
+                        if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                            $uePlatformAssets = @($platformProp.Value)
+                        }
+                        elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                            $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                        }
+                        foreach ($asset in @($uePlatformAssets)) {
+                            if (([string]$asset.namespace) -eq 'ue') {
+                                $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                                if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                            }
+                        }
+                    }
+                }
+                catch {}
+                break
+            }
             try {
                 if ($LegendaryCacheFile -and (Test-Path -LiteralPath $LegendaryCacheFile -PathType Leaf)) {
                     $cacheText = [System.IO.File]::ReadAllText($LegendaryCacheFile)
@@ -39192,6 +39348,8 @@ $script:InvokeWingetSearch = {
                         foreach ($game in @($library)) {
                             $title = [string]$game.Title
                             if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                            $legId = ([string]$game.Id).Trim()
+                            if ($hideUe -and ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$')) { continue }
                             if ([string]::IsNullOrWhiteSpace($needle) -or $title.ToLowerInvariant().Contains($needle)) {
                                 # Show installed version in Version column, latest in Available.
                                 $isInst = $false
@@ -39707,10 +39865,12 @@ $mniCopyAll.Add_Click({
 # Attach to the ListView
 # Prevent context menu from opening when right-clicking empty space, headers, or scrollbars
 $lstFw.Add_PreviewMouseRightButtonDown({
-    try { Set-WmtListViewRightClickSelection -ListView $lstFw -OriginalSource $_.OriginalSource } catch {}
+    param($s, $e)
+    try { Set-WmtListViewRightClickSelection -ListView $s -OriginalSource $e.OriginalSource } catch {}
 })
 $lstFw.Add_ContextMenuOpening({
-    if ($lstFw.SelectedItems.Count -eq 0) { $_.Handled = $true }
+    param($s, $e)
+    if (@($s.SelectedItems).Count -eq 0) { $e.Handled = $true }
 })
 
 # Attach to the ListView
@@ -40546,6 +40706,50 @@ $btnStartWithWindows.Add_Click({
     })
 }
 
+# Start the boot-time background jobs immediately. Called when Background Jobs
+# are re-enabled at runtime (Settings toggle or search action) so the user does
+# not have to restart WMT or revisit tabs to get stats, tweak states, caches and
+# the update auto-scan timer running.
+function Start-WmtBackgroundJobsNow {
+try {
+    # My Device stats (sections run in pooled runspaces; safe to kick from UI thread)
+    if (-not $script:MyDeviceStatsStarted) {
+        $script:MyDeviceStatsStarted = $true
+        Update-MyDeviceStats
+    }
+    elseif ($script:MyDeviceStatsLastDisabled) {
+        # Stats were last loaded while background jobs were disabled: the section
+        # collector timer never ran, so My Device still shows the "scanning is
+        # disabled" placeholders. Reload now — RAM-cached sections apply instantly.
+        Update-MyDeviceStats
+    }
+
+    # Tweak states + optional features background loads (each has a one-shot guard)
+    if (-not $script:TweakStatesReady) {
+        Start-TweakButtonStatesBackgroundUpdate
+        Start-OptionalFeaturesBackgroundCheck
+    }
+
+    # AppX bloatware list (normally triggered on first Tweaks tab visit)
+    if (-not $script:AppxListLoaded) {
+        $script:AppxListLoaded = $true
+        Start-AppxBackgroundLoad
+    }
+
+    # Legendary/GOG library cache for the Updates search box (self-guarding,
+    # refreshes only when a cache file is missing or older than 24 hours)
+    try { Start-WmtLibraryCacheBuilder } catch {}
+
+    # Periodic update auto-scan timer (requires update scans enabled too)
+    if (-not (Get-WmtUpdateScansDisabled)) {
+        try { Start-WmtUpdateAutoScanTimer } catch {}
+    }
+}
+catch {
+    try { Write-GuiLog "Background jobs failed to start: $($_.Exception.Message)" } catch {}
+}
+}
+
 # ── Background Jobs Toggle ──
 $btnDisableBgJobs = Get-Ctrl "btnDisableBgJobs"
 if ($btnDisableBgJobs) {
@@ -40566,11 +40770,18 @@ function Update-WmtDisableBgJobsButton {
 Update-WmtDisableBgJobsButton
 
 $btnDisableBgJobs.Add_Click({
-        $currentlyDisabled = Get-WmtDisableBackgroundJobs
+        $currentlyDisabled = [System.Convert]::ToBoolean((Get-WmtDisableBackgroundJobs))
         Set-WmtDisableBackgroundJobs -Enabled (-not $currentlyDisabled)
         Update-WmtDisableBgJobsButton
-        $newState = if (-not $currentlyDisabled) { 'enabled' } else { 'disabled' }
-        Write-GuiLog "Background jobs $newState. Changes take effect on next tab visit."
+        if ($currentlyDisabled) {
+            # Bg jobs were OFF, now ON — fire the boot-time jobs immediately
+            # instead of waiting for the next tab visit or an app restart.
+            Write-GuiLog "Background jobs enabled. Starting pending background jobs..."
+            try { Start-WmtBackgroundJobsNow } catch {}
+        }
+        else {
+            Write-GuiLog "Background jobs disabled. In-flight jobs will finish; new ones will not start."
+        }
     })
 }
 
@@ -40600,11 +40811,22 @@ function Update-WmtUpdateScansButton {
 Update-WmtUpdateScansButton
 
 $btnDisableUpdateScans.Add_Click({
-        $currentlyDisabled = Get-WmtUpdateScansDisabled
+        $currentlyDisabled = [System.Convert]::ToBoolean((Get-WmtUpdateScansDisabled))
         Set-WmtUpdateScansDisabled -Enabled (-not $currentlyDisabled)
         Update-WmtUpdateScansButton
         $newState = if (-not $currentlyDisabled) { 'disabled' } else { 'enabled' }
         Write-GuiLog "Update scans $newState."
+        if ($currentlyDisabled) {
+            # Update scans were OFF, now ON — restart the periodic auto-scan
+            # timer immediately (only when background jobs are also enabled).
+            if (-not (Get-WmtDisableBackgroundJobs)) {
+                try { Start-WmtUpdateAutoScanTimer } catch {}
+            }
+        }
+        else {
+            # Turning scans OFF — stop the periodic timer so no ticks fire at all.
+            try { Stop-WmtUpdateAutoScanTimer } catch {}
+        }
     })
 }
 if ($btnDonate) { $btnDonate.Add_Click({ Start-Process "https://github.com/sponsors/Chaython" }) }
@@ -41193,7 +41415,7 @@ $btnToggleTakeOwnership.Add_Click({
                 Write-GuiLog "Take Ownership context menu added (files, folders, drives)."
             } "Adding Take Ownership..."
         }
-        Update-WmtTweakToggle $btnToggleTakeOwnership (-not $installed) "Add Take Ownership" "Remove Take Ownership"
+        Update-WmtTweakToggle $btnToggleTakeOwnership (-not $installed) "Remove Take Ownership" "Add Take Ownership"
     })
 }
 
@@ -41217,7 +41439,7 @@ $btnTogglePsHere.Add_Click({
                 Write-GuiLog "PowerShell Here context menu added."
             } "Adding PowerShell Here..."
         }
-        Update-WmtTweakToggle $btnTogglePsHere (-not $installed) "Add PowerShell Here" "Remove PowerShell Here"
+        Update-WmtTweakToggle $btnTogglePsHere (-not $installed) "Remove PowerShell Here" "Add PowerShell Here"
     })
 }
 
@@ -41942,9 +42164,45 @@ $ps = New-WmtPooledPowerShell
                 $cacheText = [System.IO.File]::ReadAllText($LegCacheFile)
                 $library = $cacheText | ConvertFrom-Json -ErrorAction Stop
                 $legCount = 0
+                # Legendary marks UE/Fab content with namespace 'ue' in its own assets.json.
+                # Use it as the authoritative UE/Fab tag (Fab app_names are arbitrary, e.g. "PlatformFunctionsPlugin_5.4").
+                $ueAppNames = @{}
+                $ueAssetsFiles = @()
+                try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+                try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+                foreach ($ueAssetsFile in $ueAssetsFiles) {
+                    if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+                    try {
+                        $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                        foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                            # Platform value can be an array of assets (legendary) or a map of
+                            # app_name -> asset (heroic-style assets.json). Handle both.
+                            $uePlatformAssets = @()
+                            if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                                $uePlatformAssets = @($platformProp.Value)
+                            }
+                            elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                                $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                            }
+                            foreach ($asset in @($uePlatformAssets)) {
+                                if (([string]$asset.namespace) -eq 'ue') {
+                                    $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                                    if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                                }
+                            }
+                        }
+                    }
+                    catch {}
+                    break
+                }
                 foreach ($game in @($library)) {
                     $title = [string]$game.Title
                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                    # Tag Unreal Engine / Fab marketplace assets. The UI hides them
+                    # when the "Hide Unreal Engine / Fab assets" toggle is checked;
+                    # update checks are never affected by the toggle.
+                    $legId = ([string]$game.Id).Trim()
+                    $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$')
                     $isInst = $false
                     try { if ($game.PSObject.Properties["IsInstalled"]) { $isInst = [bool]$game.IsInstalled } } catch {}
                     $instVer = ""
@@ -41958,6 +42216,7 @@ $ps = New-WmtPooledPowerShell
                             Available   = if (-not [string]::IsNullOrWhiteSpace($latestVer)) { $latestVer } else { "-" }
                             IsInstalled = $isInst
                             ProviderKey = "legendary"
+                            IsUe        = $legIsUe
                         })
                     $legCount++
                 }
@@ -42040,6 +42299,7 @@ $script:WmtLibraryScanTimer.Add_Tick({
             if ($lstLibrary -and $brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible) {
                 $lstLibrary.Items.Clear()
                 foreach ($item in $script:WmtLibraryScanResults) {
+                    if (Test-WmtFabAssetHidden $item) { continue }
                     [void]$lstLibrary.Items.Add($item)
                 }
                 if ($lblLibraryStatus) {
@@ -42076,6 +42336,7 @@ $btnShowLibrary.Add_Click({
         $brdLibraryList.Visibility = "Visible"
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
 
         # Highlight the Your Library button (AccentBtn style).
         if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
@@ -42084,6 +42345,7 @@ $btnShowLibrary.Add_Click({
         if ($script:WmtLibraryScanResults -and $script:WmtLibraryScanResults.Count -gt 0) {
             $lstLibrary.Items.Clear()
             foreach ($item in $script:WmtLibraryScanResults) {
+                if (Test-WmtFabAssetHidden $item) { continue }
                 [void]$lstLibrary.Items.Add($item)
             }
             if ($lblLibraryStatus) {
@@ -42104,6 +42366,7 @@ $btnBackToCatalog.Add_Click({
         $brdCatalogList.Visibility = "Visible"
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Collapsed" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
+        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
 
         # Restore the Your Library button to ActionBtn style (gray).
@@ -42113,6 +42376,32 @@ $btnBackToCatalog.Add_Click({
 $btnLibraryRefresh.Add_Click({
         Start-WmtLibraryScan
     })
+
+# --- Unreal Engine / Fab assets visibility toggle (Your Library) ---
+# Hides UE/Fab assets from the library view only; update scans for them
+# are never disabled. Persisted in settings.json as HideLegendaryUeAssets.
+# State lives in $global:WmtHideUeAssets (see Test-WmtFabAssetHidden) so the
+# search debounce and every list population path share one live value.
+if ($btnToggleFabAssets) {
+$btnToggleFabAssets.Add_Click({
+        $global:WmtHideUeAssets = -not $global:WmtHideUeAssets
+        try {
+            $wmtUeSettings = Get-WmtSettings
+            if ($wmtUeSettings -is [System.Collections.IDictionary]) { $wmtUeSettings["HideLegendaryUeAssets"] = [bool]$global:WmtHideUeAssets }
+            else { $wmtUeSettings | Add-Member -MemberType NoteProperty -Name "HideLegendaryUeAssets" -Value ([bool]$global:WmtHideUeAssets) -Force }
+            Save-WmtSettings -Settings $wmtUeSettings
+        }
+        catch {}
+        Set-WmtFabAssetsButtonLabel
+        # Re-apply the filter instantly; Update-WmtLibrarySearch respects any
+        # active search text and the shared hide flag.
+        Update-WmtLibrarySearch
+        if ($lblLibraryStatus -and $brdLibraryList -and $brdLibraryList.Visibility -eq "Visible" -and $lstLibrary -and $lstLibrary.Items.Count -gt 0) {
+            $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
+        }
+        Write-GuiLog ("Unreal Engine / Fab assets are now " + $(if ($global:WmtHideUeAssets) { "hidden" } else { "shown" }) + " in Your Library. Update checks are unaffected.")
+    })
+}
 
 # --- Library context menu ---
 # Helper: get the selected library item.
@@ -42637,12 +42926,14 @@ function Update-WmtLibrarySearch {
     if ([string]::IsNullOrWhiteSpace($query)) {
         # No filter � show all.
         foreach ($item in $script:WmtLibraryScanResults) {
+            if (Test-WmtFabAssetHidden $item) { continue }
             [void]$lstLibrary.Items.Add($item)
         }
     }
     else {
         $needle = $query.ToLowerInvariant()
         foreach ($item in $script:WmtLibraryScanResults) {
+            if (Test-WmtFabAssetHidden $item) { continue }
             $name = ([string]$item.Name).ToLowerInvariant()
             $id = ([string]$item.Id).ToLowerInvariant()
             $source = ([string]$item.Source).ToLowerInvariant()
@@ -42703,7 +42994,6 @@ if ($txtLibrarySearch) {
     $script:WmtLibrarySearchTimer.Add_Tick({
             try { $script:WmtLibrarySearchTimer.Stop() } catch {}
             Update-WmtLibrarySearch
-            $script:WmtLibrarySearchTimer = $null
         }.GetNewClosure())
 }
 
@@ -43084,8 +43374,8 @@ function Sync-WmtTweakOverlayHide {
 # states background job AND the optional features background check have
 # completed.  Updates the overlay subtitle so the user knows what's still loading.
 try {
-    $tweakStatesDone = $script:TweakStatesReady
-    $optFeaturesDone = $script:OptionalFeaturesReady
+    $tweakStatesDone = [bool]$script:TweakStatesReady
+    $optFeaturesDone = [bool]$script:OptionalFeaturesReady
     if ($tweakStatesDone -and $optFeaturesDone) {
         Set-TweakStatesLoadingOverlay -Visible $false
     }
@@ -43095,6 +43385,18 @@ try {
         Set-TweakStatesLoadingOverlay -Visible $true
         $sub = Get-Ctrl "txtTweakOverlaySubtitle"
         if ($sub) { $sub.Text = "Tweak buttons loaded. Checking optional features (.NET, WSL, Hyper-V...)" }
+        }
+    elseif (-not $tweakStatesDone -and $optFeaturesDone) {
+        # Optional features are ready, but tweak toggle buttons are still loading.
+        Set-TweakStatesLoadingOverlay -Visible $true
+        $sub = Get-Ctrl "txtTweakOverlaySubtitle"
+        if ($sub) { $sub.Text = "Optional features loaded. Loading tweak buttons..." }
+    }
+    else {
+        # Both tweak states and optional features are still loading.
+        Set-TweakStatesLoadingOverlay -Visible $true
+        $sub = Get-Ctrl "txtTweakOverlaySubtitle"
+        if ($sub) { $sub.Text = "Loading tweak buttons and checking optional features..." }
     }
 } catch {}
 }
@@ -43485,6 +43787,26 @@ $script:TweakStatesBgTimeout.Add_Tick({
 $script:TweakStatesBgTimeout.Start()
 }
 
+$script:OptionalFeaturesMap = @{
+    "Microsoft-Hyper-V-All"              = "btnFeatHyperV"
+    "Microsoft-Windows-Subsystem-Linux"  = "btnFeatWSL"
+    "Containers-DisposableClientVM"      = "btnFeatSandbox"
+    "NetFx3"                             = "btnFeatDotNet35"
+    "ServicesForNFS-ClientOnly"          = "btnFeatNFS"
+    "TelnetClient"                       = "btnFeatTelnet"
+    "IIS-WebServerRole"                  = "btnFeatIIS"
+    "WindowsMediaPlayer"                 = "btnFeatLegacy"
+    "VirtualMachinePlatform"             = "btnFeatVMP"
+    "HypervisorPlatform"                 = "btnFeatWHP"
+    "OpenSSH.Client"                     = "btnFeatSSHClient"
+    "OpenSSH.Server"                     = "btnFeatSSHServer"
+    "Windows-Defender-ApplicationGuard"  = "btnFeatAppGuard"
+    "WirelessDisplay"                    = "btnFeatMiracast"
+    "QuickAssist"                        = "btnFeatQuickAssist"
+    "XpsViewer"                          = "btnFeatXPS"
+    "TIFFIFilter"                        = "btnFeatTIFF"
+}
+
 function Start-OptionalFeaturesBackgroundCheck {
 # Check all optional features in a SINGLE query (not 17 separate calls).
 # Runs only ONCE, deferred until the user first visits the Tweaks tab
@@ -43493,25 +43815,7 @@ if ($script:OptionalFeaturesCheckStarted) { return }
 $script:OptionalFeaturesCheckStarted = $true
 
 # Map feature names to button names
-$featureMap = @{
-    "Microsoft-Hyper-V-All"             = "btnFeatHyperV"
-    "Microsoft-Windows-Subsystem-Linux" = "btnFeatWSL"
-    "Containers-DisposableClientVM"     = "btnFeatSandbox"
-    "NetFx3"                            = "btnFeatDotNet35"
-    "ServicesForNFS-ClientOnly"         = "btnFeatNFS"
-    "TelnetClient"                      = "btnFeatTelnet"
-    "IIS-WebServerRole"                 = "btnFeatIIS"
-    "WindowsMediaPlayer"                = "btnFeatLegacy"
-    "VirtualMachinePlatform"            = "btnFeatVMP"
-    "HypervisorPlatform"                = "btnFeatWHP"
-    "OpenSSH.Client"                    = "btnFeatSSHClient"
-    "OpenSSH.Server"                    = "btnFeatSSHServer"
-    "Windows-Defender-ApplicationGuard" = "btnFeatAppGuard"
-    "WirelessDisplay"                   = "btnFeatMiracast"
-    "QuickAssist"                       = "btnFeatQuickAssist"
-    "XpsViewer"                         = "btnFeatXPS"
-    "TIFFIFilter"                       = "btnFeatTIFF"
-}
+$featureMap = $script:OptionalFeaturesMap
 
 # Run in a background runspace (shared pool)
 $ps = New-WmtPooledPowerShell
@@ -43605,6 +43909,69 @@ $script:FeaturesCheckTimer.Add_Tick({
         }
     })
 $script:FeaturesCheckTimer.Start()
+}
+
+function Update-OptionalFeaturesSynchronously {
+    $featureMap = $script:OptionalFeaturesMap
+    $results = @{}
+    $useCmdlet = $false
+    try {
+        if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+            $useCmdlet = $true
+        }
+    }
+    catch {}
+    if ($useCmdlet) {
+        try {
+            Write-GuiLog "[Optional Features] Querying all features with PowerShell..."
+            $allFeatures = Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue
+            if ($allFeatures) {
+                foreach ($feat in $allFeatures) {
+                    $btnName = $featureMap[$feat.FeatureName]
+                    if ($btnName) {
+                        $results[$btnName] = ($feat.State -eq "Enabled")
+                    }
+                }
+            }
+        }
+        catch {
+            try { Write-GuiLog "[Optional Features] PowerShell query failed: $($_.Exception.Message)" } catch {}
+        }
+    }
+    if ($results.Count -eq 0) {
+        try {
+            Write-GuiLog "[Optional Features] Querying all features with DISM..."
+            $output = Invoke-WmtCliText `
+                -FilePath "dism" `
+                -Arguments "/Online /Get-Features" `
+                -TimeoutMs 120000
+            foreach ($featureName in $featureMap.Keys) {
+                $btnName = $featureMap[$featureName]
+                if ($output -match "(?s)Feature Name :\s*$([regex]::Escape($featureName))\s*\r?\n.*?State\s*:\s*Enabled") {
+                    $results[$btnName] = $true
+                }
+                else {
+                    $results[$btnName] = $false
+                }
+            }
+        }
+        catch {
+            try { Write-GuiLog "[Optional Features] DISM query failed: $($_.Exception.Message)" } catch {}
+        }
+    }
+    foreach ($btnName in $results.Keys) {
+        $btn = Get-Ctrl $btnName
+        if (-not $btn) { continue }
+        if ($results[$btnName]) {
+            $btn.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style])
+            $btn.ToolTip = "Current state: Enabled (Blue = installed/active)`nClick to uninstall this feature (Gray).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
+        }
+        else {
+            $btn.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style])
+            $btn.ToolTip = "Current state: Disabled (Gray = not installed)`nClick to install this feature (Blue).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
+        }
+    }
+    Write-GuiLog "[Optional Features] Synchronous detection completed. Buttons updated: $($results.Count)"
 }
 
 $onMainWindowContentRendered = {
@@ -43967,7 +44334,11 @@ try {
                     }
 
                     $arr = $result.ToArray()
-                    $arr | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $LegCacheFile -Force -Encoding UTF8
+                    # Guard: never wipe an existing cache with an empty result (e.g. a
+                    # network outage during the fetch) — keep the last good list.
+                    if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
+                        $arr | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $LegCacheFile -Force -Encoding UTF8
+                    }
                     Write-Output "LOG:Legendary library cached: $($arr.Count) games."
                 }
                 catch {
@@ -44492,11 +44863,11 @@ if ($script:WmtDispatcherUnhandledHandler) {
 $script:WmtDispatcherUnhandledHandler = [System.Windows.Threading.DispatcherUnhandledExceptionEventHandler] {
     param($s, $eA)
 
-    try { $eventArgs.Handled = $true } catch {}
+    try { $eA.Handled = $true } catch {}
     try {
-        Write-WmtLastCrash -Context "Unhandled WPF dispatcher exception" -Exception $eventArgs.Exception
+        Write-WmtLastCrash -Context "Unhandled WPF dispatcher exception" -Exception $eA.Exception
         if ($script:WingetJob -or $script:WingetActiveAction) {
-            Reset-WmtUpdateUiAfterMonitorError -Context "Unhandled WPF dispatcher exception" -Exception $eventArgs.Exception -SkipCrashWrite
+            Reset-WmtUpdateUiAfterMonitorError -Context "Unhandled WPF dispatcher exception" -Exception $eA.Exception -SkipCrashWrite
         }
     }
     catch {}
