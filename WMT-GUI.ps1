@@ -34086,7 +34086,7 @@ try {
             $app = $match.Groups["app"].Value.Trim()
             $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
             if ([string]::IsNullOrWhiteSpace($title)) { continue }
-            $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$')
+            $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
             if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                 foreach ($ueMetaRoot in $ueMetaRoots) {
                     $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
@@ -39817,7 +39817,7 @@ $script:InvokeWingetSearch = {
                                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
                                     $app = $match.Groups["app"].Value.Trim()
                                     $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
-                                    $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$')
+                                    $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
                                     if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                                         foreach ($ueMetaRoot in $ueMetaRoots) {
                                             $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
@@ -40351,7 +40351,7 @@ $script:InvokeWingetSearch = {
                             # assets.json namespace set and name patterns as fallbacks.
                             $legIsUe = $false
                             try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
-                            if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$') }
+                            if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
                             if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                                 foreach ($ueMetaRoot in $ueMetaRoots) {
                                     $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
@@ -43267,7 +43267,7 @@ $ps = New-WmtPooledPowerShell
                     # a text-parsed cache does not veto the other sources.
                     $legIsUe = $false
                     try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
-                    if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$') }
+                    if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
                     if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                         foreach ($ueMetaRoot in $ueMetaRoots) {
                             $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
@@ -45531,7 +45531,7 @@ try {
                                 if ([string]::IsNullOrWhiteSpace($title)) { continue }
                                 $app = $match.Groups["app"].Value.Trim()
                                 $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
-                                $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$')
+                                $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
                                 if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                                     foreach ($ueMetaRoot in $ueMetaRoots) {
                                         $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
