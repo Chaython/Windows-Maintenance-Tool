@@ -5364,11 +5364,20 @@ param($Item)
 
 # Shared guard for every Your Library population path (list view, search,
 # scan collector, toggle re-apply). Returns $true only when UE/Fab assets
-# are hidden AND the row is tagged as UE.
+# are hidden AND the row is tagged as UE. Reclassify Epic rows here as well
+# so older library caches are filtered without requiring a cache rebuild.
 if (-not $global:WmtHideUeAssets) { return $false }
 if (-not $Item) { return $false }
-if (-not $Item.PSObject.Properties["IsUe"]) { return $false }
-return [bool]$Item.IsUe
+$isUe = $false
+if ($Item.PSObject.Properties["IsUe"]) { $isUe = [bool]$Item.IsUe }
+if (-not $isUe -and ([string]$Item.Source).Trim() -match "(?i)^(epic|legendary)$") {
+    $title = [string]$Item.Name
+    $id = [string]$Item.Id
+    $isUe = ($id -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or
+        $id -match '(?i)(?:^|_)(?:5\.\d+)$' -or
+        $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
+}
+return $isUe
 }
 
 function Get-WmtSavedUpdateAutoScanMinutes {
