@@ -197,6 +197,20 @@ if ($script:LogBox) {
 }
 }
 
+function Remove-WmtGuiLogMessage {
+param([string]$Message)
+if (-not $script:LogBox -or [string]::IsNullOrWhiteSpace($Message)) { return }
+
+try {
+    $lines = @($script:LogBox.Text -split "\r?\n" | Where-Object {
+        $_ -and $_ -notmatch ('^\[[^\]]+\]\s*' + [regex]::Escape($Message) + '\s*$')
+    })
+    $script:LogBox.Text = if ($lines.Count -gt 0) { ($lines -join "`n") + "`n" } else { "" }
+    $script:LogBox.ScrollToEnd()
+}
+catch {}
+}
+
 function ConvertTo-WmtVersion {
 param([string]$VersionText)
 
@@ -36593,11 +36607,24 @@ param([switch]$ResetNextRun)
 
 $minutes = Get-WmtUpdateAutoScanMinutes
 
+$updateScansDisabled = Get-WmtUpdateScansDisabled
+if ($updateScansDisabled) {
+    $disabledMessagePattern = '(?m)^\[[^\]]+\]\s*' + [regex]::Escape("Update auto scan is disabled.") + '\s*$'
+    if (-not $script:LogBox -or $script:LogBox.Text -notmatch $disabledMessagePattern) {
+        Write-GuiLog "Update auto scan is disabled."
+    }
+}
+else {
+    # Re-enabling background jobs or update scans can revisit this path with a
+    # zero-minute interval. Remove the old disabled status instead of retaining
+    # a stale final line in the activity log.
+    Remove-WmtGuiLogMessage -Message "Update auto scan is disabled."
+}
+
 # DispatcherTimer is not IDisposable. Stop it and detach the Tick handler instead.
 Stop-WmtUpdateAutoScanTimer
 
 if ($minutes -le 0) {
-    Write-GuiLog "Update auto scan is disabled."
     return
 }
 
