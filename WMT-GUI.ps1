@@ -1957,7 +1957,11 @@ return $pool
 
 function Get-WmtBackgroundRunspacePool {
 if (-not $script:WmtBackgroundPool) {
-    Initialize-WmtBackgroundRunspacePool
+    # Initialize RETURNS the pool object; discard it so this function emits
+    # exactly one object. The leaked return used to hand the first caller
+    # TWO pool objects (an array), which then tripped the old pool-health
+    # checks with reports like "state: Opened Opened" for a healthy pool.
+    $null = Initialize-WmtBackgroundRunspacePool
 }
 return $script:WmtBackgroundPool
 }
@@ -1978,24 +1982,42 @@ if ($script:WmtBackgroundPool) {
 # Falls back to standalone if the pool is unavailable or closed.
 function New-WmtPooledPowerShell {
 try {
-    $pool = Get-WmtBackgroundRunspacePool
+    $pool = $null
+    try { $pool = Get-WmtBackgroundRunspacePool } catch { $pool = $null }
     if (-not $pool) { return [PowerShell]::Create() }
-    # Check if pool is still open — if it was disposed/closed, fall back to standalone
-    if ($pool.IsDisposed -or ($pool.RunspacePoolStateInfo -and $pool.RunspacePoolStateInfo.State -ne 'Opened')) {
-        try { Write-GuiLog "[RunspacePool] Pool is no longer open (state: $($pool.RunspacePoolStateInfo.State)). Falling back to standalone runspace." } catch {}
-        return [PowerShell]::Create()
+
+    # Guard the stored value itself: anything that is not exactly one
+    # RunspacePool (a stray collection, for instance) makes every health
+    # guess below misfire - that is what once printed "state: Opened
+    # Opened" for a perfectly healthy pool and bounced every worker to a
+    # standalone runspace. Reset and rebuild instead of guessing.
+    if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
+        try {
+            foreach ($item in @($pool)) {
+                if ($item -is [System.Management.Automation.Runspaces.RunspacePool]) { $item.Dispose() }
+            }
+        } catch {}
+        $script:WmtBackgroundPool = $null
+        try { $pool = Get-WmtBackgroundRunspacePool } catch { $pool = $null }
+        if (-not $pool) { return [PowerShell]::Create() }
     }
+
     $ps = [PowerShell]::Create()
     try {
+        # Assigning the pool is itself the authoritative health check: a
+        # closed, broken or disposed pool raises right here, so no
+        # state-name string comparison is left to guess with.
         $ps.RunspacePool = $pool
+        return $ps
     }
     catch {
-        # Pool may have been closed between the check above and the assignment
-        try { Write-GuiLog "[RunspacePool] Failed to assign pool to PowerShell: $($_.Exception.Message). Using standalone." } catch {}
-        $ps.Dispose()
+        try { Write-GuiLog "[RunspacePool] Pool rejected a worker ($($_.Exception.Message)); a fresh pool will be built for the next job." } catch {}
+        try { $pool.Close() } catch {}
+        try { $pool.Dispose() } catch {}
+        $script:WmtBackgroundPool = $null
+        try { $ps.Dispose() } catch {}
         return [PowerShell]::Create()
     }
-    return $ps
 }
 catch {
     return [PowerShell]::Create()
@@ -3018,6 +3040,33 @@ foreach ($column in $Columns) {
 }
 }
 
+# --- SCHEDULED TASKS ENGINE (native Task Scheduler COM API) ---
+# Every scheduled-task view and toggle in this tool goes through the Task
+# Scheduler's own COM interface (Schedule.Service) - the same API schtasks.exe
+# uses. The ScheduledTasks module cmdlets wrap a CIM layer that fails wholesale
+# on some Windows 10 machines ("Value cannot be null. Parameter name: key"),
+# which used to blank the task lists and fail every telemetry toggle even
+# though the Task Scheduler service itself was healthy. The COM API does
+# exact-path lookups in milliseconds and never depends on WMI/CIM health.
+function New-WmtTaskSchedulerService {
+if ($script:WmtTaskService) {
+    # Re-validate a cached connection (the service may have been stopped or
+    # its RCW released since the last call); fall through to a fresh connect.
+    try { [void]$script:WmtTaskService.GetFolder("\"); return $script:WmtTaskService } catch { $script:WmtTaskService = $null }
+}
+
+try {
+    $service = New-Object -ComObject "Schedule.Service"
+    $service.Connect()
+    $script:WmtTaskService = $service
+    return $service
+}
+catch {
+    $script:WmtTaskService = $null
+    return $null
+}
+}
+
 function ConvertTo-WmtScheduledTaskIdentity {
 param(
     [string]$FullName = "",
@@ -3050,64 +3099,311 @@ $full = if ($TaskPath -eq "\") { "\$TaskName" } else { "$TaskPath$TaskName" }
 }
 }
 
-function Get-WmtScheduledTaskByIdentity {
+function ConvertFrom-WmtRegisteredTask {
 param(
-    [string]$FullName = "",
-    [string]$TaskName = "",
-    [string]$TaskPath = ""
+    $Task,
+    [string]$FallbackTaskName = "",
+    [string]$FallbackTaskPath = "\"
 )
 
-$id = ConvertTo-WmtScheduledTaskIdentity -FullName $FullName -TaskName $TaskName -TaskPath $TaskPath
-if ([string]::IsNullOrWhiteSpace($id.TaskName)) { return $null }
+# Property reads on a registered task can throw for tasks with damaged XML or
+# locked-down principals, so every read is guarded and the identity falls back
+# to caller-supplied values when the object will not cooperate.
+$taskName = ([string]$FallbackTaskName).Trim()
+try { $taskName = ([string]$Task.Name).Trim() } catch {}
 
-try {
-    return Get-ScheduledTask -TaskName $id.TaskName -TaskPath $id.TaskPath -ErrorAction Stop | Select-Object -First 1
+$taskPath = ""
+try { $taskPath = ([string]$Task.Path).Trim() } catch {}
+
+$id = if (-not [string]::IsNullOrWhiteSpace($taskPath)) {
+    ConvertTo-WmtScheduledTaskIdentity -FullName $taskPath
 }
-catch {
+else {
+    ConvertTo-WmtScheduledTaskIdentity -TaskName $taskName -TaskPath $FallbackTaskPath
+}
+
+$state = "Unknown"
+try {
+    switch ([int]$Task.State) {
+        0 { $state = "Unknown" }
+        1 { $state = "Disabled" }
+        2 { $state = "Queued" }
+        3 { $state = "Ready" }
+        4 { $state = "Running" }
+        default { $state = "Unknown" }
+    }
+}
+catch {}
+
+$enabled = ($state -ne "Disabled")
+try { $enabled = [bool]$Task.Enabled } catch {}
+
+$author = ""
+try { $author = [string]$Task.Definition.RegistrationInfo.Author } catch {}
+$description = ""
+try { $description = [string]$Task.Definition.RegistrationInfo.Description } catch {}
+
+[PSCustomObject]@{
+    TaskName    = [string]$id.TaskName
+    TaskPath    = [string]$id.TaskPath
+    State       = $state
+    Enabled     = $enabled
+    Author      = $author
+    Description = $description
+    FullName    = [string]$id.FullName
+}
+}
+
+function Get-WmtAllRegisteredTasks {
+param([Parameter(Mandatory = $true)]$Service)
+
+# Iterative walk of the task folder tree. GetTasks(1) also lists hidden tasks
+# (matching what the module cmdlets returned); a folder that refuses
+# enumeration is skipped instead of aborting the whole listing.
+$tasks = [System.Collections.ArrayList]::new()
+$stack = [System.Collections.Generic.Stack[object]]::new()
+try { $stack.Push($Service.GetFolder("\")) } catch { return @($tasks) }
+while ($stack.Count -gt 0) {
+    $folder = $stack.Pop()
     try {
-        return Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -eq $id.TaskName -and $_.TaskPath -eq $id.TaskPath } | Select-Object -First 1
+        foreach ($task in @($folder.GetTasks(1))) { [void]$tasks.Add($task) }
+    }
+    catch {}
+    try {
+        foreach ($subFolder in @($folder.GetFolders(0))) { $stack.Push($subFolder) }
     }
     catch {}
 }
-return $null
+return @($tasks)
 }
 
 function Get-WmtScheduledTaskRows {
 param(
     [string[]]$FullPaths = @(),
-    [string[]]$TaskPaths = @()
+    [string[]]$TaskPaths = @(),
+    [string[]]$TelemetryFolders = @()
 )
 
-$tasks = @()
-if ($FullPaths -and $FullPaths.Count -gt 0) {
-    foreach ($fullPath in $FullPaths) {
-        $task = Get-WmtScheduledTaskByIdentity -FullName $fullPath
-        if ($task) { $tasks += $task }
+$raw = @()
+$service = New-WmtTaskSchedulerService
+
+if (-not $service) {
+    # No Task Scheduler connection: keep explicit rows for every requested
+    # task so the grid always shows what was asked for (and why it failed).
+    foreach ($fullPath in @($FullPaths)) {
+        $id = ConvertTo-WmtScheduledTaskIdentity -FullName $fullPath
+        if ([string]::IsNullOrWhiteSpace($id.TaskName)) { continue }
+        $raw += [PSCustomObject]@{
+            TaskName    = [string]$id.TaskName
+            TaskPath    = [string]$id.TaskPath
+            State       = "ReadError"
+            Enabled     = $false
+            Author      = ""
+            Description = "Task Scheduler service is unavailable."
+            FullName    = [string]$id.FullName
+        }
+    }
+    if (@($FullPaths).Count -eq 0) {
+        $raw += [PSCustomObject]@{
+            TaskName    = "Task Scheduler unavailable"
+            TaskPath    = ""
+            State       = "ReadError"
+            Enabled     = $false
+            Author      = ""
+            Description = "Could not connect to the Task Scheduler COM service. Run WMT elevated and verify the Task Scheduler service is running."
+            FullName    = ""
+        }
+    }
+}
+elseif ($TelemetryFolders -and $TelemetryFolders.Count -gt 0) {
+    # Live "invoke the Task Scheduler" enumeration: walk every telemetry
+    # folder and list ALL tasks the scheduler actually has there (GetTasks(1)
+    # includes hidden tasks) instead of assuming a fixed name list - Windows
+    # builds vary; machines are missing some of the canonical nine while
+    # carrying extra CEIP/Appraiser/Siuf sub-tasks no fixed list knows.
+    # Folders that do not exist on this install raise 0x80070002 and are
+    # simply skipped (no tasks registered there). The Office folder mixes
+    # telemetry agents with unrelated servicing tasks, so its tasks are
+    # name-filtered at read time.
+    $seen = @{}
+    foreach ($folderPath in @($TelemetryFolders)) {
+        try {
+            # GetFolder takes the path WITHOUT a trailing backslash.
+            $folder = $service.GetFolder(([string]$folderPath).TrimEnd("\"))
+            $isOffice = (([string]$folderPath).TrimEnd("\") -eq "\Microsoft\Office")
+            foreach ($task in @($folder.GetTasks(1))) {
+                if ($isOffice) {
+                    $officeName = ""
+                    try { $officeName = [string]$task.Name } catch {}
+                    if ($officeName -notmatch "(?i)telemetry|apphealth|crash|consent") { continue }
+                }
+                $row = ConvertFrom-WmtRegisteredTask -Task $task
+                $key = ([string]$row.FullName).ToLowerInvariant()
+                if ([string]::IsNullOrWhiteSpace($key) -or $seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+                $raw += $row
+            }
+        }
+        catch {}
+    }
+    # Merge the canonical button paths (deduped against the walk: tasks the
+    # walk already returned are listed from their live folder state; only the
+    # ones this machine is missing are new here, as explicit NotFound /
+    # ReadError rows so the grid always explains what the buttons target).
+    foreach ($fullPath in @($FullPaths)) {
+        $id = ConvertTo-WmtScheduledTaskIdentity -FullName $fullPath
+        if ([string]::IsNullOrWhiteSpace($id.TaskName)) { continue }
+        $key = ([string]$id.FullName).ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        try {
+            $canonicalFolder = ([string]$id.TaskPath).TrimEnd("\")
+            if ([string]::IsNullOrWhiteSpace($canonicalFolder)) { $canonicalFolder = "\" }
+            $folder = $service.GetFolder($canonicalFolder)
+            $task = $folder.GetTask([string]$id.TaskName)
+            if ($task) {
+                $raw += ConvertFrom-WmtRegisteredTask -Task $task -FallbackTaskName $id.TaskName -FallbackTaskPath $id.TaskPath
+            }
+            else {
+                $raw += [PSCustomObject]@{
+                    TaskName    = [string]$id.TaskName
+                    TaskPath    = [string]$id.TaskPath
+                    State       = "NotFound"
+                    Enabled     = $false
+                    Author      = ""
+                    Description = "Task is not registered on this system."
+                    FullName    = [string]$id.FullName
+                }
+            }
+        }
+        catch {
+            $hr = 0
+            try { $hr = $_.Exception.HResult } catch {}
+            $message = [string]$_.Exception.Message
+            $notFound = ($hr -eq -2147024894 -or $message -match '(?i)(cannot find|not found|does not exist|0x80070002)')
+            $raw += [PSCustomObject]@{
+                TaskName    = [string]$id.TaskName
+                TaskPath    = [string]$id.TaskPath
+                State       = if ($notFound) { "NotFound" } else { "ReadError" }
+                Enabled     = $false
+                Author      = ""
+                Description = if ($notFound) { "Task is not registered on this system." } else { $message }
+                FullName    = [string]$id.FullName
+            }
+        }
+    }
+    # Sort by folder then name so related tasks read as a block.
+    $raw = @($raw | Sort-Object TaskPath, TaskName)
+}
+elseif ($FullPaths -and $FullPaths.Count -gt 0) {
+    foreach ($fullPath in @($FullPaths)) {
+        $id = ConvertTo-WmtScheduledTaskIdentity -FullName $fullPath
+        if ([string]::IsNullOrWhiteSpace($id.TaskName)) { continue }
+        try {
+            # Exact-path COM lookup: no wildcard layer, no full-store scan.
+            # ITaskService has no GetTask member - tasks are opened through
+            # their folder (the same two-step the device-health probe uses).
+            # A missing folder raises 0x80070002, classified as NotFound below.
+            # GetFolder's documented path format carries NO trailing backslash
+            # ("Do not use a backslash following the last folder name in the
+            # path" - ITaskService::GetFolder), while the identity's TaskPath
+            # keeps one for display; strip it before every folder open.
+            $folderPath = ([string]$id.TaskPath).TrimEnd("\")
+            if ([string]::IsNullOrWhiteSpace($folderPath)) { $folderPath = "\" }
+            $folder = $service.GetFolder($folderPath)
+            $task = $folder.GetTask([string]$id.TaskName)
+            if ($task) {
+                $raw += ConvertFrom-WmtRegisteredTask -Task $task -FallbackTaskName $id.TaskName -FallbackTaskPath $id.TaskPath
+            }
+            else {
+                $raw += [PSCustomObject]@{
+                    TaskName    = [string]$id.TaskName
+                    TaskPath    = [string]$id.TaskPath
+                    State       = "NotFound"
+                    Enabled     = $false
+                    Author      = ""
+                    Description = "Task is not registered on this system."
+                    FullName    = [string]$id.FullName
+                }
+            }
+        }
+        catch {
+            # Missing or unreadable tasks stay visible as explicit rows instead
+            # of silently vanishing; the classification matches the task probe
+            # used by the device-health scan (HRESULT 0x80070002 family or a
+            # not-found message means absent, anything else is a read error).
+            $hr = 0
+            try { $hr = $_.Exception.HResult } catch {}
+            $message = [string]$_.Exception.Message
+            $notFound = ($hr -eq -2147024894 -or $message -match '(?i)(cannot find|not found|does not exist|0x80070002)')
+            $raw += [PSCustomObject]@{
+                TaskName    = [string]$id.TaskName
+                TaskPath    = [string]$id.TaskPath
+                State       = if ($notFound) { "NotFound" } else { "ReadError" }
+                Enabled     = $false
+                Author      = ""
+                Description = if ($notFound) { "Task is not registered on this system." } else { $message }
+                FullName    = [string]$id.FullName
+            }
+        }
     }
 }
 else {
     try {
-        $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+        $comTasks = @(Get-WmtAllRegisteredTasks -Service $service)
         if ($TaskPaths -and $TaskPaths.Count -gt 0) {
             $normalizedPaths = @($TaskPaths | ForEach-Object { (ConvertTo-WmtScheduledTaskIdentity -TaskPath $_ -TaskName "_").TaskPath })
-            $tasks = @($tasks | Where-Object { $_.TaskPath -in $normalizedPaths })
+            $comTasks = @($comTasks | Where-Object {
+                    $taskPath = ""
+                    try { $taskPath = ([string]$_.Path).Trim() } catch {}
+                    if ([string]::IsNullOrWhiteSpace($taskPath)) { $false }
+                    else {
+                        $taskId = ConvertTo-WmtScheduledTaskIdentity -FullName $taskPath
+                        $taskId.TaskPath -in $normalizedPaths
+                    }
+                })
+        }
+        foreach ($task in @($comTasks)) {
+            $raw += ConvertFrom-WmtRegisteredTask -Task $task
+        }
+        if ($comTasks.Count -eq 0 -and @($TaskPaths).Count -eq 0) {
+            $raw += [PSCustomObject]@{
+                TaskName    = "No scheduled tasks returned"
+                TaskPath    = ""
+                State       = "ReadError"
+                Enabled     = $false
+                Author      = ""
+                Description = "Task Scheduler returned no tasks. Check COM access, permissions, and the Task Scheduler service."
+                FullName    = ""
+            }
         }
     }
     catch {
-        $tasks = @()
+        $raw = @()
     }
 }
 
-foreach ($task in @($tasks)) {
-    $id = ConvertTo-WmtScheduledTaskIdentity -TaskName $task.TaskName -TaskPath $task.TaskPath
+# Project the raw rows into the display shape the grids expect (Enabled as
+# Yes/No), keeping placeholder rows explicit so telemetry tasks stay listed
+# even when they are missing or unreadable.
+foreach ($task in @($raw)) {
+    $state = [string]$task.State
+    $enabledText = "-"
+    if ($state -ne "NotFound" -and $state -ne "ReadError") {
+        if ($task.Enabled -is [bool]) {
+            $enabledText = if ($task.Enabled) { "Yes" } else { "No" }
+        }
+        elseif ($state -eq "Disabled") { $enabledText = "No" }
+        else { $enabledText = "Yes" }
+    }
     [PSCustomObject]@{
-        TaskName    = [string]$id.TaskName
-        TaskPath    = [string]$id.TaskPath
-        State       = [string]$task.State
-        Enabled     = if ([string]$task.State -eq "Disabled") { "No" } else { "Yes" }
+        TaskName    = [string]$task.TaskName
+        TaskPath    = [string]$task.TaskPath
+        State       = $state
+        Enabled     = $enabledText
         Author      = [string]$task.Author
         Description = [string]$task.Description
-        FullName    = [string]$id.FullName
+        FullName    = [string]$task.FullName
     }
 }
 }
@@ -3121,14 +3417,42 @@ param(
 )
 
 $id = ConvertTo-WmtScheduledTaskIdentity -FullName $FullName -TaskName $TaskName -TaskPath $TaskPath
+if ([string]::IsNullOrWhiteSpace($id.TaskName)) {
+    return [PSCustomObject]@{ Success = $false; Task = $id.FullName; Message = "Task name is missing." }
+}
+
 try {
-    $task = Get-WmtScheduledTaskByIdentity -TaskName $id.TaskName -TaskPath $id.TaskPath
-    if (-not $task) { throw "Task not found: $($id.FullName)" }
+    $service = New-WmtTaskSchedulerService
+    if (-not $service) { throw "The Task Scheduler service is unavailable." }
+
+    $task = $null
+    $openError = ""
+    # ITaskService has no GetTask member: open the task's folder, then fetch
+    # the task by name (the same two-step the device-health probe uses).
+    try {
+        # Same contract as the row lookup: GetFolder must not receive a
+        # trailing backslash, so strip the display-form TaskPath here too.
+        $folderPath = ([string]$id.TaskPath).TrimEnd("\")
+        if ([string]::IsNullOrWhiteSpace($folderPath)) { $folderPath = "\" }
+        $folder = $service.GetFolder($folderPath)
+        $task = $folder.GetTask([string]$id.TaskName)
+    } catch { $openError = [string]$_.Exception.Message }
+    if (-not $task) {
+        if (-not [string]::IsNullOrWhiteSpace($openError)) { throw "Could not open task $($id.FullName): $openError" }
+        throw "Task not found: $($id.FullName)"
+    }
 
     switch ($Action) {
-        "Enable" { Enable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null }
-        "Disable" { Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null }
-        "Delete" { Unregister-ScheduledTask -InputObject $task -Confirm:$false -ErrorAction Stop | Out-Null }
+        # Flipping IRegisteredTask.Enabled persists immediately - the same
+        # switch the schtasks /Change command flips - without any CIM layer.
+        "Enable" { $task.Enabled = $true }
+        "Disable" { $task.Enabled = $false }
+        "Delete" {
+            $folderPath = ([string]$id.TaskPath).TrimEnd("\")
+            if ([string]::IsNullOrWhiteSpace($folderPath)) { $folderPath = "\" }
+            $folder = $service.GetFolder($folderPath)
+            $folder.DeleteTask([string]$id.TaskName, 0)
+        }
     }
 
     [PSCustomObject]@{ Success = $true; Task = $id.FullName; Message = "$Action succeeded." }
@@ -3142,8 +3466,25 @@ function Show-WmtScheduledTasksDialog {
 param(
     [string]$Title = "Scheduled Tasks",
     [string[]]$FullPaths = @(),
-    [string[]]$TaskPaths = @()
+    [string[]]$TaskPaths = @(),
+    [string[]]$TelemetryFolders = @()
 )
+
+# Guard for the one caller contract this dialog has: show the live state
+# of the exact tasks the two telemetry buttons toggle. The View Tasks
+# button already passes that list ($script:TelemetryTasks, nine paths);
+# if a future caller or a scope surprise ever reaches the dialog with no
+# paths at all, fall back to the canonical telemetry list so the grid can
+# never open empty.
+if (@($FullPaths).Count -eq 0 -and @($TaskPaths).Count -eq 0 -and $script:TelemetryTasks) {
+    $FullPaths = @($script:TelemetryTasks)
+}
+if (@($TelemetryFolders).Count -eq 0 -and $script:WmtTelemetryTaskFolders) {
+    # No folders passed: default to the live all-telemetry enumeration.
+    $TelemetryFolders = @($script:WmtTelemetryTaskFolders)
+}
+$enumerateNote = if (@($TelemetryFolders).Count -gt 0) { " + live enumeration of $(@($TelemetryFolders).Count) telemetry folder(s)" } else { "" }
+Write-GuiLog "[Scheduled Tasks] Dialog '$Title' opened with $(@($FullPaths).Count) path(s)$enumerateNote."
 
 $content = @'
 <Grid Margin="16">
@@ -3155,6 +3496,7 @@ $content = @'
     <DataGrid Name="dgTasks" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
     <TextBlock Name="lblStatus" Grid.Row="1" Foreground="{DynamicResource TextSecondary}" Margin="0,10,0,0"/>
     <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,12,0,0">
+        <Button Name="btnOpenScheduler" Content="Open Task Scheduler" MinWidth="128" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextPrimary}" Margin="0,0,8,8"/>
         <Button Name="btnRefresh" Content="Refresh" MinWidth="92" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}" Margin="0,0,8,8"/>
         <Button Name="btnEnable" Content="Enable" MinWidth="92" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,8"/>
         <Button Name="btnDisable" Content="Disable" MinWidth="92" Background="{DynamicResource Warning}" Foreground="{DynamicResource WarningText}" Margin="0,0,8,8"/>
@@ -3165,42 +3507,322 @@ $content = @'
 $dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml $content -Width 960 -Height 560 -MinWidth 760 -MinHeight 420
 $dg = $dialog.FindName("dgTasks")
 $lblStatus = $dialog.FindName("lblStatus")
+$btnOpenScheduler = $dialog.FindName("btnOpenScheduler")
 $btnRefresh = $dialog.FindName("btnRefresh")
 $btnEnable = $dialog.FindName("btnEnable")
 $btnDisable = $dialog.FindName("btnDisable")
 $btnClose = $dialog.FindName("btnClose")
 
-$state = @{ Table = $null }
-$load = {
-    $rows = @(Get-WmtScheduledTaskRows -FullPaths $FullPaths -TaskPaths $TaskPaths)
-    $table = New-WmtDataTable -Columns @("TaskName", "TaskPath", "State", "Enabled", "Author", "Description", "FullName") -Rows $rows
-    $state.Table = $table
-    $dg.ItemsSource = $table.DefaultView
-    Set-WmtDataGridColumns -DataGrid $dg -Columns @("TaskName", "TaskPath", "State", "Enabled", "Author", "Description", "FullName") -Widths @{ TaskName = "*"; TaskPath = 260; State = 100; Enabled = 80; Author = 180; Description = "2*" } -Hidden @("FullName")
-    $lblStatus.Text = if ($table.Rows.Count -gt 0) { "$($table.Rows.Count) task(s)" } else { "No scheduled tasks found. Try running WMT as administrator." }
-}.GetNewClosure()
+# Two reads of the same exact paths: the direct synchronous one first
+# (milliseconds), and - only if it comes back empty or throws - the
+# background transport (Start-WmtScheduledTaskViewQuery), which re-reads
+# the paths through the pooled-runspace mechanism the Disable/Restore
+# telemetry buttons use: the one scheduled-task transport that is
+# field-proven on every machine this tool has been reported from. Every
+# failure mode lands somewhere visible: missing or unreadable tasks
+# become explicit rows (NotFound / ReadError), and a total read failure
+# goes to the status line instead of an eternal spinner.
+Set-WmtDataGridColumns -DataGrid $dg -Columns @("TaskName", "TaskPath", "State", "Enabled", "Author", "Description", "FullName") -Widths @{ TaskName = "*"; TaskPath = 260; State = 100; Enabled = 80; Author = 180; Description = "2*" } -Hidden @("FullName")
 
-$invokeSelected = {
+$load = {
+    try {
+        Set-WmtBusyCursor -Busy
+        $lblStatus.Text = "Loading tasks..."
+        $rows = @(Get-WmtScheduledTaskRows -FullPaths $FullPaths -TaskPaths $TaskPaths -TelemetryFolders $TelemetryFolders)
+        $dg.ItemsSource = @($rows)
+        Write-GuiLog "[Scheduled Tasks] View loaded $($rows.Count) row(s)."
+        if ($rows.Count -gt 0) {
+            $lblStatus.Text = "$($rows.Count) task(s)"
+        }
+        else {
+            # A zero-row direct read should be impossible (every requested
+            # path yields at least a NotFound/ReadError row); treat it as
+            # a failed read and retry through the background transport.
+            $lblStatus.Text = "Direct read returned nothing - querying in background..."
+            Start-WmtScheduledTaskViewQuery -FullPaths @($FullPaths) -TelemetryFolders @($TelemetryFolders) -DataGrid $dg -StatusBlock $lblStatus
+        }
+    }
+    catch {
+        # The direct UI-thread read threw: retry through the transport the
+        # Disable/Restore buttons use before declaring failure.
+        Write-GuiLog "[Scheduled Tasks] Direct read failed, retrying in background: $($_.Exception.Message)"
+        try {
+            $lblStatus.Text = "Retrying in background: $($_.Exception.Message)"
+            Start-WmtScheduledTaskViewQuery -FullPaths @($FullPaths) -TelemetryFolders @($TelemetryFolders) -DataGrid $dg -StatusBlock $lblStatus
+        }
+        catch {
+            Write-GuiLog "[Scheduled Tasks] Load failed: $($_.Exception.Message)"
+            $lblStatus.Text = "Failed to load tasks: $($_.Exception.Message)"
+        }
+    }
+    finally {
+        Set-WmtBusyCursor
+    }
+}.GetNewClosure()
+$apply = {
     param([string]$Action)
     $selected = @(Get-WmtDataGridSelectedRows -DataGrid $dg)
     if ($selected.Count -eq 0) { return }
     $failures = @()
-    foreach ($row in $selected) {
-        $result = Invoke-WmtScheduledTaskAction -Action $Action -TaskName ([string]$row["TaskName"]) -TaskPath ([string]$row["TaskPath"])
-        if (-not $result.Success) { $failures += "$($result.Task): $($result.Message)" }
+    try {
+        Set-WmtBusyCursor -Busy
+        foreach ($row in $selected) {
+            $result = Invoke-WmtScheduledTaskAction -Action $Action -TaskName ([string]$row.TaskName) -TaskPath ([string]$row.TaskPath)
+            if ($result.Success) {
+                Write-GuiLog "[Scheduled Tasks] $($Action)d: $($result.Task)"
+            }
+            else {
+                $failures += "$($result.Task): $($result.Message)"
+            }
+        }
     }
+    finally {
+        Set-WmtBusyCursor
+    }
+    # Flip the task, then re-read everything from Task Scheduler: flipping
+    # IRegisteredTask.Enabled is exactly what schtasks /Change does, but the
+    # grid should show what the scheduler reports now, not what we asked it
+    # to do.
     & $load
     if ($failures.Count -gt 0) {
         Show-WmtMessageBox -Owner $dialog -Message ($failures -join "`r`n") -Title "Scheduled Tasks" -Image Warning | Out-Null
     }
 }.GetNewClosure()
 
+$btnOpenScheduler.Add_Click({
+    # The dialog lists everything itself, but one click also hands over the
+    # real Task Scheduler (taskschd.msc) for anyone who wants the native
+    # view - the same launch the Startup Manager's Scheduled Tasks tab uses.
+    try {
+        Start-Process -FilePath "taskschd.msc" -ErrorAction Stop
+        Write-GuiLog "[Scheduled Tasks] Opened Windows Task Scheduler (taskschd.msc)."
+    }
+    catch {
+        Write-GuiLog "[Scheduled Tasks] Could not open Task Scheduler: $($_.Exception.Message)"
+        Show-WmtMessageBox -Owner $dialog -Message "Could not open Task Scheduler: $($_.Exception.Message)" -Title "Scheduled Tasks" -Image Warning | Out-Null
+    }
+}.GetNewClosure())
 $btnRefresh.Add_Click({ & $load }.GetNewClosure())
-$btnEnable.Add_Click({ & $invokeSelected "Enable" }.GetNewClosure())
-$btnDisable.Add_Click({ & $invokeSelected "Disable" }.GetNewClosure())
+$btnEnable.Add_Click({ & $apply "Enable" }.GetNewClosure())
+$btnDisable.Add_Click({ & $apply "Disable" }.GetNewClosure())
 $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
-$dialog.Add_ContentRendered({ & $load }.GetNewClosure())
+# Bind one dispatcher turn after the window has been realized. WPF DataGrid
+# can throw while measuring DataView rows during the initial layout pass.
+$dialog.Add_ContentRendered({
+    $dialog.Dispatcher.BeginInvoke(
+        [Action] { & $load },
+        [System.Windows.Threading.DispatcherPriority]::Background
+    ) | Out-Null
+}.GetNewClosure())
 $dialog.ShowDialog() | Out-Null
+}
+
+function Start-WmtScheduledTaskBatchAction {
+param(
+    [Parameter(Mandatory = $true)][ValidateSet("Enable", "Disable")][string]$Action,
+    [Parameter(Mandatory = $true)][string[]]$FullPaths,
+    [Parameter(Mandatory = $true)][string]$StartMessage,
+    [Parameter(Mandatory = $true)][string]$DoneMessage
+)
+
+# Enable/Disable for a batch of tasks (telemetry toggles) runs in a background
+# runspace through the COM engine (exact-path lookups, no CIM layer) and
+# streams its results back through a collector timer.
+if ($script:WmtTaskBatchAsync) {
+    Write-GuiLog "[Scheduled Tasks] A task action is already in progress."
+    return
+}
+
+# The background runspace cannot see this script's scope, so the helper
+# functions are handed over as text. ${function:X} yields the body only (no
+# "function NAME" wrapper), so each definition is re-wrapped here; reading the
+# live definitions keeps the copies in sync automatically.
+$taskHelpers = @(
+    "function ConvertTo-WmtScheduledTaskIdentity {",
+    ${function:ConvertTo-WmtScheduledTaskIdentity},
+    "}",
+    "function New-WmtTaskSchedulerService {",
+    ${function:New-WmtTaskSchedulerService},
+    "}",
+    "function Invoke-WmtScheduledTaskAction {",
+    ${function:Invoke-WmtScheduledTaskAction},
+    "}"
+) -join "`r`n"
+
+Write-GuiLog $StartMessage
+Set-WmtBusyCursor -Busy
+
+try {
+    $ps = New-WmtPooledPowerShell
+    [void]$ps.AddScript({
+        param($Helpers, [string]$Action, $Tasks)
+        # Dot-source the helper definitions into this runspace.
+        if ($Helpers) { . ([scriptblock]::Create($Helpers)) }
+        foreach ($task in @($Tasks)) {
+            $result = Invoke-WmtScheduledTaskAction -Action $Action -FullName $task
+            if ($result.Success) {
+                Write-Output "LOG:$($Action)d: $($result.Task)"
+            }
+            else {
+                Write-Output "LOG:Failed to $($Action.ToLower()) $($result.Task): $($result.Message)"
+            }
+        }
+    }).AddArgument($taskHelpers).AddArgument($Action).AddArgument($FullPaths)
+    $script:WmtTaskBatchPs = $ps
+    $script:WmtTaskBatchAsync = $ps.BeginInvoke()
+}
+catch {
+    Write-GuiLog "[Scheduled Tasks] Failed to start task action: $($_.Exception.Message)"
+    try { if ($script:WmtTaskBatchPs) { $script:WmtTaskBatchPs.Dispose() } } catch {}
+    $script:WmtTaskBatchPs = $null
+    $script:WmtTaskBatchAsync = $null
+    Set-WmtBusyCursor
+    return
+}
+
+$script:WmtTaskBatchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WmtTaskBatchTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$script:WmtTaskBatchTimer.Add_Tick({
+        if (-not $script:WmtTaskBatchTimer -or -not $script:WmtTaskBatchAsync) { return }
+        if (-not $script:WmtTaskBatchAsync.IsCompleted) { return }
+        $script:WmtTaskBatchTimer.Stop()
+        try {
+            $results = @($script:WmtTaskBatchPs.EndInvoke($script:WmtTaskBatchAsync))
+            $doneMessage = $script:WmtTaskBatchDoneMessage
+            foreach ($line in $results) {
+                if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog $line.Substring(4) }
+            }
+            Write-GuiLog $doneMessage
+        }
+        catch {
+            Write-GuiLog "[Scheduled Tasks] Task action failed: $($_.Exception.Message)"
+        }
+        finally {
+            try { if ($script:WmtTaskBatchPs) { $script:WmtTaskBatchPs.Dispose() } } catch {}
+            $script:WmtTaskBatchPs = $null
+            $script:WmtTaskBatchAsync = $null
+            $script:WmtTaskBatchDoneMessage = $null
+            try { if ($script:WmtTaskBatchTimer) { $script:WmtTaskBatchTimer.Stop() } } catch {}
+            $script:WmtTaskBatchTimer = $null
+            Set-WmtBusyCursor
+        }
+    })
+$script:WmtTaskBatchDoneMessage = $DoneMessage
+$script:WmtTaskBatchTimer.Start()
+}
+
+function Start-WmtScheduledTaskViewQuery {
+param(
+    [string[]]$FullPaths = @(),
+    [string[]]$TelemetryFolders = @(),
+    $DataGrid,
+    $StatusBlock
+)
+
+# Background fallback for the View Tasks dialog. The synchronous UI-thread
+# read normally answers in milliseconds, but if it ever returns zero rows or
+# throws, this query re-reads the same exact paths through the SAME transport
+# the Disable/Restore telemetry buttons use (pooled runspace, helper functions
+# handed over as text, 250ms collector timer): the scheduled-task path that is
+# field-proven on machines where the UI-thread read has never been confirmed.
+# Each row comes back as one compact JSON string, so no live object crosses
+# the runspace boundary.
+if (@($FullPaths).Count -eq 0 -and @($TelemetryFolders).Count -eq 0) { return }
+if (-not $DataGrid) { return }
+if ($script:WmtTaskViewAsync) { return }
+
+$taskHelpers = @(
+    "function ConvertTo-WmtScheduledTaskIdentity {",
+    ${function:ConvertTo-WmtScheduledTaskIdentity},
+    "}",
+    "function New-WmtTaskSchedulerService {",
+    ${function:New-WmtTaskSchedulerService},
+    "}",
+    "function ConvertFrom-WmtRegisteredTask {",
+    ${function:ConvertFrom-WmtRegisteredTask},
+    "}",
+    "function Get-WmtAllRegisteredTasks {",
+    ${function:Get-WmtAllRegisteredTasks},
+    "}",
+    "function Get-WmtScheduledTaskRows {",
+    ${function:Get-WmtScheduledTaskRows},
+    "}"
+) -join "`r`n"
+
+$script:WmtTaskViewGrid = $DataGrid
+$script:WmtTaskViewStatus = $StatusBlock
+
+Write-GuiLog "[Scheduled Tasks] Background view query started for $(@($FullPaths).Count) path(s), $(@($TelemetryFolders).Count) telemetry folder(s)."
+
+try {
+    $ps = New-WmtPooledPowerShell
+    [void]$ps.AddScript({
+        param($Helpers, $Tasks, $Folders)
+        # Dot-source the helper definitions into this runspace.
+        if ($Helpers) { . ([scriptblock]::Create($Helpers)) }
+        try {
+            $rows = @(Get-WmtScheduledTaskRows -FullPaths $Tasks -TelemetryFolders $Folders)
+            foreach ($row in @($rows)) {
+                Write-Output ("ROW:" + ($row | ConvertTo-Json -Compress))
+            }
+        }
+        catch {
+            Write-Output ("ERR:" + [string]$_.Exception.Message)
+        }
+    }).AddArgument($taskHelpers).AddArgument($FullPaths).AddArgument($TelemetryFolders)
+    $script:WmtTaskViewPs = $ps
+    $script:WmtTaskViewAsync = $ps.BeginInvoke()
+}
+catch {
+    Write-GuiLog "[Scheduled Tasks] Failed to start background view query: $($_.Exception.Message)"
+    try { if ($script:WmtTaskViewPs) { $script:WmtTaskViewPs.Dispose() } } catch {}
+    $script:WmtTaskViewPs = $null
+    $script:WmtTaskViewAsync = $null
+    $script:WmtTaskViewGrid = $null
+    $script:WmtTaskViewStatus = $null
+    return
+}
+
+$script:WmtTaskViewTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WmtTaskViewTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$script:WmtTaskViewTimer.Add_Tick({
+        if (-not $script:WmtTaskViewTimer -or -not $script:WmtTaskViewAsync) { return }
+        if (-not $script:WmtTaskViewAsync.IsCompleted) { return }
+        $script:WmtTaskViewTimer.Stop()
+        try {
+            $results = @($script:WmtTaskViewPs.EndInvoke($script:WmtTaskViewAsync))
+            $rowObjects = @()
+            foreach ($line in $results) {
+                if ($line -isnot [string]) { continue }
+                if ($line.StartsWith("ROW:")) {
+                    try { $rowObjects += ($line.Substring(4) | ConvertFrom-Json) } catch {}
+                }
+                elseif ($line.StartsWith("ERR:")) {
+                    Write-GuiLog "[Scheduled Tasks] Background view query failed: $($line.Substring(4))"
+                }
+            }
+            $dg = $script:WmtTaskViewGrid
+            $lbl = $script:WmtTaskViewStatus
+            if ($dg) { $dg.ItemsSource = @($rowObjects) }
+            if ($lbl) {
+                $lbl.Text = if ($rowObjects.Count -gt 0) { "$($rowObjects.Count) task(s) (background)" } else { "No scheduled tasks found. Try running WMT as administrator." }
+            }
+            Write-GuiLog "[Scheduled Tasks] View loaded $($rowObjects.Count) row(s) via background query."
+        }
+        catch {
+            Write-GuiLog "[Scheduled Tasks] Background view result failed: $($_.Exception.Message)"
+        }
+        finally {
+            try { if ($script:WmtTaskViewPs) { $script:WmtTaskViewPs.Dispose() } } catch {}
+            $script:WmtTaskViewPs = $null
+            $script:WmtTaskViewAsync = $null
+            $script:WmtTaskViewGrid = $null
+            $script:WmtTaskViewStatus = $null
+            try { if ($script:WmtTaskViewTimer) { $script:WmtTaskViewTimer.Stop() } } catch {}
+            $script:WmtTaskViewTimer = $null
+        }
+    })
+$script:WmtTaskViewTimer.Start()
 }
 
 function Get-WmtThemeHex {
@@ -4037,6 +4659,59 @@ catch {
 }
 }
 
+function Copy-WmtLibrarySelectedRowsToClipboard {
+param([System.Windows.Controls.ListView]$ListView = $lstLibrary)
+
+# Ctrl+C support for the Your Library list: copies the selected row(s) as
+# tab-separated lines (Source, Name, ID, Installed, Latest, IsUe) that
+# paste cleanly into any editor or spreadsheet - the trailing IsUe column
+# (True/False on Epic rows) makes the UE/Fab tagging verifiable straight
+# from a paste. Falls back to the focused row
+# when nothing is selected. Set-Clipboard can lose a race with another
+# app holding the clipboard open, so the write is retried briefly.
+if (-not $ListView) { return $false }
+$selectedRows = @($ListView.SelectedItems | Where-Object { $null -ne $_ })
+if ($selectedRows.Count -eq 0 -and $ListView.SelectedItem) { $selectedRows = @($ListView.SelectedItem) }
+if ($selectedRows.Count -eq 0) {
+    Write-GuiLog "Copy skipped: no library row selected."
+    return $false
+}
+
+$columns = @("Source", "Name", "Id", "Version", "Available", "IsUe")
+$lines = [System.Collections.Generic.List[string]]::new()
+foreach ($row in $selectedRows) {
+    $cells = @()
+    foreach ($column in $columns) {
+        $value = ""
+        try {
+            $property = $row.PSObject.Properties[$column]
+            if ($property) { $value = [string]$property.Value }
+        }
+        catch {}
+        $cells += (($value -replace '\r?\n', ' ').Trim())
+    }
+    [void]$lines.Add(($cells -join "`t"))
+}
+if ($lines.Count -eq 0) { return $false }
+$text = [string]::Join([Environment]::NewLine, $lines)
+
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+    try {
+        [System.Windows.Clipboard]::SetText($text)
+        Write-GuiLog "Copied $($lines.Count) library line(s) to clipboard."
+        return $true
+    }
+    catch {
+        if ($attempt -eq 5) {
+            Write-GuiLog "ERROR: Could not copy library lines: $($_.Exception.Message)"
+            return $false
+        }
+        Start-Sleep -Milliseconds 40
+    }
+}
+return $false
+}
+
 function ConvertTo-WmtProcessArgument {
 param([string]$Value)
 
@@ -4781,8 +5456,10 @@ else {
             $settings.PSObject.Properties.Remove("SavedUpdateAutoScanMinutes")
         }
     }
+    # The timer restart is deliberately left to the UI layer (toggle handler /
+    # search action), which also enforces the Background Jobs gate. Starting it
+    # here as well made the "Update auto scan ..." line appear twice in the log.
     Save-WmtSettings -Settings $settings
-    Start-WmtUpdateAutoScanTimer -ResetNextRun
     return
 }
 
@@ -11873,7 +12550,14 @@ $lblStatus.Text = "Scan complete. Scanning..."
 
 $registryRows = @(
     foreach ($item in $ScanResults) {
-        $autoSelected = Test-WmtRegistryFindingAutoSelected -Item $item
+        $confidenceText = if ($item.PSObject.Properties["Confidence"] -and -not [string]::IsNullOrWhiteSpace([string]$item.Confidence)) {
+            [string]$item.Confidence
+        }
+        else {
+            ""
+        }
+        $confidenceRank = if ($confidenceText -match "(?i)^high") { 3 } elseif ($confidenceText -match "(?i)^medium") { 2 } else { 0 }
+        $autoSelected = (Test-WmtRegistryFindingAutoSelected -Item $item) -or ($confidenceRank -ge 2)
         $fixAction = if ($item.Type -eq "ReviewOnly") { "Review" } elseif ($item.Type -eq "Key") { "Delete key" } elseif ($item.Type -eq "SetValue") { "Update value" } else { "Delete value" }
         $risk = if ($item.PSObject.Properties["Risk"] -and -not [string]::IsNullOrWhiteSpace([string]$item.Risk)) {
             [string]$item.Risk
@@ -11887,8 +12571,8 @@ $registryRows = @(
         else {
             "Low"
         }
-        $confidence = if ($item.PSObject.Properties["Confidence"] -and -not [string]::IsNullOrWhiteSpace([string]$item.Confidence)) {
-            [string]$item.Confidence
+        $confidence = if (-not [string]::IsNullOrWhiteSpace($confidenceText)) {
+            $confidenceText
         }
         elseif ($autoSelected) {
             "High"
@@ -12738,6 +13422,12 @@ foreach ($candidate in $candidates) {
     if ($seen.Add($candidate)) { [void]$paths.Add($candidate) }
 }
 
+# Keep only the first usable reg.exe (System32 on 64-bit PowerShell, Sysnative
+# from a 32-bit host). One reg.exe serves /reg:32 and /reg:64 views, so trying
+# every candidate multiplied every query/delete/verify into 3-4 process spawns
+# and made deep registry cleans dramatically slower.
+if ($paths.Count -gt 1) { $paths.RemoveRange(1, $paths.Count - 1) }
+
 return @($paths)
 }
 
@@ -13111,20 +13801,10 @@ try {
     if ($existingTargets.Count -eq 0 -and $existingRegExeTargets.Count -eq 0) { return $true }
     & $AddAttempt "existing-provider/native=$($existingTargets.Count) existing-regexe=$($existingRegExeTargets.Count)"
 
-    foreach ($target in $existingTargets) {
-        if ($target.Kind -eq "Provider") { & $UnlockProviderPath ([string]$target.Path) }
-    }
-    if ($allowNativeAclUnlock) {
-        foreach ($target in $existingTargets) {
-            if ($target.Kind -eq "Native") {
-                try {
-                    $aclChanged = Grant-WmtRegistryKeyFullControlNative -Hive $target.Hive -View $target.View -SubPath $target.SubPath
-                    & $AddAttempt "acl-native=$($target.Label):$($target.SubPath) changed=$aclChanged"
-                }
-                catch { & $AddAttempt "acl-native-exception=$($target.Label):$($target.SubPath) error=$($_.Exception.Message)" }
-            }
-        }
-    }
+    # ACL unlock is deferred to the retry paths below. Rewriting ACLs before the
+    # first delete attempt (recursively for provider paths) made every cleanup
+    # item several times slower and was unnecessary for keys that delete fine;
+    # protected keys are still unlocked on the delete/retry paths below.
 
     foreach ($target in $existingTargets) {
         if (-not (& $TestTargetExists $target)) { continue }
@@ -13175,7 +13855,12 @@ try {
         }
         catch { & $AddAttempt "delete-regexe-exception=$($regTarget.RegPath) error=$($_.Exception.Message)" }
     }
-    if ($allowNativeAclUnlock) {
+    # Only use the .reg import deletion fallback when a target still exists after
+    # the direct attempts. It used to run for every CLSID-style item and added a
+    # reg.exe import (per candidate path) to every single cleanup item.
+    $preFallbackTargets = @($deleteTargets | Where-Object { & $TestTargetExists $_ })
+    $preFallbackRegTargets = @($regExeTargets | Where-Object { Test-WmtRegExeKeyExists -RegPath $_.RegPath -View $_.View })
+    if ($allowNativeAclUnlock -and ($preFallbackTargets.Count -gt 0 -or $preFallbackRegTargets.Count -gt 0)) {
         try {
             $importResult = Invoke-WmtRegExeDeleteImportFallback -RegTargets $regExeTargets
             & $AddAttempt "delete-reg-import-fallback result=$importResult"
@@ -13265,7 +13950,8 @@ catch {}
 function Start-WmtRegistryCleanupBackground {
 param(
     [object[]]$Items,
-    [string]$BackupDirectory
+    [string]$BackupDirectory,
+    [switch]$CreateRestorePoint
 )
 
 if ($script:WmtRegistryCleanupActive) {
@@ -13381,6 +14067,7 @@ try {
     $runspace.SessionStateProxy.SetVariable("CleanupSync", $cleanupSync)
     $runspace.SessionStateProxy.SetVariable("CleanupItems", $selectedItems)
     $runspace.SessionStateProxy.SetVariable("CleanupBackupDirectory", $BackupDirectory)
+    $runspace.SessionStateProxy.SetVariable("CleanupRestorePoint", [bool]$CreateRestorePoint)
 
     $workerScript = {
         Import-Module Microsoft.PowerShell.Management
@@ -13393,6 +14080,17 @@ try {
         }
 
         try {
+            if ($CleanupRestorePoint) {
+                $CleanupSync.Status = "Creating system restore point (this can take a minute)..."
+                Add-WmtCleanupWorkerLog "Creating system restore point before cleanup..."
+                try {
+                    Checkpoint-Computer -Description "WMT DeepClean" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+                    Add-WmtCleanupWorkerLog "Restore Point created."
+                }
+                catch {
+                    Add-WmtCleanupWorkerLog "Restore Point failed (Disabled?). Continuing..."
+                }
+            }
             $itemsToClean = @($CleanupItems | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.RegPath) })
             if (-not (Test-Path -LiteralPath $CleanupBackupDirectory -PathType Container -ErrorAction SilentlyContinue)) {
                 New-Item -Path $CleanupBackupDirectory -ItemType Directory -Force | Out-Null
@@ -18669,12 +19367,12 @@ if ($Action -eq "DeepClean") {
                 # --- SAFETY PROMPT ---
                 $res = Show-SafetyDialog -Count $toDelete.Count
                 if ($res -eq "Cancel") { return }
-                if ($res -eq "Yes") {
-                    Invoke-UiCommand { try { Checkpoint-Computer -Description "WMT DeepClean" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop; "Restore Point created." } catch { "Restore Point failed (Disabled?). Continuing..." } } "Creating Restore Point..."
-                }
+                # The restore point is now created inside the background cleanup
+                # worker: running Checkpoint-Computer on the UI thread (via
+                # Invoke-UiCommand) froze the entire main window for its duration.
 
                 # --- EXECUTE FIX (Background Runspace) ---
-                Start-WmtRegistryCleanupBackground -Items $toDelete -BackupDirectory $bkDir
+                Start-WmtRegistryCleanupBackground -Items $toDelete -BackupDirectory $bkDir -CreateRestorePoint:($res -eq "Yes")
             }
         }.GetNewClosure())
 
@@ -22716,14 +23414,12 @@ function Show-StartupRowDetails {
                     }
                     "Scheduled Tasks" {
                         if ([string]::IsNullOrWhiteSpace($taskName)) { throw "Task name is missing." }
-                        if ([bool]$chkEnabled.IsChecked) {
-                            Enable-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop | Out-Null
-                            Set-StartupCellValue $row "State" "Ready"
-                        }
-                        else {
-                            Disable-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop | Out-Null
-                            Set-StartupCellValue $row "State" "Disabled"
-                        }
+                        # COM engine route: the module cmdlets fail wholesale on
+                        # broken CIM task stores, this path survives them.
+                        $taskAction = if ([bool]$chkEnabled.IsChecked) { "Enable" } else { "Disable" }
+                        $taskResult = Invoke-WmtScheduledTaskAction -Action $taskAction -TaskName $taskName -TaskPath $taskPath
+                        if (-not $taskResult.Success) { throw $taskResult.Message }
+                        Set-StartupCellValue $row "State" $(if ($taskAction -eq "Enable") { "Ready" } else { "Disabled" })
                     }
                     "Context Menu" {
                         if ([string]::IsNullOrWhiteSpace($ctxPath)) { throw "Registry key is missing." }
@@ -22907,7 +23603,9 @@ function Invoke-StartupWindowsLoad {
 }
 
 function Invoke-StartupTasksLoad {
-    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Select-Object TaskName, TaskPath, State)
+    # COM engine instead of the module cmdlets: it survives broken CIM task
+    # stores and answers in milliseconds even on slow machines.
+    $tasks = @(Get-WmtScheduledTaskRows | Select-Object TaskName, TaskPath, State)
     $table = [System.Data.DataTable]::new()
     foreach ($name in @("TaskName", "Path", "State")) { [void]$table.Columns.Add($name) }
     foreach ($task in @($tasks)) {
@@ -24276,7 +24974,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             </Grid>
                         </Border>
                         <ListView Name="lstLibrary" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0"
-                                  SelectionMode="Single" ItemContainerStyle="{StaticResource FwItem}"
+                                  SelectionMode="Extended" ItemContainerStyle="{StaticResource FwItem}"
                                   VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                             <ListView.ContextMenu>
                                 <ContextMenu Name="ctxLibrary">
@@ -24288,6 +24986,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                                     <MenuItem Name="miLibGoToDir" Header="Go to install directory" ToolTip="Open the folder where the game is installed"/>
                                     <MenuItem Name="miLibStorePage" Header="Open store page" ToolTip="Open the game's store page in your browser"/>
                                     <MenuItem Name="miLibCopyId" Header="Copy ID" ToolTip="Copy the game ID to clipboard"/>
+                                    <MenuItem Name="miLibCopyRows" Header="Copy Row Data" ToolTip="Copy the selected row(s) as tab-separated text, including the IsUe (Unreal Engine / Fab) tag"/>
                                 </ContextMenu>
                             </ListView.ContextMenu>
                             <ListView.View>
@@ -27589,6 +28288,7 @@ $miLibRepair = Get-Ctrl "miLibRepair"
 $miLibGoToDir = Get-Ctrl "miLibGoToDir"
 $miLibStorePage = Get-Ctrl "miLibStorePage"
 $miLibCopyId = Get-Ctrl "miLibCopyId"
+$miLibCopyRows = Get-Ctrl "miLibCopyRows"
 if ($lstLibrary -and $ctxLibrary) { $lstLibrary.ContextMenu = $ctxLibrary }
 $btnBackToCatalog = Get-Ctrl "btnBackToCatalog"
 $btnLibraryRefresh = Get-Ctrl "btnLibraryRefresh"
@@ -33249,7 +33949,15 @@ try {
     # Try JSON output first (much more reliable than text parsing).
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
-    $psi.Arguments = "list --json"
+    # --api-timeout 30 (a global, pre-subcommand option): the same patience for
+    # slow Epic routes as the update scan; failed fetches keep the old cache.
+    # --include-ue only while UE/Fab assets are actually shown: with the
+    # default "Fab Assets: Hidden" legendary itself omits every
+    # namespace-'ue' item, so no UE/Fab row can reach the cache even if
+    # a tag heuristic fails (this is upstream v6.6's default behavior).
+    $ueFlag = ""
+    try { if (-not (Get-WmtHideLegendaryUeAssets)) { $ueFlag = " --include-ue" } } catch {}
+    $psi.Arguments = "--api-timeout 30 list --json$ueFlag"
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -33283,6 +33991,30 @@ try {
                         try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
                         if ([string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                     }
+                    # Tag UE/Fab assets (namespace 'ue', legendary's own skip
+                    # marker). 'namespace' is not a top-level JSON key (it is a
+                    # Python property there); it lives in asset_infos (per
+                    # platform) and in the EGS metadata blob.
+                    $legIsUe = $false
+                    try {
+                        if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
+                            foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
+                                # Object form: read .namespace directly. String form:
+                                # legendary serializes GameAsset objects via str() (json
+                                # default=str), so the value arrives as a Python repr - match
+                                # the namespace field inside that text instead.
+                                if ($aiProp.Value -is [string]) {
+                                    if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
+                                }
+                                elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
+                            }
+                        }
+                    } catch {}
+                    if (-not $legIsUe) {
+                        try {
+                            if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                        } catch {}
+                    }
                     $result.Add([PSCustomObject]@{
                             Provider         = "legendary"
                             Title            = $title
@@ -33292,6 +34024,7 @@ try {
                             IsInstalled      = $isInstalled
                             Source           = "legendary"
                             Kind             = "Library"
+                            IsUe             = $legIsUe
                         })
                 }
                 if ($result.Count -gt 0) { $parsed = $true }
@@ -33303,15 +34036,69 @@ try {
     }
 
     # Attempt 2: Text parsing fallback.
-    # Format:  * Game Title (App name: app_name, Version: version)
-    #          * Game Title (App name: app_name, Version: version, Installed: ...)
+    # Format:  * Game Title (App name: app_name | Version: version)
+    # Legendary separates the fields with a pipe, not a comma (all
+    # releases since 2020); the pattern accepts both so the app name
+    # never swallows the " | Version: ..." tail.
     if (-not $parsed) {
-        $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,)]+?)\s*(?:,\s*Version\s*:\s*(?<version>[^,)]+?))?\s*(?:,\s*[^)]*)?\)'
+        # The text output carries no UE/Fab marker, so tag each row from
+        # legendary's own side data (assets.json namespace set plus the
+        # per-game metadata files) and the name heuristics - the same chain
+        # the JSON path and the library scan worker use.
+        $ueAppNames = @{}
+        $ueAssetsFiles = @()
+        try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+        try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+        try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
+        try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+        try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+        foreach ($ueAssetsFile in $ueAssetsFiles) {
+            if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+            try {
+                $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                    $uePlatformAssets = @()
+                    if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                        $uePlatformAssets = @($platformProp.Value)
+                    }
+                    elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                        $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                    }
+                    foreach ($asset in @($uePlatformAssets)) {
+                        if (([string]$asset.namespace) -eq 'ue') {
+                            $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                            if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                        }
+                    }
+                }
+            }
+            catch {}
+        }
+        $ueMetaRoots = @()
+        try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+        try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+        try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+        try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+        try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
+        $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,|)]+?)\s*(?:[,|]\s*Version\s*:\s*(?<version>[^,|)]+?))?\s*(?:[,|]\s*[^)]*)?\)'
         foreach ($match in $regex.Matches($stdout)) {
             $title = $match.Groups["title"].Value.Trim()
             $app = $match.Groups["app"].Value.Trim()
             $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
             if ([string]::IsNullOrWhiteSpace($title)) { continue }
+            $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$')
+            if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                foreach ($ueMetaRoot in $ueMetaRoots) {
+                    $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
+                    if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                    try {
+                        $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                        if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                    }
+                    catch {}
+                    break
+                }
+            }
             $result.Add([PSCustomObject]@{
                     Provider = "legendary"
                     Title    = $title
@@ -33319,6 +34106,7 @@ try {
                     Version  = $ver
                     Source   = "legendary"
                     Kind     = "Library"
+                    IsUe     = $legIsUe
                 })
         }
     }
@@ -34548,33 +35336,53 @@ if (-not (Test-Path -LiteralPath $legendaryDir)) {
 $firstInstall = -not (Test-Path -LiteralPath $legendaryExe -PathType Leaf)
 $downloadUrl = $fallbackUrl
 $releaseName = "latest"
+$releaseResolved = $false
+for ($releaseAttempt = 1; $releaseAttempt -le 3 -and -not $releaseResolved; $releaseAttempt++) {
 try {
-Write-Host "Checking latest Legendary release..."
-$release = Invoke-RestMethod -Uri $latestApi -Headers $headers -UseBasicParsing -ErrorAction Stop
+Write-Host "Checking latest Legendary release... (attempt $releaseAttempt of 3)"
+$release = Invoke-RestMethod -Uri $latestApi -Headers $headers -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
 if ($release -and $release.tag_name) { $releaseName = [string]$release.tag_name }
 $asset = @($release.assets | Where-Object { ([string]$_.name) -ieq "legendary.exe" } | Select-Object -First 1)
 if ($asset -and $asset.browser_download_url) {
     $downloadUrl = [string]$asset.browser_download_url
 }
+$releaseResolved = $true
 }
 catch {
-Write-Warning "Could not query GitHub latest release API: $($_.Exception.Message)"
+Write-Warning "Could not query GitHub latest release API (attempt $releaseAttempt of 3): $($_.Exception.Message)"
+if ($releaseAttempt -lt 3) { Start-Sleep -Seconds (5 * $releaseAttempt) }
+}
+}
+if (-not $releaseResolved) {
 Write-Host "Falling back to GitHub's latest/download redirect."
 }
 
 $tmpPath = Join-Path $legendaryDir ("legendary.exe.{0}.download" -f ([Guid]::NewGuid().ToString("N")))
+$downloaded = $false
 try {
-Write-Host "Downloading Legendary $releaseName..."
-Write-Host $downloadUrl
-Invoke-WebRequest -Uri $downloadUrl -Headers $headers -UseBasicParsing -OutFile $tmpPath -ErrorAction Stop
+for ($downloadAttempt = 1; $downloadAttempt -le 3 -and -not $downloaded; $downloadAttempt++) {
+    Write-Host "Downloading Legendary $releaseName... (attempt $downloadAttempt of 3)"
+    Write-Host $downloadUrl
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -Headers $headers -UseBasicParsing -OutFile $tmpPath -TimeoutSec 180 -ErrorAction Stop
 
-$download = Get-Item -LiteralPath $tmpPath -ErrorAction Stop
-if ($download.Length -lt 1MB) {
-    throw "Downloaded file is unexpectedly small ($($download.Length) bytes)."
+        $download = Get-Item -LiteralPath $tmpPath -ErrorAction Stop
+        if ($download.Length -lt 1MB) {
+            throw "Downloaded file is unexpectedly small ($($download.Length) bytes)."
+        }
+
+        Move-Item -LiteralPath $tmpPath -Destination $legendaryExe -Force
+        try { Unblock-File -LiteralPath $legendaryExe -ErrorAction SilentlyContinue } catch {}
+        $downloaded = $true
+    }
+    catch {
+        Write-Warning "Legendary download failed (attempt $downloadAttempt of 3): $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $tmpPath) {
+            Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($downloadAttempt -lt 3) { Start-Sleep -Seconds (5 * $downloadAttempt) }
+    }
 }
-
-Move-Item -LiteralPath $tmpPath -Destination $legendaryExe -Force
-try { Unblock-File -LiteralPath $legendaryExe -ErrorAction SilentlyContinue } catch {}
 }
 finally {
 if (Test-Path -LiteralPath $tmpPath) {
@@ -34582,11 +35390,21 @@ if (Test-Path -LiteralPath $tmpPath) {
 }
 }
 
+if (-not $downloaded -and $firstInstall) {
+throw "Legendary could not be downloaded after 3 attempts. Check the network connection and run the repair again."
+}
+
 if (-not (Test-Path -LiteralPath $legendaryExe -PathType Leaf)) {
 throw "Legendary executable was not saved to $legendaryExe."
 }
 
+if ($downloaded) {
 Write-Host "Legendary saved to:"
+}
+else {
+Write-Warning "Download failed - keeping the existing Legendary executable."
+Write-Host "Legendary kept at:"
+}
 Write-Host $legendaryExe
 & $legendaryExe --version
 
@@ -35816,6 +36634,7 @@ $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
         if ($script:ScanTimer -and $script:ScanTimer.IsEnabled) { $scanBusy = $true }
         if ($script:WmtLibraryScanTimer -and $script:WmtLibraryScanTimer.IsEnabled) { $scanBusy = $true }
         if ($script:WmtLibraryCacheRunspace) { $scanBusy = $true }
+        if ($script:WmtRegistryCleanupActive -or ($script:WmtRegistryCleanupTimer -and $script:WmtRegistryCleanupTimer.IsEnabled)) { $scanBusy = $true }
         if (-not $scanBusy) {
             # Release parsed cleaner rules (re-parsed on next cleaner use)
             if ($script:CleanerMlRulesMemoryCache) { $script:CleanerMlRulesMemoryCache = $null }
@@ -37315,7 +38134,11 @@ $btnWingetScan.Add_Click({
 
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo
                     $pInfo.FileName = $legendaryCommand
-                    $pInfo.Arguments = "list-installed --check-updates --csv --show-dirs"
+                    # --api-timeout is a global (pre-subcommand) option; 30s instead of
+                    # legendary's 10s default gives slow-but-alive Epic routes time to
+                    # answer. Builds older than 0.20.27 reject it, which the retry loop
+                    # below detects and retries without the flag.
+                    $pInfo.Arguments = "--api-timeout 30 list-installed --check-updates --csv --show-dirs"
                     $pInfo.RedirectStandardOutput = $true
                     $pInfo.RedirectStandardError = $true
                     $pInfo.UseShellExecute = $false
@@ -37324,13 +38147,19 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
 
                     # Epic endpoints intermittently fail with transient read timeouts
-                    # (legendary's HTTP client uses a 10s read timeout). Retry once on
-                    # network-class failures so a momentary blip does not kill the scan.
+                    # (legendary's HTTP client defaults to a 10s read timeout; raised to
+                    # 30s above). Retry once on network-class failures; if Epic stays
+                    # unreachable, fall back to legendary's local database below so the
+                    # installed Epic games still load.
                     $out = ""
                     $err = ""
                     $exitCode = 0
                     $maxAttempts = 2
                     $attempt = 0
+                    $networkFailure = $false
+                    $timedOut = $false
+                    $apiTimeoutStripped = $false
+                    $offlineMode = $false
                     while ($true) {
                         $attempt++
                         $p = [System.Diagnostics.Process]::Start($pInfo)
@@ -37340,7 +38169,8 @@ $btnWingetScan.Add_Click({
                             Write-Output "LOG:Legendary scan timed out after 90 seconds."
                             try { $p.Kill() } catch {}
                             try { [void]$p.WaitForExit(2000) } catch {}
-                            return
+                            $timedOut = $true
+                            break
                         }
 
                         $out = $outTask.GetAwaiter().GetResult()
@@ -37349,6 +38179,15 @@ $btnWingetScan.Add_Click({
 
                         # Success = clean exit with a CSV payload
                         if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($out)) { break }
+
+                        # A legendary build older than 0.20.27 rejects --api-timeout
+                        # (argparse exit code 2); retry the same attempt without it.
+                        if (-not $apiTimeoutStripped -and $exitCode -eq 2 -and (([string]$err) -match '(?i)unrecognized arguments[^\r\n]*--api-timeout')) {
+                            $apiTimeoutStripped = $true
+                            $pInfo.Arguments = "list-installed --check-updates --csv --show-dirs"
+                            $attempt--
+                            continue
+                        }
 
                         $networkFailure = (([string]$err) -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out')
                         if ($networkFailure -and $attempt -lt $maxAttempts) {
@@ -37362,9 +38201,49 @@ $btnWingetScan.Add_Click({
                     if ($exitCode -ne 0) {
                         Write-Output "LOG:Legendary scan exited with code $exitCode."
                         if (-not [string]::IsNullOrWhiteSpace($err)) {
-                            foreach ($errLine in ($err -split "`r?`n")) {
-                                if (-not [string]::IsNullOrWhiteSpace($errLine)) { Write-Output "LOG:Legendary: $errLine" }
+                            # Python tracebacks are dozens of stack frames; keep the GUI
+                            # log readable by showing the first few and the last lines.
+                            $errLines = @(($err -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                            for ($i = 0; $i -lt $errLines.Count; $i++) {
+                                if ($i -lt 4 -or $i -ge ($errLines.Count - 2)) {
+                                    Write-Output "LOG:Legendary: $($errLines[$i])"
+                                }
                             }
+                            if ($errLines.Count -gt 6) {
+                                Write-Output "LOG:Legendary: ... ($($errLines.Count - 6) additional stderr lines suppressed)"
+                            }
+                        }
+                    }
+
+                    # OFFLINE FALLBACK: when Epic is unreachable, list-installed WITHOUT
+                    # --check-updates reads the local install database plus the
+                    # last-synced asset versions (legendary's assets.json) with no
+                    # network access - the Epic games still load, with update info
+                    # from the last successful Epic sync.
+                    if ([string]::IsNullOrWhiteSpace($out) -and ($networkFailure -or $timedOut)) {
+                        Write-Output "LOG:Legendary could not reach Epic servers - loading installed Epic games from the local database (offline)..."
+                        try {
+                            $pInfo.Arguments = ([string]$pInfo.Arguments).Replace(" --check-updates", "")
+                            $p = [System.Diagnostics.Process]::Start($pInfo)
+                            $outTask = $p.StandardOutput.ReadToEndAsync()
+                            $errTask = $p.StandardError.ReadToEndAsync()
+                            if ($p.WaitForExit(60000)) {
+                                $out = $outTask.GetAwaiter().GetResult()
+                                $exitCode = $p.ExitCode
+                            }
+                            else {
+                                try { $p.Kill() } catch {}
+                                try { [void]$p.WaitForExit(2000) } catch {}
+                            }
+                        }
+                        catch {
+                            Write-Output "LOG:Legendary offline fallback failed: $($_.Exception.Message)"
+                        }
+                        if (-not [string]::IsNullOrWhiteSpace($out)) {
+                            $offlineMode = $true
+                        }
+                        else {
+                            Write-Output "LOG:Legendary offline fallback returned no data (no Epic games cached locally yet)."
                         }
                     }
 
@@ -37424,11 +38303,12 @@ $btnWingetScan.Add_Click({
                         }
                     }
 
+                    $offlineTag = if ($offlineMode) { " (offline - last synced Epic data)" } else { "" }
                     if ($pendingCount -eq 0) {
-                        Write-Output "LOG:Legendary scan found $installedCount installed Epic game(s), with no pending updates."
+                        Write-Output "LOG:Legendary scan$($offlineTag) found $installedCount installed Epic game(s), with no pending updates."
                     }
                     else {
-                        Write-Output "LOG:Legendary scan found $pendingCount pending Epic game update(s)."
+                        Write-Output "LOG:Legendary scan$($offlineTag) found $pendingCount pending Epic game update(s)."
                     }
                 }
                 catch {
@@ -38821,7 +39701,19 @@ $script:InvokeWingetSearch = {
                         if ($LegendaryExe -and (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
                             $psi = New-Object System.Diagnostics.ProcessStartInfo
                             $psi.FileName = $LegendaryExe
-                            $psi.Arguments = "list --json"
+                            # --include-ue only while UE/Fab assets are shown;
+                            # this runspace cannot call the settings helper,
+                            # so read the persisted flag from settings.json.
+                            $ueFlag = ""
+                            try {
+                                $wmtUeSettingsFile = Join-Path (Split-Path -Parent $LegCacheFile) "settings.json"
+                                if (Test-Path -LiteralPath $wmtUeSettingsFile -PathType Leaf) {
+                                    $wmtUeSettingsJson = [System.IO.File]::ReadAllText($wmtUeSettingsFile) | ConvertFrom-Json -ErrorAction Stop
+                                    if ($wmtUeSettingsJson.PSObject.Properties["HideLegendaryUeAssets"] -and -not [bool]$wmtUeSettingsJson.HideLegendaryUeAssets) { $ueFlag = " --include-ue" }
+                                }
+                            }
+                            catch {}
+                            $psi.Arguments = "--api-timeout 30 list --json$ueFlag"
                             $psi.RedirectStandardOutput = $true
                             $psi.RedirectStandardError = $true
                             $psi.UseShellExecute = $false
@@ -38848,7 +39740,29 @@ $script:InvokeWingetSearch = {
                                                 try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
                                                 if ([string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                                             }
-                                            $result.Add([PSCustomObject]@{ Provider = "legendary"; Title = $title; Id = [string]$game.app_name; Version = $latestVer; InstalledVersion = $installedVer; IsInstalled = $isInstalled; Source = "legendary"; Kind = "Library" })
+                                            # Tag UE/Fab assets from the JSON namespace data
+                                            # (asset_infos per platform, or the metadata blob).
+                                            $legIsUe = $false
+                                            try {
+                                                if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
+                                                    foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
+                                                        # Object form: read .namespace directly. String form:
+                                                        # legendary serializes GameAsset objects via str() (json
+                                                        # default=str), so the value arrives as a Python repr - match
+                                                        # the namespace field inside that text instead.
+                                                        if ($aiProp.Value -is [string]) {
+                                                            if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
+                                                        }
+                                                        elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
+                                                    }
+                                                }
+                                            } catch {}
+                                            if (-not $legIsUe) {
+                                                try {
+                                                    if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                                } catch {}
+                                            }
+                                            $result.Add([PSCustomObject]@{ Provider = "legendary"; Title = $title; Id = [string]$game.app_name; Version = $latestVer; InstalledVersion = $installedVer; IsInstalled = $isInstalled; Source = "legendary"; Kind = "Library"; IsUe = $legIsUe })
                                         }
                                         if ($result.Count -gt 0) { $parsed = $true }
                                     }
@@ -38856,16 +39770,85 @@ $script:InvokeWingetSearch = {
                                 catch {}
                             }
                             if (-not $parsed) {
-                                $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,)]+?)\s*(?:,\s*Version\s*:\s*(?<version>[^,)]+?))?\s*(?:,\s*[^)]*)?\)'
+                                # The text output carries no UE/Fab marker; tag each row
+                                # from legendary's own side data (assets.json namespace
+                                # set plus per-game metadata files) and the name
+                                # heuristics - the same chain every other cache writer
+                                # and the library scan worker use, so no row from this
+                                # path can reach the library cache without an IsUe tag.
+                                $ueAppNames = @{}
+                                $ueAssetsFiles = @()
+                                try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+                                try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+                                try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
+                                try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+                                try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+                                foreach ($ueAssetsFile in $ueAssetsFiles) {
+                                    if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+                                    try {
+                                        $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                                        foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                                            $uePlatformAssets = @()
+                                            if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                                                $uePlatformAssets = @($platformProp.Value)
+                                            }
+                                            elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                                                $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                                            }
+                                            foreach ($asset in @($uePlatformAssets)) {
+                                                if (([string]$asset.namespace) -eq 'ue') {
+                                                    $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                                                    if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    catch {}
+                                }
+                                $ueMetaRoots = @()
+                                try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+                                try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+                                try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+                                try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+                                try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
+                                $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,|)]+?)\s*(?:[,|]\s*Version\s*:\s*(?<version>[^,|)]+?))?\s*(?:[,|]\s*[^)]*)?\)'
                                 foreach ($match in $regex.Matches($stdout)) {
                                     $title = $match.Groups["title"].Value.Trim()
                                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                                    $app = $match.Groups["app"].Value.Trim()
                                     $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
-                                    $result.Add([PSCustomObject]@{ Provider = "legendary"; Title = $title; Id = $match.Groups["app"].Value.Trim(); Version = $ver; Source = "legendary"; Kind = "Library" })
+                                    $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$')
+                                    if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                                        foreach ($ueMetaRoot in $ueMetaRoots) {
+                                            $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
+                                            if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                                            try {
+                                                $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                                                if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                            }
+                                            catch {}
+                                            break
+                                        }
+                                    }
+                                    $result.Add([PSCustomObject]@{
+                                            Provider = "legendary"
+                                            Title    = $title
+                                            Id       = $app
+                                            Version  = $ver
+                                            Source   = "legendary"
+                                            Kind     = "Library"
+                                            IsUe     = $legIsUe
+                                        })
                                 }
                             }
                         }
-                        $result.ToArray() | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $LegCacheFile -Force -Encoding UTF8
+                        # Guard: never overwrite the cache with an empty result
+                        # (failed fetch racing the boot builder) - keep the last
+                        # good list, mirroring the other cache writers.
+                        $arrLeg = $result.ToArray()
+                        if ($arrLeg.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
+                            $arrLeg | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $LegCacheFile -Force -Encoding UTF8
+                        }
                     }
                     catch {}
                 }
@@ -39311,7 +40294,15 @@ $script:InvokeWingetSearch = {
             # Legendary marks UE/Fab content with namespace 'ue' in its own assets.json.
             # Use it as the authoritative filter (Fab app_names are arbitrary, e.g. "PlatformFunctionsPlugin_5.4").
             $ueAppNames = @{}
+            # Legendary's config home (every release since ~2021, Windows included)
+            # is %USERPROFILE%\.config\legendary, overridable via LEGENDARY_CONFIG_PATH
+            # or XDG_CONFIG_HOME. Older builds used %USERPROFILE%\.legendary, and
+            # Heroic keeps its own copy. Probe every candidate; missing files are
+            # skipped and all hits are merged below.
             $ueAssetsFiles = @()
+            try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+            try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+            try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
             try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
             try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
             foreach ($ueAssetsFile in $ueAssetsFiles) {
@@ -39337,8 +40328,15 @@ $script:InvokeWingetSearch = {
                     }
                 }
                 catch {}
-                break
             }
+            # Per-game metadata files (metadata/<app_name>.json) are the most
+            # durable UE tag source; see the library scan worker.
+            $ueMetaRoots = @()
+            try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+            try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+            try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+            try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+            try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
             try {
                 if ($LegendaryCacheFile -and (Test-Path -LiteralPath $LegendaryCacheFile -PathType Leaf)) {
                     $cacheText = [System.IO.File]::ReadAllText($LegendaryCacheFile)
@@ -39349,7 +40347,24 @@ $script:InvokeWingetSearch = {
                             $title = [string]$game.Title
                             if ([string]::IsNullOrWhiteSpace($title)) { continue }
                             $legId = ([string]$game.Id).Trim()
-                            if ($hideUe -and ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$')) { continue }
+                            # Same OR chain as the library scan: cached IsUe tag first,
+                            # assets.json namespace set and name patterns as fallbacks.
+                            $legIsUe = $false
+                            try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
+                            if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$') }
+                            if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                                foreach ($ueMetaRoot in $ueMetaRoots) {
+                                    $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
+                                    if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                                    try {
+                                        $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                                        if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                    }
+                                    catch {}
+                                    break
+                                }
+                            }
+                            if ($hideUe -and $legIsUe) { continue }
                             if ([string]::IsNullOrWhiteSpace($needle) -or $title.ToLowerInvariant().Contains($needle)) {
                                 # Show installed version in Version column, latest in Available.
                                 $isInst = $false
@@ -40052,6 +41067,9 @@ if (-not $Rule -or [string]::IsNullOrWhiteSpace([string]$Rule.Name)) { return }
 if ($Rule.PSObject.Properties["DetailsLoaded"] -and $Rule.DetailsLoaded) { return }
 
 $name = [string]$Rule.Name
+# The periodic memory trim releases this cache; re-create it on demand instead
+# of calling ContainsKey on $null (threw on every rule click / list rebuild).
+if (-not $script:FirewallDetailCache) { $script:FirewallDetailCache = @{} }
 if ($script:FirewallDetailCache.ContainsKey($name)) {
     Set-FirewallRuleDetails -Rule $Rule -Details $script:FirewallDetailCache[$name]
     if ($lstFw) { $lstFw.Items.Refresh() }
@@ -40115,6 +41133,7 @@ $script:FirewallDetailTimer.Add_Tick({
 
             $target = @($script:AllFw | Where-Object { $_.Name -eq $job.Name } | Select-Object -First 1)
             if ($result -and $result.Success) {
+                if (-not $script:FirewallDetailCache) { $script:FirewallDetailCache = @{} }
                 $script:FirewallDetailCache[$result.Name] = $result
                 if ($target.Count -gt 0) { Set-FirewallRuleDetails -Rule $target[0] -Details $result }
             }
@@ -40153,6 +41172,9 @@ if (-not $Rule -or [string]::IsNullOrWhiteSpace([string]$Rule.Name)) { return }
 if ($Rule.PSObject.Properties["DetailsLoaded"] -and $Rule.DetailsLoaded) { return }
 
 $name = [string]$Rule.Name
+# Self-heal after the memory trim nulls the cache (this is the selection-changed
+# entry point, so a throw here surfaced as "Exception while setting SelectedItem").
+if (-not $script:FirewallDetailCache) { $script:FirewallDetailCache = @{} }
 if ($script:FirewallDetailCache.ContainsKey($name)) {
     Set-FirewallRuleDetails -Rule $Rule -Details $script:FirewallDetailCache[$name]
     if ($lstFw) { $lstFw.Items.Refresh() }
@@ -41145,40 +42167,59 @@ $script:TelemetryTasks = @(
 "\Microsoft\Windows\Windows Error Reporting\QueueReporting"
 )
 
+# Live enumeration folders for the View Tasks dialog: every task the Task
+# Scheduler actually has under these folders is listed (merged with the
+# canonical list above), so the grid shows what THIS machine registered
+# instead of a fixed name list. The Office folder is name-filtered at read
+# time because it also holds non-telemetry servicing tasks.
+$script:WmtTelemetryTaskFolders = @(
+    "\Microsoft\Windows\Application Experience",
+    "\Microsoft\Windows\Customer Experience Improvement Program",
+    "\Microsoft\Windows\Autochk",
+    "\Microsoft\Windows\DiskDiagnostic",
+    "\Microsoft\Windows\Feedback\Siuf",
+    "\Microsoft\Windows\Windows Error Reporting",
+    "\Microsoft\Windows\NetTrace",
+    "\Microsoft\Windows\PI",
+    "\Microsoft\Windows\Device Information",
+    "\Microsoft\Office"
+)
+
 if ($btnTasksDisableTelemetry) { $btnTasksDisableTelemetry.Add_Click({
-    Invoke-UiCommand {
-        param($tasks)
-        foreach ($task in $tasks) {
-            $result = Invoke-WmtScheduledTaskAction -Action Disable -FullName $task
-            if ($result.Success) {
-                Write-GuiLog "Disabled: $task"
-            }
-            else {
-                Write-GuiLog "Failed to disable $task`: $($result.Message)"
-            }
-        }
-        Write-GuiLog "Telemetry tasks disabled!"
-    } "Disabling telemetry tasks..." -ArgumentList $script:TelemetryTasks
+    # Runs off the UI thread (the old Invoke-UiCommand version froze the whole
+    # window while every task did its own slow CIM lookup).
+    try {
+        Start-WmtScheduledTaskBatchAction -Action Disable -FullPaths $script:TelemetryTasks -StartMessage "Disabling telemetry tasks..." -DoneMessage "Telemetry tasks disabled!"
+    }
+    catch {
+        Write-WmtLastCrash -Context "Disable telemetry tasks failed" -Exception $_.Exception -ErrorRecord $_
+        Write-GuiLog "ERROR: Disable telemetry tasks failed: $($_.Exception.Message)"
+    }
 }) }
 
 if ($btnTasksRestore) { $btnTasksRestore.Add_Click({
-    Invoke-UiCommand {
-        param($tasks)
-        foreach ($task in $tasks) {
-            $result = Invoke-WmtScheduledTaskAction -Action Enable -FullName $task
-            if ($result.Success) {
-                Write-GuiLog "Enabled: $task"
-            }
-            else {
-                Write-GuiLog "Failed to enable $task`: $($result.Message)"
-            }
-        }
-        Write-GuiLog "Telemetry tasks restored!"
-    } "Restoring telemetry tasks..." -ArgumentList $script:TelemetryTasks
+    # Runs off the UI thread (the old Invoke-UiCommand version froze the whole
+    # window while every task did its own slow CIM lookup).
+    try {
+        Start-WmtScheduledTaskBatchAction -Action Enable -FullPaths $script:TelemetryTasks -StartMessage "Restoring telemetry tasks..." -DoneMessage "Telemetry tasks restored!"
+    }
+    catch {
+        Write-WmtLastCrash -Context "Restore telemetry tasks failed" -Exception $_.Exception -ErrorRecord $_
+        Write-GuiLog "ERROR: Restore telemetry tasks failed: $($_.Exception.Message)"
+    }
 }) }
 
 if ($btnTasksView) { $btnTasksView.Add_Click({
-    Show-WmtScheduledTasksDialog -Title "Telemetry Tasks" -FullPaths $script:TelemetryTasks
+    # Fully instrumented: if anything inside the dialog ever throws again, the
+    # exact PowerShell position and call stack land in last-crash.txt instead
+    # of an anonymous "Unhandled WPF dispatcher exception" line.
+    try {
+        Show-WmtScheduledTasksDialog -Title "Telemetry Tasks" -FullPaths $script:TelemetryTasks -TelemetryFolders $script:WmtTelemetryTaskFolders
+    }
+    catch {
+        Write-WmtLastCrash -Context "Telemetry tasks view failed" -Exception $_.Exception -ErrorRecord $_
+        Write-GuiLog "ERROR: Telemetry tasks view failed: $($_.Exception.Message)"
+    }
 }) }
 
 # --- WINDOWS UPDATE PRESETS ---
@@ -42167,7 +43208,15 @@ $ps = New-WmtPooledPowerShell
                 # Legendary marks UE/Fab content with namespace 'ue' in its own assets.json.
                 # Use it as the authoritative UE/Fab tag (Fab app_names are arbitrary, e.g. "PlatformFunctionsPlugin_5.4").
                 $ueAppNames = @{}
+                # Legendary's config home (every release since ~2021, Windows included)
+                # is %USERPROFILE%\.config\legendary, overridable via LEGENDARY_CONFIG_PATH
+                # or XDG_CONFIG_HOME. Older builds used %USERPROFILE%\.legendary, and
+                # Heroic keeps its own copy. Probe every candidate; missing files are
+                # skipped and all hits are merged below.
                 $ueAssetsFiles = @()
+                try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+                try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+                try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
                 try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
                 try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
                 foreach ($ueAssetsFile in $ueAssetsFiles) {
@@ -42193,8 +43242,17 @@ $ps = New-WmtPooledPowerShell
                         }
                     }
                     catch {}
-                    break
                 }
+                # Per-game metadata files are legendary's most durable UE tag
+                # source: every synced game gets metadata/<app_name>.json with
+                # the EGS namespace inside, even when assets.json is missing
+                # or stale.
+                $ueMetaRoots = @()
+                try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+                try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+                try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+                try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+                try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
                 foreach ($game in @($library)) {
                     $title = [string]$game.Title
                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
@@ -42202,7 +43260,26 @@ $ps = New-WmtPooledPowerShell
                     # when the "Hide Unreal Engine / Fab assets" toggle is checked;
                     # update checks are never affected by the toggle.
                     $legId = ([string]$game.Id).Trim()
-                    $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$')
+                    # Prefer the IsUe tag newer WMT builds write into the cache
+                    # (from legendary's own namespace data), then fall back to the
+                    # assets.json namespace set and the name patterns so older or
+                    # stale caches still get tagged. OR semantics: a false tag from
+                    # a text-parsed cache does not veto the other sources.
+                    $legIsUe = $false
+                    try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
+                    if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$') }
+                    if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                        foreach ($ueMetaRoot in $ueMetaRoots) {
+                            $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
+                            if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                            try {
+                                $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                                if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                            }
+                            catch {}
+                            break
+                        }
+                    }
                     $isInst = $false
                     try { if ($game.PSObject.Properties["IsInstalled"]) { $isInst = [bool]$game.IsInstalled } } catch {}
                     $instVer = ""
@@ -42331,32 +43408,38 @@ $script:WmtLibraryScanTimer.Start()
 
 if ($btnShowLibrary -and $btnBackToCatalog -and $btnLibraryRefresh -and $brdCatalogList -and $brdLibraryList -and $pnlCatalogActions -and $lstLibrary) {
 $btnShowLibrary.Add_Click({
-        # Switch to library view (keep all buttons visible).
-        $brdCatalogList.Visibility = "Collapsed"
-        $brdLibraryList.Visibility = "Visible"
-        if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
-        if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
-        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
+        try {
+            # Switch to library view (keep all buttons visible).
+            $brdCatalogList.Visibility = "Collapsed"
+            $brdLibraryList.Visibility = "Visible"
+            if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
+            if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+            if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
 
-        # Highlight the Your Library button (AccentBtn style).
-        if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
+            # Highlight the Your Library button (AccentBtn style).
+            if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
 
-        # If we have pre-loaded results, display them instantly.
-        if ($script:WmtLibraryScanResults -and $script:WmtLibraryScanResults.Count -gt 0) {
-            $lstLibrary.Items.Clear()
-            foreach ($item in $script:WmtLibraryScanResults) {
-                if (Test-WmtFabAssetHidden $item) { continue }
-                [void]$lstLibrary.Items.Add($item)
+            # If we have pre-loaded results, display them instantly.
+            if ($script:WmtLibraryScanResults -and $script:WmtLibraryScanResults.Count -gt 0) {
+                $lstLibrary.Items.Clear()
+                foreach ($item in $script:WmtLibraryScanResults) {
+                    if (Test-WmtFabAssetHidden $item) { continue }
+                    [void]$lstLibrary.Items.Add($item)
+                }
+                if ($lblLibraryStatus) {
+                    $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
+                }
             }
-            if ($lblLibraryStatus) {
-                $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
+            elseif (-not $script:WmtLibraryScanRunspace) {
+                Start-WmtLibraryScan
+            }
+            else {
+                if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Scanning libraries..." }
             }
         }
-        elseif (-not $script:WmtLibraryScanRunspace) {
-            Start-WmtLibraryScan
-        }
-        else {
-            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Scanning libraries..." }
+        catch {
+            Write-WmtLastCrash -Context "Open library view failed" -Exception $_.Exception -ErrorRecord $_
+            Write-GuiLog "ERROR: Could not open the library view: $($_.Exception.Message)"
         }
     })
 
@@ -42374,7 +43457,11 @@ $btnBackToCatalog.Add_Click({
     })
 
 $btnLibraryRefresh.Add_Click({
-        Start-WmtLibraryScan
+        try { Start-WmtLibraryScan }
+        catch {
+            Write-WmtLastCrash -Context "Library refresh failed" -Exception $_.Exception -ErrorRecord $_
+            Write-GuiLog "ERROR: Library refresh failed: $($_.Exception.Message)"
+        }
     })
 
 # --- Unreal Engine / Fab assets visibility toggle (Your Library) ---
@@ -42396,6 +43483,11 @@ $btnToggleFabAssets.Add_Click({
         # Re-apply the filter instantly; Update-WmtLibrarySearch respects any
         # active search text and the shared hide flag.
         Update-WmtLibrarySearch
+        # Rebuild the Legendary cache to match the new visibility: Hidden
+        # (default) builds it without --include-ue, Shown with UE/Fab rows.
+        # The builder's completion handler refreshes the open library view,
+        # so flipping the toggle both ways takes effect without a restart.
+        try { Start-WmtLibraryCacheBuilder } catch { Write-GuiLog "Fab assets cache refresh failed: $($_.Exception.Message)" }
         if ($lblLibraryStatus -and $brdLibraryList -and $brdLibraryList.Visibility -eq "Visible" -and $lstLibrary -and $lstLibrary.Items.Count -gt 0) {
             $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
         }
@@ -42821,9 +43913,10 @@ if ($ctxLibrary -and $lstLibrary) {
             # Show Install only if NOT installed.
             if ($miLibInstall) { $miLibInstall.Visibility = if (-not $isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
 
-            # Store page + Copy ID always visible.
+            # Store page + Copy ID + Copy Row Data always visible.
             if ($miLibStorePage) { $miLibStorePage.Visibility = [System.Windows.Visibility]::Visible }
             if ($miLibCopyId) { $miLibCopyId.Visibility = [System.Windows.Visibility]::Visible }
+            if ($miLibCopyRows) { $miLibCopyRows.Visibility = [System.Windows.Visibility]::Visible }
         }.GetNewClosure())
 
     if ($miLibLaunch) {
@@ -42905,6 +43998,38 @@ if ($ctxLibrary -and $lstLibrary) {
                 try { Set-Clipboard -Value $id; Write-GuiLog "Copied ID: $id" } catch {}
             }.GetNewClosure())
     }
+
+    if ($miLibCopyRows) {
+        $miLibCopyRows.Add_Click({
+                # Full-row copy (Source/Name/Id/Version/Available/IsUe) - the
+                # same TSV Ctrl+C produces, so the UE/Fab tag of any row can
+                # be verified straight from a paste.
+                try { [void](Copy-WmtLibrarySelectedRowsToClipboard -ListView $lstLibrary) } catch { Write-GuiLog "ERROR: Copy row data failed: $($_.Exception.Message)" }
+            }.GetNewClosure())
+    }
+}
+
+# Ctrl+C copies the selected library line(s) to the clipboard as
+# tab-separated rows (Source, Name, ID, Installed, Latest, IsUe); Ctrl+A
+# selects every row first. Mirrors the keyboard support the updates list
+# has; "Copy Row Data" in the right-click menu performs the same copy.
+if ($lstLibrary) {
+    $lstLibrary.Add_PreviewKeyDown({
+            param($s, $e)
+            try {
+                $hasControl = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq [System.Windows.Input.ModifierKeys]::Control)
+                if ($hasControl -and $e.Key -eq [System.Windows.Input.Key]::C) {
+                    if (Copy-WmtLibrarySelectedRowsToClipboard -ListView $s) { $e.Handled = $true }
+                }
+                elseif ($hasControl -and $e.Key -eq [System.Windows.Input.Key]::A) {
+                    $s.SelectAll()
+                    $e.Handled = $true
+                }
+            }
+            catch {
+                Write-GuiLog "ERROR: Library key handler failed: $($_.Exception.Message)"
+            }
+        })
 }
 
 # --- Library search box ---
@@ -43975,6 +45100,12 @@ function Update-OptionalFeaturesSynchronously {
 }
 
 $onMainWindowContentRendered = {
+# Build identity first: the title suffix and the log line answer
+# "is this the latest build?" without guessing (see the download page
+# for the line count / size / MD5 of the newest delivery).
+try {
+    Write-GuiLog "WMT GUI v$AppVersion started."
+} catch {}
 $settings = Get-WmtSettings
 
 # Restore persisted window geometry/state when valid.
@@ -44105,6 +45236,10 @@ $script:WmtLibraryCacheAsyncResult = $null
 
 function Start-WmtLibraryCacheBuilder {
 try {
+    if ($script:WmtLibraryCacheAsyncResult -and -not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
+        Write-GuiLog "Library cache build already in progress."
+        return
+    }
     $settings = Get-WmtSettings
     $enabled = @($settings.EnabledProviders)
     $toggles = Get-WmtProviderToggles -Settings $settings
@@ -44265,7 +45400,19 @@ try {
                     if ($LegendaryExe -and (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
                         $psi = New-Object System.Diagnostics.ProcessStartInfo
                         $psi.FileName = $LegendaryExe
-                        $psi.Arguments = "list --json"
+                        # --include-ue only while UE/Fab assets are shown;
+                        # this runspace cannot call the settings helper,
+                        # so read the persisted flag from settings.json.
+                        $ueFlag = ""
+                        try {
+                            $wmtUeSettingsFile = Join-Path (Split-Path -Parent $LegCacheFile) "settings.json"
+                            if (Test-Path -LiteralPath $wmtUeSettingsFile -PathType Leaf) {
+                                $wmtUeSettingsJson = [System.IO.File]::ReadAllText($wmtUeSettingsFile) | ConvertFrom-Json -ErrorAction Stop
+                                if ($wmtUeSettingsJson.PSObject.Properties["HideLegendaryUeAssets"] -and -not [bool]$wmtUeSettingsJson.HideLegendaryUeAssets) { $ueFlag = " --include-ue" }
+                            }
+                        }
+                        catch {}
+                        $psi.Arguments = "--api-timeout 30 list --json$ueFlag"
                         $psi.RedirectStandardOutput = $true
                         $psi.RedirectStandardError = $true
                         $psi.UseShellExecute = $false
@@ -44295,6 +45442,28 @@ try {
                                             try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
                                             if ([string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                                         }
+                                        # Tag UE/Fab assets from the JSON namespace data
+                                        # (asset_infos per platform, or the metadata blob).
+                                        $legIsUe = $false
+                                        try {
+                                            if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
+                                                foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
+                                                    # Object form: read .namespace directly. String form:
+                                                    # legendary serializes GameAsset objects via str() (json
+                                                    # default=str), so the value arrives as a Python repr - match
+                                                    # the namespace field inside that text instead.
+                                                    if ($aiProp.Value -is [string]) {
+                                                        if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
+                                                    }
+                                                    elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
+                                                }
+                                            }
+                                        } catch {}
+                                        if (-not $legIsUe) {
+                                            try {
+                                                if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                            } catch {}
+                                        }
                                         $result.Add([PSCustomObject]@{
                                                 Provider         = "legendary"
                                                 Title            = $title
@@ -44304,6 +45473,7 @@ try {
                                                 IsInstalled      = $isInstalled
                                                 Source           = "legendary"
                                                 Kind             = "Library"
+                                                IsUe             = $legIsUe
                                             })
                                     }
                                     if ($result.Count -gt 0) { $parsed = $true }
@@ -44316,18 +45486,72 @@ try {
 
                         # Attempt 2: Text parsing fallback
                         if (-not $parsed) {
-                            $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,)]+?)\s*(?:,\s*Version\s*:\s*(?<version>[^,)]+?))?\s*(?:,\s*[^)]*)?\)'
+                            # The text output carries no UE/Fab marker; tag each
+                            # row from legendary's own side data (assets.json
+                            # namespace set plus per-game metadata files) and
+                            # the name heuristics, like every other site.
+                            $ueAppNames = @{}
+                            $ueAssetsFiles = @()
+                            try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+                            try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+                            try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+                            foreach ($ueAssetsFile in $ueAssetsFiles) {
+                                if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+                                try {
+                                    $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                                    foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                                        $uePlatformAssets = @()
+                                        if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                                            $uePlatformAssets = @($platformProp.Value)
+                                        }
+                                        elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                                            $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                                        }
+                                        foreach ($asset in @($uePlatformAssets)) {
+                                            if (([string]$asset.namespace) -eq 'ue') {
+                                                $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                                                if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                                            }
+                                        }
+                                    }
+                                }
+                                catch {}
+                            }
+                            $ueMetaRoots = @()
+                            try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+                            try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+                            try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
+                            $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,|)]+?)\s*(?:[,|]\s*Version\s*:\s*(?<version>[^,|)]+?))?\s*(?:[,|]\s*[^)]*)?\)'
                             foreach ($match in $regex.Matches($stdout)) {
                                 $title = $match.Groups["title"].Value.Trim()
                                 if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                                $app = $match.Groups["app"].Value.Trim()
                                 $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
+                                $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$')
+                                if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                                    foreach ($ueMetaRoot in $ueMetaRoots) {
+                                        $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
+                                        if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                                        try {
+                                            $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                                            if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                        }
+                                        catch {}
+                                        break
+                                    }
+                                }
                                 $result.Add([PSCustomObject]@{
                                         Provider = "legendary"
                                         Title    = $title
-                                        Id       = $match.Groups["app"].Value.Trim()
+                                        Id       = $app
                                         Version  = $ver
                                         Source   = "legendary"
                                         Kind     = "Library"
+                                        IsUe     = $legIsUe
                                     })
                             }
                         }
@@ -44666,6 +45890,14 @@ try {
             try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
             $script:WmtLibraryCacheRunspace = $null
             $script:WmtLibraryCacheAsyncResult = $null
+            # If the library view is open, refresh it from the rebuilt
+            # cache (covers the Fab-assets toggle: the rebuild flips the
+            # --include-ue flag and the open view picks the change up
+            # immediately; the boot-time build finds the view closed and
+            # skips this).
+            if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+                try { Start-WmtLibraryScan -Silent } catch {}
+            }
         }.GetNewClosure())
     $timer.Start()
 }
@@ -44810,7 +46042,16 @@ try {
     }
 }
 catch {}
-try { if ($script:WmtLibraryScanTimer) { $script:WmtLibraryScanTimer.Stop(); $script:WmtLibraryScanTimer = $null } } catch {}
+try { if ($script:WmtTaskBatchTimer) { $script:WmtTaskBatchTimer.Stop(); $script:WmtTaskBatchTimer = $null } } catch {}
+try {
+    if ($script:WmtTaskBatchPs) {
+        try { $script:WmtTaskBatchPs.Stop() } catch {}
+        try { $script:WmtTaskBatchPs.Dispose() } catch {}
+        $script:WmtTaskBatchPs = $null
+        $script:WmtTaskBatchAsync = $null
+    }
+}
+catch {}
 try { if ($script:WmtLibrarySearchTimer) { $script:WmtLibrarySearchTimer.Stop(); $script:WmtLibrarySearchTimer = $null } } catch {}
 try { if ($script:StatsTimer) { $script:StatsTimer.Stop(); $script:StatsTimer = $null } } catch {}
 try { if ($script:UpdateTimer) { $script:UpdateTimer.Stop(); $script:UpdateTimer = $null } } catch {}
