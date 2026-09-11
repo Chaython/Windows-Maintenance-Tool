@@ -4879,6 +4879,7 @@ try {
         ReduceRamInTray            = [bool](Get-WmtReduceRamInTray -Settings $Settings)
         DisableBackgroundJobs      = [bool](Get-WmtDisableBackgroundJobs -Settings $Settings)
         UpdateScansDisabled         = [bool](Get-WmtUpdateScansDisabled -Settings $Settings)
+        LaunchMinimized             = [bool]$Settings.LaunchMinimized
         HideLegendaryUeAssets       = [bool](Get-WmtHideLegendaryUeAssets -Settings $Settings)
         SavedUpdateAutoScanMinutes  = (ConvertTo-Int (Get-WmtSavedUpdateAutoScanMinutes -Settings $Settings) 0)
         LoadWinapp2                = [bool]$Settings.LoadWinapp2
@@ -4931,6 +4932,7 @@ $defaults = @{
     ReduceRamInTray            = $true
     DisableBackgroundJobs      = $false
     UpdateScansDisabled         = $false
+    LaunchMinimized             = $false
     HideLegendaryUeAssets      = $true
     SavedUpdateAutoScanMinutes = 0
     LoadWinapp2                = $false 
@@ -4983,6 +4985,7 @@ if (Test-Path $path) {
         if ($json.PSObject.Properties["ReduceRamInTray"]) { $defaults.ReduceRamInTray = [bool]$json.ReduceRamInTray }
         if ($json.PSObject.Properties["DisableBackgroundJobs"]) { $defaults.DisableBackgroundJobs = [bool]$json.DisableBackgroundJobs }
         if ($json.PSObject.Properties["UpdateScansDisabled"]) { $defaults.UpdateScansDisabled = [bool]$json.UpdateScansDisabled }
+        if ($json.PSObject.Properties["LaunchMinimized"]) { $defaults.LaunchMinimized = [bool]$json.LaunchMinimized }
         if ($json.PSObject.Properties["HideLegendaryUeAssets"]) { $defaults.HideLegendaryUeAssets = [bool]$json.HideLegendaryUeAssets }
         if ($json.PSObject.Properties["SavedUpdateAutoScanMinutes"]) {
             try { $defaults.SavedUpdateAutoScanMinutes = [int]$json.SavedUpdateAutoScanMinutes } catch { $defaults.SavedUpdateAutoScanMinutes = 0 }
@@ -26359,7 +26362,8 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <TextBlock Text="Windows Maintenance Tool v$AppVersion" FontSize="14" Foreground="{DynamicResource TextSecondary}" FontWeight="SemiBold"/>
                         </StackPanel>
                         <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
-                            <Button Name="btnStartWithWindows" Content="Start with Windows" Style="{StaticResource ActionBtn}" Height="32" MinWidth="140" Margin="0,0,8,0" ToolTip="Launch WMT automatically when Windows starts"/>
+                            <Button Name="btnStartWithWindows" Content="Start with Windows: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="170" Margin="0,0,8,0" ToolTip="WMT does not launch at logon (no startup task, or task state: Disabled). Click to set the state to On."/>
+                            <Button Name="btnLaunchMinimized" Content="Launch Minimized: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="160" Margin="0,0,8,0" ToolTip="WMT starts with a visible window. Click to start hidden in the system tray instead."/>
                             <Button Name="btnDisableBgJobs" Content="Bg Jobs: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="130" Margin="0,0,8,0" ToolTip="Background auto-refresh ENABLED. My Device info and Tweaks states load automatically. Click to disable."/>
                             <Button Name="btnDisableUpdateScans" Content="Update Scans: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="150" Margin="0,0,8,0" ToolTip="Disable all automatic and tray-triggered update scans. Manual scans will still work. Click to toggle."/>
                             <Button Name="btnToggleTheme" Content="Toggle Theme" Style="{StaticResource ActionBtn}" Height="32" MinWidth="112" ToolTip="Switch between dark and light theme"/>
@@ -28335,6 +28339,7 @@ $btnSupportDiscord = Get-Ctrl "btnSupportDiscord"
 $btnSupportIssue = Get-Ctrl "btnSupportIssue"
 $btnToggleTheme = Get-Ctrl "btnToggleTheme"
 $btnStartWithWindows = Get-Ctrl "btnStartWithWindows"
+$btnLaunchMinimized = Get-Ctrl "btnLaunchMinimized"
 $btnNavDownloads = Get-Ctrl "btnNavDownloads"
 $btnDonateIos12 = Get-Ctrl "btnDonateIos12"
 $btnDonate = Get-Ctrl "btnDonate"
@@ -28421,6 +28426,11 @@ $tabButton.Add_Click({
             if ($lstWinget.Items.Count -eq 0 -and -not (Get-WmtUpdateScansDisabled)) {
                 $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
             }
+        }
+        if ($s.Name -eq "btnTabSupport") {
+            # Re-check the real Task Scheduler state whenever the Support tab
+            # is shown so the Start with Windows button always reflects off/on.
+            try { Update-WmtStartWithWindowsButton } catch {}
         }
         if ($s.Name -eq "btnTabMyDevice") {
             Update-MyDeviceResponsiveLayout
@@ -29891,6 +29901,11 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexAction "Disable Update Scans" { Set-WmtUpdateScansDisabled -Enabled $true; Update-WmtUpdateScansButton; Write-GuiLog "Update scans disabled." } "btnTabSupport"
     Add-SearchIndexAction "Enable Update Scans"  { Set-WmtUpdateScansDisabled -Enabled $false; Update-WmtUpdateScansButton; Write-GuiLog "Update scans enabled."; try { if (-not (Get-WmtDisableBackgroundJobs)) { Start-WmtUpdateAutoScanTimer } } catch {} } "btnTabSupport"
     Add-SearchIndexEntry "btnStartWithWindows" "Start with Windows"              "btnTabSupport"
+    Add-SearchIndexAction "Enable Start with Windows"  { Set-WmtStartWithWindows -Enabled $true;  Update-WmtStartWithWindowsButton; Write-GuiLog "Start with Windows enabled." } "btnTabSupport"
+    Add-SearchIndexAction "Disable Start with Windows" { Set-WmtStartWithWindows -Enabled $false; Update-WmtStartWithWindowsButton; Write-GuiLog "Start with Windows disabled." } "btnTabSupport"
+    Add-SearchIndexEntry "btnLaunchMinimized" "Launch Minimized" "btnTabSupport"
+    Add-SearchIndexAction "Enable Launch Minimized"  { Set-WmtLaunchMinimized -Enabled $true;  Update-WmtLaunchMinimizedButton; Write-GuiLog "Launch Minimized enabled. WMT will start hidden in the system tray." } "btnTabSupport"
+    Add-SearchIndexAction "Disable Launch Minimized" { Set-WmtLaunchMinimized -Enabled $false; Update-WmtLaunchMinimizedButton; Write-GuiLog "Launch Minimized disabled. WMT will start with a visible window." } "btnTabSupport"
     Add-SearchIndexAction "Light Mode" { Set-WmtThemePreference -Theme "light" } "btnTabSupport"
     Add-SearchIndexAction "Dark Mode" { Set-WmtThemePreference -Theme "dark" }  "btnTabSupport"
 
@@ -41629,138 +41644,261 @@ $btnToggleTheme.Add_Click({
 $script:WmtStartupTaskName = "WindowsMaintenanceTool"
 
 function Get-WmtStartupCommand {
-# Build the command parts for Task Scheduler.
-# Returns a hashtable: @{ FilePath; Arguments }
-if ($script:WmtIsCompiledExe) {
-    $exePath = $script:WmtProcessPath
-    if ([string]::IsNullOrWhiteSpace($exePath) -or -not (Test-Path -LiteralPath $exePath -PathType Leaf)) { return $null }
-    return @{ FilePath = $exePath; Arguments = "" }
-}
-else {
+    # Build the command parts for Task Scheduler.
+    # Returns a hashtable: @{ FilePath; Arguments }
+    if ($script:WmtIsCompiledExe) {
+        $exePath = $script:WmtProcessPath
+        if ([string]::IsNullOrWhiteSpace($exePath) -or -not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            return $null
+        }
+        return @{ FilePath = $exePath; Arguments = "" }
+    }
+
     $scriptPath = $script:WmtScriptPath
-    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+        return $null
+    }
+
     $psExe = "powershell.exe"
     try {
         $cmd = Get-Command powershell.exe -ErrorAction SilentlyContinue
         if ($cmd -and $cmd.Source) { $psExe = $cmd.Source }
     }
     catch {}
-    return @{ FilePath = $psExe; Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" }
+
+    return @{
+        FilePath  = $psExe
+        Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    }
 }
+
+function Get-WmtStartupTask {
+    try {
+        $service = New-WmtTaskSchedulerService
+        if (-not $service) { return $null }
+
+        $root = $service.GetFolder("\")
+        return $root.GetTask($script:WmtStartupTaskName)
+    }
+    catch {
+        return $null
+    }
 }
 
 function Test-WmtStartWithWindows {
-try {
-    $task = Get-ScheduledTask -TaskName $script:WmtStartupTaskName -ErrorAction SilentlyContinue
-    if ($task -and $task.State -ne "Disabled") { return $true }
-}
-catch {}
-return $false
-}
+    try {
+        $task = Get-WmtStartupTask
+        if (-not $task) { return $false }
 
-function Test-WmtStartupEntryValid {
-# Check if the existing scheduled task points to a file that still exists.
-try {
-    $task = Get-ScheduledTask -TaskName $script:WmtStartupTaskName -ErrorAction SilentlyContinue
-    if (-not $task) { return $false }
-    foreach ($action in @($task.Actions)) {
-        $filePath = [string]$action.Execute
-        if (-not [string]::IsNullOrWhiteSpace($filePath) -and (Test-Path -LiteralPath $filePath -PathType Leaf)) {
-            return $true
-        }
+        # Task.State: 1 = Disabled, 2 = Queued, 3 = Ready, 4 = Running.
+        return ([int]$task.State -ne 1 -and [bool]$task.Enabled)
     }
-    return $false
-}
-catch {}
-return $false
-}
-
-function Repair-WmtStartupEntry {
-# If the scheduled task exists but points to a moved/deleted file,
-# update it to the current WMT path. If the current path is also
-# invalid, remove the task entirely.
-try {
-    if (-not (Test-WmtStartWithWindows)) { return }
-    $isValid = Test-WmtStartupEntryValid
-    if ($isValid) { return }
-
-    # Entry is stale � try to repair with the current path.
-    $cmdParts = Get-WmtStartupCommand
-    if (-not $cmdParts -or [string]::IsNullOrWhiteSpace($cmdParts.FilePath)) {
-        # Can't build a valid command � remove the stale task.
-        Unregister-ScheduledTask -TaskName $script:WmtStartupTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-GuiLog "Start with Windows: removed stale task (file was moved or deleted)."
-        return
+    catch {
+        return $false
     }
-
-    # Recreate the task with the current path.
-    Set-WmtStartWithWindows -Enabled $true
-    Write-GuiLog "Start with Windows: updated task to current path."
-}
-catch {
-    Write-GuiLog "Failed to repair startup task: $($_.Exception.Message)"
-}
 }
 
 function Set-WmtStartWithWindows {
-param([bool]$Enabled)
-try {
-    if ($Enabled) {
-        $cmdParts = Get-WmtStartupCommand
-        if (-not $cmdParts -or [string]::IsNullOrWhiteSpace($cmdParts.FilePath)) {
-            Write-GuiLog "Start with Windows: could not determine WMT launch path."
-            return
+    param([Parameter(Mandatory = $true)][bool]$Enabled)
+
+    try {
+        $service = New-WmtTaskSchedulerService
+        if (-not $service) {
+            Write-GuiLog "Start with Windows: could not connect to Task Scheduler."
+            return $false
         }
 
-        # Remove existing task if it exists.
-        Unregister-ScheduledTask -TaskName $script:WmtStartupTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        $root = $service.GetFolder("\")
+        $existing = $null
+        try { $existing = $root.GetTask($script:WmtStartupTaskName) } catch {}
 
-        # Build the scheduled task:
-        # - Trigger: At logon
-        # - Action: Run WMT (exe or powershell.exe -File script.ps1)
-        # - Settings: Run with highest privileges (skips UAC)
-        $action = New-ScheduledTaskAction -FilePath $cmdParts.FilePath -Argument $cmdParts.Arguments
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        if (-not $Enabled) {
+            if ($existing) {
+                try {
+                    $existing.Enabled = $false
+                    Write-GuiLog "Start with Windows disabled."
+                    return $true
+                }
+                catch {
+                    Write-GuiLog "Start with Windows: failed to disable task: $($_.Exception.Message)"
+                    return $false
+                }
+            }
 
-        Register-ScheduledTask -TaskName $script:WmtStartupTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-        Write-GuiLog "Start with Windows: enabled (Task Scheduler, no UAC prompt)."
+            Write-GuiLog "Start with Windows disabled (no startup task exists)."
+            return $true
+        }
+
+        $command = Get-WmtStartupCommand
+        if (-not $command) {
+            Write-GuiLog "Start with Windows: WMT launch file could not be located."
+            return $false
+        }
+
+        # Task Scheduler COM constants.
+        $TASK_TRIGGER_LOGON          = 9
+        $TASK_ACTION_EXEC            = 0
+        $TASK_CREATE_OR_UPDATE       = 6
+        $TASK_LOGON_INTERACTIVE_TOKEN = 3
+        $TASK_RUNLEVEL_HIGHEST       = 1
+
+        $definition = $service.NewTask(0)
+        $definition.RegistrationInfo.Description = "Starts Windows Maintenance Tool when the user logs on."
+        try { $definition.RegistrationInfo.Author = [Environment]::UserName } catch {}
+
+        $principal = $definition.Principal
+        $principal.UserId = "$env:USERDOMAIN\$env:USERNAME"
+        $principal.LogonType = $TASK_LOGON_INTERACTIVE_TOKEN
+        $principal.RunLevel = $TASK_RUNLEVEL_HIGHEST
+
+        $trigger = $definition.Triggers.Create($TASK_TRIGGER_LOGON)
+        try { $trigger.UserId = "$env:USERDOMAIN\$env:USERNAME" } catch {}
+        try { $trigger.Enabled = $true } catch {}
+
+        $action = $definition.Actions.Create($TASK_ACTION_EXEC)
+        $action.Path = [string]$command.FilePath
+        $action.Arguments = [string]$command.Arguments
+        try { $action.WorkingDirectory = Split-Path -Parent ([string]$command.FilePath) } catch {}
+
+        $settings = $definition.Settings
+        try { $settings.Enabled = $true } catch {}
+        try { $settings.StartWhenAvailable = $true } catch {}
+        try { $settings.DisallowStartIfOnBatteries = $false } catch {}
+        try { $settings.StopIfGoingOnBatteries = $false } catch {}
+        try { $settings.ExecutionTimeLimit = "PT0S" } catch {}
+
+        # RegisterTaskDefinition with INTERACTIVE_TOKEN keeps the task tied to
+        # the logged-on user while RunLevel=Highest removes the normal UAC prompt.
+        [void]$root.RegisterTaskDefinition(
+            $script:WmtStartupTaskName,
+            $definition,
+            $TASK_CREATE_OR_UPDATE,
+            $null,
+            $null,
+            $TASK_LOGON_INTERACTIVE_TOKEN,
+            $null
+        )
+
+        Write-GuiLog "Start with Windows enabled."
+        return $true
     }
-    else {
-        Unregister-ScheduledTask -TaskName $script:WmtStartupTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-GuiLog "Start with Windows: disabled."
+    catch {
+        Write-GuiLog "Start with Windows: failed to update Task Scheduler: $($_.Exception.Message)"
+        return $false
     }
 }
-catch {
-    Write-GuiLog "Failed to set Start with Windows: $($_.Exception.Message)"
-}
+
+function Test-WmtStartupEntryValid {
+    try {
+        $task = Get-WmtStartupTask
+        if (-not $task -or -not (Test-WmtStartWithWindows)) { return $false }
+
+        $command = Get-WmtStartupCommand
+        if (-not $command) { return $false }
+
+        $actions = @($task.Definition.Actions)
+        if ($actions.Count -lt 1) { return $false }
+
+        $action = $actions[0]
+        $pathMatches = ([string]$action.Path).Trim() -ieq ([string]$command.FilePath).Trim()
+        $argsMatches = ([string]$action.Arguments).Trim() -eq ([string]$command.Arguments).Trim()
+
+        if ($pathMatches -and $argsMatches) { return $true }
+
+        # The WMT executable/script was moved or updated. Rebuild the enabled
+        # task so the button remains truthful and the next logon uses the
+        # current launch path.
+        Set-WmtStartWithWindows -Enabled $true | Out-Null
+        return (Test-WmtStartWithWindows)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Update-WmtStartWithWindowsButton {
-if (-not $btnStartWithWindows) { return }
-$isEnabled = Test-WmtStartWithWindows
-if ($isEnabled) {
-    $btnStartWithWindows.Content = "Stop Starting with Windows"
-    $btnStartWithWindows.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style])
-}
-else {
-    $btnStartWithWindows.Content = "Start with Windows"
-    $btnStartWithWindows.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style])
-}
+    $btn = Get-Ctrl "btnStartWithWindows"
+    if (-not $btn) { return }
+
+    $isEnabled = Test-WmtStartWithWindows
+    Update-WmtTweakToggle `
+        -Button $btn `
+        -IsOn $isEnabled `
+        -OnLabel "Start with Windows: On" `
+        -OffLabel "Start with Windows: Off" `
+        -Description "Launches WMT automatically when Windows logs in using Task Scheduler with highest privileges."
 }
 
 if ($btnStartWithWindows) {
-# On startup, repair the startup entry if the file was moved.
-Repair-WmtStartupEntry
+    # Repair the startup entry if the WMT file was moved or the command changed.
+    Test-WmtStartupEntryValid | Out-Null
 
-# Set initial button state.
-Update-WmtStartWithWindowsButton
+    Update-WmtStartWithWindowsButton
 
-$btnStartWithWindows.Add_Click({
+    $btnStartWithWindows.Add_Click({
+        $script:WmtTaskService = $null
         $isEnabled = Test-WmtStartWithWindows
-        Set-WmtStartWithWindows -Enabled (-not $isEnabled)
-        Update-WmtStartWithWindowsButton
+        if (Set-WmtStartWithWindows -Enabled (-not $isEnabled)) {
+            Update-WmtStartWithWindowsButton
+        }
+    })
+}
+
+# --- Launch Minimized ---
+# Persists the preference in WMT's settings.json. When enabled, WMT hides
+# itself to the system tray immediately after the first window render.
+function Get-WmtLaunchMinimized {
+    try {
+        $settings = Get-WmtSettings
+        return [bool]$settings.LaunchMinimized
+    }
+    catch {
+        return $false
+    }
+}
+
+function Set-WmtLaunchMinimized {
+    param([Parameter(Mandatory = $true)][bool]$Enabled)
+
+    try {
+        $settings = Get-WmtSettings
+        $settings.LaunchMinimized = $Enabled
+        Save-WmtSettings -Settings $settings
+        return $true
+    }
+    catch {
+        Write-GuiLog "Launch Minimized: failed to save setting: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Update-WmtLaunchMinimizedButton {
+    $btn = Get-Ctrl "btnLaunchMinimized"
+    if (-not $btn) { return }
+
+    $isEnabled = Get-WmtLaunchMinimized
+    Update-WmtTweakToggle `
+        -Button $btn `
+        -IsOn $isEnabled `
+        -OnLabel "Launch Minimized: On" `
+        -OffLabel "Launch Minimized: Off" `
+        -Description "When enabled, WMT starts hidden in the system tray instead of showing the main window."
+}
+
+if ($btnLaunchMinimized) {
+    Update-WmtLaunchMinimizedButton
+
+    $btnLaunchMinimized.Add_Click({
+        $currentlyEnabled = Get-WmtLaunchMinimized
+        if (Set-WmtLaunchMinimized -Enabled (-not $currentlyEnabled)) {
+            Update-WmtLaunchMinimizedButton
+            if ($currentlyEnabled) {
+                Write-GuiLog "Launch Minimized disabled. WMT will start with a visible window."
+            }
+            else {
+                Write-GuiLog "Launch Minimized enabled. WMT will start hidden in the system tray."
+            }
+        }
     })
 }
 
@@ -45210,6 +45348,22 @@ $preloadDeferTimer.Start()
 # (deferred to avoid competing with My Device page stats for system resources).
 Update-MyDeviceResponsiveLayout
 Update-TweaksResponsiveLayout
+
+# If Launch Minimized is enabled, hide the freshly rendered window in the
+# system tray. This runs after ContentRendered so WPF has a real window to hide.
+try {
+    if (Get-WmtLaunchMinimized) {
+        if (Initialize-WmtTrayIcon -Window $window) {
+            $script:WmtHiddenToTray = $true
+            $window.ShowInTaskbar = $false
+            $window.Hide()
+            Write-GuiLog "Launch Minimized is enabled. WMT started hidden in the system tray."
+        }
+    }
+}
+catch {
+    try { Write-GuiLog "Launch Minimized startup handling failed: $($_.Exception.Message)" } catch {}
+}
 }.GetNewClosure()
 [void]$window.Add_ContentRendered($onMainWindowContentRendered)
 
