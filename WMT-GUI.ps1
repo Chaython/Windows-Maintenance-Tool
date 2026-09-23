@@ -9,7 +9,7 @@
 # ==========================================
 # 1. SETUP
 # ==========================================
-$AppVersion = "6.6"
+$AppVersion = "6.7"
 $ErrorActionPreference = "SilentlyContinue"
 $script:WmtDebug = [bool](Get-WmtSetting -Name "DebugMode" -Default $false -ErrorAction SilentlyContinue)
 # Preserve UTF-8 for web content, alt codes, and Unicode symbols.
@@ -27352,6 +27352,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <WrapPanel>
                             <Button Name="btnUtilSysInfo" Content="System Report" Style="{StaticResource ActionBtn}" ToolTip="Generate detailed system report"/>
                             <Button Name="btnUtilTrim" Content="Trim SSD" Style="{StaticResource ActionBtn}" ToolTip="Optimize SSD performance"/>
+                            <Button Name="btnUtilCompact" Content="Compact Compression" Style="{StaticResource ActionBtn}" ToolTip="Compress or decompress an NTFS folder or whole drive using compact.exe with NTFS, XPRESS, or LZX compression"/>
                             <Button Name="btnUtilWinRE" Content="Check WinRE" Style="{StaticResource ActionBtn}" ToolTip="Checks Windows Recovery Environment status via reagentc /info"/>
                             <Button Name="btnUtilRestoreMgr" Content="Restore Manager" Style="{StaticResource ActionBtn}" ToolTip="List, create, and delete system restore points"/>
                             <Button Name="btnUtilStartupMgr" Content="Startup Manager" Style="{StaticResource ActionBtn}" ToolTip="Manage startup apps, tasks, context menu entries, and services"/>
@@ -27916,6 +27917,7 @@ $iconDeferTimer.Add_Tick({
     Set-ButtonIcon "btnToggleDrvMeta" "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M15,17H9V15H15V17M16.59,11.17L15.17,12.59L12,9.41L8.83,12.59L7.41,11.17L12,6.58L16.59,11.17Z" "Device Metadata" "Toggle device metadata downloads from the internet"
     Set-ButtonIcon "btnUtilSysInfo" "M13,9H18.5L13,3.5V9M6,2H14L20,8V20A2,2 0 0,1 18,22H6C4.89,22 4,21.1 4,20V4C4,2.89 4.89,2 6,2M15,18V16H6V18H15M18,14V12H6V14H18Z" "System Info Report" "Generates a full system information report"
     Set-ButtonIcon "btnUtilTrim" "M6,2H18A2,2 0 0,1 20,4V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V4A2,2 0 0,1 6,2M12,4A6,6 0 0,0 6,10C6,13.31 8.69,16 12,16A6,6 0 0,0 18,10C18,6.69 15.31,4 12,4M12,14A4,4 0 0,1 8,10A4,4 0 0,1 12,6A4,4 0 0,1 16,10A4,4 0 0,1 12,14Z" "Trim SSD" "Optimizes SSD performance via Trim command"
+    Set-ButtonIcon "btnUtilCompact" "M7,3H17A2,2 0 0,1 19,5V19A2,2 0 0,1 17,21H7A2,2 0 0,1 5,19V5A2,2 0 0,1 7,3M9,5V7H11V5H9M11,7V9H13V7H11M9,9V11H11V9H9M11,11V13H13V11H11M9,13V15H11V13H9M11,15V17H13V15H11M9,17V19H11V17H9Z" "Compact Compression" "Compress or decompress NTFS folders and drives with compact.exe"
     Set-ButtonIcon "btnMyDeviceTrim" "M6,2H18A2,2 0 0,1 20,4V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V4A2,2 0 0,1 6,2M12,4A6,6 0 0,0 6,10C6,13.31 8.69,16 12,16A6,6 0 0,0 18,10C18,6.69 15.31,4 12,4M12,14A4,4 0 0,1 8,10A4,4 0 0,1 12,6A4,4 0 0,1 16,10A4,4 0 0,1 12,14Z" "Trim" "Runs Trim/ReTrim or defrag optimization for storage drives"
     Set-ButtonIcon "btnMyDeviceDiskpart" "M4,4H20A2,2 0 0,1 22,6V18A2,2 0 0,1 20,20H4A2,2 0 0,1 2,18V6A2,2 0 0,1 4,4M4,8V18H20V8H4M6,10L10,14L6,18V15L8,14L6,13V10M11,16H18V18H11V16Z" "Disk Mgmt" "Opens Windows Disk Management"
     Set-ButtonIcon "btnMyDeviceDriveBenchmark" "M12,16A2,2 0 0,0 14,14C14,13.62 13.9,13.27 13.71,12.97L17.71,8.97L16.29,7.56L12.29,11.55C12.19,11.53 12.1,11.5 12,11.5A2.5,2.5 0 0,0 9.5,14A2.5,2.5 0 0,0 12,16M12,3A11,11 0 0,1 23,14H21A9,9 0 0,0 12,5A9,9 0 0,0 3,14H1A11,11 0 0,1 12,3M5.64,7.64L7.05,9.05C6.4,9.71 5.92,10.54 5.67,11.46L3.74,10.94C4.11,9.68 4.77,8.55 5.64,7.64M18.36,7.64C19.23,8.55 19.89,9.68 20.26,10.94L18.33,11.46C18.08,10.54 17.6,9.71 16.95,9.05L18.36,7.64Z" "Benchmark" "Runs a quick read/write benchmark in the background"
@@ -29514,6 +29516,7 @@ $btnCleanupOneDrive = Get-Ctrl "btnCleanupOneDrive"
 
 $btnUtilSysInfo = Get-Ctrl "btnUtilSysInfo"
 $btnUtilTrim = Get-Ctrl "btnUtilTrim"
+$btnUtilCompact = Get-Ctrl "btnUtilCompact"
 $btnUtilWinRE = Get-Ctrl "btnUtilWinRE"
 $btnUtilRestoreMgr = Get-Ctrl "btnUtilRestoreMgr"
 $btnUtilStartupMgr = Get-Ctrl "btnUtilStartupMgr"
@@ -31301,6 +31304,7 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnUtilSysInfo"       "System Info Report"              "btnTabUtils"
     Add-SearchIndexEntry "btnUtilResetGPU"     "Reset GPU Driver"                "btnTabUtils"
     Add-SearchIndexEntry "btnUtilTrim"          "Trim SSD (Optimize)"             "btnTabUtils"
+    Add-SearchIndexEntry "btnUtilCompact"       "Compact Compression Folder Drive XPRESS LZX NTFS" "btnTabUtils"
     Add-SearchIndexEntry "btnUtilWinRE"         "Check WinRE Status"              "btnTabUtils"
     Add-SearchIndexEntry "btnUtilRestoreMgr"    "System Restore Manager"          "btnTabUtils"
     Add-SearchIndexEntry "btnUtilStartupMgr"    "Startup Manager (4 Tabs)"        "btnTabUtils"
@@ -44398,6 +44402,586 @@ if ($btnCleanXbox) { $btnCleanXbox.Add_Click({
 }) }
 
 # --- Utilities ---
+
+function Get-WmtCompactDriveChoices {
+    $result = @()
+    try {
+        $volumes = @(Get-Volume -ErrorAction Stop |
+            Where-Object { $null -ne $_.DriveLetter -and $_.DriveType -eq "Fixed" -and [string]$_.FileSystem -eq "NTFS" } |
+            Sort-Object DriveLetter -Unique)
+
+        foreach ($volume in $volumes) {
+            $drive = ("{0}:\" -f $volume.DriveLetter)
+            $label = if ([string]::IsNullOrWhiteSpace([string]$volume.FileSystemLabel)) { "(No label)" } else { [string]$volume.FileSystemLabel }
+            $sizeText = if ($volume.Size -gt 0) { ConvertTo-StorageSizeText ([double]$volume.Size) } else { "Unknown size" }
+            $result += [pscustomobject]@{
+                Path    = $drive
+                Display = ("{0}  {1}  |  NTFS  |  {2}" -f $drive, $label, $sizeText)
+            }
+        }
+    }
+    catch {}
+
+    if ($result.Count -eq 0) {
+        try {
+            foreach ($disk in @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop |
+                Where-Object { [string]$_.FileSystem -eq "NTFS" } |
+                Sort-Object DeviceID)) {
+                $drive = "$($disk.DeviceID)\"
+                $label = if ([string]::IsNullOrWhiteSpace([string]$disk.VolumeName)) { "(No label)" } else { [string]$disk.VolumeName }
+                $sizeText = if ($disk.Size -gt 0) { ConvertTo-StorageSizeText ([double]$disk.Size) } else { "Unknown size" }
+                $result += [pscustomobject]@{
+                    Path    = $drive
+                    Display = ("{0}  {1}  |  NTFS  |  {2}" -f $drive, $label, $sizeText)
+                }
+            }
+        }
+        catch {}
+    }
+
+    return @($result)
+}
+
+function Resolve-WmtCompactTarget {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "Select a target folder or drive." }
+    if ($Path -match '^\\\\') { throw "Compact compression supports local NTFS targets only; UNC/network paths are not supported." }
+
+    try { $fullPath = [System.IO.Path]::GetFullPath($Path) }
+    catch { throw "Invalid target path: $Path" }
+
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) {
+        throw "Target folder does not exist: $fullPath"
+    }
+
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root) -or $root -notmatch '^[A-Za-z]:\\$') {
+        throw "Target must be on a local drive with a drive letter."
+    }
+
+    $driveLetter = $root.Substring(0, 1)
+    $fileSystem = $null
+    try {
+        $volume = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
+        $fileSystem = [string]$volume.FileSystem
+    }
+    catch {
+        try {
+            $filter = ("DeviceID='{0}:'" -f $driveLetter)
+            $logical = Get-CimInstance Win32_LogicalDisk -Filter $filter -ErrorAction Stop | Select-Object -First 1
+            $fileSystem = [string]$logical.FileSystem
+        }
+        catch {}
+    }
+
+    if ($fileSystem -ne "NTFS") {
+        $detected = if ([string]::IsNullOrWhiteSpace($fileSystem)) { "unknown" } else { $fileSystem }
+        throw "Compact compression requires NTFS. $root is $detected."
+    }
+
+    return $fullPath
+}
+
+function Start-WmtCompactConsole {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateSet("Compress", "Decompress")][string]$Mode = "Compress",
+        [ValidateSet("NTFS", "XPRESS4K", "XPRESS8K", "XPRESS16K", "LZX")][string]$Algorithm = "XPRESS8K"
+    )
+
+    try { $target = Resolve-WmtCompactTarget -Path $Path }
+    catch {
+        Show-WmtMessageBox -Message $_.Exception.Message -Title "Compact Compression" -Image Error | Out-Null
+        return
+    }
+
+    $targetBytes = [System.Text.Encoding]::Unicode.GetBytes($target)
+    $targetBase64 = [Convert]::ToBase64String($targetBytes)
+
+    $consoleScript = @'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$ErrorActionPreference = "Continue"
+$ScriptToDelete = $PSCommandPath
+
+$Target = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__TARGET_BASE64__"))
+$Mode = "__MODE__"
+$Algorithm = "__ALGORITHM__"
+$compactExe = Join-Path $env:SystemRoot "System32\compact.exe"
+if (-not (Test-Path -LiteralPath $compactExe -PathType Leaf)) { $compactExe = "compact.exe" }
+
+Write-Host "WMT Compact Compression" -ForegroundColor Cyan
+Write-Host "Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Host "Target:  $Target"
+Write-Host "Mode:    $Mode"
+if ($Mode -eq "Compress") { Write-Host "Method:  $Algorithm" }
+Write-Host ""
+
+$locationPushed = $false
+try {
+    Push-Location -LiteralPath $Target -ErrorAction Stop
+    $locationPushed = $true
+
+    if ($Mode -eq "Compress") {
+        $args = @("/C", "/S", "/I", "/A", "/F")
+        if ($Algorithm -ne "NTFS") { $args += "/EXE:$Algorithm" }
+
+        Write-Host ("Running: compact.exe " + ($args -join " ")) -ForegroundColor Yellow
+        Write-Host ""
+        & $compactExe @args
+        $exitCode = $LASTEXITCODE
+    }
+    else {
+        Write-Host "Removing Compact /EXE compression..." -ForegroundColor Yellow
+        & $compactExe "/U" "/S" "/I" "/A" "/F" "/EXE"
+        $exeExitCode = $LASTEXITCODE
+
+        Write-Host ""
+        Write-Host "Removing standard NTFS compression..." -ForegroundColor Yellow
+        & $compactExe "/U" "/S" "/I" "/A" "/F"
+        $ntfsExitCode = $LASTEXITCODE
+
+        $exitCode = if ($exeExitCode -ne 0) { $exeExitCode } else { $ntfsExitCode }
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    $exitCode = 1
+}
+finally {
+    if ($locationPushed) { try { Pop-Location } catch {} }
+}
+
+Write-Host ""
+if ($exitCode -eq 0) {
+    Write-Host "Compact operation completed." -ForegroundColor Green
+}
+else {
+    Write-Host "Compact operation finished with exit code $exitCode. Review the output above for skipped or inaccessible files." -ForegroundColor Yellow
+}
+Write-Host ""
+[void](Read-Host "Press Enter to close")
+try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyContinue } catch {}
+'@
+
+    $consoleScript = $consoleScript.Replace("__TARGET_BASE64__", $targetBase64).Replace("__MODE__", $Mode).Replace("__ALGORITHM__", $Algorithm)
+    $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ("WMT_Compact_{0}.ps1" -f (Get-Random))
+
+    try {
+        $consoleScript | Set-Content -LiteralPath $tmpScript -Encoding UTF8 -Force
+
+        $quote = [char]34
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = "powershell.exe"
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File " + $quote + $tmpScript + $quote
+        $psi.UseShellExecute = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+        [void][System.Diagnostics.Process]::Start($psi)
+
+        Write-GuiLog "[Compact] Started $Mode on '$target' using $Algorithm."
+    }
+    catch {
+        Write-GuiLog "[Compact] Failed to launch: $($_.Exception.Message)"
+        Show-WmtMessageBox -Message ("Failed to launch compact.exe operation." + [Environment]::NewLine + $_.Exception.Message) -Title "Compact Compression" -Image Error | Out-Null
+    }
+}
+
+function Select-WmtExplorerFolder {
+    param(
+        [string]$Description = "Select folder",
+        [string]$InitialDirectory = "",
+        [System.Windows.Window]$OwnerWindow = $null
+    )
+
+    if (-not ("WmtNativeFolderPicker.NativeFolderPicker" -as [type])) {
+        $source = @"
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace WmtNativeFolderPicker
+{
+    [Flags]
+    internal enum FileOpenOptions : uint
+    {
+        OverwritePrompt      = 0x00000002,
+        StrictFileTypes      = 0x00000004,
+        NoChangeDir          = 0x00000008,
+        PickFolders          = 0x00000020,
+        ForceFileSystem      = 0x00000040,
+        AllNonStorageItems   = 0x00000080,
+        NoValidate           = 0x00000100,
+        AllowMultiSelect     = 0x00000200,
+        PathMustExist        = 0x00000800,
+        FileMustExist        = 0x00001000,
+        CreatePrompt         = 0x00002000,
+        ShareAware           = 0x00004000,
+        NoReadOnlyReturn     = 0x00008000,
+        NoTestFileCreate     = 0x00010000,
+        HideMruPlaces        = 0x00020000,
+        HidePinnedPlaces     = 0x00040000,
+        NoDereferenceLinks   = 0x00100000,
+        OkButtonNeedsInteract= 0x00200000,
+        DontAddToRecent      = 0x02000000,
+        ForceShowHidden      = 0x10000000,
+        DefaultNoMiniMode    = 0x20000000,
+        ForcePreviewPaneOn   = 0x40000000,
+        SupportStreamableItems = 0x80000000
+    }
+
+    internal enum ShellItemDisplayName : uint
+    {
+        FileSystemPath = 0x80058000
+    }
+
+    [ComImport]
+    [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    internal class FileOpenDialog
+    {
+    }
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("42F85136-DB7E-439C-85F1-E4075D135FC8")]
+    internal interface IFileDialog
+    {
+        [PreserveSig]
+        int Show(IntPtr parent);
+
+        void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+        void SetFileTypeIndex(uint iFileType);
+        void GetFileTypeIndex(out uint piFileType);
+        void Advise(IntPtr pfde, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOptions(FileOpenOptions fos);
+        void GetOptions(out FileOpenOptions pfos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem ppsi);
+        void GetCurrentSelection(out IShellItem ppsi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+        void AddPlace(IShellItem psi, int fdap);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+        void Close(int hr);
+        void SetClientGuid(ref Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr pFilter);
+    }
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+    internal interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(ShellItemDisplayName sigdnName, out IntPtr ppszName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+
+    public static class NativeFolderPicker
+    {
+        private static readonly Guid ShellItemGuid = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+        private const int CancelledHResult = unchecked((int)0x800704C7);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+        private static extern void SHCreateItemFromParsingName(
+            [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+            IntPtr pbc,
+            ref Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+
+        public static string PickFolder(IntPtr owner, string title, string initialDirectory)
+        {
+            IFileDialog dialog = null;
+            IShellItem initialItem = null;
+            IShellItem resultItem = null;
+
+            try
+            {
+                dialog = (IFileDialog)new FileOpenDialog();
+
+                FileOpenOptions options;
+                dialog.GetOptions(out options);
+                options |= FileOpenOptions.PickFolders |
+                           FileOpenOptions.ForceFileSystem |
+                           FileOpenOptions.PathMustExist |
+                           FileOpenOptions.NoChangeDir;
+                dialog.SetOptions(options);
+
+                if (!String.IsNullOrWhiteSpace(title))
+                    dialog.SetTitle(title);
+
+                dialog.SetOkButtonLabel("Select folder");
+
+                if (!String.IsNullOrWhiteSpace(initialDirectory) &&
+                    Directory.Exists(initialDirectory))
+                {
+                    Guid shellItemGuid = ShellItemGuid;
+                    SHCreateItemFromParsingName(
+                        Path.GetFullPath(initialDirectory),
+                        IntPtr.Zero,
+                        ref shellItemGuid,
+                        out initialItem);
+
+                    if (initialItem != null)
+                        dialog.SetFolder(initialItem);
+                }
+
+                int hr = dialog.Show(owner);
+                if (hr == CancelledHResult)
+                    return null;
+
+                if (hr < 0)
+                    Marshal.ThrowExceptionForHR(hr);
+
+                dialog.GetResult(out resultItem);
+                if (resultItem == null)
+                    return null;
+
+                IntPtr pathPtr = IntPtr.Zero;
+                try
+                {
+                    resultItem.GetDisplayName(
+                        ShellItemDisplayName.FileSystemPath,
+                        out pathPtr);
+
+                    return pathPtr == IntPtr.Zero
+                        ? null
+                        : Marshal.PtrToStringUni(pathPtr);
+                }
+                finally
+                {
+                    if (pathPtr != IntPtr.Zero)
+                        Marshal.FreeCoTaskMem(pathPtr);
+                }
+            }
+            finally
+            {
+                if (resultItem != null && Marshal.IsComObject(resultItem))
+                    Marshal.ReleaseComObject(resultItem);
+
+                if (initialItem != null && Marshal.IsComObject(initialItem))
+                    Marshal.ReleaseComObject(initialItem);
+
+                if (dialog != null && Marshal.IsComObject(dialog))
+                    Marshal.ReleaseComObject(dialog);
+            }
+        }
+    }
+}
+"@
+
+        try {
+            Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+        }
+        catch {
+            Write-GuiLog "[Compact] Failed to initialize Explorer folder picker: $($_.Exception.Message)"
+            return $null
+        }
+    }
+
+    $ownerHandle = [IntPtr]::Zero
+    if ($OwnerWindow) {
+        try {
+            $interop = [System.Windows.Interop.WindowInteropHelper]::new($OwnerWindow)
+            $ownerHandle = $interop.Handle
+        }
+        catch {}
+    }
+
+    if ([string]::IsNullOrWhiteSpace($InitialDirectory) -or -not (Test-Path -LiteralPath $InitialDirectory -PathType Container)) {
+        try {
+            $InitialDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        }
+        catch {
+            $InitialDirectory = ""
+        }
+    }
+
+    try {
+        return [WmtNativeFolderPicker.NativeFolderPicker]::PickFolder(
+            $ownerHandle,
+            $Description,
+            $InitialDirectory
+        )
+    }
+    catch {
+        Write-GuiLog "[Compact] Explorer folder picker failed: $($_.Exception.Message)"
+        Show-WmtMessageBox -Message ("The Explorer folder picker could not be opened." + [Environment]::NewLine + $_.Exception.Message) -Title "Compact Compression" -Image Error | Out-Null
+        return $null
+    }
+}
+function Show-WmtCompactManager {
+    [xml]$compactXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Compact Compression" Width="660" Height="590"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
+        FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13">
+    <Grid Margin="22">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,18">
+            <TextBlock Text="Compact Compression" FontSize="22" FontWeight="SemiBold"/>
+            <TextBlock Text="Compress a folder or an entire NTFS drive with Windows compact.exe. XPRESS and LZX are optimized for executables and mostly read-only data."
+                       Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Margin="0,6,0,0" LineHeight="19"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="16" Margin="0,0,0,12">
+            <StackPanel>
+                <TextBlock Text="TARGET" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,10">
+                    <RadioButton Name="rbCompactFolder" Content="Folder" IsChecked="True" Margin="0,0,22,0"/>
+                    <RadioButton Name="rbCompactDrive" Content="Whole drive"/>
+                </StackPanel>
+
+                <Grid Name="pnlCompactFolder">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox Name="txtCompactFolder" Grid.Column="0" MinHeight="32" VerticalContentAlignment="Center" Margin="0,0,8,0"
+                             ToolTip="Choose a local folder on an NTFS volume."/>
+                    <Button Name="btnCompactBrowse" Grid.Column="1" Content="Browse..." Width="92" Margin="0"/>
+                </Grid>
+
+                <ComboBox Name="cmbCompactDrive" Visibility="Collapsed" MinHeight="32" Margin="0,2,0,0"
+                          ToolTip="Only fixed NTFS volumes are listed."/>
+            </StackPanel>
+        </Border>
+
+        <Border Grid.Row="2" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="16" Margin="0,0,0,12">
+            <StackPanel>
+                <TextBlock Text="COMPRESSION METHOD" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
+                <ComboBox Name="cmbCompactAlgorithm" SelectedIndex="2" MinHeight="32" Margin="0,6,0,8">
+                    <ComboBoxItem Content="Standard NTFS - best for writable data" Tag="NTFS"/>
+                    <ComboBoxItem Content="XPRESS4K - fastest Compact compression" Tag="XPRESS4K"/>
+                    <ComboBoxItem Content="XPRESS8K - balanced" Tag="XPRESS8K"/>
+                    <ComboBoxItem Content="XPRESS16K - higher compression" Tag="XPRESS16K"/>
+                    <ComboBoxItem Content="LZX - highest compression, slowest" Tag="LZX"/>
+                </ComboBox>
+                <TextBlock Text="XPRESS8K is a good general-purpose default. LZX favors maximum space savings for files that are rarely modified."
+                           Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" LineHeight="18"/>
+            </StackPanel>
+        </Border>
+
+        <Border Grid.Row="3" Background="{DynamicResource BgElevated}" BorderBrush="{DynamicResource Warning}" BorderThickness="1"
+                CornerRadius="6" Padding="12" Margin="0,0,0,12">
+            <TextBlock Text="Whole-drive compression can take a long time. Some locked, encrypted, sparse, or unsupported files may be skipped. LZX/XPRESS files that are modified later may be decompressed by Windows and require recompression."
+                       Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap" LineHeight="18"/>
+        </Border>
+
+        <TextBlock Grid.Row="4" Text="Decompress runs both Compact /EXE and standard NTFS decompression passes so either compression type can be removed."
+                   Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" VerticalAlignment="Top"/>
+
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button Name="btnCompactDecompress" Content="Decompress" MinWidth="112" Margin="0,0,8,0" Background="{DynamicResource Warning}" Foreground="{DynamicResource WarningText}"/>
+            <Button Name="btnCompactCompress" Content="Compress" MinWidth="112" Margin="0,0,8,0" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}"/>
+            <Button Name="btnCompactClose" Content="Close" MinWidth="90" Margin="0"/>
+        </StackPanel>
+    </Grid>
+</Window>
+'@
+
+    $dialog = New-WmtWindowFromFullXaml -Xaml $compactXaml
+    $rbFolder = $dialog.FindName("rbCompactFolder")
+    $rbDrive = $dialog.FindName("rbCompactDrive")
+    $folderPanel = $dialog.FindName("pnlCompactFolder")
+    $txtFolder = $dialog.FindName("txtCompactFolder")
+    $btnBrowse = $dialog.FindName("btnCompactBrowse")
+    $cmbDrive = $dialog.FindName("cmbCompactDrive")
+    $cmbAlgorithm = $dialog.FindName("cmbCompactAlgorithm")
+    $btnCompress = $dialog.FindName("btnCompactCompress")
+    $btnDecompress = $dialog.FindName("btnCompactDecompress")
+    $btnClose = $dialog.FindName("btnCompactClose")
+
+    foreach ($drive in @(Get-WmtCompactDriveChoices)) {
+        $item = [System.Windows.Controls.ComboBoxItem]::new()
+        $item.Content = $drive.Display
+        $item.Tag = $drive.Path
+        [void]$cmbDrive.Items.Add($item)
+    }
+    if ($cmbDrive.Items.Count -gt 0) { $cmbDrive.SelectedIndex = 0 }
+
+    $setTargetMode = {
+        $folderMode = [bool]$rbFolder.IsChecked
+        $folderPanel.Visibility = if ($folderMode) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+        $cmbDrive.Visibility = if ($folderMode) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    }.GetNewClosure()
+
+    $rbFolder.Add_Checked($setTargetMode)
+    $rbDrive.Add_Checked($setTargetMode)
+
+    $btnBrowse.Add_Click({
+        $initial = [string]$txtFolder.Text
+        $picked = Select-WmtExplorerFolder -Description "Select folder to compress or decompress" -InitialDirectory $initial -OwnerWindow $dialog
+        if (-not [string]::IsNullOrWhiteSpace($picked)) { $txtFolder.Text = $picked }
+    }.GetNewClosure())
+
+    $runOperation = {
+        param([string]$Mode)
+
+        $target = $null
+        if ([bool]$rbFolder.IsChecked) {
+            $target = [string]$txtFolder.Text
+        }
+        elseif ($cmbDrive.SelectedItem) {
+            $target = [string]$cmbDrive.SelectedItem.Tag
+        }
+
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            Show-WmtMessageBox -Message "Select a folder or NTFS drive first." -Title "Compact Compression" -Image Warning | Out-Null
+            return
+        }
+
+        $algorithm = "XPRESS8K"
+        if ($cmbAlgorithm.SelectedItem -and $cmbAlgorithm.SelectedItem.Tag) {
+            $algorithm = [string]$cmbAlgorithm.SelectedItem.Tag
+        }
+
+        $scopeText = if ([bool]$rbDrive.IsChecked) { "the entire drive $target" } else { "'$target' and all subfolders" }
+        if ($Mode -eq "Compress") {
+            $detail = "Compress $scopeText using $algorithm?" + [Environment]::NewLine + [Environment]::NewLine + "The operation runs in a separate live console and can take a long time."
+            if ([bool]$rbDrive.IsChecked -and -not [string]::IsNullOrWhiteSpace($env:SystemDrive) -and $target.StartsWith($env:SystemDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $detail += [Environment]::NewLine + [Environment]::NewLine + "WARNING: This is the Windows system drive. Whole-drive compression affects Windows and installed applications. Use only if you accept the performance and compatibility tradeoffs."
+            }
+        }
+        else {
+            $detail = "Decompress $scopeText?" + [Environment]::NewLine + [Environment]::NewLine + "Both Compact /EXE and standard NTFS compression will be removed where possible."
+        }
+
+        $confirm = Show-WmtMessageBox -Message $detail -Title "Compact Compression" -Button YesNo -Image Warning
+        if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        Start-WmtCompactConsole -Path $target -Mode $Mode -Algorithm $algorithm
+    }.GetNewClosure()
+
+    $btnCompress.Add_Click({ & $runOperation "Compress" }.GetNewClosure())
+    $btnDecompress.Add_Click({ & $runOperation "Decompress" }.GetNewClosure())
+    $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
+
+    & $setTargetMode
+    $dialog.ShowDialog() | Out-Null
+}
+
+if ($btnUtilCompact) { $btnUtilCompact.Add_Click({ Show-WmtCompactManager }) }
+
 if ($btnUpdateServices) { $btnUpdateServices.Add_Click({
     $confirm = Show-WmtMessageBox -Message "Restart Windows Update related services (wuauserv/cryptsvc/bits/appidsvc)?" -Title "Restart Update Services" -Button YesNo -Image Warning
     if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
