@@ -12817,6 +12817,10 @@ function script:ConvertTo-WmtRegistryResultClipboardText {
         $cleanValue = {
             param($Value)
             if ($null -eq $Value) { return "" }
+            if (($Value -is [System.Array]) -or (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string]))) {
+                $parts = @($Value | ForEach-Object { if ($null -eq $_) { "" } else { [string]$_ } })
+                return (($parts -join " | ") -replace '\r?\n', ' ' -replace "`t", ' ').Trim()
+            }
             $text = [string]$Value
             $text = $text -replace '\r?\n', ' '
             $text = $text -replace "`t", ' '
@@ -13186,7 +13190,7 @@ $registryRows = @(
         else {
             (Test-WmtRegistryFindingAutoSelected -Item $item) -or ($confidenceRank -ge 2)
         }
-        $fixAction = if ($item.Type -eq "ReviewOnly") { "Review" } elseif ($item.Type -eq "Key") { "Delete key" } elseif ($item.Type -eq "SetValue") { "Update value" } else { "Delete value" }
+        $fixAction = if ($item.Type -eq "ReviewOnly") { "Review" } elseif ($item.Type -eq "Key") { "Delete key" } elseif ($item.Type -eq "SetPendingRename") { "Rewrite pairs" } elseif ($item.Type -eq "SetValue") { "Update value" } else { "Delete value" }
         $risk = if ($item.PSObject.Properties["Risk"] -and -not [string]::IsNullOrWhiteSpace([string]$item.Risk)) {
             [string]$item.Risk
         }
@@ -13230,7 +13234,7 @@ $registryRows = @(
             Confidence         = $confidence
             DefaultAction      = if ($autoSelected) { "Selected" } else { "Review" }
             Type               = $item.Type
-            NewData            = if ($item.PSObject.Properties["NewData"]) { [string]$item.NewData } else { $null }
+            NewData            = if ($item.PSObject.Properties["NewData"]) { $item.NewData } else { $null }
             Details            = $details
             IsReviewOnly       = (-not $autoSelected)
             IsProtected        = ([string]$item.Problem -eq 'Protected ActiveX Issue')
@@ -13482,7 +13486,7 @@ $btnFix.Add_Click({
                         if ($null -eq $orig) { continue }
                         [void]$toFix.Add([PSCustomObject]@{
                             Problem       = $orig.Problem
-                            Action        = if ($orig.Type -eq "Key") { "Delete key" } elseif ($orig.Type -eq "SetValue") { "Update value" } else { "Delete value" }
+                            Action        = if ($orig.Type -eq "Key") { "Delete key" } elseif ($orig.Type -eq "SetPendingRename") { "Rewrite pairs" } elseif ($orig.Type -eq "SetValue") { "Update value" } else { "Delete value" }
                             Risk          = if ($orig.PSObject.Properties["Risk"]) { [string]$orig.Risk } else { "Medium" }
                             Confidence    = if ($orig.PSObject.Properties["Confidence"]) { [string]$orig.Confidence } else { "High" }
                             DefaultAction = "Selected"
@@ -13492,7 +13496,7 @@ $btnFix.Add_Click({
                             DisplayKey    = if ($orig.PSObject.Properties["DisplayKey"]) { $orig.DisplayKey } else { $orig.RegPath }
                             Data          = $orig.Data
                             WhyFlagged    = if ($orig.PSObject.Properties["Details"]) { $orig.Details } else { "" }
-                            NewData       = if ($orig.PSObject.Properties["NewData"]) { [string]$orig.NewData } else { $null }
+                            NewData       = if ($orig.PSObject.Properties["NewData"]) { $orig.NewData } else { $null }
                         })
                     }
                 } else {
@@ -13968,6 +13972,264 @@ elseif ($normalized -match '^(?i)HKU:\\(?<Rest>.+)$') {
 }
 
 return $targets
+}
+
+if (-not ([System.Management.Automation.PSTypeName]'WmtRegistryNative.PendingRenameMultiSz').Type) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace WmtRegistryNative
+{
+    public static class PendingRenameMultiSz
+    {
+        private const string SessionManagerSubKey =
+            @"SYSTEM\CurrentControlSet\Control\Session Manager";
+
+        private const uint REG_MULTI_SZ = 7;
+        private const int ERROR_SUCCESS = 0;
+        private const int ERROR_FILE_NOT_FOUND = 2;
+        private const int ERROR_MORE_DATA = 234;
+        private const int KEY_QUERY_VALUE = 0x0001;
+        private const int KEY_SET_VALUE = 0x0002;
+
+        private static readonly UIntPtr HKEY_LOCAL_MACHINE =
+            new UIntPtr(0x80000002u);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int RegOpenKeyEx(
+            UIntPtr hKey,
+            string subKey,
+            uint options,
+            int samDesired,
+            out UIntPtr phkResult);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int RegQueryValueEx(
+            UIntPtr hKey,
+            string valueName,
+            IntPtr reserved,
+            out uint type,
+            byte[] data,
+            ref uint dataSize);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int RegSetValueEx(
+            UIntPtr hKey,
+            string valueName,
+            int reserved,
+            uint type,
+            byte[] data,
+            uint dataSize);
+
+        [DllImport("advapi32.dll")]
+        private static extern int RegCloseKey(UIntPtr hKey);
+
+        public static string[] ReadPairs(string valueName)
+        {
+            UIntPtr key = UIntPtr.Zero;
+            int openResult = RegOpenKeyEx(
+                HKEY_LOCAL_MACHINE,
+                SessionManagerSubKey,
+                0,
+                KEY_QUERY_VALUE,
+                out key);
+
+            if (openResult == ERROR_FILE_NOT_FOUND)
+                return null;
+            if (openResult != ERROR_SUCCESS)
+                throw new Win32Exception(openResult);
+
+            try
+            {
+                uint type;
+                uint size = 0;
+
+                int queryResult = RegQueryValueEx(
+                    key,
+                    valueName,
+                    IntPtr.Zero,
+                    out type,
+                    null,
+                    ref size);
+
+                if (queryResult == ERROR_FILE_NOT_FOUND)
+                    return null;
+                if (queryResult != ERROR_SUCCESS && queryResult != ERROR_MORE_DATA)
+                    throw new Win32Exception(queryResult);
+                if (type != REG_MULTI_SZ)
+                    return null;
+                if (size == 0)
+                    return new string[0];
+
+                byte[] buffer = new byte[size];
+
+                queryResult = RegQueryValueEx(
+                    key,
+                    valueName,
+                    IntPtr.Zero,
+                    out type,
+                    buffer,
+                    ref size);
+
+                if (queryResult != ERROR_SUCCESS)
+                    throw new Win32Exception(queryResult);
+                if (type != REG_MULTI_SZ)
+                    return null;
+
+                return ParsePairs(buffer, checked((int)size));
+            }
+            finally
+            {
+                if (key != UIntPtr.Zero)
+                    RegCloseKey(key);
+            }
+        }
+
+        private static string[] ParsePairs(byte[] data, int byteCount)
+        {
+            if (data == null || byteCount <= 0)
+                return new string[0];
+
+            if ((byteCount & 1) != 0)
+                byteCount--;
+
+            char[] chars = Encoding.Unicode
+                .GetString(data, 0, byteCount)
+                .ToCharArray();
+
+            List<string> items = new List<string>();
+            int index = 0;
+
+            while (index < chars.Length)
+            {
+                // If a NUL appears while a source is waiting for its destination,
+                // this is the meaningful empty destination used for delete-at-reboot.
+                // If it appears after a complete pair, it is only final padding.
+                if (chars[index] == '\0')
+                {
+                    if ((items.Count & 1) == 1)
+                    {
+                        items.Add(String.Empty);
+                        index++;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                int start = index;
+                while (index < chars.Length && chars[index] != '\0')
+                    index++;
+
+                items.Add(new string(chars, start, index - start));
+
+                if (index < chars.Length && chars[index] == '\0')
+                    index++;
+            }
+
+            return items.ToArray();
+        }
+
+        public static bool WritePairs(string valueName, string[] pairs)
+        {
+            if (pairs == null || pairs.Length == 0 || (pairs.Length & 1) != 0)
+                return false;
+
+            StringBuilder data = new StringBuilder();
+
+            for (int i = 0; i < pairs.Length; i += 2)
+            {
+                string source = pairs[i];
+                string destination = pairs[i + 1] ?? String.Empty;
+
+                if (String.IsNullOrEmpty(source))
+                    return false;
+                if (source.IndexOf('\0') >= 0 || destination.IndexOf('\0') >= 0)
+                    return false;
+
+                data.Append(source);
+                data.Append('\0');
+                data.Append(destination);
+                data.Append('\0');
+            }
+
+            // A non-empty final destination needs the extra MultiSZ terminator.
+            // An empty final destination already ends in the required double-NUL
+            // sequence: source terminator + empty destination terminator.
+            if (!String.IsNullOrEmpty(pairs[pairs.Length - 1]))
+                data.Append('\0');
+
+            byte[] bytes = Encoding.Unicode.GetBytes(data.ToString());
+
+            UIntPtr key = UIntPtr.Zero;
+            int openResult = RegOpenKeyEx(
+                HKEY_LOCAL_MACHINE,
+                SessionManagerSubKey,
+                0,
+                KEY_QUERY_VALUE | KEY_SET_VALUE,
+                out key);
+
+            if (openResult != ERROR_SUCCESS)
+                return false;
+
+            try
+            {
+                // Refuse to change a value which is no longer REG_MULTI_SZ.
+                uint currentType;
+                uint currentSize = 0;
+                int queryResult = RegQueryValueEx(
+                    key,
+                    valueName,
+                    IntPtr.Zero,
+                    out currentType,
+                    null,
+                    ref currentSize);
+
+                if (queryResult != ERROR_SUCCESS &&
+                    queryResult != ERROR_MORE_DATA)
+                    return false;
+                if (currentType != REG_MULTI_SZ)
+                    return false;
+
+                int setResult = RegSetValueEx(
+                    key,
+                    valueName,
+                    0,
+                    REG_MULTI_SZ,
+                    bytes,
+                    checked((uint)bytes.Length));
+
+                if (setResult != ERROR_SUCCESS)
+                    return false;
+            }
+            finally
+            {
+                if (key != UIntPtr.Zero)
+                    RegCloseKey(key);
+            }
+
+            string[] written = ReadPairs(valueName);
+            if (written == null || written.Length != pairs.Length)
+                return false;
+
+            for (int i = 0; i < pairs.Length; i++)
+            {
+                if (!String.Equals(
+                    written[i] ?? String.Empty,
+                    pairs[i] ?? String.Empty,
+                    StringComparison.Ordinal))
+                    return false;
+            }
+
+            return true;
+        }
+    }
+}
+"@
 }
 
 function Set-WmtRegistryValueNative {
@@ -14820,15 +15082,33 @@ try {
                     $shouldAppendItemBackup = $true
                 }
 
-                if ($item.Type -eq "SetValue") {
+                $isUpdateAction = ($item.Type -in @("SetValue", "SetPendingRename"))
+                if ($isUpdateAction) {
                     Add-WmtCleanupWorkerLog "Updating: $($item.DisplayKey)"
                 }
                 else {
                     Add-WmtCleanupWorkerLog "Removing: $($item.DisplayKey)"
                 }
 
+                $pendingRenameFailure = $null
                 if ($item.Type -eq "SetValue") {
                     $success = Set-WmtRegistryValueNative -Path $item.RegPath -ValueName $item.ValueName -ValueData $item.NewData
+                }
+                elseif ($item.Type -eq "SetPendingRename") {
+                    try {
+                        $pendingPairs = [string[]]@($item.NewData)
+                        $success = [WmtRegistryNative.PendingRenameMultiSz]::WritePairs(
+                            [string]$item.ValueName,
+                            $pendingPairs
+                        )
+                        if (-not $success) {
+                            $pendingRenameFailure = "Native REG_MULTI_SZ pair rewrite failed verification or the registry value changed type/state before cleanup."
+                        }
+                    }
+                    catch {
+                        $success = $false
+                        $pendingRenameFailure = $_.Exception.Message
+                    }
                 }
                 else {
                     $isKey = ($item.Type -eq "Key")
@@ -14838,7 +15118,7 @@ try {
                 if ($success) {
                     $fixed++
                     if ($shouldAppendItemBackup) { & $appendVerifiedBackup $itemBackupFile }
-                    if ($item.Type -eq "SetValue") {
+                    if ($isUpdateAction) {
                         Add-WmtCleanupWorkerLog "Updated: $($item.RegPath)\$($item.ValueName)"
                     }
                     else {
@@ -14847,9 +15127,16 @@ try {
                 }
                 else {
                     $skipped++
-                    if ($item.Type -eq "SetValue") {
+                    if ($item.Type -eq "SetPendingRename") {
+                        if ([string]::IsNullOrWhiteSpace([string]$pendingRenameFailure)) {
+                            $pendingRenameFailure = "The pending rename value could not be rewritten and verified."
+                        }
+                        Add-WmtCleanupWorkerLog "Failed to rewrite pending rename pairs: $pendingRenameFailure"
+                        & $writeSkippedRegistryLog $item "Pending rename rewrite failed" $pendingRenameFailure
+                    }
+                    elseif ($item.Type -eq "SetValue") {
                         Add-WmtCleanupWorkerLog "Failed to update: $($item.RegPath)\$($item.ValueName)"
-                        & $writeSkippedRegistryLog $item "Update failed" "The value was still present or could not be verified after SetValue."
+                        & $writeSkippedRegistryLog $item "Update failed" "The value could not be updated and verified."
                     }
                     else {
                         $deleteFailureDetail = if (-not [string]::IsNullOrWhiteSpace([string]$script:WmtLastRegistryDeleteFailure)) { $script:WmtLastRegistryDeleteFailure } else { "Delete helper returned failure but did not provide a remaining target. Run elevated and check whether another service recreated the key immediately." }
@@ -19116,63 +19403,21 @@ if ($Action -eq "DeepClean") {
                 if ($SelectedScans -contains "BamEntries") {
                     $SyncHash.Status = "Scanning BAM/DAM Activity Entries..."
 
-                    # Build NT device path → drive letter mapping from MountedDevices
-                    $deviceMap = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    try {
-                        $mdKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\MountedDevices", $false)
-                        if ($mdKey) {
-                            foreach ($mv in $mdKey.GetValueNames()) {
-                                try {
-                                    if ($mv -match '^\\DosDevices\\([A-Z]):$') {
-                                        $driveLetter = $matches[1] + ":"
-                                        $mdata = $mdKey.GetValue($mv)
-                                        if ($mdata -is [byte[]] -and $mdata.Length -gt 12) {
-                                            $raw = [System.Text.Encoding]::Unicode.GetString($mdata)
-                                            # MountedDevices binary may have a 4-byte or 12-byte header before the NT path.
-                                            # Look for \??\ prefix in the decoded string
-                                            $ntIdx = $raw.IndexOf('\??\')
-                                            if ($ntIdx -ge 0) {
-                                                $ntPath = $raw.Substring($ntIdx).TrimEnd("`0")
-                                            } else {
-                                                # Try skipping first 12 bytes (3 Unicode chars header) then look for \Device\
-                                                if ($mdata.Length -gt 24) {
-                                                    $ntPath = [System.Text.Encoding]::Unicode.GetString($mdata, 12, $mdata.Length - 12).TrimEnd("`0")
-                                                } else {
-                                                    $ntPath = $raw.TrimEnd("`0")
-                                                }
-                                            }
-                                            if ($ntPath.Length -gt 3 -and -not $deviceMap.ContainsKey($ntPath)) {
-                                                $deviceMap.Add($ntPath, $driveLetter)
-                                            }
-                                        }
-                                    }
-                                }
-                                catch {}
-                            }
-                            $mdKey.Close()
-                        }
-                    }
-                    catch {}
+                    # WMT BAM/DAM value-based scan
+                    # Executable records are registry VALUES under each SID key.
+                    # Scan both current State\UserSettings and older UserSettings.
+                    $activityRoots = @(
+                        [PSCustomObject]@{ Name = "BAM"; Layout = "State";  Root = "SYSTEM\CurrentControlSet\Services\bam\State\UserSettings" },
+                        [PSCustomObject]@{ Name = "BAM"; Layout = "Legacy"; Root = "SYSTEM\CurrentControlSet\Services\bam\UserSettings" },
+                        [PSCustomObject]@{ Name = "DAM"; Layout = "State";  Root = "SYSTEM\CurrentControlSet\Services\dam\State\UserSettings" },
+                        [PSCustomObject]@{ Name = "DAM"; Layout = "Legacy"; Root = "SYSTEM\CurrentControlSet\Services\dam\UserSettings" }
+                    )
 
-                    # Helper function: convert NT device path to DOS path using the map
-                    # Sort keys longest-first so more specific prefixes match before shorter ones
-                    $sortedPrefixes = @($deviceMap.Keys | Sort-Object { $_.Length } -Descending)
-                    function script:Convert-BamNtToDos {
-                        param([string]$NtPath)
-                        foreach ($prefix in $sortedPrefixes) {
-                            if ($NtPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                                return ($deviceMap[$prefix] + "\" + $NtPath.Substring($prefix.Length))
-                            }
-                        }
-                        return $null
-                    }
+                    foreach ($activityRoot in $activityRoots) {
+                        $svcName = [string]$activityRoot.Name
+                        $layoutName = [string]$activityRoot.Layout
+                        $svcRoot = [string]$activityRoot.Root
 
-                    # BAM = Background Activity Moderator, DAM = Desktop Activity Moderator
-                    $bamRoot = "SYSTEM\CurrentControlSet\Services\bam\State\UserSettings"
-                    $damRoot = "SYSTEM\CurrentControlSet\Services\dam\State\UserSettings"
-
-                    foreach ($svcRoot in @($bamRoot, $damRoot)) {
-                        $svcName = if ($svcRoot -match '\\bam\\') { "BAM" } else { "DAM" }
                         $rootKey = $null
                         try {
                             $rootKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($svcRoot, $false)
@@ -19180,66 +19425,79 @@ if ($Action -eq "DeepClean") {
                         catch { continue }
                         if (-not $rootKey) { continue }
 
-                        $sids = @($rootKey.GetSubKeyNames())
-                        $total = [math]::Max($sids.Count, 1); $i = 0
-                        foreach ($sid in $sids) {
-                            $i++; & $Tick "Scanning $svcName SID: $($sid.Substring(0, [math]::Min($sid.Length, 20)))" $i $total
-                            $sidKey = $null
-                            try {
-                                $sidKey = $rootKey.OpenSubKey($sid, $false)
-                                if (-not $sidKey) { continue }
+                        try {
+                            $sids = @($rootKey.GetSubKeyNames())
+                            $total = [math]::Max($sids.Count, 1)
+                            $i = 0
 
-                                foreach ($entryName in $sidKey.GetSubKeyNames()) {
-                                    try {
-                                        $cleanPath = $entryName
+                            foreach ($sid in $sids) {
+                                $i++
+                                & $Tick "Scanning $svcName ($layoutName) SID: $($sid.Substring(0, [math]::Min($sid.Length, 20)))" $i $total
 
-                                        # Convert NT device paths (\Device\HarddiskVolume3\...) to DOS paths
-                                        if ($cleanPath -match '^\\Device\\') {
-                                            $dosPath = Convert-BamNtToDos -NtPath $cleanPath
-                                            if ($null -ne $dosPath) {
-                                                $cleanPath = $dosPath
-                                            } else {
-                                                continue
+                                $sidKey = $null
+                                try {
+                                    $sidKey = $rootKey.OpenSubKey($sid, $false)
+                                    if (-not $sidKey) { continue }
+
+                                    foreach ($entryName in @($sidKey.GetValueNames())) {
+                                        try {
+                                            if ([string]::IsNullOrWhiteSpace([string]$entryName)) { continue }
+
+                                            # Keep the original value name for deletion. Convert only
+                                            # the probe/display path.
+                                            $originalEntryName = [string]$entryName
+                                            $cleanPath = $originalEntryName
+
+                                            if ($cleanPath -match '^\\Device\\') {
+                                                $dosPath = Convert-BamNtToDos -NtPath $cleanPath
+                                                if ($null -ne $dosPath) {
+                                                    $cleanPath = $dosPath
+                                                }
+                                                else {
+                                                    # No reliable drive-letter mapping: do not guess.
+                                                    continue
+                                                }
                                             }
-                                        }
-                                        # Strip \??\ prefix if present (e.g. \??\C:\...)
-                                        elseif ($cleanPath -match '^\\\?\?\\(.+)$') {
-                                            $cleanPath = $matches[1]
-                                        }
-
-                                        $expanded = [Environment]::ExpandEnvironmentVariables($cleanPath)
-                                        if ($expanded -match '^(?i)[a-z]:\\.*\.(?:exe|msi|bat|cmd|com)$') {
-                                            if (-not (Test-IsProtectedWindowsPath $expanded) -and -not (Test-PathExists $expanded)) {
-                                                [void]$SyncHash.Findings.Add([PSCustomObject]@{
-                                                    Problem    = "Stale BAM/DAM Entry"
-                                                    Data       = "App no longer exists: $expanded"
-                                                    DisplayKey = "$svcName\$sid\$entryName"
-                                                    RegPath    = "HKLM:\$svcRoot\$sid\$entryName"
-                                                    ValueName  = $null
-                                                    Type       = "Key"
-                                                    SafeToFix  = $true
-                                                    Risk       = "Low"
-                                                    Confidence = "High"
-                                                    Details    = "$svcName activity tracking has an entry for '$expanded' but the executable no longer exists. Stale BAM/DAM entries accumulate over time and can be safely cleaned."
-                                                })
+                                            elseif ($cleanPath -match '^\\\?\?\\(.+)$') {
+                                                $cleanPath = $matches[1]
                                             }
+
+                                            $expanded = [Environment]::ExpandEnvironmentVariables($cleanPath)
+                                            if ($expanded -notmatch '^(?i)[a-z]:\\.*\.(?:exe|msi|bat|cmd|com)$') { continue }
+                                            if (Test-IsProtectedWindowsPath $expanded) { continue }
+                                            if (Test-PathExists $expanded) { continue }
+
+                                            [void]$SyncHash.Findings.Add([PSCustomObject]@{
+                                                Problem    = "Stale BAM/DAM Entry"
+                                                Data       = "App no longer exists: $expanded"
+                                                DisplayKey = "$svcName ($layoutName)\$sid\$originalEntryName"
+                                                RegPath    = "HKLM:\$svcRoot\$sid"
+                                                ValueName  = $originalEntryName
+                                                Type       = "Value"
+                                                SafeToFix  = $true
+                                                Risk       = "Low"
+                                                Confidence = "High"
+                                                Details    = "$svcName activity tracking contains a value for '$expanded', but the executable no longer exists. Cleanup removes only this stale activity value and leaves the SID key and all other BAM/DAM records intact."
+                                            })
                                         }
+                                        catch {}
                                     }
-                                    catch {}
+                                }
+                                catch {}
+                                finally {
+                                    if ($sidKey) { $sidKey.Close() }
                                 }
                             }
-                            catch {}
-                            finally {
-                                if ($sidKey) { $sidKey.Close() }
-                            }
                         }
-                        $rootKey.Close()
+                        finally {
+                            if ($rootKey) { $rootKey.Close() }
+                        }
                     }
 
                     & $EndCategory
                 }
 
-                # 35. WINDOWS DEFENDER EXCLUSION PATH VALIDATION
+# 35. WINDOWS DEFENDER EXCLUSION PATH VALIDATION
                 if ($SelectedScans -contains "DefenderExclusions") {
                     $SyncHash.Status = "Scanning Defender Exclusions..."
 
@@ -19605,69 +19863,161 @@ if ($Action -eq "DeepClean") {
                 if ($SelectedScans -contains "PendingRenames") {
                     $SyncHash.Status = "Scanning Pending File Rename Operations..."
 
-                    $smRoot = "SYSTEM\CurrentControlSet\Control\Session Manager"
-                    $smKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($smRoot, $false)
-                    if ($smKey) {
-                        $valNames = @("PendingFileRenameOperations", "PendingFileRenameOperations2")
-                        $total = [math]::Max($valNames.Count, 1); $i = 0
-                        foreach ($valName in $valNames) {
-                            $i++; & $Tick "Scanning: $valName" $i $total
-                            try {
-                                $data = $smKey.GetValue($valName)
-                                if ($null -eq $data) { continue }
+                    # WMT PendingRename pair-preserving scan
+                    # Data is flattened source/destination pairs. An empty
+                    # destination means delete-at-reboot and is meaningful.
+                    function script:Get-WmtPendingRenameDriveLetter {
+                        param([string]$Entry)
 
-                                # Multi-string: each pair is (source, destination)
-                                $lines = @()
-                                if ($data -is [string[]]) {
-                                    $lines = @($data)
-                                } elseif ($data -is [string]) {
-                                    $lines = @($data)
-                                }
+                        if ([string]::IsNullOrWhiteSpace($Entry)) { return $null }
+                        $candidate = ([string]$Entry).Trim()
 
-                                $driveLetters = @()
-                                try {
-                                    $driveLetters = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady } | ForEach-Object { $_.Name.Substring(0,1).ToUpper() })
-                                }
-                                catch {}
-
-                                $flaggedLines = [System.Collections.Generic.List[string]]::new()
-                                for ($lineIdx = 0; $lineIdx -lt $lines.Count; $lineIdx++) {
-                                    $line = $lines[$lineIdx]
-                                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                                    # Check if the path references a drive that doesn't exist
-                                    if ($line -match '(?i)^\\\?\?([a-z]):\\') {
-                                        $drive = $matches[1].ToUpper()
-                                        if ($drive -notin $driveLetters) {
-                                            [void]$flaggedLines.Add($line)
-                                        }
-                                    }
-                                }
-
-                                if ($flaggedLines.Count -gt 0) {
-                                    $sampleLines = @($flaggedLines | Select-Object -First 3) -join "; "
-                                    [void]$SyncHash.Findings.Add([PSCustomObject]@{
-                                        Problem    = "Invalid Pending Rename"
-                                        Data       = "References non-existent drive(s). $($flaggedLines.Count) entries flagged. Sample: $sampleLines"
-                                        DisplayKey = $valName
-                                        RegPath    = "HKLM:\$smRoot"
-                                        ValueName  = $valName
-                                        Type       = "Value"
-                                        SafeToFix  = $true
-                                        Risk       = "Low"
-                                        Confidence = "High"
-                                        Details    = "Pending file rename operations reference drive letter(s) that do not exist. These operations fail silently on every boot and never complete. The entire value can be cleared safely."
-                                    })
-                                }
-                            }
-                            catch {}
+                        # Destination strings can carry a leading ! marker.
+                        if ($candidate.StartsWith("!")) {
+                            $candidate = $candidate.Substring(1)
                         }
-                        $smKey.Close()
+
+                        if ($candidate -match '^(?i)\\\?\?\\([a-z]):\\') {
+                            return $matches[1].ToUpperInvariant()
+                        }
+                        if ($candidate -match '^(?i)\\\\\?\\([a-z]):\\') {
+                            return $matches[1].ToUpperInvariant()
+                        }
+                        if ($candidate -match '^(?i)([a-z]):\\') {
+                            return $matches[1].ToUpperInvariant()
+                        }
+
+                        return $null
+                    }
+
+                    $existingDriveLetters = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    try {
+                        # Do not require IsReady. An empty removable drive still has
+                        # a valid assigned drive letter and is not safely "stale".
+                        foreach ($driveInfo in [System.IO.DriveInfo]::GetDrives()) {
+                            if ($null -eq $driveInfo -or [string]::IsNullOrWhiteSpace([string]$driveInfo.Name)) { continue }
+                            if ($driveInfo.Name -match '^(?i)([a-z]):\\') {
+                                [void]$existingDriveLetters.Add($matches[1])
+                            }
+                        }
+                    }
+                    catch {}
+
+                    $smRoot = "SYSTEM\CurrentControlSet\Control\Session Manager"
+                    $valNames = @("PendingFileRenameOperations", "PendingFileRenameOperations2")
+                    $total = [math]::Max($valNames.Count, 1)
+                    $i = 0
+
+                    foreach ($valName in $valNames) {
+                        $i++
+                        & $Tick "Scanning: $valName" $i $total
+
+                        try {
+                            $data = [WmtRegistryNative.PendingRenameMultiSz]::ReadPairs($valName)
+                            if ($null -eq $data) { continue }
+
+                            $lines = [string[]]@($data)
+                            if ($lines.Count -eq 0) { continue }
+
+                            # Pair parser should always return an even count. If raw
+                            # data is malformed, report it but do not modify anything.
+                            if (($lines.Count % 2) -ne 0) {
+                                [void]$SyncHash.Findings.Add([PSCustomObject]@{
+                                    Problem    = "Invalid Pending Rename"
+                                    Data       = "$valName contains an incomplete source/destination pair."
+                                    DisplayKey = $valName
+                                    RegPath    = "HKLM:\$smRoot"
+                                    ValueName  = $valName
+                                    Type       = "ReviewOnly"
+                                    SafeToFix  = $false
+                                    Risk       = "High"
+                                    Confidence = "High"
+                                    Details    = "Pending rename data is malformed. WMT will not rewrite or delete it because doing so could discard an unrelated Windows Update, installer, driver, or application operation."
+                                })
+                                continue
+                            }
+
+                            # If drive enumeration failed, do not infer that all
+                            # referenced drive letters are missing.
+                            if ($existingDriveLetters.Count -eq 0) { continue }
+
+                            $keptStrings = [System.Collections.Generic.List[string]]::new()
+                            $removedPairs = [System.Collections.Generic.List[object]]::new()
+
+                            for ($pairIndex = 0; $pairIndex -lt $lines.Count; $pairIndex += 2) {
+                                $sourceEntry = [string]$lines[$pairIndex]
+                                $destinationEntry = [string]$lines[$pairIndex + 1]
+
+                                $sourceDrive = Get-WmtPendingRenameDriveLetter -Entry $sourceEntry
+                                $destinationDrive = Get-WmtPendingRenameDriveLetter -Entry $destinationEntry
+
+                                $missingDrives = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                                if ($sourceDrive -and -not $existingDriveLetters.Contains($sourceDrive)) {
+                                    [void]$missingDrives.Add($sourceDrive)
+                                }
+                                if ($destinationDrive -and -not $existingDriveLetters.Contains($destinationDrive)) {
+                                    [void]$missingDrives.Add($destinationDrive)
+                                }
+
+                                if ($missingDrives.Count -gt 0) {
+                                    [void]$removedPairs.Add([PSCustomObject]@{
+                                        Source      = $sourceEntry
+                                        Destination = $destinationEntry
+                                        Drives      = @($missingDrives)
+                                    })
+                                    continue
+                                }
+
+                                # Preserve every unaffected string exactly, including
+                                # empty destinations used for delete-at-reboot.
+                                [void]$keptStrings.Add($sourceEntry)
+                                [void]$keptStrings.Add($destinationEntry)
+                            }
+
+                            if ($removedPairs.Count -eq 0) { continue }
+
+                            $pairSamples = @(
+                                $removedPairs |
+                                Select-Object -First 3 |
+                                ForEach-Object {
+                                    $destText = if ([string]::IsNullOrEmpty([string]$_.Destination)) { "<delete>" } else { [string]$_.Destination }
+                                    "$([string]$_.Source) -> $destText"
+                                }
+                            )
+                            $sampleText = $pairSamples -join "; "
+
+                            $newData = [string[]]$keptStrings.ToArray()
+                            $actionType = if ($newData.Count -gt 0) { "SetPendingRename" } else { "Value" }
+
+                            [void]$SyncHash.Findings.Add([PSCustomObject]@{
+                                Problem    = "Invalid Pending Rename"
+                                Data       = "$($removedPairs.Count) operation pair(s) reference drive letter(s) that are not currently present. Sample: $sampleText"
+                                DisplayKey = $valName
+                                RegPath    = "HKLM:\$smRoot"
+                                ValueName  = $valName
+                                Type       = $actionType
+                                NewData    = if ($newData.Count -gt 0) { $newData } else { $null }
+                                SafeToFix  = $false
+                                Risk       = "Medium"
+                                Confidence = "Medium"
+                                Details    = if ($newData.Count -gt 0) {
+                                    "WMT can remove only the $($removedPairs.Count) affected source/destination pair(s) while preserving the remaining $($newData.Count / 2) pair(s), their order, and delete-at-reboot empty destinations. This is review-only because an absent drive letter can be temporary."
+                                }
+                                else {
+                                    "Every pending operation pair references a drive letter that is not currently present. If explicitly selected, WMT will remove the value because no unaffected pairs remain. This is review-only because an absent drive letter can be temporary."
+                                }
+                            })
+                        }
+                        catch {
+                            # Scanner should never alter the value on read failure.
+                            continue
+                        }
                     }
 
                     & $EndCategory
                 }
 
-                # 40. INVALID NETWORK PROVIDER ORDER DLLs
+# 40. INVALID NETWORK PROVIDER ORDER DLLs
                 if ($SelectedScans -contains "NetworkProviders") {
                     $SyncHash.Status = "Scanning Network Provider DLLs..."
 
