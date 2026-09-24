@@ -5605,6 +5605,179 @@ else { $settings | Add-Member -MemberType NoteProperty -Name "CustomUpdateComman
 Save-WmtSettings -Settings $settings
 }
 
+function Show-WmtCustomUpdateCommandDialog {
+param([Parameter(Mandatory = $true)]$Item, [System.Windows.Window]$Owner = $null)
+
+$source = ([string]$Item.Source).Trim()
+$id = ([string]$Item.Id).Trim()
+$name = ([string]$Item.Name).Trim()
+if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($id)) {
+    Show-WmtMessageBox -Message "This row does not have a stable package source and ID, so a custom update command cannot be attached to it." -Title "Custom Update Command" -Image Information | Out-Null
+    return
+}
+
+# The generic input dialog is too short for command help and a multiline editor.
+# Keep the actions outside the scrolling areas so they remain reachable on resize.
+$content = @'
+<Grid Margin="18">
+    <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <ScrollViewer MaxHeight="130" VerticalScrollBarVisibility="Auto" Margin="0,0,0,12">
+        <StackPanel>
+            <TextBlock Name="lblPackage" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBlock Text="Run this PowerShell command instead of the normal provider command when this package has a pending update." TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBlock Text="Optional placeholders: {id}, {name}, {source}, {version}, {available}." TextWrapping="Wrap"/>
+        </StackPanel>
+    </ScrollViewer>
+    <TextBox Name="txtCommand" Grid.Row="1" MinHeight="100" AcceptsReturn="True" AcceptsTab="True"
+             TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+             FontFamily="Consolas" FontSize="13" Padding="8" VerticalContentAlignment="Top"/>
+    <TextBlock Grid.Row="2" Text="Save an empty command to restore the normal provider update command."
+               TextWrapping="Wrap" Margin="0,10,0,0"/>
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+        <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
+        <Button Name="btnSave" Content="Save" Width="94" IsDefault="True" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
+    </StackPanel>
+</Grid>
+'@
+$dialog = New-WmtWindowFromXaml -Title "Custom Update Command - $name" -ContentXaml $content -Width 720 -Height 480 -MinWidth 560 -MinHeight 400
+if ($Owner) { $dialog.Owner = $Owner }
+$dialog.FindName("lblPackage").Text = "$name ($source / $id)"
+$txtCommand = $dialog.FindName("txtCommand")
+$txtCommand.Text = Get-WmtCustomUpdateCommand -Source $source -Id $id
+$result = @{ Command = $null }
+$dialog.FindName("btnSave").Add_Click({
+        $result.Command = [string]$txtCommand.Text
+        $dialog.DialogResult = $true
+    }.GetNewClosure())
+$dialog.FindName("btnCancel").Add_Click({ $dialog.Close() }.GetNewClosure())
+$dialog.Add_ContentRendered({
+        $txtCommand.Focus() | Out-Null
+        $txtCommand.CaretIndex = $txtCommand.Text.Length
+    }.GetNewClosure())
+
+$dialog.ShowDialog() | Out-Null
+if ($null -eq $result.Command) { return }
+if ([string]::IsNullOrWhiteSpace([string]$result.Command)) {
+    Remove-WmtCustomUpdateCommand -Source $source -Id $id
+    Write-GuiLog "Removed custom update command for $name ($source / $id)."
+}
+else {
+    Set-WmtCustomUpdateCommand -Source $source -Id $id -Name $name -Command $result.Command
+    Write-GuiLog "Saved custom update command for $name ($source / $id)."
+}
+}
+
+function Show-WmtCustomUpdateCommandManager {
+param($SelectedPackage = $null)
+
+$content = @'
+<Grid Margin="18">
+    <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <TextBlock Text="Saved custom update commands. Select an entry to edit it, or remove it to restore the normal provider command."
+               TextWrapping="Wrap" Margin="0,0,0,12"/>
+    <Grid Grid.Row="1">
+        <DataGrid Name="dgCommands" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
+                  CanUserDeleteRows="False" SelectionMode="Single" SelectionUnit="FullRow" HeadersVisibility="Column">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="100"/>
+                <DataGridTextColumn Header="Package" Binding="{Binding Name}" Width="170"/>
+                <DataGridTextColumn Header="ID" Binding="{Binding Id}" Width="180"/>
+                <DataGridTextColumn Header="Command" Binding="{Binding Command}" Width="*" MinWidth="140">
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="TextWrapping" Value="NoWrap"/>
+                            <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+                            <Setter Property="MaxHeight" Value="22"/>
+                            <Setter Property="ToolTip" Value="{Binding Command}"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+            </DataGrid.Columns>
+        </DataGrid>
+        <TextBlock Name="lblEmpty" Text="No custom update commands saved yet." Visibility="Collapsed"
+                   HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False"/>
+    </Grid>
+    <TextBlock Name="lblSelectedPackage" Grid.Row="2" TextWrapping="Wrap" MaxHeight="44" Margin="0,10,0,0"/>
+    <WrapPanel Grid.Row="3" HorizontalAlignment="Right" Margin="0,12,0,0">
+        <Button Name="btnSetPackage" Content="Set for Selected Package..." MinWidth="200" Margin="0,0,8,6"/>
+        <Button Name="btnEdit" Content="Edit..." Width="94" IsEnabled="False" Margin="0,0,8,6"/>
+        <Button Name="btnRemove" Content="Remove" Width="94" IsEnabled="False" Margin="0,0,8,6"/>
+        <Button Name="btnClose" Content="Close" Width="94" IsCancel="True" Margin="0,0,0,6"/>
+    </WrapPanel>
+</Grid>
+'@
+$dialog = New-WmtWindowFromXaml -Title "Custom Update Commands" -ContentXaml $content -Width 900 -Height 500 -MinWidth 700 -MinHeight 360
+$grid = $dialog.FindName("dgCommands")
+$lblEmpty = $dialog.FindName("lblEmpty")
+$btnEdit = $dialog.FindName("btnEdit")
+$btnRemove = $dialog.FindName("btnRemove")
+$btnSetPackage = $dialog.FindName("btnSetPackage")
+$canSetPackage = ($null -ne $SelectedPackage -and
+    -not [string]::IsNullOrWhiteSpace([string]$SelectedPackage.Source) -and
+    -not [string]::IsNullOrWhiteSpace([string]$SelectedPackage.Id))
+$btnSetPackage.IsEnabled = $canSetPackage
+$dialog.FindName("lblSelectedPackage").Text = if ($canSetPackage) {
+    "Selected in Updates: $($SelectedPackage.Name) ($($SelectedPackage.Source) / $($SelectedPackage.Id))"
+} else {
+    "Select one package in the Updates list to add a custom command for it."
+}
+
+$reload = {
+    param($PreferredItem = $null)
+    if (-not $PreferredItem) { $PreferredItem = $grid.SelectedItem }
+    $entries = @(Get-WmtCustomUpdateCommands | Sort-Object Source, Name, Id)
+    $grid.ItemsSource = $entries
+    $lblEmpty.Visibility = if ($entries.Count -eq 0) { "Visible" } else { "Collapsed" }
+    $grid.SelectedItem = $null
+    if ($PreferredItem) {
+        foreach ($entry in $entries) {
+            if ($entry.Source -ieq $PreferredItem.Source -and $entry.Id -ieq $PreferredItem.Id) {
+                $grid.SelectedItem = $entry
+                break
+            }
+        }
+    }
+    if (-not $grid.SelectedItem -and $entries.Count -gt 0) { $grid.SelectedIndex = 0 }
+    $btnEdit.IsEnabled = ($null -ne $grid.SelectedItem)
+    $btnRemove.IsEnabled = ($null -ne $grid.SelectedItem)
+}.GetNewClosure()
+$grid.Add_SelectionChanged({
+    $btnEdit.IsEnabled = ($null -ne $grid.SelectedItem)
+    $btnRemove.IsEnabled = ($null -ne $grid.SelectedItem)
+}.GetNewClosure())
+$btnEdit.Add_Click({
+    $entry = $grid.SelectedItem
+    if (-not $entry) { return }
+    Show-WmtCustomUpdateCommandDialog -Item $entry -Owner $dialog
+    & $reload $entry
+}.GetNewClosure())
+$btnSetPackage.Add_Click({
+    if (-not $canSetPackage) { return }
+    Show-WmtCustomUpdateCommandDialog -Item $SelectedPackage -Owner $dialog
+    & $reload $SelectedPackage
+}.GetNewClosure())
+$btnRemove.Add_Click({
+    $entry = $grid.SelectedItem
+    if (-not $entry) { return }
+    Remove-WmtCustomUpdateCommand -Source $entry.Source -Id $entry.Id
+    Write-GuiLog "Removed custom update command for $($entry.Name) ($($entry.Source) / $($entry.Id))."
+    & $reload
+}.GetNewClosure())
+$dialog.FindName("btnClose").Add_Click({ $dialog.Close() }.GetNewClosure())
+& $reload $SelectedPackage
+$dialog.ShowDialog() | Out-Null
+}
+
 function Get-WmtUpdateAutoScanMinutes {
 param($Settings)
 
@@ -26269,6 +26442,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <Button Name="btnWingetUpdateAll" Content="Update All" Style="{StaticResource PositiveBtn}"/>
                         <Button Name="btnWingetInstall" Content="Install" Style="{StaticResource PositiveBtn}" Visibility="Collapsed"/>
                         <Button Name="btnWingetUninstall" Content="Uninstall" Style="{StaticResource DestructiveBtn}"/>
+                        <Button Name="btnWingetCustom" Content="Custom" Style="{StaticResource ActionBtn}" ToolTip="View and edit saved custom update commands, or set one for the selected package."/>
                         <Button Name="btnWingetIgnore" Content="Ignore" Style="{StaticResource WarningBtn}"/>
                         <Button Name="btnWingetUnignore" Content="Manage Ignored" Style="{StaticResource ActionBtn}"/>
                     </WrapPanel>
@@ -28402,6 +28576,7 @@ $btnWingetUpdateSel = Get-Ctrl "btnWingetUpdateSel"
 $btnWingetUpdateAll = Get-Ctrl "btnWingetUpdateAll"
 $btnWingetInstall = Get-Ctrl "btnWingetInstall"
 $btnWingetUninstall = Get-Ctrl "btnWingetUninstall"
+$btnWingetCustom = Get-Ctrl "btnWingetCustom"
 $btnWingetClearSearch = Get-Ctrl "btnWingetClearSearch"
 $lstWinget = Get-Ctrl "lstWinget"
 $txtWingetSearch = Get-Ctrl "txtWingetSearch"
@@ -31673,6 +31848,7 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnWingetUpdateAll"   "Update All Apps"                 "btnTabUpdates"
     Add-SearchIndexEntry "btnWingetInstall"     "Install Selected Apps"           "btnTabUpdates"
     Add-SearchIndexEntry "btnWingetUninstall"   "Uninstall Selected Apps"         "btnTabUpdates"
+    Add-SearchIndexEntry "btnWingetCustom"      "Custom Update Command"           "btnTabUpdates"
     Add-SearchIndexEntry "txtWingetSearch"         "Search Winget Packages"          "btnTabUpdates"
 
     # 2. System Health
@@ -32278,36 +32454,16 @@ $miCopyRow.Add_Click({
 $miCustomUpdateCommand = New-Object System.Windows.Controls.MenuItem
 $miCustomUpdateCommand.Header = "Set Custom Update Command..."
 $miCustomUpdateCommand.ToolTip = "Use a PowerShell command instead of the package provider when this package has a pending update."
-$miCustomUpdateCommand.Add_Click({
+$editCustomUpdateCommand = {
     $selected = @($lstWinget.SelectedItems)
     if ($selected.Count -ne 1) { return }
-
-    $item = $selected[0]
-    $source = ([string]$item.Source).Trim()
-    $id = ([string]$item.Id).Trim()
-    $name = ([string]$item.Name).Trim()
-    if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($id)) {
-        Show-WmtMessageBox -Message "This row does not have a stable package source and ID, so a custom update command cannot be attached to it." -Title "Custom Update Command" -Image Information | Out-Null
-        return
-    }
-
-    $current = Get-WmtCustomUpdateCommand -Source $source -Id $id
-    $example = 'iex "& { $(iwr -useb ''https://raw.githubusercontent.com/SpotX-Official/SpotX/refs/heads/main/run.ps1'') } -new_theme"'
-    $prompt = "PowerShell command to run when WMT finds an update for $name ($source / $id)." + [Environment]::NewLine + [Environment]::NewLine +
-        "This replaces the normal provider update command for this package only. Optional placeholders: {id}, {name}, {source}, {version}, {available}." + [Environment]::NewLine + [Environment]::NewLine +
-        "Example for Spotify / SpotX:" + [Environment]::NewLine + $example + [Environment]::NewLine + [Environment]::NewLine +
-        "Clear the field and press OK to remove the override."
-    $command = Show-WmtInputDialog -Title "Custom Update Command - $name" -Prompt $prompt -DefaultValue $current
-    if ($null -eq $command) { return }
-
-    if ([string]::IsNullOrWhiteSpace([string]$command)) {
-        Remove-WmtCustomUpdateCommand -Source $source -Id $id
-        Write-GuiLog "Removed custom update command for $name ($source / $id)."
-    }
-    else {
-        Set-WmtCustomUpdateCommand -Source $source -Id $id -Name $name -Command $command
-        Write-GuiLog "Saved custom update command for $name ($source / $id)."
-    }
+    Show-WmtCustomUpdateCommandDialog -Item $selected[0]
+}
+$miCustomUpdateCommand.Add_Click($editCustomUpdateCommand)
+$btnWingetCustom.Add_Click({
+    $selected = @($lstWinget.SelectedItems)
+    $package = if ($selected.Count -eq 1) { $selected[0] } else { $null }
+    Show-WmtCustomUpdateCommandManager -SelectedPackage $package
 })
 
 $miClearCustomUpdateCommand = New-Object System.Windows.Controls.MenuItem
