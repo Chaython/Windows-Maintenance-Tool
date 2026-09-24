@@ -33025,6 +33025,102 @@ $script:WingetJob = Start-Job -ArgumentList $jobArgs -ScriptBlock {
         return $safeExe
     }
 
+    function Invoke-WmtPortableProviderBinaryUpdate {
+        param(
+            [string]$ProviderKey,
+            [string]$TargetPath,
+            [ref]$Result
+        )
+
+        $Result.Value = [PSCustomObject]@{ ExitCode = 1 }
+        $provider = ([string]$ProviderKey).Trim().ToLowerInvariant()
+        $target = ([string]$TargetPath).Trim()
+        $tmpPath = ""
+
+        try {
+            if ([string]::IsNullOrWhiteSpace($target) -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                throw "Portable provider executable was not found at '$target'."
+            }
+
+            $isArm64 = (($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64"))
+            $releaseApi = ""
+            $assetCandidates = @()
+            $displayName = $provider
+
+            switch ($provider) {
+                "legendary" {
+                    $releaseApi = "https://api.github.com/repos/legendary-gl/legendary/releases/latest"
+                    $preferredAsset = if ($isArm64) { "legendary_windows_arm64.exe" } else { "legendary_windows_x64.exe" }
+                    $assetCandidates = @($preferredAsset, "legendary.exe")
+                    $displayName = "Legendary"
+                }
+                "gogdl" {
+                    $releaseApi = "https://api.github.com/repos/Heroic-Games-Launcher/heroic-gogdl/releases/latest"
+                    $preferredAsset = if ($isArm64) { "gogdl_windows_arm64.exe" } else { "gogdl_windows_x86_64.exe" }
+                    $assetCandidates = @($preferredAsset)
+                    $displayName = "GOGDL"
+                }
+                default {
+                    throw "Unsupported portable provider '$ProviderKey'."
+                }
+            }
+
+            Write-Output "LOG:[Provider Update] Resolving latest $displayName portable release..."
+            $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
+            $release = Invoke-RestMethod -Uri $releaseApi -Headers $headers -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            if (-not $release -or -not $release.assets) {
+                throw "Latest release metadata did not contain downloadable assets."
+            }
+
+            $asset = $null
+            foreach ($candidateName in $assetCandidates) {
+                $asset = @($release.assets | Where-Object { ([string]$_.name) -ieq $candidateName } | Select-Object -First 1)
+                if ($asset) { break }
+            }
+            if (-not $asset -or [string]::IsNullOrWhiteSpace([string]$asset.browser_download_url)) {
+                throw "No matching Windows portable asset was found in release $([string]$release.tag_name)."
+            }
+
+            $targetDir = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDir -PathType Container)) {
+                [void][System.IO.Directory]::CreateDirectory($targetDir)
+            }
+            $tmpPath = Join-Path $targetDir ("{0}.{1}.download" -f (Split-Path -Leaf $target), ([Guid]::NewGuid().ToString("N")))
+
+            Write-Output "LOG:[Provider Update] Downloading $displayName $([string]$release.tag_name)..."
+            Invoke-WebRequest -Uri ([string]$asset.browser_download_url) -Headers $headers -UseBasicParsing -OutFile $tmpPath -TimeoutSec 180 -ErrorAction Stop
+            $download = Get-Item -LiteralPath $tmpPath -ErrorAction Stop
+            if ($download.Length -lt 1MB) {
+                throw "Downloaded provider binary is unexpectedly small ($($download.Length) bytes)."
+            }
+
+            Move-Item -LiteralPath $tmpPath -Destination $target -Force
+            $tmpPath = ""
+            try { Unblock-File -LiteralPath $target -ErrorAction SilentlyContinue } catch {}
+
+            $installedText = ""
+            try { $installedText = ((& $target --version 2>&1) | Out-String).Trim() } catch {}
+            if ([string]::IsNullOrWhiteSpace($installedText)) {
+                Write-Output "LOG:[Provider Update] $displayName provider binary was replaced successfully."
+            }
+            else {
+                $installedLine = (@($installedText -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+                Write-Output "LOG:[Provider Update] $displayName updated successfully: $installedLine"
+            }
+
+            $Result.Value = [PSCustomObject]@{ ExitCode = 0 }
+        }
+        catch {
+            Write-Output "LOG:[Provider Update] $provider update failed: $($_.Exception.Message)"
+            $Result.Value = [PSCustomObject]@{ ExitCode = 1 }
+        }
+        finally {
+            if (-not [string]::IsNullOrWhiteSpace($tmpPath) -and (Test-Path -LiteralPath $tmpPath)) {
+                try { Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+    }
+
     function Invoke-WmtStoreFallbackPage {
         param(
             [string]$PackageName,
@@ -35078,6 +35174,20 @@ exit /b %WMT_EXIT%
             }
             # --- LEGENDARY / EPIC GAMES ---
             elseif ($src -eq "legendary") {
+                if ($act -eq "Update" -and ([string]$id) -eq "__wmt_provider_legendary__") {
+                    $providerUpdateResult = $null
+                    Invoke-WmtPortableProviderBinaryUpdate -ProviderKey "legendary" -TargetPath $legendaryExePath -Result ([ref]$providerUpdateResult)
+                    if ($providerUpdateResult -and $providerUpdateResult.ExitCode -eq 0) {
+                        Write-Output "LOG:[$act][$index/$total] SUCCESS: $name"
+                        Write-Output "RESULT:${index}:SUCCESS:$name"
+                    }
+                    else {
+                        Write-Output "LOG:[$act][$index/$total] FAILED: $name"
+                        Write-Output "RESULT:${index}:FAILED:$name"
+                    }
+                    continue
+                }
+
                 $legendaryCommand = Get-WmtLegendaryCommandText -ForPowerShell:($act -ne "Update" -or $silentUpdateInstallEnabled)
                 $legendaryHeadlessArgs = "--max-workers 4 --dl-timeout 30 --skip-sdl --skip-dlcs"
                 if ($act -eq "Install") { $cmd = "$legendaryCommand -y install `"$id`" $legendaryHeadlessArgs" }
@@ -35087,6 +35197,20 @@ exit /b %WMT_EXIT%
             }
             # --- GOGDL / GOG GAMES ---
             elseif ($src -eq "gogdl") {
+                if ($act -eq "Update" -and ([string]$id) -eq "__wmt_provider_gogdl__") {
+                    $providerUpdateResult = $null
+                    Invoke-WmtPortableProviderBinaryUpdate -ProviderKey "gogdl" -TargetPath $gogdlExePath -Result ([ref]$providerUpdateResult)
+                    if ($providerUpdateResult -and $providerUpdateResult.ExitCode -eq 0) {
+                        Write-Output "LOG:[$act][$index/$total] SUCCESS: $name"
+                        Write-Output "RESULT:${index}:SUCCESS:$name"
+                    }
+                    else {
+                        Write-Output "LOG:[$act][$index/$total] FAILED: $name"
+                        Write-Output "RESULT:${index}:FAILED:$name"
+                    }
+                    continue
+                }
+
                 if ($act -eq "Update") {
                     $installDir = ([string]$item.InstallDir).Trim()
                     if ([string]::IsNullOrWhiteSpace($installDir)) {
@@ -37594,7 +37718,10 @@ composer --version
 $legendaryDir = '__WMT_LEGENDARY_DIR__'
 $legendaryExe = '__WMT_LEGENDARY_EXE__'
 $latestApi = "https://api.github.com/repos/legendary-gl/legendary/releases/latest"
-$fallbackUrl = "https://github.com/legendary-gl/legendary/releases/latest/download/legendary.exe"
+$isArm64 = (($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64"))
+$legendaryAssetName = if ($isArm64) { "legendary_windows_arm64.exe" } else { "legendary_windows_x64.exe" }
+$legendaryAssetCandidates = @($legendaryAssetName, "legendary.exe")
+$fallbackUrl = "https://github.com/legendary-gl/legendary/releases/latest/download/$legendaryAssetName"
 $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
 
 try {
@@ -37615,7 +37742,11 @@ try {
 Write-Host "Checking latest Legendary release... (attempt $releaseAttempt of 3)"
 $release = Invoke-RestMethod -Uri $latestApi -Headers $headers -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
 if ($release -and $release.tag_name) { $releaseName = [string]$release.tag_name }
-$asset = @($release.assets | Where-Object { ([string]$_.name) -ieq "legendary.exe" } | Select-Object -First 1)
+$asset = $null
+foreach ($candidateName in $legendaryAssetCandidates) {
+    $asset = @($release.assets | Where-Object { ([string]$_.name) -ieq $candidateName } | Select-Object -First 1)
+    if ($asset) { break }
+}
 if ($asset -and $asset.browser_download_url) {
     $downloadUrl = [string]$asset.browser_download_url
 }
@@ -37723,7 +37854,9 @@ $gogdlDir = '__WMT_GOGDL_DIR__'
 $gogdlExe = '__WMT_GOGDL_EXE__'
 $authConfig = '__WMT_GOGDL_AUTH__'
 $latestApi = "https://api.github.com/repos/Heroic-Games-Launcher/heroic-gogdl/releases/latest"
-$fallbackUrl = "https://github.com/Heroic-Games-Launcher/heroic-gogdl/releases/latest/download/gogdl_windows_x86_64.exe"
+$isArm64 = (($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64"))
+$gogdlAssetName = if ($isArm64) { "gogdl_windows_arm64.exe" } else { "gogdl_windows_x86_64.exe" }
+$fallbackUrl = "https://github.com/Heroic-Games-Launcher/heroic-gogdl/releases/latest/download/$gogdlAssetName"
 $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
 
 try {
@@ -37742,7 +37875,7 @@ try {
 Write-Host "Checking latest GOGDL release..."
 $release = Invoke-RestMethod -Uri $latestApi -Headers $headers -UseBasicParsing -ErrorAction Stop
 if ($release -and $release.tag_name) { $releaseName = [string]$release.tag_name }
-$asset = @($release.assets | Where-Object { ([string]$_.name) -ieq "gogdl_windows_x86_64.exe" } | Select-Object -First 1)
+$asset = @($release.assets | Where-Object { ([string]$_.name) -ieq $gogdlAssetName } | Select-Object -First 1)
 if ($asset -and $asset.browser_download_url) {
     $downloadUrl = [string]$asset.browser_download_url
 }
@@ -40850,7 +40983,133 @@ $btnWingetScan.Add_Click({
         [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
     }
 
-    # K. STEAM WORKER
+    # K. PORTABLE PROVIDER SELF-UPDATE WORKER
+    # Legendary and GOGDL are downloaded as WMT-managed portable binaries. Their
+    # game/library workers check game updates; this worker separately checks the
+    # provider executables themselves and emits normal actionable update rows.
+    $portableProviderChecks = @()
+    if ("legendary" -in $enabled) {
+        $legendaryPortablePath = Get-WmtLegendaryExePath
+        if (Test-Path -LiteralPath $legendaryPortablePath -PathType Leaf) {
+            $portableProviderChecks += [PSCustomObject]@{
+                Source         = "legendary"
+                Name           = "Legendary CLI (portable provider)"
+                Id             = "__wmt_provider_legendary__"
+                ExePath        = $legendaryPortablePath
+                ReleaseApi     = "https://api.github.com/repos/legendary-gl/legendary/releases/latest"
+            }
+        }
+    }
+    if ("gogdl" -in $enabled) {
+        $gogdlPortablePath = Get-WmtGogdlExePath
+        if (Test-Path -LiteralPath $gogdlPortablePath -PathType Leaf) {
+            $portableProviderChecks += [PSCustomObject]@{
+                Source         = "gogdl"
+                Name           = "GOGDL CLI (portable provider)"
+                Id             = "__wmt_provider_gogdl__"
+                ExePath        = $gogdlPortablePath
+                ReleaseApi     = "https://api.github.com/repos/Heroic-Games-Launcher/heroic-gogdl/releases/latest"
+            }
+        }
+    }
+
+    if ($portableProviderChecks.Count -gt 0) {
+        $ps = New-WmtPooledPowerShell
+        [void]$ps.AddScript({
+                param($ProviderChecks, $IgnoreList)
+                [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+                function Get-PortableProviderVersion {
+                    param([string]$ExePath)
+
+                    try {
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = $ExePath
+                        $psi.Arguments = "--version"
+                        $psi.RedirectStandardOutput = $true
+                        $psi.RedirectStandardError = $true
+                        $psi.UseShellExecute = $false
+                        $psi.CreateNoWindow = $true
+                        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+                        $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+
+                        $proc = [System.Diagnostics.Process]::Start($psi)
+                        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+                        $stderrTask = $proc.StandardError.ReadToEndAsync()
+                        if (-not $proc.WaitForExit(10000)) {
+                            try { $proc.Kill() } catch {}
+                            return ""
+                        }
+
+                        $text = (($stdoutTask.GetAwaiter().GetResult()) + "`n" + ($stderrTask.GetAwaiter().GetResult())).Trim()
+                        if ([string]::IsNullOrWhiteSpace($text)) { return "" }
+
+                        $match = [regex]::Match($text, '(?i)(?<!\d)v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?)(?!\d)')
+                        if ($match.Success) { return [string]$match.Groups[1].Value }
+                    }
+                    catch {}
+
+                    return ""
+                }
+
+                function ConvertTo-ComparableProviderVersion {
+                    param([string]$VersionText)
+
+                    $match = [regex]::Match(([string]$VersionText), '(\d+(?:\.\d+){1,3})')
+                    if (-not $match.Success) { return $null }
+                    try { return [version]$match.Groups[1].Value } catch { return $null }
+                }
+
+                $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
+                foreach ($check in @($ProviderChecks)) {
+                    $source = ([string]$check.Source).Trim().ToLowerInvariant()
+                    $name = ([string]$check.Name).Trim()
+                    $id = ([string]$check.Id).Trim()
+                    $exePath = ([string]$check.ExePath).Trim()
+                    if ($IgnoreList -and ($IgnoreList -contains $id -or $IgnoreList -contains $name)) { continue }
+
+                    try {
+                        $installedVersion = Get-PortableProviderVersion -ExePath $exePath
+                        if ([string]::IsNullOrWhiteSpace($installedVersion)) {
+                            Write-Output "LOG:$name version check skipped: --version did not return a parseable version."
+                            continue
+                        }
+
+                        $release = Invoke-RestMethod -Uri ([string]$check.ReleaseApi) -Headers $headers -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+                        $latestVersion = ([string]$release.tag_name).Trim() -replace '^[vV]', ''
+                        $installedComparable = ConvertTo-ComparableProviderVersion -VersionText $installedVersion
+                        $latestComparable = ConvertTo-ComparableProviderVersion -VersionText $latestVersion
+                        if ($null -eq $installedComparable -or $null -eq $latestComparable) {
+                            Write-Output "LOG:$name version check skipped: installed '$installedVersion', latest '$latestVersion' could not be compared safely."
+                            continue
+                        }
+
+                        if ($latestComparable -gt $installedComparable) {
+                            [PSCustomObject]@{
+                                Source         = $source
+                                Name           = $name
+                                Id             = $id
+                                Version        = $installedVersion
+                                Available      = $latestVersion
+                                VersionSort    = $installedVersion
+                                AvailableSort  = $latestVersion
+                                ExecutablePath = $exePath
+                            }
+                            Write-Output "LOG:$name update available: $installedVersion -> $latestVersion"
+                        }
+                        else {
+                            Write-Output "LOG:$name is current ($installedVersion)."
+                        }
+                    }
+                    catch {
+                        Write-Output "LOG:$name update check failed: $($_.Exception.Message)"
+                    }
+                }
+            }).AddArgument($portableProviderChecks).AddArgument($ignoreList)
+        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+    }
+
+    # L. STEAM WORKER
     if ("steam" -in $enabled) {
         $ps = New-WmtPooledPowerShell
         [void]$ps.AddScript({
