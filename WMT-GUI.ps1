@@ -5318,6 +5318,7 @@ try {
         RegistryScan               = $Settings.RegistryScan
         WingetIgnore               = $Settings.WingetIgnore
         WingetIncludeUnknown       = [bool](Get-WmtWingetIncludeUnknown -Settings $Settings)
+        CustomUpdateCommands       = @(Get-WmtCustomUpdateCommands -Settings $Settings)
         UpdateAutoScanMinutes      = (ConvertTo-Int (Get-WmtUpdateAutoScanMinutes -Settings $Settings) 0)
         UpdateNotificationsEnabled = [bool](Get-WmtUpdateNotificationsEnabled -Settings $Settings)
         UpdateSilentInstallEnabled = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $Settings)
@@ -5371,6 +5372,7 @@ $defaults = @{
     RegistryScan               = @{}
     WingetIgnore               = @("228980") # Filter false positive updates for Steamworks Redist
     WingetIncludeUnknown       = $true
+    CustomUpdateCommands       = @()
     UpdateAutoScanMinutes      = 0
     UpdateNotificationsEnabled = $true
     UpdateSilentInstallEnabled = $false
@@ -5421,6 +5423,22 @@ if (Test-Path $path) {
             $defaults.WingetIgnore = $clean.ToArray()
         }
         if ($json.PSObject.Properties["WingetIncludeUnknown"]) { $defaults.WingetIncludeUnknown = [bool]$json.WingetIncludeUnknown }
+        if ($json.PSObject.Properties["CustomUpdateCommands"]) {
+            $customUpdateCommands = New-Object System.Collections.Generic.List[object]
+            foreach ($entry in @($json.CustomUpdateCommands)) {
+                $source = ([string]$entry.Source).Trim()
+                $id = ([string]$entry.Id).Trim()
+                $command = ([string]$entry.Command).Trim()
+                if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($id) -or [string]::IsNullOrWhiteSpace($command)) { continue }
+                [void]$customUpdateCommands.Add([PSCustomObject]@{
+                        Source  = $source
+                        Id      = $id
+                        Name    = ([string]$entry.Name).Trim()
+                        Command = $command
+                    })
+            }
+            $defaults.CustomUpdateCommands = $customUpdateCommands.ToArray()
+        }
         if ($json.PSObject.Properties["UpdateAutoScanMinutes"]) {
             try { $defaults.UpdateAutoScanMinutes = [int]$json.UpdateAutoScanMinutes } catch { $defaults.UpdateAutoScanMinutes = 0 }
             if ($defaults.UpdateAutoScanMinutes -lt 0) { $defaults.UpdateAutoScanMinutes = 0 }
@@ -5519,6 +5537,71 @@ elseif ($settings.PSObject.Properties["WingetIncludeUnknown"]) {
 else {
     $settings | Add-Member -MemberType NoteProperty -Name "WingetIncludeUnknown" -Value $IncludeUnknown -Force
 }
+Save-WmtSettings -Settings $settings
+}
+
+function Get-WmtCustomUpdateCommands {
+param($Settings)
+if (-not $Settings) { $Settings = Get-WmtSettings }
+try {
+    if ($Settings -is [System.Collections.IDictionary] -and $Settings.Contains("CustomUpdateCommands")) { return @($Settings["CustomUpdateCommands"]) }
+    if ($Settings.PSObject.Properties["CustomUpdateCommands"]) { return @($Settings.CustomUpdateCommands) }
+}
+catch {}
+return @()
+}
+
+function Get-WmtCustomUpdateCommand {
+param([string]$Source, [string]$Id, $Settings)
+$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
+$idKey = ([string]$Id).Trim().ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($sourceKey) -or [string]::IsNullOrWhiteSpace($idKey)) { return "" }
+
+foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $Settings)) {
+    if (-not $entry) { continue }
+    if (([string]$entry.Source).Trim().ToLowerInvariant() -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) {
+        return ([string]$entry.Command).Trim()
+    }
+}
+return ""
+}
+
+function Set-WmtCustomUpdateCommand {
+param([string]$Source, [string]$Id, [string]$Name, [string]$Command)
+$sourceValue = ([string]$Source).Trim()
+$idValue = ([string]$Id).Trim()
+$commandValue = ([string]$Command).Trim()
+if ([string]::IsNullOrWhiteSpace($sourceValue) -or [string]::IsNullOrWhiteSpace($idValue)) { throw "A package source and ID are required." }
+if ([string]::IsNullOrWhiteSpace($commandValue)) { Remove-WmtCustomUpdateCommand -Source $sourceValue -Id $idValue; return }
+
+$settings = Get-WmtSettings
+$updated = New-Object System.Collections.Generic.List[object]
+foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $settings)) {
+    if (-not $entry) { continue }
+    if (([string]$entry.Source).Trim().ToLowerInvariant() -eq $sourceValue.ToLowerInvariant() -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idValue.ToLowerInvariant()) { continue }
+    [void]$updated.Add($entry)
+}
+[void]$updated.Add([PSCustomObject]@{ Source = $sourceValue; Id = $idValue; Name = ([string]$Name).Trim(); Command = $commandValue })
+if ($settings -is [System.Collections.IDictionary]) { $settings["CustomUpdateCommands"] = $updated.ToArray() }
+else { $settings | Add-Member -MemberType NoteProperty -Name "CustomUpdateCommands" -Value $updated.ToArray() -Force }
+Save-WmtSettings -Settings $settings
+}
+
+function Remove-WmtCustomUpdateCommand {
+param([string]$Source, [string]$Id)
+$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
+$idKey = ([string]$Id).Trim().ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($sourceKey) -or [string]::IsNullOrWhiteSpace($idKey)) { return }
+
+$settings = Get-WmtSettings
+$updated = New-Object System.Collections.Generic.List[object]
+foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $settings)) {
+    if (-not $entry) { continue }
+    if (([string]$entry.Source).Trim().ToLowerInvariant() -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) { continue }
+    [void]$updated.Add($entry)
+}
+if ($settings -is [System.Collections.IDictionary]) { $settings["CustomUpdateCommands"] = $updated.ToArray() }
+else { $settings | Add-Member -MemberType NoteProperty -Name "CustomUpdateCommands" -Value $updated.ToArray() -Force }
 Save-WmtSettings -Settings $settings
 }
 
@@ -32191,6 +32274,59 @@ $miCopyRow.Add_Click({
 })
 [void]$ctxMenu.Items.Add($miCopyRow)
 
+# 5b. Custom Update Command
+$miCustomUpdateCommand = New-Object System.Windows.Controls.MenuItem
+$miCustomUpdateCommand.Header = "Set Custom Update Command..."
+$miCustomUpdateCommand.ToolTip = "Use a PowerShell command instead of the package provider when this package has a pending update."
+$miCustomUpdateCommand.Add_Click({
+    $selected = @($lstWinget.SelectedItems)
+    if ($selected.Count -ne 1) { return }
+
+    $item = $selected[0]
+    $source = ([string]$item.Source).Trim()
+    $id = ([string]$item.Id).Trim()
+    $name = ([string]$item.Name).Trim()
+    if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($id)) {
+        Show-WmtMessageBox -Message "This row does not have a stable package source and ID, so a custom update command cannot be attached to it." -Title "Custom Update Command" -Image Information | Out-Null
+        return
+    }
+
+    $current = Get-WmtCustomUpdateCommand -Source $source -Id $id
+    $example = 'iex "& { $(iwr -useb ''https://raw.githubusercontent.com/SpotX-Official/SpotX/refs/heads/main/run.ps1'') } -new_theme"'
+    $prompt = "PowerShell command to run when WMT finds an update for $name ($source / $id)." + [Environment]::NewLine + [Environment]::NewLine +
+        "This replaces the normal provider update command for this package only. Optional placeholders: {id}, {name}, {source}, {version}, {available}." + [Environment]::NewLine + [Environment]::NewLine +
+        "Example for Spotify / SpotX:" + [Environment]::NewLine + $example + [Environment]::NewLine + [Environment]::NewLine +
+        "Clear the field and press OK to remove the override."
+    $command = Show-WmtInputDialog -Title "Custom Update Command - $name" -Prompt $prompt -DefaultValue $current
+    if ($null -eq $command) { return }
+
+    if ([string]::IsNullOrWhiteSpace([string]$command)) {
+        Remove-WmtCustomUpdateCommand -Source $source -Id $id
+        Write-GuiLog "Removed custom update command for $name ($source / $id)."
+    }
+    else {
+        Set-WmtCustomUpdateCommand -Source $source -Id $id -Name $name -Command $command
+        Write-GuiLog "Saved custom update command for $name ($source / $id)."
+    }
+})
+
+$miClearCustomUpdateCommand = New-Object System.Windows.Controls.MenuItem
+$miClearCustomUpdateCommand.Header = "Clear Custom Update Command"
+$miClearCustomUpdateCommand.ToolTip = "Restore the normal package-provider update command for this package."
+$miClearCustomUpdateCommand.Add_Click({
+    $selected = @($lstWinget.SelectedItems)
+    if ($selected.Count -ne 1) { return }
+    $item = $selected[0]
+    $source = ([string]$item.Source).Trim()
+    $id = ([string]$item.Id).Trim()
+    $name = ([string]$item.Name).Trim()
+    if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($id)) { return }
+    Remove-WmtCustomUpdateCommand -Source $source -Id $id
+    Write-GuiLog "Removed custom update command for $name ($source / $id)."
+})
+[void]$ctxMenu.Items.Add($miCustomUpdateCommand)
+[void]$ctxMenu.Items.Add($miClearCustomUpdateCommand)
+
 # --- Separator ---
 [void]$ctxMenu.Items.Add((New-Object System.Windows.Controls.Separator))
 
@@ -32267,6 +32403,17 @@ $ctxMenu.Add_Opened({
     $miUpdateAll.IsEnabled = ($btnWingetUpdateAll -and $btnWingetUpdateAll.Visibility -eq [System.Windows.Visibility]::Visible)
     $miManifest.IsEnabled = $canShowManifest
     $miCopyRow.IsEnabled = ($selected.Count -gt 0)
+    $canConfigureCustomUpdate = $false
+    $hasCustomUpdateCommand = $false
+    if ($selected.Count -eq 1) {
+        $selectedSource = ([string]$selected[0].Source).Trim()
+        $selectedId = ([string]$selected[0].Id).Trim()
+        $canConfigureCustomUpdate = (-not [string]::IsNullOrWhiteSpace($selectedSource) -and -not [string]::IsNullOrWhiteSpace($selectedId))
+        if ($canConfigureCustomUpdate) { $hasCustomUpdateCommand = -not [string]::IsNullOrWhiteSpace((Get-WmtCustomUpdateCommand -Source $selectedSource -Id $selectedId)) }
+    }
+    $miCustomUpdateCommand.IsEnabled = $canConfigureCustomUpdate
+    $miCustomUpdateCommand.Header = if ($hasCustomUpdateCommand) { "Edit Custom Update Command..." } else { "Set Custom Update Command..." }
+    $miClearCustomUpdateCommand.IsEnabled = $hasCustomUpdateCommand
     $canShowChoco = ($selected.Count -eq 1 -and (Test-ChocoManifestSupportedItem $selected[0]))
     $miChocoManifest.IsEnabled = $canShowChoco
     $miChocoPage.IsEnabled = $canShowChoco
@@ -32419,6 +32566,13 @@ param($ListItems, $ActionName, $CmdTemplate)
 if (-not $ListItems -or $ListItems.Count -eq 0) { return }
 
 $uniqueItems = @($ListItems | Select-Object -Property Source, Name, Id, Version, Available, VersionSort, AvailableSort, IsChecked, LibraryPath, InstallDir, ManifestPath, ExecutablePath, Platform, RawAvailable, WUIsOptional -Unique)
+if ($ActionName -eq "Update") {
+    $customSettings = Get-WmtSettings
+    foreach ($updateItem in $uniqueItems) {
+        $customUpdateCommand = Get-WmtCustomUpdateCommand -Source ([string]$updateItem.Source) -Id ([string]$updateItem.Id) -Settings $customSettings
+        $updateItem | Add-Member -MemberType NoteProperty -Name "CustomUpdateCommand" -Value $customUpdateCommand -Force
+    }
+}
 $totalItems = $uniqueItems.Count
 
 # UI Updates
@@ -34492,7 +34646,9 @@ exit /b %WMT_EXIT%
         $src = $item.Source
         $srcKey = ([string]$src).ToLowerInvariant()
         $cmd = ""
-        $userCmd = "" 
+        $userCmd = ""
+        $displayCmd = ""
+        $isCustomUpdateCommand = $false
         $pipArguments = $null
         $wingetArgs = $null
         $storeCliArgs = $null
@@ -34504,7 +34660,7 @@ exit /b %WMT_EXIT%
         Write-Output "PROGRESS:${index}/${total}:$name"
         Write-Output "ITEM_SOURCE:$srcKey"
 
-        if ($act -eq "Update" -and ([string]$src).ToLowerInvariant() -eq "msstore") {
+        if ($act -eq "Update" -and ([string]$src).ToLowerInvariant() -eq "msstore" -and [string]::IsNullOrWhiteSpace(([string]$item.CustomUpdateCommand))) {
             $storeGuiResult = $null
             Invoke-WmtStoreGuiUpdate -PackageName $name -Result ([ref]$storeGuiResult)
             if ($storeGuiResult -and $storeGuiResult.ExitCode -eq 0) {
@@ -34528,7 +34684,28 @@ exit /b %WMT_EXIT%
         }
 
         # --- COMMAND GENERATION ---
-        if ($tmpl) {
+        $customUpdateCommand = ""
+        if ($act -eq "Update" -and $item.PSObject.Properties["CustomUpdateCommand"]) {
+            $customUpdateCommand = ([string]$item.CustomUpdateCommand).Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($customUpdateCommand)) {
+            $expandedCustomCommand = $customUpdateCommand
+            $expandedCustomCommand = $expandedCustomCommand.Replace("{id}", [string]$id)
+            $expandedCustomCommand = $expandedCustomCommand.Replace("{name}", [string]$name)
+            $expandedCustomCommand = $expandedCustomCommand.Replace("{source}", [string]$src)
+            $expandedCustomCommand = $expandedCustomCommand.Replace("{version}", [string]$item.Version)
+            $expandedCustomCommand = $expandedCustomCommand.Replace("{available}", [string]$item.Available)
+
+            # -EncodedCommand avoids quoting damage when the custom command contains
+            # quotes, pipes, ampersands, subexpressions, URLs, etc.
+            $encodedCustomCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($expandedCustomCommand))
+            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCustomCommand"
+            $userCmd = $cmd
+            $displayCmd = $expandedCustomCommand
+            $isCustomUpdateCommand = $true
+            Write-Output "LOG:[Custom Update] Using saved PowerShell override for $name ($src / $id)."
+        }
+        elseif ($tmpl) {
             $cmd = $tmpl -f $id
             $userCmd = $cmd -replace "--disable-interactivity", "" 
         }
@@ -34872,7 +35049,8 @@ exit /b %WMT_EXIT%
 
         if ($cmd) {
             Write-Output "LOG:[$act][$index/$total] Starting: $name ($src)..."
-            Write-Output "LOG:[$act] Command: $userCmd"
+            $commandForLog = if (-not [string]::IsNullOrWhiteSpace($displayCmd)) { $displayCmd } else { $userCmd }
+            Write-Output "LOG:[$act] Command: $commandForLog"
 
             # 1. RUN COMMAND (First Attempt - Admin)
             # UX: most package updates run one-by-one in visible windows (auto-close when done),
@@ -34899,7 +35077,8 @@ exit /b %WMT_EXIT%
                     "^(windowsupdate)$" { "WindowsUpdate"; break }
                     default { "Package" }
                 }
-                if ($isPipUpdate) { $windowTag = "PIP" }
+                if ($isCustomUpdateCommand) { $windowTag = "Custom" }
+                elseif ($isPipUpdate) { $windowTag = "PIP" }
                 elseif ($isChocoUpdate) { $windowTag = "Chocolatey" }
                 elseif ($isPythonUpdate) { $windowTag = "Python" }
                 Write-Output "LOG:[$act] Launching visible $windowTag window for: $name"
