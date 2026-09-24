@@ -2325,6 +2325,58 @@ foreach ($key in $Palette.Keys) {
     $brush.Freeze()
     $Element.Resources[$key] = $brush
 }
+
+# Native selection templates also use system brushes when keyboard focus leaves
+# the list. Keep both states paired with the current theme's accent text.
+$Element.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = $Element.Resources["Accent"]
+$Element.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $Element.Resources["AccentText"]
+$Element.Resources[[System.Windows.SystemColors]::InactiveSelectionHighlightBrushKey] = $Element.Resources["Accent"]
+$Element.Resources[[System.Windows.SystemColors]::InactiveSelectionHighlightTextBrushKey] = $Element.Resources["AccentText"]
+Add-WmtListSelectionResources -Element $Element
+}
+
+function Add-WmtListSelectionResources {
+param([System.Windows.FrameworkElement]$Element)
+
+if (-not $Element -or $Element.Resources.Contains("__WmtListSelectionResourcesApplied")) { return }
+[xml]$selectionXaml = @'
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Style TargetType="{x:Type ListBoxItem}">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+        <Setter Property="Padding" Value="6,4"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type ListBoxItem}">
+                    <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"
+                            BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+            </Trigger>
+            <Trigger Property="IsSelected" Value="True">
+                <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.55"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+</ResourceDictionary>
+'@
+$reader = [System.Xml.XmlNodeReader]::new($selectionXaml)
+[void]$Element.Resources.MergedDictionaries.Add([Windows.Markup.XamlReader]::Load($reader))
+$Element.Resources["__WmtListSelectionResourcesApplied"] = $true
 }
 
 function Set-WmtThemedBrush {
@@ -2379,7 +2431,7 @@ try {
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 <Style TargetType="{x:Type TextBlock}">
-    <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+    <!-- Inherit the containing control's foreground, including selected rows. -->
     <Setter Property="TextWrapping" Value="Wrap"/>
 </Style>
 
@@ -2638,6 +2690,12 @@ try {
 <Style TargetType="{x:Type DataGridCell}">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Setter Property="BorderThickness" Value="0"/>
+    <Style.Triggers>
+        <Trigger Property="IsSelected" Value="True">
+            <Setter Property="Background" Value="{DynamicResource Accent}"/>
+            <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+        </Trigger>
+    </Style.Triggers>
 </Style>
 
 <Style TargetType="{x:Type DataGridRow}">
@@ -13331,6 +13389,12 @@ function Test-WmtRegistryFindingAutoSelected {
         <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="Padding" Value="6,3"/>
+        <Style.Triggers>
+            <Trigger Property="IsSelected" Value="True">
+                <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+            </Trigger>
+        </Style.Triggers>
     </Style>
     <Style TargetType="DataGridRow">
         <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
@@ -26155,6 +26219,20 @@ powercfg /S SCHEME_CURRENT | Out-Null
         <Setter Property="UseLayoutRounding" Value="True"/>
         <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
         <Setter Property="TextOptions.TextRenderingMode" Value="ClearType"/>
+        <!-- Paint the row with theme brushes instead of native selection chrome. -->
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListViewItem">
+                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <GridViewRowPresenter Content="{TemplateBinding Content}"
+                                              Columns="{Binding View.Columns, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
         <Style.Triggers>
             <Trigger Property="ItemsControl.AlternationIndex" Value="0">
                 <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
@@ -26162,13 +26240,13 @@ powercfg /S SCHEME_CURRENT | Out-Null
             <Trigger Property="ItemsControl.AlternationIndex" Value="1">
                 <Setter Property="Background" Value="{DynamicResource BgDark}"/>
             </Trigger>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+            </Trigger>
             <Trigger Property="IsSelected" Value="True">
                 <Setter Property="Background" Value="{DynamicResource Accent}"/>
                 <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
                 <Setter Property="FontWeight" Value="Medium"/>
-            </Trigger>
-            <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="Background" Value="{DynamicResource BgHover}"/>
             </Trigger>
         </Style.Triggers>
     </Style>
@@ -37057,11 +37135,6 @@ foreach ($p in $providerDefinitions) {
         <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
         <Setter Property="Background" Value="{DynamicResource BgDark}"/>
         <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-    </Style>
-    <Style TargetType="ListBoxItem">
-        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Setter Property="Background" Value="{DynamicResource BgDark}"/>
-        <Setter Property="Padding" Value="6,4"/>
     </Style>
 </Window.Resources>
 <Grid Margin="20">
