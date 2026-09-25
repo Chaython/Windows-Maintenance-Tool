@@ -247,6 +247,116 @@ finally {
 }
 }
 
+$script:WmtUiBackgroundCommands = @{}
+
+function Invoke-WmtUiBackgroundCommand {
+param(
+    [Parameter(Mandatory = $true)][scriptblock]$Sb,
+    [string]$Msg = "Processing...",
+    [object[]]$ArgumentList = @(),
+    [string]$Name = "",
+    [int]$IntervalMs = 200,
+    [int]$TimeoutMs = 0,
+    [scriptblock]$OnComplete,
+    [scriptblock]$OnError,
+    [switch]$SuppressResultLog
+)
+
+if (-not $script:WmtUiBackgroundCommands) { $script:WmtUiBackgroundCommands = @{} }
+if ([string]::IsNullOrWhiteSpace($Name)) { $Name = "UiCommand_" + [guid]::NewGuid().ToString("N") }
+if ($script:WmtUiBackgroundCommands.ContainsKey($Name)) {
+    Write-GuiLog "Background operation '$Name' is already running."
+    return $null
+}
+
+$ps = New-WmtPooledPowerShell -PoolKind Background
+try {
+    [void]$ps.AddScript($Sb.ToString())
+    foreach ($arg in @($ArgumentList)) { [void]$ps.AddArgument($arg) }
+    Write-GuiLog $Msg
+    $async = $ps.BeginInvoke()
+    $job = [PSCustomObject]@{
+        Name              = $Name
+        PowerShell        = $ps
+        Async             = $async
+        OnComplete        = $OnComplete
+        OnError           = $OnError
+        SuppressResultLog = [bool]$SuppressResultLog
+    }
+    $script:WmtUiBackgroundCommands[$Name] = $job
+
+    $testComplete = {
+        param($Operation)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        return [bool]($current -and $current.Async -and $current.Async.IsCompleted)
+    }.GetNewClosure()
+
+    $finish = {
+        param($Operation)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        if (-not $current) { return }
+        try {
+            $results = @($current.PowerShell.EndInvoke($current.Async))
+            if (-not $current.SuppressResultLog) {
+                $wroteOutput = $false
+                foreach ($item in $results) {
+                    if ($null -eq $item) { continue }
+                    $text = if ($item -is [string]) { [string]$item } else { (($item | Out-String).Trim()) }
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        Write-GuiLog $text
+                        $wroteOutput = $true
+                    }
+                }
+                if (-not $wroteOutput) { Write-GuiLog "Done." }
+            }
+            elseif (-not $current.OnComplete) {
+                Write-GuiLog "Done."
+            }
+            if ($current.OnComplete) { & $current.OnComplete $results }
+        }
+        catch {
+            Write-GuiLog "ERROR: $($_.Exception.Message)"
+            if ($current.OnError) { try { & $current.OnError $_ } catch {} }
+        }
+        finally {
+            try { $current.PowerShell.Dispose() } catch {}
+            [void]$script:WmtUiBackgroundCommands.Remove($Name)
+        }
+    }.GetNewClosure()
+
+    $timeout = {
+        param($Operation)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        if (-not $current) { return }
+        try { $current.PowerShell.Stop() } catch {}
+        Write-GuiLog "ERROR: Background operation '$Name' timed out."
+        if ($current.OnError) { try { & $current.OnError ([System.TimeoutException]::new("Background operation '$Name' timed out.")) } catch {} }
+        try { $current.PowerShell.Dispose() } catch {}
+        [void]$script:WmtUiBackgroundCommands.Remove($Name)
+    }.GetNewClosure()
+
+    $pollError = {
+        param($Operation, $ErrorRecord)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        if ($current) {
+            try { $current.PowerShell.Stop() } catch {}
+            try { $current.PowerShell.Dispose() } catch {}
+            if ($current.OnError) { try { & $current.OnError $ErrorRecord } catch {} }
+            [void]$script:WmtUiBackgroundCommands.Remove($Name)
+        }
+    }.GetNewClosure()
+
+    Register-WmtUiPollOperation -Name ("UiCommand:" + $Name) -IntervalMs $IntervalMs -TimeoutMs $TimeoutMs -TestComplete $testComplete -OnComplete $finish -OnTimeout $timeout -OnError $pollError | Out-Null
+    return $job
+}
+catch {
+    try { $ps.Dispose() } catch {}
+    Write-GuiLog "ERROR: $($_.Exception.Message)"
+    if ($OnError) { try { & $OnError $_ } catch {} }
+    return $null
+}
+}
+
 function Enable-WmtWpfItemsVirtualization {
 param([System.Windows.Controls.ItemsControl]$Control)
 if (-not $Control) { return }
@@ -7612,24 +7722,26 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
 }
 
 function Start-UpdateRepair {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairQuick" -Msg "Repairing Windows Update..." -Sb {
     Stop-Service -Name wuauserv, bits, cryptsvc, msiserver -Force -ErrorAction SilentlyContinue
     $rnd = Get-Random
     if (Test-Path "$env:windir\SoftwareDistribution") { Rename-Item "$env:windir\SoftwareDistribution" "$env:windir\SoftwareDistribution.bak_$rnd" -ErrorAction SilentlyContinue }
     if (Test-Path "$env:windir\System32\catroot2") { Rename-Item "$env:windir\System32\catroot2" "$env:windir\System32\catroot2.bak_$rnd" -ErrorAction SilentlyContinue }
     netsh winsock reset | Out-Null
     Start-Service -Name wuauserv, bits, cryptsvc, msiserver -ErrorAction SilentlyContinue
-} "Repairing Windows Update..."
+    Write-Output "Windows Update repair completed."
+} | Out-Null
 }
 
 function Start-NetRepair {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Sb {
     ipconfig /release | Out-Null
     ipconfig /renew | Out-Null
     ipconfig /flushdns | Out-Null
     netsh winsock reset | Out-Null
     netsh int ip reset | Out-Null
-} "Running Full Network Repair..."
+    Write-Output "Network repair completed."
+} | Out-Null
 }
 
 function Start-RegClean {
@@ -7645,29 +7757,21 @@ Invoke-UiCommand {
 }
 
 function Start-XboxClean {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "XboxCredentialCleanup" -Msg "Cleaning Xbox Credentials..." -Sb {
     Write-Output "Stopping Xbox Auth Manager..."
     Stop-Service -Name "XblAuthManager" -Force -ErrorAction SilentlyContinue
-
-    $allCreds = (cmdkey /list) -split "`r?`n"
+    $allCreds = (cmdkey /list) -split "\r?\n"
     $targets = @()
     foreach ($line in $allCreds) {
         if ($line -match '^\s*Target:.*(Xbl.*)$') { $targets += $matches[1] }
     }
-
-    if ($targets.Count -eq 0) {
-        Write-Output "No Xbox Live credentials found."
-    }
+    if ($targets.Count -eq 0) { Write-Output "No Xbox Live credentials found." }
     else {
-        foreach ($t in $targets) {
-            Write-Output "Deleting credential: $t"
-            cmdkey /delete:$t 2>$null
-        }
+        foreach ($t in $targets) { Write-Output "Deleting credential: $t"; cmdkey /delete:$t 2>$null }
         Write-Output "Deleted $($targets.Count) credential(s)."
     }
-
     Start-Service -Name "XblAuthManager" -ErrorAction SilentlyContinue
-} "Cleaning Xbox Credentials..."
+} | Out-Null
 }
 
 function Start-GpeditInstall {
@@ -22391,7 +22495,7 @@ Invoke-UiCommand {
 # --- FIREWALL TOOLS ---
 function Invoke-FirewallExport {
 $target = Join-Path (Get-DataPath) ("firewall_rules_{0}.wfw" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-Invoke-UiCommand { param($target) netsh advfirewall export "$target" } "Exporting firewall rules..." -ArgumentList $target
+Invoke-WmtUiBackgroundCommand -Name "FirewallExport" -Msg "Exporting firewall rules..." -Sb { param($target) netsh advfirewall export "$target" } -ArgumentList $target | Out-Null
 }
 
 function Invoke-FirewallImport {
@@ -22399,64 +22503,34 @@ $dlg = [Microsoft.Win32.OpenFileDialog]::new()
 $dlg.Filter = "Windows Firewall Policy (*.wfw)|*.wfw"
 if ($dlg.ShowDialog() -ne $true) { return }
 $file = $dlg.FileName
-Invoke-UiCommand { param($file) netsh advfirewall import "$file" } "Importing firewall rules..." -ArgumentList $file
+Invoke-WmtUiBackgroundCommand -Name "FirewallImport" -Msg "Importing firewall rules..." -Sb { param($file) netsh advfirewall import "$file" } -ArgumentList $file | Out-Null
 }
 
 function Invoke-FirewallDefaults {
 $confirm = [System.Windows.MessageBox]::Show("Restore default Windows Firewall rules? Custom rules will be removed.", "Restore Defaults", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
-Invoke-UiCommand { netsh advfirewall reset } "Restoring default firewall rules..."
+Invoke-WmtUiBackgroundCommand -Name "FirewallReset" -Msg "Restoring default firewall rules..." -Sb { netsh advfirewall reset } | Out-Null
 }
 
 function Invoke-FirewallPurge {
 $confirm = [System.Windows.MessageBox]::Show("Delete ALL firewall rules? This is destructive.", "Delete All Rules", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
-Invoke-UiCommand { Remove-NetFirewallRule -All } "Deleting all firewall rules..."
+Invoke-WmtUiBackgroundCommand -Name "FirewallPurge" -Msg "Deleting all firewall rules..." -Sb { Remove-NetFirewallRule -All } | Out-Null
 }
 
 # --- DRIVER TOOLS ---
 function Invoke-DriverReport {
-Invoke-UiCommand {
-    $outfile = Join-Path (Get-DataPath) "Installed_Drivers.txt"
+$outfile = Join-Path (Get-DataPath) "Installed_Drivers.txt"
+Invoke-WmtUiBackgroundCommand -Name "DriverReport" -Msg "Creating driver report..." -Sb {
+    param($outfile)
     driverquery /v > $outfile
     Write-Output "Driver report saved to $outfile"
-} "Creating driver report..."
+} -ArgumentList $outfile | Out-Null
 }
 
 function Invoke-ExportDrivers {
 Write-GuiLog "Starting Driver Export Tool..."
 $dataPath = try { Get-DataPath } catch { Join-Path $env:PUBLIC "WMT_Exports" }
-
-Set-WmtBusyCursor -Busy
-try {
-    $drivers = @()
-    foreach ($d in @(Get-WindowsDriver -Online -All | Where-Object { $_.Inbox -eq $false })) {
-        $classProbe = "$($d.ClassName) $($d.ProviderName)".ToLowerInvariant()
-        $class = "Other"
-        if ($classProbe -match "display|graphics|nvidia|amd|intel.*graphics") { $class = "Display" }
-        elseif ($classProbe -match "net|network|wifi|ethernet|realtek|broadcom|intel.*network") { $class = "Network" }
-        elseif ($classProbe -match "audio|sound") { $class = "Audio" }
-        elseif ($classProbe -match "storage|sata|nvme|raid|disk") { $class = "Storage" }
-        elseif ($classProbe -match "usb") { $class = "USB" }
-        elseif ($classProbe -match "print") { $class = "Printer" }
-        elseif ($classProbe -match "system|chipset|acpi") { $class = "System" }
-
-        $drivers += [PSCustomObject]@{
-            PublishedName = [string]$d.Driver
-            OriginalName  = [string]$d.OriginalFileName
-            Class         = $class
-            Provider      = [string]$d.ProviderName
-            Version       = [string]$d.Version
-            Date          = if ($d.Date) { $d.Date.ToString("yyyy-MM-dd") } else { "" }
-        }
-    }
-}
-finally { Set-WmtBusyCursor }
-
-if (-not $drivers -or $drivers.Count -eq 0) {
-    Show-WmtMessageBox -Message "No 3rd-party drivers found to export." -Title "Driver Export Tool" -Image Information | Out-Null
-    return
-}
 
 $content = @"
 <Grid Margin="16">
@@ -22476,10 +22550,10 @@ $content = @"
         <DataGrid Name="dgDrivers" Grid.Column="2" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
     </Grid>
     <Grid Grid.Row="2" Margin="0,12,0,0">
-        <TextBlock Name="lblStatus" Text="Ready" VerticalAlignment="Center" Foreground="{DynamicResource Accent}"/>
+        <TextBlock Name="lblStatus" Text="Loading drivers..." VerticalAlignment="Center" Foreground="{DynamicResource Accent}"/>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnExportSel" Content="Export Selected" MinWidth="128" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
-            <Button Name="btnExportAll" Content="Export All" MinWidth="104" Margin="0,0,8,0"/>
+            <Button Name="btnExportSel" Content="Export Selected" MinWidth="128" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0" IsEnabled="False"/>
+            <Button Name="btnExportAll" Content="Export All" MinWidth="104" Margin="0,0,8,0" IsEnabled="False"/>
             <Button Name="btnClose" Content="Close" Width="90" IsCancel="True"/>
         </StackPanel>
     </Grid>
@@ -22497,24 +22571,27 @@ $btnClose = $dialog.FindName("btnClose")
 Set-WmtDataGridColumns -DataGrid $dg -Columns @("PublishedName", "OriginalName", "Provider", "Version", "Date", "Class") -Widths @{ PublishedName = 130; OriginalName = "*"; Provider = 160; Version = 110; Date = 90; Class = 90 }
 $rows = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $dg.ItemsSource = $rows
-
-$classes = @([PSCustomObject]@{ Display = "All ($($drivers.Count))"; Class = "" })
-$classes += @($drivers | Group-Object Class | Sort-Object Name | ForEach-Object { [PSCustomObject]@{ Display = "$($_.Name) ($($_.Count))"; Class = $_.Name } })
-$lstClasses.DisplayMemberPath = "Display"
-$lstClasses.ItemsSource = $classes
-$lstClasses.SelectedIndex = 0
+$state = [PSCustomObject]@{ Drivers = @() }
 
 $refresh = {
     $rows.Clear()
     $selectedClass = if ($lstClasses.SelectedItem) { [string]$lstClasses.SelectedItem.Class } else { "" }
     $search = ([string]$txtSearch.Text).Trim().ToLowerInvariant()
-    foreach ($d in @($drivers)) {
+    foreach ($d in @($state.Drivers)) {
         if ($selectedClass -and $d.Class -ne $selectedClass) { continue }
         $haystack = "$($d.PublishedName) $($d.OriginalName) $($d.Provider) $($d.Version)".ToLowerInvariant()
         if ($search -and -not $haystack.Contains($search)) { continue }
         [void]$rows.Add($d)
     }
-    $lblStatus.Text = "$($rows.Count) shown / $($drivers.Count) drivers"
+    $lblStatus.Text = "$($rows.Count) shown / $(@($state.Drivers).Count) drivers"
+}.GetNewClosure()
+
+$rebuildClasses = {
+    $classes = @([PSCustomObject]@{ Display = "All ($(@($state.Drivers).Count))"; Class = "" })
+    $classes += @($state.Drivers | Group-Object Class | Sort-Object Name | ForEach-Object { [PSCustomObject]@{ Display = "$($_.Name) ($($_.Count))"; Class = $_.Name } })
+    $lstClasses.DisplayMemberPath = "Display"
+    $lstClasses.ItemsSource = $classes
+    $lstClasses.SelectedIndex = 0
 }.GetNewClosure()
 
 $exportDrivers = {
@@ -22524,41 +22601,101 @@ $exportDrivers = {
         Show-WmtMessageBox -Owner $dialog -Message "Please select at least one driver to export." -Title "Driver Export Tool" -Image Warning | Out-Null
         return
     }
-
-    $exportPath = Join-Path $dataPath "Drivers_Backup_$(Get-Date -Format yyyyMMdd_HHmm)"
-    New-Item -ItemType Directory -Path $exportPath -Force | Out-Null
-    Set-WmtBusyCursor -Busy
+    $payload = [PSCustomObject]@{
+        Targets    = $targets
+        ExportPath = (Join-Path $dataPath "Drivers_Backup_$(Get-Date -Format yyyyMMdd_HHmm)")
+    }
     $dialog.IsEnabled = $false
-    try {
-        $done = 0
-        foreach ($drv in $targets) {
-            $done++
-            $lblStatus.Text = "Exporting $done / $($targets.Count): $($drv.PublishedName)"
-            Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
-            $dir = Join-Path $exportPath $drv.Class
-            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            $process = Start-Process pnputil -ArgumentList "/export-driver", $drv.PublishedName, "`"$dir`"" -NoNewWindow -Wait -PassThru
-            if ($process.ExitCode -ne 0) { Write-GuiLog "Driver export failed for $($drv.PublishedName) (exit $($process.ExitCode))." }
-        }
-        $lblStatus.Text = "Done"
-        Show-WmtMessageBox -Owner $dialog -Message "Export Complete!`n`nSaved to:`n$exportPath" -Title "Success" -Image Information | Out-Null
-    }
-    catch {
-        $lblStatus.Text = "Error"
-        Show-WmtMessageBox -Owner $dialog -Message "An error occurred during export:`n`n$($_.Exception.Message)" -Title "Error" -Image Error | Out-Null
-    }
-    finally {
+    $lblStatus.Text = "Exporting $($targets.Count) driver(s)..."
+
+    $complete = {
+        param($results)
+        if (-not $dialog.IsLoaded) { return }
         $dialog.IsEnabled = $true
-        Set-WmtBusyCursor
-    }
+        $summary = @($results | Where-Object { $_ -and $_.PSObject.Properties["ExportPath"] } | Select-Object -Last 1)[0]
+        if ($summary) {
+            $failedCount = @($summary.Failed).Count
+            $lblStatus.Text = if ($failedCount -gt 0) { "Completed with $failedCount failure(s)" } else { "Done" }
+            $message = if ($failedCount -gt 0) { "Driver export completed with $failedCount failure(s). Saved to: $($summary.ExportPath)" } else { "Export Complete. Saved to: $($summary.ExportPath)" }
+            $image = if ($failedCount -gt 0) { "Warning" } else { "Information" }
+            Show-WmtMessageBox -Owner $dialog -Message $message -Title "Driver Export" -Image $image | Out-Null
+        }
+    }.GetNewClosure()
+
+    $failed = {
+        param($errorRecord)
+        if (-not $dialog.IsLoaded) { return }
+        $dialog.IsEnabled = $true
+        $lblStatus.Text = "Error"
+        $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+        Show-WmtMessageBox -Owner $dialog -Message "An error occurred during export: $message" -Title "Error" -Image Error | Out-Null
+    }.GetNewClosure()
+
+    Invoke-WmtUiBackgroundCommand -Msg "Exporting $($targets.Count) driver package(s)..." -SuppressResultLog -Sb {
+        param($payload)
+        $failedItems = [System.Collections.Generic.List[object]]::new()
+        foreach ($drv in @($payload.Targets)) {
+            $dir = Join-Path ([string]$payload.ExportPath) ([string]$drv.Class)
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            $process = Start-Process pnputil -ArgumentList "/export-driver", ([string]$drv.PublishedName), ('"' + $dir + '"') -NoNewWindow -Wait -PassThru
+            if ($process.ExitCode -ne 0) { [void]$failedItems.Add([PSCustomObject]@{ Driver = [string]$drv.PublishedName; ExitCode = [int]$process.ExitCode }) }
+        }
+        [PSCustomObject]@{ ExportPath = [string]$payload.ExportPath; Failed = $failedItems.ToArray() }
+    } -ArgumentList $payload -OnComplete $complete -OnError $failed | Out-Null
 }.GetNewClosure()
 
 if ($lstClasses) { $lstClasses.Add_SelectionChanged({ & $refresh }.GetNewClosure()) }
 if ($txtSearch) { $txtSearch.Add_TextChanged({ & $refresh }.GetNewClosure()) }
 if ($btnExportSel) { $btnExportSel.Add_Click({ & $exportDrivers -DriversToExport @($dg.SelectedItems) }.GetNewClosure()) }
-if ($btnExportAll) { $btnExportAll.Add_Click({ & $exportDrivers -DriversToExport @($drivers) }.GetNewClosure()) }
+if ($btnExportAll) { $btnExportAll.Add_Click({ & $exportDrivers -DriversToExport @($state.Drivers) }.GetNewClosure()) }
 if ($btnClose) { $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure()) }
-& $refresh
+
+$loadComplete = {
+    param($results)
+    if (-not $dialog.IsLoaded) { return }
+    $state.Drivers = @($results)
+    & $rebuildClasses
+    & $refresh
+    $btnExportSel.IsEnabled = ($state.Drivers.Count -gt 0)
+    $btnExportAll.IsEnabled = ($state.Drivers.Count -gt 0)
+    if ($state.Drivers.Count -eq 0) {
+        $lblStatus.Text = "No 3rd-party drivers found."
+        Show-WmtMessageBox -Owner $dialog -Message "No 3rd-party drivers found to export." -Title "Driver Export Tool" -Image Information | Out-Null
+    }
+}.GetNewClosure()
+
+$loadError = {
+    param($errorRecord)
+    if (-not $dialog.IsLoaded) { return }
+    $lblStatus.Text = "Failed to load drivers"
+    $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+    Show-WmtMessageBox -Owner $dialog -Message "Unable to enumerate third-party drivers: $message" -Title "Driver Export Tool" -Image Error | Out-Null
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Msg "Loading third-party drivers..." -SuppressResultLog -Sb {
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in @(Get-WindowsDriver -Online -All | Where-Object { $_.Inbox -eq $false })) {
+        $classProbe = "$($d.ClassName) $($d.ProviderName)".ToLowerInvariant()
+        $class = "Other"
+        if ($classProbe -match "display|graphics|nvidia|amd|intel.*graphics") { $class = "Display" }
+        elseif ($classProbe -match "net|network|wifi|ethernet|realtek|broadcom|intel.*network") { $class = "Network" }
+        elseif ($classProbe -match "audio|sound") { $class = "Audio" }
+        elseif ($classProbe -match "storage|sata|nvme|raid|disk") { $class = "Storage" }
+        elseif ($classProbe -match "usb") { $class = "USB" }
+        elseif ($classProbe -match "print") { $class = "Printer" }
+        elseif ($classProbe -match "system|chipset|acpi") { $class = "System" }
+        [void]$items.Add([PSCustomObject]@{
+            PublishedName = [string]$d.Driver
+            OriginalName  = [string]$d.OriginalFileName
+            Class         = $class
+            Provider      = [string]$d.ProviderName
+            Version       = [string]$d.Version
+            Date          = if ($d.Date) { $d.Date.ToString("yyyy-MM-dd") } else { "" }
+        })
+    }
+    $items.ToArray()
+} -OnComplete $loadComplete -OnError $loadError | Out-Null
+
 $dialog.ShowDialog() | Out-Null
 }
 
@@ -23047,7 +23184,7 @@ if (-not $script:DriverCacheLoaded -and $script:DriverPackages.Count -gt 0) {
 
 # --- UPDATE / REPORT TOOLS ---
 function Invoke-WindowsUpdateRepairFull {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairFull" -Msg "Running full Windows Update repair..." -Sb {
     $services = @('wuauserv', 'bits', 'cryptsvc', 'msiserver', 'usosvc', 'trustedinstaller')
     foreach ($svc in $services) { try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue } catch {} }
     try { Get-BitsTransfer -AllUsers | Remove-BitsTransfer -Confirm:$false } catch {}
@@ -23060,7 +23197,7 @@ Invoke-UiCommand {
     try { netsh winhttp reset proxy | Out-Null } catch {}
     foreach ($svc in $services) { try { Start-Service -Name $svc -ErrorAction SilentlyContinue } catch {} }
     Write-Output "Windows Update repair completed."
-} "Running full Windows Update repair..."
+} | Out-Null
 }
 
 function Invoke-SystemReports {
@@ -30268,15 +30405,10 @@ if ($btnDrvReport) { $btnDrvReport.Add_Click({ Invoke-DriverReport }) }
 
 $btnDrvBackup = Get-Ctrl "btnDrvBackup"
 if ($btnDrvBackup) { 
-$btnDrvBackup.Add_Click({ 
-        # Disable button immediately to prevent double-clicks
-        $this.IsEnabled = $false 
-
-        Invoke-ExportDrivers 
-
-        # Freeze this specific UI thread for 1 second, then re-enable
-        Start-Sleep -Seconds 1
-        $this.IsEnabled = $true
+$btnDrvBackup.Add_Click({
+        $this.IsEnabled = $false
+        try { Invoke-ExportDrivers }
+        finally { $this.IsEnabled = $true }
     }) 
 }
 
