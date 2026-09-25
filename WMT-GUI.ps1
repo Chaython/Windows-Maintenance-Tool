@@ -45693,7 +45693,38 @@ function Resolve-WmtCompactTarget {
 
 
 function Get-WmtCompactTrackerPath {
-    return (Join-Path (Get-DataPath) "compact-tracker.json")
+    # Automatic recompression can run as SYSTEM, so its configuration must not
+    # live in WMT's normal user-writable data directory. Keep the tracker beside
+    # the secured worker and migrate the legacy tracker once.
+    $root = Join-Path $env:ProgramData "WindowsMaintenanceTool"
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+    }
+
+    try {
+        $aclOutput = & icacls.exe $root /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls exit code $LASTEXITCODE. $($aclOutput -join ' ')"
+        }
+    }
+    catch {
+        throw "Could not secure Compact tracker storage: $($_.Exception.Message)"
+    }
+
+    $path = Join-Path $root "compact-tracker.json"
+    $legacyPath = Join-Path (Get-DataPath) "compact-tracker.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -and (Test-Path -LiteralPath $legacyPath -PathType Leaf)) {
+        try {
+            Copy-Item -LiteralPath $legacyPath -Destination $path -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $legacyPath -Force -ErrorAction SilentlyContinue
+            Write-GuiLog "[Compact] Migrated tracker data to secured ProgramData storage."
+        }
+        catch {
+            throw "Could not migrate the Compact tracker to secured storage: $($_.Exception.Message)"
+        }
+    }
+
+    return $path
 }
 
 function Get-WmtCompactTrackerData {
@@ -46740,7 +46771,7 @@ function Show-WmtCompactManager {
             </Grid>
         </Border>
 
-        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, then invoke compact.exe only when recompression is needed. Reparse points are skipped during analysis. The secured worker log is stored under ProgramData\WindowsMaintenanceTool."
+        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, then invoke compact.exe only when recompression is needed. Reparse points are skipped during analysis. Tracker state and the worker log are secured under ProgramData\WindowsMaintenanceTool."
                    Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
 
         <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
