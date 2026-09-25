@@ -3975,35 +3975,27 @@ catch {
     return
 }
 
-$script:WmtTaskBatchTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:WmtTaskBatchTimer.Interval = [TimeSpan]::FromMilliseconds(250)
-$script:WmtTaskBatchTimer.Add_Tick({
-        if (-not $script:WmtTaskBatchTimer -or -not $script:WmtTaskBatchAsync) { return }
-        if (-not $script:WmtTaskBatchAsync.IsCompleted) { return }
-        $script:WmtTaskBatchTimer.Stop()
+$script:WmtTaskBatchTimer = $null
+$script:WmtTaskBatchDoneMessage = $DoneMessage
+Register-WmtUiPollOperation -Name "ScheduledTaskBatch" `
+    -TestComplete { $script:WmtTaskBatchAsync -and $script:WmtTaskBatchAsync.IsCompleted } `
+    -OnComplete {
         try {
             $results = @($script:WmtTaskBatchPs.EndInvoke($script:WmtTaskBatchAsync))
-            $doneMessage = $script:WmtTaskBatchDoneMessage
             foreach ($line in $results) {
                 if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog $line.Substring(4) }
             }
-            Write-GuiLog $doneMessage
+            Write-GuiLog $script:WmtTaskBatchDoneMessage
         }
-        catch {
-            Write-GuiLog "[Scheduled Tasks] Task action failed: $($_.Exception.Message)"
-        }
+        catch { Write-GuiLog "[Scheduled Tasks] Task action failed: $($_.Exception.Message)" }
         finally {
             try { if ($script:WmtTaskBatchPs) { $script:WmtTaskBatchPs.Dispose() } } catch {}
             $script:WmtTaskBatchPs = $null
             $script:WmtTaskBatchAsync = $null
             $script:WmtTaskBatchDoneMessage = $null
-            try { if ($script:WmtTaskBatchTimer) { $script:WmtTaskBatchTimer.Stop() } } catch {}
-            $script:WmtTaskBatchTimer = $null
             Set-WmtBusyCursor
         }
-    })
-$script:WmtTaskBatchDoneMessage = $DoneMessage
-$script:WmtTaskBatchTimer.Start()
+    } | Out-Null
 }
 
 function Start-WmtScheduledTaskViewQuery {
@@ -4078,12 +4070,10 @@ catch {
     return
 }
 
-$script:WmtTaskViewTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:WmtTaskViewTimer.Interval = [TimeSpan]::FromMilliseconds(250)
-$script:WmtTaskViewTimer.Add_Tick({
-        if (-not $script:WmtTaskViewTimer -or -not $script:WmtTaskViewAsync) { return }
-        if (-not $script:WmtTaskViewAsync.IsCompleted) { return }
-        $script:WmtTaskViewTimer.Stop()
+$script:WmtTaskViewTimer = $null
+Register-WmtUiPollOperation -Name "ScheduledTaskView" `
+    -TestComplete { $script:WmtTaskViewAsync -and $script:WmtTaskViewAsync.IsCompleted } `
+    -OnComplete {
         try {
             $results = @($script:WmtTaskViewPs.EndInvoke($script:WmtTaskViewAsync))
             $rowObjects = @()
@@ -4104,20 +4094,15 @@ $script:WmtTaskViewTimer.Add_Tick({
             }
             Write-GuiLog "[Scheduled Tasks] View loaded $($rowObjects.Count) row(s) via background query."
         }
-        catch {
-            Write-GuiLog "[Scheduled Tasks] Background view result failed: $($_.Exception.Message)"
-        }
+        catch { Write-GuiLog "[Scheduled Tasks] Background view result failed: $($_.Exception.Message)" }
         finally {
             try { if ($script:WmtTaskViewPs) { $script:WmtTaskViewPs.Dispose() } } catch {}
             $script:WmtTaskViewPs = $null
             $script:WmtTaskViewAsync = $null
             $script:WmtTaskViewGrid = $null
             $script:WmtTaskViewStatus = $null
-            try { if ($script:WmtTaskViewTimer) { $script:WmtTaskViewTimer.Stop() } } catch {}
-            $script:WmtTaskViewTimer = $null
         }
-    })
-$script:WmtTaskViewTimer.Start()
+    } | Out-Null
 }
 
 function Get-WmtThemeHex {
@@ -7833,6 +7818,8 @@ return (($script:DnsRunspace -and $script:DnsAsyncResult -and -not $script:DnsAs
 }
 
 function Stop-WmtDnsRunspaces {
+try { Unregister-WmtUiPollOperation -Name "DnsAssignment" } catch {}
+try { Unregister-WmtUiPollOperation -Name "DohAction" } catch {}
 if ($script:DnsTimer) {
     try { $script:DnsTimer.Stop() } catch {}
     $script:DnsTimer = $null
@@ -7882,7 +7869,8 @@ $startMessage = if ($isReset) { "Resetting DNS..." } else { "Applying $labelText
 Write-GuiLog $startMessage
 Set-WmtDnsActionButtonsEnabled $false
 
-$script:DnsRunspace = [PowerShell]::Create().AddScript({
+$script:DnsRunspace = New-WmtPooledPowerShell
+$null = $script:DnsRunspace.AddScript({
         param($ServerAddresses, $OperationLabel, $ResetAddresses)
 
         $lines = New-Object System.Collections.Generic.List[string]
@@ -7900,16 +7888,7 @@ $script:DnsRunspace = [PowerShell]::Create().AddScript({
                 return "DNS resolver cache cleared."
             }
             catch {
-                # Inline OEM-aware capture (isolated runspace — no access to script functions)
-                $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-                $psi = [System.Diagnostics.ProcessStartInfo]::new()
-                $psi.FileName = "ipconfig"; $psi.Arguments = "/flushdns"
-                $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-                $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-                $psi.StandardOutputEncoding = $oem; $psi.StandardErrorEncoding = $oem
-                $p = [System.Diagnostics.Process]::Start($psi)
-                $txt = "$($p.StandardOutput.ReadToEnd())$($p.StandardError.ReadToEnd())".TrimEnd()
-                $p.WaitForExit()
+                $txt = Invoke-WmtCliText -FilePath (Join-Path $env:SystemRoot "System32\ipconfig.exe") -Arguments "/flushdns" -TimeoutMs 15000
                 if ($txt) { return $txt }
                 return "DNS resolver cache flush attempted."
             }
@@ -7963,16 +7942,7 @@ $script:DnsRunspace = [PowerShell]::Create().AddScript({
                     Add-DnsLine "DNS client re-registered with new server addresses."
                 }
                 catch {
-                    # Fallback for systems where the cmdlet is unavailable
-                    $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-                    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-                    $psi.FileName = "ipconfig"; $psi.Arguments = "/registerdns"
-                    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-                    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-                    $psi.StandardOutputEncoding = $oem; $psi.StandardErrorEncoding = $oem
-                    $p = [System.Diagnostics.Process]::Start($psi)
-                    $regResult = "$($p.StandardOutput.ReadToEnd())$($p.StandardError.ReadToEnd())".TrimEnd()
-                    $p.WaitForExit()
+                    $regResult = Invoke-WmtCliText -FilePath (Join-Path $env:SystemRoot "System32\ipconfig.exe") -Arguments "/registerdns" -TimeoutMs 20000
                     if ($regResult) { Add-DnsLine $regResult }
                 }
                 Add-DnsLine (Clear-DnsResolverCacheInRunspace)
@@ -8019,48 +7989,34 @@ catch {
 
 $dnsRunspace = $script:DnsRunspace
 $dnsAsync = $script:DnsAsyncResult
-$dnsTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:DnsTimer = $dnsTimer
-$dnsTimer.Interval = [TimeSpan]::FromMilliseconds(250)
-$dnsTimer.Add_Tick({
-        if (-not $dnsAsync -or -not $dnsAsync.IsCompleted) { return }
-
-        $dnsTimer.Stop()
+$script:DnsTimer = $null
+Register-WmtUiPollOperation -Name "DnsAssignment" `
+    -TestComplete { $dnsAsync -and $dnsAsync.IsCompleted } `
+    -OnComplete {
         $result = $null
         try {
             $raw = $dnsRunspace.EndInvoke($dnsAsync)
             if ($raw -is [System.Collections.ObjectModel.Collection[PSObject]]) { $result = $raw | Select-Object -Last 1 }
             else { $result = $raw }
-
             if ($result -and $result.Lines) {
                 $text = ($result.Lines | Out-String).Trim()
                 if ($text) { Write-GuiLog $text }
             }
-            elseif ($result -and $result.Success) {
-                Write-GuiLog "Done."
-            }
-            else {
-                Write-GuiLog "DNS operation finished with no output."
-            }
+            elseif ($result -and $result.Success) { Write-GuiLog "Done." }
+            else { Write-GuiLog "DNS operation finished with no output." }
         }
-        catch {
-            Write-GuiLog "DNS Error: $($_.Exception.Message)"
-        }
+        catch { Write-GuiLog "DNS Error: $($_.Exception.Message)" }
         finally {
             try { $dnsRunspace.Dispose() } catch {}
             if ([object]::ReferenceEquals($script:DnsRunspace, $dnsRunspace)) { $script:DnsRunspace = $null }
             if ([object]::ReferenceEquals($script:DnsAsyncResult, $dnsAsync)) { $script:DnsAsyncResult = $null }
-            if ([object]::ReferenceEquals($script:DnsTimer, $dnsTimer)) { $script:DnsTimer = $null }
             Set-WmtDnsActionButtonsEnabled $true
         }
-
         if ($completion) {
             try { & $completion $result }
             catch { Write-GuiLog "DNS completion action failed: $($_.Exception.Message)" }
         }
-    }.GetNewClosure())
-
-$dnsTimer.Start()
+    } | Out-Null
 return $true
 }
 
@@ -8378,7 +8334,8 @@ Write-GuiLog "$actionStr DoH templates..."
 Set-WmtDnsActionButtonsEnabled $false
 
 try {
-    $script:DohRunspace = [PowerShell]::Create().AddScript({
+    $script:DohRunspace = New-WmtPooledPowerShell
+        $null = $script:DohRunspace.AddScript({
             param($List, $IsEnable)
 
             $cnt = 0
@@ -8433,29 +8390,17 @@ if (-not $dohRunspace -or -not $dohAsync) {
 }
 
 if ($script:DohTimer) { $script:DohTimer.Stop() }
-$dohTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:DohTimer = $dohTimer
-$dohTimer.Interval = [TimeSpan]::FromMilliseconds(250)
-
-$dohTimer.Add_Tick({
-        if (-not $dohAsync -or -not $dohAsync.IsCompleted) { return }
-
-        $dohTimer.Stop()
+$script:DohTimer = $null
+Register-WmtUiPollOperation -Name "DohAction" `
+    -TestComplete { $dohAsync -and $dohAsync.IsCompleted } `
+    -OnComplete {
         try {
             $rawResults = $dohRunspace.EndInvoke($dohAsync)
             $res = $rawResults | Where-Object { $_ -is [PSCustomObject] -and $_.Psobject.Properties.Match('Count') } | Select-Object -Last 1
-
             if ($res -and $res.Success) {
                 $c = $res.Count
-                if ($isEnableForTimer) {
-                    $finMsg = "Registered $c DoH templates."
-                }
-                else {
-                    $finMsg = "Removed or verified $c DoH templates."
-                }
-
+                $finMsg = if ($isEnableForTimer) { "Registered $c DoH templates." } else { "Removed or verified $c DoH templates." }
                 Write-GuiLog "Done. $finMsg"
-
                 if ($c -gt 0) {
                     [System.Windows.MessageBox]::Show($finMsg, "DoH Manager", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
                 }
@@ -8465,22 +8410,14 @@ $dohTimer.Add_Tick({
                 Write-GuiLog "DoH operation failed or no changes were made.$failedText"
             }
         }
-        catch {
-            Write-GuiLog "DoH Error: $($_.Exception.Message)"
-        }
+        catch { Write-GuiLog "DoH Error: $($_.Exception.Message)" }
         finally {
-            try {
-                $dohRunspace.Dispose()
-            }
-            catch {}
+            try { $dohRunspace.Dispose() } catch {}
             if ([object]::ReferenceEquals($script:DohRunspace, $dohRunspace)) { $script:DohRunspace = $null }
             if ([object]::ReferenceEquals($script:DohAsyncResult, $dohAsync)) { $script:DohAsyncResult = $null }
-            if ([object]::ReferenceEquals($script:DohTimer, $dohTimer)) { $script:DohTimer = $null }
             Set-WmtDnsActionButtonsEnabled $true
         }
-    }.GetNewClosure())
-
-$dohTimer.Start()
+    } | Out-Null
 }
 
 # Redirect existing function calls to the new Async handler
@@ -11051,7 +10988,8 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
             if ($pbEventLogProgress) { $pbEventLogProgress.Value = 0 }
             if ($lblEventLogStatus) { $lblEventLogStatus.Text = "Clearing event logs..." }
 
-            $script:EventLogRunspace = [PowerShell]::Create().AddScript({
+            $script:EventLogRunspace = New-WmtPooledPowerShell
+            $null = $script:EventLogRunspace.AddScript({
                     $logs = wevtutil el
                     $cleared = 0
                     foreach ($log in $logs) {
@@ -11063,36 +11001,31 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
             $script:EventLogAsyncResult = $script:EventLogRunspace.BeginInvoke()
 
             $script:marqueeVal = 0
-            $script:EventLogTimer = New-Object System.Windows.Threading.DispatcherTimer
-            $script:EventLogTimer.Interval = [TimeSpan]::FromMilliseconds(250)
-            $script:EventLogTimer.Add_Tick({
-                    if ($script:EventLogAsyncResult.IsCompleted) {
-                        $script:EventLogTimer.Stop()
-
-                        if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Collapsed }
-                        $btnEventLogs.IsEnabled = $true
-                        $btnEventLogs.Content = "Clear Event Logs"
-
-                        try {
-                            $clearedCount = $script:EventLogRunspace.EndInvoke($script:EventLogAsyncResult)
-                            if ($clearedCount -is [System.Collections.ObjectModel.Collection[PSObject]] -and $clearedCount.Count -gt 0) {
-                                $clearedCount = $clearedCount[-1]
-                            }
-                            $successMessage = "Successfully processed $clearedCount Event Logs."
-                            Write-GuiLog "[Event Logs] $successMessage"
-                            Show-WmtMessageBox -Owner $dialog -Message $successMessage -Title "Success" -Image Information | Out-Null
-                        }
-                        catch {
-                            Show-WmtMessageBox -Owner $dialog -Message "Error: $($_.Exception.Message)" -Title "Error" -Image Error | Out-Null
-                        }
-                        $script:EventLogRunspace.Dispose()
+            $script:EventLogTimer = $null
+            Register-WmtUiPollOperation -Name "EventLogClear" `
+                -TestComplete { $script:EventLogAsyncResult -and $script:EventLogAsyncResult.IsCompleted } `
+                -OnTick {
+                    $script:marqueeVal = ($script:marqueeVal + 3) % 110
+                    if ($pbEventLogProgress) { $pbEventLogProgress.Value = [Math]::Min($script:marqueeVal, 100) }
+                } `
+                -OnComplete {
+                    if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Collapsed }
+                    $btnEventLogs.IsEnabled = $true
+                    $btnEventLogs.Content = "Clear Event Logs"
+                    try {
+                        $clearedCount = $script:EventLogRunspace.EndInvoke($script:EventLogAsyncResult)
+                        if ($clearedCount -is [System.Collections.ObjectModel.Collection[PSObject]] -and $clearedCount.Count -gt 0) { $clearedCount = $clearedCount[-1] }
+                        $successMessage = "Successfully processed $clearedCount Event Logs."
+                        Write-GuiLog "[Event Logs] $successMessage"
+                        Show-WmtMessageBox -Owner $dialog -Message $successMessage -Title "Success" -Image Information | Out-Null
                     }
-                    else {
-                        $script:marqueeVal = ($script:marqueeVal + 3) % 110
-                        if ($pbEventLogProgress) { $pbEventLogProgress.Value = [Math]::Min($script:marqueeVal, 100) }
+                    catch { Show-WmtMessageBox -Owner $dialog -Message "Error: $($_.Exception.Message)" -Title "Error" -Image Error | Out-Null }
+                    finally {
+                        try { if ($script:EventLogRunspace) { $script:EventLogRunspace.Dispose() } } catch {}
+                        $script:EventLogRunspace = $null
+                        $script:EventLogAsyncResult = $null
                     }
-                })
-            $script:EventLogTimer.Start()
+                } | Out-Null
         }
     }) }
 
