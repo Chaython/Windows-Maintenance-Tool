@@ -46013,6 +46013,8 @@ function Start-WmtCompactConsole {
 
     $targetBytes = [System.Text.Encoding]::Unicode.GetBytes($target)
     $targetBase64 = [Convert]::ToBase64String($targetBytes)
+    $trackerPath = Get-WmtCompactTrackerPath
+    $trackerPathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($trackerPath))
 
     $consoleScript = @'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -46020,6 +46022,7 @@ $ErrorActionPreference = "Continue"
 $ScriptToDelete = $PSCommandPath
 
 $Target = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__TARGET_BASE64__"))
+$TrackerPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__TRACKER_BASE64__"))
 $Mode = "__MODE__"
 $Algorithm = "__ALGORITHM__"
 $compactExe = Join-Path $env:SystemRoot "System32\compact.exe"
@@ -46068,6 +46071,49 @@ finally {
     if ($locationPushed) { try { Pop-Location } catch {} }
 }
 
+function Set-TrackerValue {
+    param($Entry, [string]$Name, $Value)
+    if ($Entry.PSObject.Properties[$Name]) { $Entry.$Name = $Value }
+    else { $Entry | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force }
+}
+
+function Update-TrackerResult {
+    if (-not (Test-Path -LiteralPath $TrackerPath -PathType Leaf)) { return }
+    try {
+        $tracker = Get-Content -LiteralPath $TrackerPath -Raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not $tracker.PSObject.Properties["Entries"]) { return }
+        $entry = @($tracker.Entries | Where-Object { [string]$_.Path -ieq $Target } | Select-Object -First 1)
+        if ($entry.Count -eq 0) { return }
+
+        $item = $entry[0]
+        Set-TrackerValue $item "LastExitCode" ([int]$exitCode)
+        if ($exitCode -eq 0) {
+            if ($Mode -eq "Compress") {
+                Set-TrackerValue $item "State" "Compressed"
+                Set-TrackerValue $item "LastCompressedUtc" ([DateTime]::UtcNow.ToString("o"))
+                Set-TrackerValue $item "LastResult" "Manual compression completed."
+            }
+            else {
+                Set-TrackerValue $item "State" "Decompressed"
+                Set-TrackerValue $item "AutoRecompress" $false
+                Set-TrackerValue $item "LastResult" "Manual decompression completed."
+            }
+        }
+        else {
+            Set-TrackerValue $item "State" "Error"
+            Set-TrackerValue $item "LastResult" ("Manual " + $Mode.ToLowerInvariant() + " exit code " + $exitCode + ".")
+        }
+
+        $tempTracker = "$TrackerPath.console.tmp"
+        $trackerJson = $tracker | ConvertTo-Json -Depth 6
+        [System.IO.File]::WriteAllText($tempTracker, $trackerJson, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tempTracker -Destination $TrackerPath -Force
+    }
+    catch {}
+}
+
+Update-TrackerResult
+
 Write-Host ""
 if ($exitCode -eq 0) {
     Write-Host "Compact operation completed." -ForegroundColor Green
@@ -46080,7 +46126,7 @@ Write-Host ""
 try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyContinue } catch {}
 '@
 
-    $consoleScript = $consoleScript.Replace("__TARGET_BASE64__", $targetBase64).Replace("__MODE__", $Mode).Replace("__ALGORITHM__", $Algorithm)
+    $consoleScript = $consoleScript.Replace("__TARGET_BASE64__", $targetBase64).Replace("__TRACKER_BASE64__", $trackerPathBase64).Replace("__MODE__", $Mode).Replace("__ALGORITHM__", $Algorithm)
     $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ("WMT_Compact_{0}.ps1" -f (Get-Random))
 
     try {
@@ -46095,10 +46141,10 @@ try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyConti
         [void][System.Diagnostics.Process]::Start($psi)
 
         if ($Mode -eq "Compress") {
-            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressed" -TouchCompressed -LastResult "Manual compression started.")
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressing" -LastResult "Manual compression started.")
         }
         else {
-            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Decompressed" -AutoRecompress:$false -LastResult "Manual decompression started.")
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Decompressing" -AutoRecompress:$false -LastResult "Manual decompression started.")
         }
 
         Write-GuiLog "[Compact] Started $Mode on '$target' using $Algorithm."
