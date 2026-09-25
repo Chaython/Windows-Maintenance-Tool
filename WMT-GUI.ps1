@@ -7119,6 +7119,55 @@ if ($script:WmtSingleInstanceActivationTimer) {
 }
 }
 
+function Show-WmtTrayPage {
+param(
+    [Parameter(Mandatory = $true)][string]$ButtonName,
+    [string]$PageName = "page"
+)
+
+try {
+    if (-not $window) { return }
+    $pageAction = {
+        try {
+            Show-WmtMainWindowFromTray
+            $tabButton = Get-Ctrl $ButtonName
+            if ($tabButton -and $tabButton.IsEnabled) {
+                $tabButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+            }
+            else {
+                Write-GuiLog "Tray shortcut could not open $PageName because its navigation button is unavailable."
+            }
+        }
+        catch {
+            Write-GuiLog "Tray shortcut failed to open \${PageName}: $($_.Exception.Message)"
+        }
+    }.GetNewClosure()
+
+    if ($window.Dispatcher.CheckAccess()) { & $pageAction }
+    else { [void]$window.Dispatcher.BeginInvoke([Action]$pageAction) }
+}
+catch {}
+}
+
+function Invoke-WmtTrayThemeToggle {
+try {
+    if (-not $window) { return }
+    $themeAction = [Action] {
+        try {
+            $nextTheme = if ($script:CurrentTheme -eq "dark") { "light" } else { "dark" }
+            Set-WmtThemePreference -Theme $nextTheme
+        }
+        catch {
+            Write-GuiLog "Tray theme toggle failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($window.Dispatcher.CheckAccess()) { $themeAction.Invoke() }
+    else { [void]$window.Dispatcher.BeginInvoke($themeAction) }
+}
+catch {}
+}
+
 function Invoke-WmtTrayUpdateScan {
 try {
     if (-not $window) { return }
@@ -7221,11 +7270,134 @@ catch {}
 return $null
 }
 
+function Set-WmtTrayMenuTheme {
+param($Menu = $script:WmtTrayMenu)
+if (-not $Menu) { return }
+
+try {
+    $background = [System.Drawing.ColorTranslator]::FromHtml((Get-WmtThemeHex -Key "BgPanel" -Fallback "#161B22"))
+    $hover = [System.Drawing.ColorTranslator]::FromHtml((Get-WmtThemeHex -Key "BgHover" -Fallback "#30363D"))
+    $border = [System.Drawing.ColorTranslator]::FromHtml((Get-WmtThemeHex -Key "BorderBrush" -Fallback "#30363D"))
+    $foreground = [System.Drawing.ColorTranslator]::FromHtml((Get-WmtThemeHex -Key "TextPrimary" -Fallback "#E6EDF3"))
+    $muted = [System.Drawing.ColorTranslator]::FromHtml((Get-WmtThemeHex -Key "TextMuted" -Fallback "#6E7681"))
+
+    if (-not $Menu.Tag -or -not $Menu.Tag.PSObject.Properties["Background"]) {
+        $Menu.Tag = [PSCustomObject]@{
+            Background = $background
+            Hover      = $hover
+            Border     = $border
+            Foreground = $foreground
+            Muted      = $muted
+        }
+    }
+    else {
+        $Menu.Tag.Background = $background
+        $Menu.Tag.Hover = $hover
+        $Menu.Tag.Border = $border
+        $Menu.Tag.Foreground = $foreground
+        $Menu.Tag.Muted = $muted
+    }
+
+    $Menu.BackColor = $background
+    $Menu.ForeColor = $foreground
+    $Menu.ShowImageMargin = $false
+    $Menu.ShowCheckMargin = $false
+
+    foreach ($item in @($Menu.Items)) {
+        if (-not $item) { continue }
+        $item.BackColor = $background
+        $item.ForeColor = $foreground
+    }
+
+    $Menu.Invalidate()
+}
+catch {
+    try { Write-GuiLog "Tray menu theme update failed: $($_.Exception.Message)" } catch {}
+}
+}
+
+function New-WmtTrayMenuRenderer {
+param($Menu)
+
+$renderer = New-Object System.Windows.Forms.ToolStripProfessionalRenderer
+$renderer.RoundedEdges = $false
+
+$renderer.Add_RenderToolStripBackground({
+        param($sender, $e)
+        try {
+            $state = $e.ToolStrip.Tag
+            if (-not $state) { return }
+            $brush = [System.Drawing.SolidBrush]::new($state.Background)
+            try { $e.Graphics.FillRectangle($brush, $e.AffectedBounds) } finally { $brush.Dispose() }
+        }
+        catch {}
+    }.GetNewClosure())
+
+$renderer.Add_RenderMenuItemBackground({
+        param($sender, $e)
+        try {
+            $state = $e.Item.Owner.Tag
+            if (-not $state) { return }
+            $fill = if ($e.Item.Selected) { $state.Hover } else { $state.Background }
+            $brush = [System.Drawing.SolidBrush]::new($fill)
+            try { $e.Graphics.FillRectangle($brush, [System.Drawing.Rectangle]::new(0, 0, $e.Item.Width, $e.Item.Height)) } finally { $brush.Dispose() }
+        }
+        catch {}
+    }.GetNewClosure())
+
+$renderer.Add_RenderItemText({
+        param($sender, $e)
+        try {
+            $state = $e.Item.Owner.Tag
+            if ($state) {
+                $e.TextColor = if ($e.Item.Enabled) { $state.Foreground } else { $state.Muted }
+            }
+        }
+        catch {}
+    }.GetNewClosure())
+
+$renderer.Add_RenderSeparator({
+        param($sender, $e)
+        try {
+            $state = $e.Item.Owner.Tag
+            if (-not $state) { return }
+            $pen = [System.Drawing.Pen]::new($state.Border)
+            try {
+                $y = [Math]::Floor($e.Item.Height / 2)
+                $e.Graphics.DrawLine($pen, 8, $y, [Math]::Max(8, $e.Item.Width - 8), $y)
+            }
+            finally { $pen.Dispose() }
+        }
+        catch {}
+    }.GetNewClosure())
+
+$renderer.Add_RenderToolStripBorder({
+        param($sender, $e)
+        try {
+            $state = $e.ToolStrip.Tag
+            if (-not $state) { return }
+            $pen = [System.Drawing.Pen]::new($state.Border)
+            try {
+                $rect = [System.Drawing.Rectangle]::new(0, 0, [Math]::Max(0, $e.ToolStrip.Width - 1), [Math]::Max(0, $e.ToolStrip.Height - 1))
+                $e.Graphics.DrawRectangle($pen, $rect)
+            }
+            finally { $pen.Dispose() }
+        }
+        catch {}
+    }.GetNewClosure())
+
+return $renderer
+}
+
 function Initialize-WmtTrayIcon {
 param($Window)
 
 if ($script:WmtTrayIcon) {
-    try { $script:WmtTrayIcon.Visible = $true } catch {}
+    try {
+        Set-WmtTrayMenuTheme -Menu $script:WmtTrayMenu
+        $script:WmtTrayIcon.Visible = $true
+    }
+    catch {}
     return $true
 }
 
@@ -7235,13 +7407,41 @@ try {
     Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    $menu.ShowImageMargin = $false
+    $menu.ShowCheckMargin = $false
+
     $openItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open WMT"
+    $updatesItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open Updates"
     $scanItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Scan updates now"
+    $healthItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open System Health"
+    $cleanupItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open Cleanup"
+    $driversItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open Drivers"
+    $utilsItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open Utilities"
+    $themeItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Toggle WMT theme"
     $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Exit WMT"
+
     [void]$menu.Items.Add($openItem)
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$menu.Items.Add($updatesItem)
     [void]$menu.Items.Add($scanItem)
+    [void]$menu.Items.Add($healthItem)
+    [void]$menu.Items.Add($cleanupItem)
+    [void]$menu.Items.Add($driversItem)
+    [void]$menu.Items.Add($utilsItem)
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$menu.Items.Add($themeItem)
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void]$menu.Items.Add($exitItem)
+
+    $menu.Renderer = New-WmtTrayMenuRenderer -Menu $menu
+    Set-WmtTrayMenuTheme -Menu $menu
+    $menu.Add_Opening({
+            try {
+                $themeItem.Text = if ($script:CurrentTheme -eq "dark") { "Switch to light theme" } else { "Switch to dark theme" }
+                Set-WmtTrayMenuTheme -Menu $menu
+            }
+            catch {}
+        }.GetNewClosure())
 
     $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
     $trayIconImage = Get-WmtTrayIconImage
@@ -7251,7 +7451,13 @@ try {
     $notifyIcon.Visible = $true
 
     $openItem.Add_Click({ Show-WmtMainWindowFromTray }.GetNewClosure())
+    $updatesItem.Add_Click({ Show-WmtTrayPage -ButtonName "btnTabUpdates" -PageName "Updates" }.GetNewClosure())
     $scanItem.Add_Click({ Invoke-WmtTrayUpdateScan }.GetNewClosure())
+    $healthItem.Add_Click({ Show-WmtTrayPage -ButtonName "btnTabHealth" -PageName "System Health" }.GetNewClosure())
+    $cleanupItem.Add_Click({ Show-WmtTrayPage -ButtonName "btnTabCleanup" -PageName "Cleanup" }.GetNewClosure())
+    $driversItem.Add_Click({ Show-WmtTrayPage -ButtonName "btnTabDrivers" -PageName "Drivers" }.GetNewClosure())
+    $utilsItem.Add_Click({ Show-WmtTrayPage -ButtonName "btnTabUtils" -PageName "Utilities" }.GetNewClosure())
+    $themeItem.Add_Click({ Invoke-WmtTrayThemeToggle }.GetNewClosure())
     $exitItem.Add_Click({
             Invoke-WmtFinalExitFromTray -Window $Window
         }.GetNewClosure())
@@ -7288,7 +7494,7 @@ try {
     if ($script:WmtTrayHideNotificationShown) { return }
     $script:WmtTrayHideNotificationShown = $true
     $script:WmtTrayIcon.BalloonTipTitle = "WMT is still running"
-    $script:WmtTrayIcon.BalloonTipText = "Background update scans and notifications will continue from the system tray. Right-click the tray icon to exit."
+    $script:WmtTrayIcon.BalloonTipText = "Background update scans and notifications will continue from the system tray. Right-click the tray icon for shortcuts, theme controls, or Exit."
     $script:WmtTrayIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
     $script:WmtTrayIcon.ShowBalloonTip(7000)
 }
@@ -28654,6 +28860,7 @@ if ($TabButtons) {
 }
 
 $script:CurrentTheme = $Theme
+if ($script:WmtTrayMenu) { Set-WmtTrayMenuTheme -Menu $script:WmtTrayMenu }
 }
 
 function Set-WmtQuickFindForeground {
