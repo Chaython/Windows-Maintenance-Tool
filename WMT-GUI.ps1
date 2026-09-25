@@ -28463,7 +28463,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
 
                 <!-- Actions Card -->
                 <Border Grid.Row="2" Style="{StaticResource CardStyle}" Margin="0,12,0,0">
-                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <WrapPanel HorizontalAlignment="Left">
                         <Button Name="btnFwRefresh" Content="Reload" Style="{StaticResource ActionBtn}"/>
                         <Button Name="btnFwAdd" Content="Add Rule" Style="{StaticResource PositiveBtn}"/>
                         <Button Name="btnFwEdit" Content="Edit" Style="{StaticResource ActionBtn}"/>
@@ -28474,7 +28474,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <Button Name="btnFwImport" Content="Import" Style="{StaticResource ActionBtn}"/>
                         <Button Name="btnFwDefaults" Content="Defaults" Style="{StaticResource WarningBtn}"/>
                         <Button Name="btnFwPurge" Content="Delete All" Style="{StaticResource DestructiveBtn}"/>
-                    </StackPanel>
+                    </WrapPanel>
                 </Border>
             </Grid>
 
