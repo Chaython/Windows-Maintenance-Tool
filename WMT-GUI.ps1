@@ -7928,15 +7928,16 @@ Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network R
 }
 
 function Start-RegClean {
-Invoke-UiCommand {
-    $bkDir = Join-Path (Get-DataPath) "RegistryBackups"
+$bkDir = Join-Path (Get-DataPath) "RegistryBackups"
+Invoke-WmtUiBackgroundCommand -Name "RegistryObsoleteClean" -Msg "Cleaning Registry..." -Sb {
+    param($bkDir)
     if (!(Test-Path $bkDir)) { New-Item -Path $bkDir -ItemType Directory | Out-Null }
     $bkFile = "$bkDir\Backup_$(Get-Date -F 'yyyyMMdd_HHmm').reg"
     reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" $bkFile /y | Out-Null
     $keys = Get-ChildItem HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall | Where-Object { $_.PSChildName -match 'IE40|IE4Data|DirectDrawEx|DXM_Runtime|SchedulingAgent' }
     if ($keys) { foreach ($k in $keys) { Remove-Item $k.PSPath -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Removed: $($k.PSChildName)" } } else { Write-Output "No obsolete keys found." }
     Write-Output "Backup saved to: $bkFile"
-} "Cleaning Registry..."
+} -ArgumentList $bkDir | Out-Null
 }
 
 function Start-XboxClean {
@@ -8725,10 +8726,11 @@ function Disable-AllDoh { Start-DohJob -List $script:DohTargets -IsEnable $false
 
 # --- Hosts Adblock ---
 function Invoke-HostsUpdate {
-Invoke-UiCommand {
+$hostsPath = "$env:windir\System32\drivers\etc\hosts"
+$backupDir = Join-Path (Get-DataPath) "hosts_backups"
+Invoke-WmtUiBackgroundCommand -Name "HostsUpdate" -Msg "Updating hosts file..." -Sb {
+    param($hostsPath, $backupDir)
     # 1. Find PATHS
-    $hostsPath = "$env:windir\System32\drivers\etc\hosts"
-    $backupDir = Join-Path (Get-DataPath) "hosts_backups"
     if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
 
     # 2. DOWNLOAD HOSTS FILE
@@ -8744,7 +8746,7 @@ Invoke-UiCommand {
             $wc.Proxy = $null 
             $wc.Encoding = [System.Text.Encoding]::UTF8
 
-            Write-GuiLog "Downloading from $mirror..."
+            Write-Output "Downloading from $mirror..."
             $tempContent = $wc.DownloadString($mirror)
 
             # SAFETY CHECK: Ensure file is valid (> 1KB)
@@ -8763,7 +8765,7 @@ Invoke-UiCommand {
     }
 
     if (-not $adBlockContent) { 
-        Write-GuiLog "ERROR: Download failed or file was empty. Aborting."
+        Write-Output "ERROR: Download failed or file was empty. Aborting."
         return 
     }
 
@@ -8818,15 +8820,15 @@ Invoke-UiCommand {
         Write-Output "Hosts file updated and DNS flushed successfully."
     }
     catch {
-        Write-GuiLog "CRITICAL ERROR: $($_.Exception.Message)"
+        Write-Output "CRITICAL ERROR: $($_.Exception.Message)"
         # Restore backup if write failed
-        $latestBackup = @(Get-WmtEnumeratedFiles -Path $backupDir | ForEach-Object { [System.IO.FileInfo]::new($_) } | Sort-Object CreationTime -Descending | Select-Object -First 1)
+        $latestBackup = @(Get-ChildItem -LiteralPath $backupDir -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName | ForEach-Object { [System.IO.FileInfo]::new($_) } | Sort-Object CreationTime -Descending | Select-Object -First 1)
         if ($latestBackup) {
             Copy-Item $latestBackup.FullName $hostsPath -Force
-            Write-GuiLog "Restored backup due to failure."
+            Write-Output "Restored backup due to failure."
         }
     }
-} "Updating hosts file..."
+} -ArgumentList $hostsPath, $backupDir | Out-Null
 }
 
 # --- HOSTS EDITOR ---
@@ -21058,8 +21060,9 @@ if ($Action -eq "DeepClean") {
 }
 
 function Invoke-SSDTrim {
-Invoke-UiCommand {
-    $log = Join-Path (Get-DataPath) ("SSD_OPTIMIZE_{0}.log" -f (Get-Date -Format "yyyy-MM-dd_HHmmss"))
+$log = Join-Path (Get-DataPath) ("SSD_OPTIMIZE_{0}.log" -f (Get-Date -Format "yyyy-MM-dd_HHmmss"))
+Invoke-WmtUiBackgroundCommand -Name "SSDTrim" -Msg "Running SSD Trim/ReTrim..." -Sb {
+    param($log)
     $out = @("SSD Optimize Log - $(Get-Date)")
 
     $volumes = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
@@ -21130,7 +21133,7 @@ Invoke-UiCommand {
     else {
         Write-Output "SSD optimization complete. Log: $log"
     }
-} "Running SSD Trim/ReTrim..."
+} -ArgumentList $log | Out-Null
 }
 
 function Start-SSDTrimConsole {
@@ -23446,11 +23449,11 @@ switch ($Mode) {
 function Invoke-MASActivation {
 $masInput = Show-WmtInputDialog -Title "MAS Activation Confirmation" -Prompt "Type YES, I UNDERSTAND to download and run MAS from massgrave.dev"
 if ($masInput -ne "YES, I UNDERSTAND") { return }
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "MASActivation" -Msg "Running MAS activation..." -Sb {
     $scriptContent = Invoke-RestMethod -Uri "https://get.activated.win"
     Invoke-Expression -Command $scriptContent
     Write-Output "MAS script executed."
-} "Running MAS activation..."
+} | Out-Null
 }
 
 function Show-ContextMenuBuilder {
@@ -32248,12 +32251,12 @@ $btnPowerUserShowDevices.Add_Click({
 }
 
 Register-WmtTweakButton "btnPowerUserRestartExplorer" {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "RestartExplorer" -Msg "Restarting Explorer..." -Sb {
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
     Start-Process explorer
-    Write-GuiLog "Explorer restarted."
-} "Restarting Explorer..."
+    Write-Output "Explorer restarted."
+} | Out-Null
 }
 
 Register-WmtTweakButton "btnPowerUserUEFI" {
@@ -45697,17 +45700,19 @@ if (-not (Test-Path $env:OneDrive -ErrorAction SilentlyContinue)) {
 }
 
 $btnCleanupOneDrive.Add_Click({
-        Invoke-UiCommand {
-            if (Test-Path $env:OneDrive) {
-                Write-GuiLog "Freeing up OneDrive space..."
+        $oneDrivePath = [string]$env:OneDrive
+        Invoke-WmtUiBackgroundCommand -Name "OneDriveFreeSpace" -Msg "Freeing OneDrive Space..." -Sb {
+            param($oneDrivePath)
+            if (Test-Path -LiteralPath $oneDrivePath) {
+                Write-Output "Freeing up OneDrive space..."
                 # +U means Unpinned (Online Only), -P removes the Always Keep on this device flag
-                Start-Process -FilePath "attrib.exe" -ArgumentList "+U -P /s /d `"$env:OneDrive\*.*`"" -Wait -WindowStyle Hidden
-                Write-GuiLog "OneDrive files have been set to Online Only."
+                Start-Process -FilePath "attrib.exe" -ArgumentList "+U -P /s /d `"$oneDrivePath\*.*`"" -Wait -WindowStyle Hidden
+                Write-Output "OneDrive files have been set to Online Only."
             }
             else {
-                Write-GuiLog "OneDrive folder not found on this system."
+                Write-Output "OneDrive folder not found on this system."
             }
-        } "Freeing OneDrive Space..."
+        } -ArgumentList $oneDrivePath | Out-Null
     })
 }
 if ($btnCleanXbox) { $btnCleanXbox.Add_Click({
@@ -47653,37 +47658,37 @@ if ($btnNavDownloads) { $btnNavDownloads.Add_Click({ Show-DownloadStats }) }
 
 # --- PERFORMANCE TWEAKS WITH REVERT ---
 $btnPerfServicesManual.Add_Click({
-    Invoke-UiCommand {
-        Write-GuiLog "Optimizing services to Manual..."
+    Invoke-WmtUiBackgroundCommand -Name "OptimizeServicesManual" -Msg "Optimizing services..." -Sb {
+        Write-Output "Optimizing services to Manual..."
         $services = @('DiagTrack', 'dmwappushservice', 'MapsBroker', 'lfsvc', 'SharedAccess', 'WbioSrvc', 'WMPNetworkSvc', 'icssvc', 'WpnService', 'PcaSvc', 'SessionEnv', 'TermService', 'UmRdpService', 'RemoteRegistry', 'RemoteAccess', 'shpamsvc', 'TapiSrv', 'TabletInputService', 'lmhosts', 'SNMPTrap', 'WebClient', 'WerSvc', 'Wecsvc', 'SDRSVC', 'fdPHost', 'FDResPub', 'HomeGroupListener', 'HomeGroupProvider', 'upnphost', 'SSDPSRV', 'swprv', 'smphost', 'SysMain', 'TrkWks', 'WMPNetworkSvc', 'WMPNetworkSvc', 'iphlpsvc', 'MSiSCSI', 'WSearch', 'WinRM', 'XblAuthManager', 'XblGameSave', 'XboxNetApiSvc')
         foreach ($svc in $services) {
             try {
                 $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
                 if ($service -and $service.StartType -eq 'Automatic') {
                     Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
-                    Write-GuiLog "Set $svc to Manual"
+                    Write-Output "Set $svc to Manual"
                 }
             }
             catch {}
         }
-        Write-GuiLog "Services optimization complete!"
-    } "Optimizing services..."
+        Write-Output "Services optimization complete!"
+    } | Out-Null
     # Deferred to ContentRendered: Update-TweakButtonStates
 })
 
 $btnPerfServicesRevert.Add_Click({
-    Invoke-UiCommand {
-        Write-GuiLog "Reverting services to default..."
+    Invoke-WmtUiBackgroundCommand -Name "RestoreServicesDefault" -Msg "Reverting services..." -Sb {
+        Write-Output "Reverting services to default..."
         $services = @('DiagTrack', 'dmwappushservice', 'MapsBroker', 'WpnService', 'PcaSvc', 'WerSvc', 'SysMain', 'WSearch', 'XblAuthManager', 'XblGameSave', 'XboxNetApiSvc', 'iphlpsvc')
         foreach ($svc in $services) {
             try {
                 Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
-                Write-GuiLog "Set $svc to Automatic"
+                Write-Output "Set $svc to Automatic"
             }
             catch {}
         }
-        Write-GuiLog "Services restored to default!"
-    } "Reverting services..."
+        Write-Output "Services restored to default!"
+    } | Out-Null
     if ($btnToggleSuperfetch) { $sm = Get-Service "SysMain" -EA Ignore; if ($sm) { Update-WmtTweakToggle $btnToggleSuperfetch ($sm.StartType -ne 'Disabled') "Enable Superfetch" "Disable Superfetch" } }
 })
 
@@ -47693,10 +47698,10 @@ $btnToggleHibernate.Add_Click({
         Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
         $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0)
         if ($h -eq 1) {
-            Invoke-UiCommand { powercfg /hibernate off; Write-GuiLog "Hibernation disabled. Disk space freed." } "Disabling hibernation..."
+            Invoke-WmtUiBackgroundCommand -Name "DisableHibernate" -Msg "Disabling hibernation..." -Sb { powercfg /hibernate off | Out-Null; Write-Output "Hibernation disabled. Disk space freed." } | Out-Null
         }
         else {
-            Invoke-UiCommand { powercfg /hibernate on; Write-GuiLog "Hibernation enabled." } "Enabling hibernation..."
+            Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb { powercfg /hibernate on | Out-Null; Write-Output "Hibernation enabled." } | Out-Null
         }
         Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Enable Hibernation" "Disable Hibernation"
     })
@@ -47706,28 +47711,28 @@ if ($btnToggleSuperfetch) { $btnToggleSuperfetch.Add_Click({
     $svc = Get-Service "SysMain" -ErrorAction SilentlyContinue
     $wasDisabled = ($svc -and $svc.StartType -eq "Disabled")
     if ($wasDisabled) {
-        Invoke-UiCommand {
+        Invoke-WmtUiBackgroundCommand -Name "EnableSysMain" -Msg "Enabling Superfetch..." -Sb {
             Set-Service -Name SysMain -StartupType Automatic
             Start-Service -Name SysMain -ErrorAction SilentlyContinue
-            Write-GuiLog "Superfetch/SysMain enabled."
-        } "Enabling Superfetch..."
+            Write-Output "Superfetch/SysMain enabled."
+        } | Out-Null
     }
     else {
-        Invoke-UiCommand {
+        Invoke-WmtUiBackgroundCommand -Name "DisableSysMain" -Msg "Disabling Superfetch..." -Sb {
             Stop-Service -Name SysMain -Force -ErrorAction SilentlyContinue
             Set-Service -Name SysMain -StartupType Disabled
-            Write-GuiLog "Superfetch/SysMain disabled."
-        } "Disabling Superfetch..."
+            Write-Output "Superfetch/SysMain disabled."
+        } | Out-Null
     }
     Update-WmtTweakToggle $btnToggleSuperfetch (-not $wasDisabled) "Enable Superfetch" "Disable Superfetch"
 }) }
 
 if ($btnPerfUltimatePower) { $btnPerfUltimatePower.Add_Click({
-    Invoke-UiCommand {
-        powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61
-        powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61
-        Write-GuiLog "Ultimate Performance power plan enabled."
-    } "Enabling Ultimate Performance..."
+    Invoke-WmtUiBackgroundCommand -Name "UltimatePerformancePowerPlan" -Msg "Enabling Ultimate Performance..." -Sb {
+        powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
+        powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
+        Write-Output "Ultimate Performance power plan enabled."
+    } | Out-Null
     Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power"); $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0); if ($btnToggleHibernate) { Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Enable Hibernation" "Disable Hibernation" }
 }) }
 
@@ -48032,34 +48037,34 @@ if ($btnTasksView) { $btnTasksView.Add_Click({
 
 # --- WINDOWS UPDATE PRESETS ---
 if ($btnWUDefault) { $btnWUDefault.Add_Click({
-    Invoke-UiCommand {
-        Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate"
-        Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates"
-        Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferQualityUpdates"
+    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate"
+    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates"
+    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferQualityUpdates"
+    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDefault" -Msg "Applying default Windows Update settings..." -Sb {
         Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
         Start-Service -Name wuauserv -ErrorAction SilentlyContinue
-        Write-GuiLog "Windows Update set to Default."
-    } "Applying default Windows Update settings..."
+        Write-Output "Windows Update set to Default."
+    } | Out-Null
 }) }
 
 if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
-    Invoke-UiCommand {
-        Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates" 1
-        Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdatesPeriodInDays" 365
-        Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 0
+    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates" 1
+    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdatesPeriodInDays" 365
+    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 0
+    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateSecurityOnly" -Msg "Applying security-only update settings..." -Sb {
         Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
-        Write-GuiLog "Windows Update set to Security Only (deferring features)."
-    } "Applying security-only update settings..."
+        Write-Output "Windows Update set to Security Only (deferring features)."
+    } | Out-Null
 }) }
 
 if ($btnWUDisable) { $btnWUDisable.Add_Click({
     if ((Show-WmtMessageBox -Message "Disable ALL Windows Updates? This is not recommended for security." -Title "Warning" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
-        Invoke-UiCommand {
+        Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 1
+        Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDisable" -Msg "Disabling Windows Update..." -Sb {
             Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
             Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
-            Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 1
-            Write-GuiLog "Windows Update DISABLED."
-        } "Disabling Windows Update..."
+            Write-Output "Windows Update DISABLED."
+        } | Out-Null
     }
 }) }
 
@@ -48091,7 +48096,15 @@ $btnMouseSpeedFast.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 15; Write-Gu
 if ($btnMouseSettings) { $btnMouseSettings.Add_Click({ Start-Process "main.cpl" }) }
 if ($btnSearchIndexRebuild) {
 $btnSearchIndexRebuild.Add_Click({
-        Invoke-UiCommand { Start-Process "powershell.exe" -ArgumentList "-NoProfile -Command `"Get-Service WSearch | Stop-Service -Force; (Get-Service WSearch).WaitForStatus('Stopped'); Start-Service WSearch`"" -Verb RunAs; Write-GuiLog "Search index rebuild started." } "Rebuilding search index..."
+        Invoke-WmtUiBackgroundCommand -Name "SearchIndexRebuild" -Msg "Rebuilding search index..." -Sb {
+            $svc = Get-Service WSearch -ErrorAction SilentlyContinue
+            if ($svc) {
+                Stop-Service WSearch -Force -ErrorAction SilentlyContinue
+                try { $svc.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(20)) } catch {}
+                Start-Service WSearch -ErrorAction SilentlyContinue
+            }
+            Write-Output "Search index rebuild started."
+        } | Out-Null
     })
 }
 
@@ -48397,11 +48410,12 @@ $btnToggleSearchIndex = Get-Ctrl "btnToggleSearchIndex"
 if ($btnToggleSearchIndex) {
 $btnToggleSearchIndex.Add_Click({
         $svc = Get-Service "WSearch" -ErrorAction SilentlyContinue
-        if ($svc -and $svc.StartType -ne "Automatic") {
-            Invoke-UiCommand { Set-Service -Name WSearch -StartupType Automatic; Start-Service -Name WSearch -ErrorAction SilentlyContinue; Write-GuiLog "Search index set to Automatic." } "Enabling search index..."
+        $currentlyOn = [bool]($svc -and $svc.StartType -eq "Automatic")
+        if (-not $currentlyOn) {
+            Invoke-WmtUiBackgroundCommand -Name "EnableSearchIndex" -Msg "Enabling search index..." -Sb { Set-Service -Name WSearch -StartupType Automatic; Start-Service -Name WSearch -ErrorAction SilentlyContinue; Write-Output "Search index set to Automatic." } | Out-Null
         }
         else {
-            Invoke-UiCommand { Set-Service -Name WSearch -StartupType Manual; Write-GuiLog "Search index set to Manual." } "Reducing search index..."
+            Invoke-WmtUiBackgroundCommand -Name "ReduceSearchIndex" -Msg "Reducing search index..." -Sb { Set-Service -Name WSearch -StartupType Manual; Write-Output "Search index set to Manual." } | Out-Null
         }
         Update-WmtTweakToggle $btnToggleSearchIndex (-not $currentlyOn) "Reduce Indexing" "Default Indexing"
     })
