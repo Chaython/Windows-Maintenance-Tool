@@ -45693,6 +45693,14 @@ function Resolve-WmtCompactTarget {
 
 
 function Get-WmtCompactTrackerPath {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:WmtCompactTrackerPath)) {
+        try {
+            $cachedRoot = Split-Path -Parent $script:WmtCompactTrackerPath
+            if (Test-Path -LiteralPath $cachedRoot -PathType Container) { return $script:WmtCompactTrackerPath }
+        }
+        catch {}
+    }
+
     # Automatic recompression can run as SYSTEM, so its configuration must not
     # live in WMT's normal user-writable data directory. Keep the tracker beside
     # the secured worker and migrate the legacy tracker once.
@@ -45724,6 +45732,7 @@ function Get-WmtCompactTrackerPath {
         }
     }
 
+    $script:WmtCompactTrackerPath = $path
     return $path
 }
 
