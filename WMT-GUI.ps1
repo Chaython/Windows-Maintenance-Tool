@@ -45847,8 +45847,17 @@ function Format-WmtCompactTrackerDate {
 
 function Write-WmtCompactRecompressWorker {
     $trackerPath = Get-WmtCompactTrackerPath
-    $workerPath = Join-Path (Get-DataPath) "compact-recompress.ps1"
-    $logPath = Join-Path (Get-DataPath) "compact-recompress.log"
+
+    # Scheduled tasks run this worker as SYSTEM. Keep executable script content
+    # out of WMT's portable/user-writable data directory to avoid a local
+    # privilege-escalation path through task-file replacement.
+    $workerRoot = Join-Path $env:ProgramData "WindowsMaintenanceTool"
+    if (-not (Test-Path -LiteralPath $workerRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $workerRoot -Force | Out-Null
+    }
+
+    $workerPath = Join-Path $workerRoot "compact-recompress.ps1"
+    $logPath = Join-Path $workerRoot "compact-recompress.log"
     $trackerBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($trackerPath))
     $logBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($logPath))
 
@@ -45944,6 +45953,19 @@ catch {
 
     $worker = $worker.Replace("__TRACKER__", $trackerBase64).Replace("__LOG__", $logBase64)
     [System.IO.File]::WriteAllText($workerPath, $worker, [System.Text.UTF8Encoding]::new($true))
+
+    # Restrict the worker directory to SYSTEM and Administrators. Use SIDs so
+    # this works on non-English Windows installations.
+    try {
+        $aclOutput = & icacls.exe $workerRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls exit code $LASTEXITCODE. $($aclOutput -join ' ')"
+        }
+    }
+    catch {
+        throw "Could not secure the Compact recompression worker directory: $($_.Exception.Message)"
+    }
+
     return $workerPath
 }
 
@@ -46526,7 +46548,7 @@ function Show-WmtCompactManager {
             </Grid>
         </Border>
 
-        <TextBlock Grid.Row="5" Text="Scheduled recompression uses compact.exe without /F, so already-compressed files are skipped while new or decompressed files are picked up. The worker log is saved under WMT's data folder."
+        <TextBlock Grid.Row="5" Text="Scheduled recompression uses compact.exe without /F, so already-compressed files are skipped while new or decompressed files are picked up. The secured worker log is stored under ProgramData\WindowsMaintenanceTool."
                    Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
 
         <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
