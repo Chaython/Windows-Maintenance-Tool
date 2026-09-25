@@ -37091,8 +37091,6 @@ try {
     }
 
     # Step 3: Resolve names for owned apps not in appmanifests.
-
-    # Step 3: Resolve names for owned apps not in appmanifests.
     # Use the Steam GetAppList API cache (steam_applist.json) if available.
     $appNames = @{}
     $appListFile = Join-Path (Get-DataPath) "steam_applist.json"
@@ -41614,9 +41612,6 @@ $btnWingetScan.Add_Click({
                 Write-Output "LOG:Scanning Steam game manifests..."
 
                 # Shared Steam helpers are injected by New-WmtRunspaceInitialState.
-                $seenAppIds = @{}
-
-                $seenAppIds = @{}
                 $manifestCount = 0
                 $pendingCount = 0
 
@@ -41627,89 +41622,64 @@ $btnWingetScan.Add_Click({
                         return
                     }
 
-                    foreach ($libraryRoot in $libraryRoots) {
-                        $steamApps = Join-Path $libraryRoot "steamapps"
-                        if (-not (Test-Path -LiteralPath $steamApps)) { continue }
+                    $installedManifests = @(Get-WmtSteamInstalledManifests)
+                    $manifestCount = $installedManifests.Count
+                    foreach ($manifestInfo in $installedManifests) {
+                        $appId = [string]$manifestInfo.Id
+                        $name = [string]$manifestInfo.Name
+                        $text = [string]$manifestInfo.Text
+                        $installDir = ConvertFrom-WmtSteamVdfPath ([string]$manifestInfo.InstallDir)
 
-                        foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-                            $manifestCount++
-                            $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                        [PSCustomObject]@{
+                            WmtStateType = "ProviderOwnership"
+                            Provider     = "steam"
+                            Name         = $name
+                            Id           = $appId
+                            InstallDir   = $installDir
+                        }
 
-                            $appId = Get-WmtSteamManifestValue -Text $text -Key "appid"
-                            if ([string]::IsNullOrWhiteSpace($appId)) {
-                                $appId = [regex]::Match($manifest.BaseName, '\d+').Value
-                            }
-                            if ([string]::IsNullOrWhiteSpace($appId)) { continue }
-                            if ($seenAppIds.ContainsKey($appId)) { continue }
-                            $seenAppIds[$appId] = $true
+                        if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
 
-                            $name = Get-WmtSteamManifestValue -Text $text -Key "name"
-                            if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
-                            $installDir = ConvertFrom-WmtSteamVdfPath (Get-WmtSteamManifestValue -Text $text -Key "installdir")
+                        $stateFlags = Get-WmtSteamManifestNumber -Text $text -Key "StateFlags"
+                        $bytesToDownload = Get-WmtSteamManifestNumber -Text $text -Key "BytesToDownload"
+                        $bytesDownloaded = Get-WmtSteamManifestNumber -Text $text -Key "BytesDownloaded"
+                        $bytesToStage = Get-WmtSteamManifestNumber -Text $text -Key "BytesToStage"
+                        $bytesStaged = Get-WmtSteamManifestNumber -Text $text -Key "BytesStaged"
+                        $buildId = [string]$manifestInfo.BuildId
+                        $targetBuildId = Get-WmtSteamManifestValue -Text $text -Key "TargetBuildID"
 
-                            # Let the UI-side scan aggregator distinguish unknown-version
-                            # winget matches from games actually owned by Steam. Use a typed
-                            # object because EndInvoke() wraps pipeline output in PSObject.
-                            # This is emitted for every installed Steam app, not only pending ones.
-                            [PSCustomObject]@{
-                                WmtStateType = "ProviderOwnership"
-                                Provider     = "steam"
-                                Name         = $name
-                                Id           = $appId
-                                InstallDir   = $installDir
-                            }
+                        $downloadRemaining = [Math]::Max([long]0, $bytesToDownload - $bytesDownloaded)
+                        $stageRemaining = [Math]::Max([long]0, $bytesToStage - $bytesStaged)
+                        $hasTargetBuild = (-not [string]::IsNullOrWhiteSpace($targetBuildId) -and $targetBuildId -ne "0" -and $targetBuildId -ne $buildId)
+                        $needsAttention = (
+                            ($stateFlags -ne 0 -and $stateFlags -ne 4) -or
+                            $downloadRemaining -gt 0 -or
+                            $stageRemaining -gt 0 -or
+                            $hasTargetBuild
+                        )
+                        if (-not $needsAttention) { continue }
 
-                            if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
+                        $pendingCount++
+                        $versionText = if (-not [string]::IsNullOrWhiteSpace($buildId) -and $buildId -ne "0") { "Build $buildId" } else { "State $stateFlags" }
+                        $availableText = "Steam pending"
+                        if ($hasTargetBuild) { $availableText = "Build $targetBuildId" }
+                        elseif ($downloadRemaining -gt 0) { $availableText = "{0:N1} MB pending" -f ($downloadRemaining / 1MB) }
+                        elseif ($stageRemaining -gt 0) { $availableText = "{0:N1} MB staging" -f ($stageRemaining / 1MB) }
+                        elseif ($stateFlags -ne 4) { $availableText = "State $stateFlags" }
 
-                            $stateFlags = Get-WmtSteamManifestNumber -Text $text -Key "StateFlags"
-                            $bytesToDownload = Get-WmtSteamManifestNumber -Text $text -Key "BytesToDownload"
-                            $bytesDownloaded = Get-WmtSteamManifestNumber -Text $text -Key "BytesDownloaded"
-                            $bytesToStage = Get-WmtSteamManifestNumber -Text $text -Key "BytesToStage"
-                            $bytesStaged = Get-WmtSteamManifestNumber -Text $text -Key "BytesStaged"
-                            $buildId = Get-WmtSteamManifestValue -Text $text -Key "buildid"
-                            $targetBuildId = Get-WmtSteamManifestValue -Text $text -Key "TargetBuildID"
-
-                            $downloadRemaining = [Math]::Max([long]0, $bytesToDownload - $bytesDownloaded)
-                            $stageRemaining = [Math]::Max([long]0, $bytesToStage - $bytesStaged)
-                            $hasTargetBuild = (-not [string]::IsNullOrWhiteSpace($targetBuildId) -and $targetBuildId -ne "0" -and $targetBuildId -ne $buildId)
-                            $needsAttention = (
-                                ($stateFlags -ne 0 -and $stateFlags -ne 4) -or
-                                $downloadRemaining -gt 0 -or
-                                $stageRemaining -gt 0 -or
-                                $hasTargetBuild
-                            )
-
-                            if (-not $needsAttention) { continue }
-
-                            $pendingCount++
-                            $versionText = if (-not [string]::IsNullOrWhiteSpace($buildId) -and $buildId -ne "0") { "Build $buildId" } else { "State $stateFlags" }
-                            $availableText = "Steam pending"
-                            if ($hasTargetBuild) {
-                                $availableText = "Build $targetBuildId"
-                            }
-                            elseif ($downloadRemaining -gt 0) {
-                                $availableText = "{0:N1} MB pending" -f ($downloadRemaining / 1MB)
-                            }
-                            elseif ($stageRemaining -gt 0) {
-                                $availableText = "{0:N1} MB staging" -f ($stageRemaining / 1MB)
-                            }
-                            elseif ($stateFlags -ne 4) {
-                                $availableText = "State $stateFlags"
-                            }
-
-                            [PSCustomObject]@{
-                                Source       = "steam"
-                                Name         = $name
-                                Id           = $appId
-                                Version      = $versionText
-                                Available    = $availableText
-                                LibraryPath  = $libraryRoot
-                                InstallDir   = $installDir
-                                ManifestPath = $manifest.FullName
-                            }
+                        [PSCustomObject]@{
+                            Source       = "steam"
+                            Name         = $name
+                            Id           = $appId
+                            Version      = $versionText
+                            Available    = $availableText
+                            LibraryPath  = [string]$manifestInfo.LibraryRoot
+                            InstallDir   = $installDir
+                            ManifestPath = [string]$manifestInfo.ManifestPath
                         }
                     }
+
+                    if ($pendingCount -eq 0) {
 
                     if ($pendingCount -eq 0) {
                         Write-Output "LOG:Steam scan found $manifestCount installed Steam app manifest(s), with no manifest-marked pending updates."
@@ -51453,8 +51423,6 @@ try {
                         foreach ($aid in @(Get-WmtSteamOwnedAppIds -SteamRoot $steamInstall)) {
                             if (-not [string]::IsNullOrWhiteSpace([string]$aid) -and -not $ownedIds.Contains([string]$aid)) { [void]$ownedIds.Add([string]$aid) }
                         }
-
-                        # Resolve names for ALL apps using the GitHub-hosted Steam app ID
 
                         # Resolve names for ALL apps using the GitHub-hosted Steam app ID
                         # list (single download, ~17MB for games + ~7.5MB for DLC).
