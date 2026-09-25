@@ -4659,12 +4659,13 @@ if (-not $SkipCrashWrite) {
 
 $autoInstallWasActive = [bool]$script:WmtAutoInstallActive
 
-try { if ($script:WingetTimer) { $script:WingetTimer.Stop() } } catch {}
-try { if ($script:WingetJob) { Stop-Job -Job $script:WingetJob -ErrorAction SilentlyContinue } } catch {}
-try { if ($script:WingetJob) { Receive-Job -Job $script:WingetJob -ErrorAction SilentlyContinue | Out-Null } } catch {}
-try { if ($script:WingetJob) { Remove-Job -Job $script:WingetJob -Force -ErrorAction SilentlyContinue } } catch {}
+try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
+try { if ($script:WingetJob) { $script:WingetJob.Stop() } } catch {}
+try { if ($script:WingetJob) { $script:WingetJob.Dispose() } } catch {}
 
 $script:WingetJob = $null
+$script:WingetAsyncResult = $null
+$script:WingetOutputQueue = $null
 $script:WingetActiveAction = $null
 $script:WingetActionStoreUpdateOnly = $false
 $script:WmtAutoInstallActive = $false
@@ -33012,9 +33013,30 @@ $jobArgs = @{
     GogdlAuthConfigPath        = Get-WmtGogdlAuthConfigPath
 }
 
-# 2. Start the Background Job
-$script:WingetJob = Start-Job -ArgumentList $jobArgs -ScriptBlock {
-    param($ArgsDict)
+# 2. Start the background worker on the shared in-process runspace pool.
+# A thread-safe queue preserves the existing live LOG:/PROGRESS:/RESULT: protocol.
+$wingetWorkerScript = {
+    param($ArgsDict, $OutputQueue)
+
+    function Write-Output {
+        param(
+            [Parameter(ValueFromPipeline = $true, Position = 0)]$InputObject,
+            [switch]$NoEnumerate
+        )
+        process {
+            if ($null -eq $InputObject) { return }
+            if ($NoEnumerate) {
+                $OutputQueue.Enqueue($InputObject)
+                return
+            }
+            if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+                foreach ($outputItem in $InputObject) { $OutputQueue.Enqueue($outputItem) }
+            }
+            else {
+                $OutputQueue.Enqueue($InputObject)
+            }
+        }
+    }
     $items = $ArgsDict.Items
     $act = $ArgsDict.ActionName
     $tmpl = $ArgsDict.CmdTemplate
@@ -35747,10 +35769,14 @@ exit /b %WMT_EXIT%
     }
 }
 
-# 3. Setup Timer
-if ($script:WingetTimer) { $script:WingetTimer.Stop() }
-$script:WingetTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:WingetTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$script:WingetOutputQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+$script:WingetJob = New-WmtPooledPowerShell
+[void]$script:WingetJob.AddScript($wingetWorkerScript.ToString()).AddArgument($jobArgs).AddArgument($script:WingetOutputQueue)
+$script:WingetAsyncResult = $script:WingetJob.BeginInvoke()
+
+# 3. Shared UI monitor for live update output and completion
+try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
+$script:WingetTimer = $null
 $script:ProcessWingetLines = {
     param($lines)
     foreach ($line in $lines) {
@@ -36064,17 +36090,27 @@ $script:ProcessWingetLines = {
     }
 }
 
-$script:WingetTimer.Add_Tick({
+$script:DrainWingetOutputQueue = {
+    $batch = [System.Collections.Generic.List[object]]::new()
+    if ($script:WingetOutputQueue) {
+        $queuedItem = $null
+        while ($script:WingetOutputQueue.TryDequeue([ref]$queuedItem)) {
+            [void]$batch.Add($queuedItem)
+            $queuedItem = $null
+        }
+    }
+    if ($batch.Count -gt 0) { & $script:ProcessWingetLines $batch.ToArray() }
+}
+
+Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTick {
         try {
-            if (-not $script:WingetJob) { return }
-            if ($script:WingetJob.HasMoreData) {
-                $results = Receive-Job -Job $script:WingetJob -ErrorAction SilentlyContinue
-                if ($results) {
-                    & $script:ProcessWingetLines $results
-                }
+            if (-not $script:WingetJob) {
+                Unregister-WmtUiPollOperation -Name "WingetAction"
+                return
             }
+            & $script:DrainWingetOutputQueue
             $pipItemRunning = (
-                $script:WingetJob.State -eq 'Running' -and
+                $script:WingetAsyncResult -and -not $script:WingetAsyncResult.IsCompleted -and
                 $script:WingetCurrentItemSource -in @("pip", "pip3") -and
                 $script:WingetCurrentItemStartedAt
             )
@@ -36083,10 +36119,10 @@ $script:WingetTimer.Add_Tick({
                 if ($pipElapsedSeconds -ge 600) {
                     $script:WingetActionForcedTimeout = $true
                     Write-GuiLog "[Pip] $($script:WingetCurrentItemName) exceeded the 10-minute action timeout. Stopping the background job."
-                    try { Stop-Job -Job $script:WingetJob -ErrorAction SilentlyContinue } catch {}
+                    try { $script:WingetJob.Stop() } catch {}
                 }
             }
-            if ($script:WingetJob.State -eq 'Running' -and $script:WingetActionStartedAt -and $script:WingetCurrentItemName) {
+            if ($script:WingetAsyncResult -and -not $script:WingetAsyncResult.IsCompleted -and $script:WingetActionStartedAt -and $script:WingetCurrentItemName) {
                 try {
                     $elapsed = (Get-Date) - $script:WingetActionStartedAt
                     $elapsedText = $elapsed.ToString("mm\:ss", [System.Globalization.CultureInfo]::InvariantCulture)
@@ -36095,14 +36131,20 @@ $script:WingetTimer.Add_Tick({
                 }
                 catch {}
             }
-            if ($script:WingetJob.State -ne 'Running') {
-                $script:WingetTimer.Stop()
-                $results = Receive-Job -Job $script:WingetJob -ErrorAction SilentlyContinue
-                if ($results) {
-                    & $script:ProcessWingetLines $results
+            if ($script:WingetAsyncResult -and $script:WingetAsyncResult.IsCompleted) {
+                try {
+                    $finalOutput = @($script:WingetJob.EndInvoke($script:WingetAsyncResult))
+                    if ($finalOutput.Count -gt 0) { & $script:ProcessWingetLines $finalOutput }
                 }
-                Remove-Job -Job $script:WingetJob -Force -ErrorAction SilentlyContinue
+                catch {
+                    if (-not $script:WingetActionForcedTimeout) { throw }
+                }
+                & $script:DrainWingetOutputQueue
+                try { $script:WingetJob.Dispose() } catch {}
                 $script:WingetJob = $null
+                $script:WingetAsyncResult = $null
+                $script:WingetOutputQueue = $null
+                Unregister-WmtUiPollOperation -Name "WingetAction"
                 if ($script:WingetActiveAction) {
                     if ($script:WingetProgressDone -lt $script:WingetProgressTotal) {
                         $missing = $script:WingetProgressTotal - $script:WingetProgressDone
@@ -36216,8 +36258,7 @@ $script:WingetTimer.Add_Tick({
         catch {
             Reset-WmtUpdateUiAfterMonitorError -Context "Update completion monitor failed" -Exception $_.Exception -ErrorRecord $_
         }
-    })
-$script:WingetTimer.Start()
+    } | Out-Null
 }
 
 # 3. EVENT HANDLERS
@@ -50682,7 +50723,10 @@ if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() }
 Stop-WmtUpdateAutoScanTimer
 Remove-WmtTrayIcon
 Stop-WmtNotificationFallbackTimers
-if ($script:WingetTimer) { $script:WingetTimer.Stop() }
+try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
+try { if ($script:WingetJob) { $script:WingetJob.Stop(); $script:WingetJob.Dispose(); $script:WingetJob = $null } } catch {}
+$script:WingetAsyncResult = $null
+$script:WingetOutputQueue = $null
 Stop-WmtStartupBackgroundPreload
 if ($script:WingetSourcePreflightTimer) { $script:WingetSourcePreflightTimer.Stop() }
 if ($script:WingetSourcePreflightRunspace) {
@@ -50710,7 +50754,8 @@ if ($script:TweakStatesBgPS) {
     $script:TweakStatesBgPS = $null
 }
 $script:TweakStatesBgAsync = $null
-# Dispose the shared background runspace pool
+# Dispose shared async infrastructure after individual workers have been stopped.
+Stop-WmtUiPoller
 Stop-WmtBackgroundRunspacePool
 if ($script:WmtRegistryCleanupTimer) { try { $script:WmtRegistryCleanupTimer.Stop() } catch {}; $script:WmtRegistryCleanupTimer = $null }
 if ($script:WmtRegistryCleanupPowerShell) { try { $script:WmtRegistryCleanupPowerShell.Stop() } catch {}; try { $script:WmtRegistryCleanupPowerShell.Dispose() } catch {}; $script:WmtRegistryCleanupPowerShell = $null }
