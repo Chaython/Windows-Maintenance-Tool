@@ -7991,33 +7991,38 @@ catch {
 $dnsRunspace = $script:DnsRunspace
 $dnsAsync = $script:DnsAsyncResult
 $script:DnsTimer = $null
+# The shared poller invokes these after this function returns, so preserve the
+# per-operation runspace/result/completion values exactly as the old timer
+# callback did with GetNewClosure().
+$dnsTestComplete = { $dnsAsync -and $dnsAsync.IsCompleted }.GetNewClosure()
+$dnsOnComplete = {
+    $result = $null
+    try {
+        $raw = $dnsRunspace.EndInvoke($dnsAsync)
+        if ($raw -is [System.Collections.ObjectModel.Collection[PSObject]]) { $result = $raw | Select-Object -Last 1 }
+        else { $result = $raw }
+        if ($result -and $result.Lines) {
+            $text = ($result.Lines | Out-String).Trim()
+            if ($text) { Write-GuiLog $text }
+        }
+        elseif ($result -and $result.Success) { Write-GuiLog "Done." }
+        else { Write-GuiLog "DNS operation finished with no output." }
+    }
+    catch { Write-GuiLog "DNS Error: $($_.Exception.Message)" }
+    finally {
+        try { $dnsRunspace.Dispose() } catch {}
+        if ([object]::ReferenceEquals($script:DnsRunspace, $dnsRunspace)) { $script:DnsRunspace = $null }
+        if ([object]::ReferenceEquals($script:DnsAsyncResult, $dnsAsync)) { $script:DnsAsyncResult = $null }
+        Set-WmtDnsActionButtonsEnabled $true
+    }
+    if ($completion) {
+        try { & $completion $result }
+        catch { Write-GuiLog "DNS completion action failed: $($_.Exception.Message)" }
+    }
+}.GetNewClosure()
 Register-WmtUiPollOperation -Name "DnsAssignment" `
-    -TestComplete { $dnsAsync -and $dnsAsync.IsCompleted } `
-    -OnComplete {
-        $result = $null
-        try {
-            $raw = $dnsRunspace.EndInvoke($dnsAsync)
-            if ($raw -is [System.Collections.ObjectModel.Collection[PSObject]]) { $result = $raw | Select-Object -Last 1 }
-            else { $result = $raw }
-            if ($result -and $result.Lines) {
-                $text = ($result.Lines | Out-String).Trim()
-                if ($text) { Write-GuiLog $text }
-            }
-            elseif ($result -and $result.Success) { Write-GuiLog "Done." }
-            else { Write-GuiLog "DNS operation finished with no output." }
-        }
-        catch { Write-GuiLog "DNS Error: $($_.Exception.Message)" }
-        finally {
-            try { $dnsRunspace.Dispose() } catch {}
-            if ([object]::ReferenceEquals($script:DnsRunspace, $dnsRunspace)) { $script:DnsRunspace = $null }
-            if ([object]::ReferenceEquals($script:DnsAsyncResult, $dnsAsync)) { $script:DnsAsyncResult = $null }
-            Set-WmtDnsActionButtonsEnabled $true
-        }
-        if ($completion) {
-            try { & $completion $result }
-            catch { Write-GuiLog "DNS completion action failed: $($_.Exception.Message)" }
-        }
-    } | Out-Null
+    -TestComplete $dnsTestComplete `
+    -OnComplete $dnsOnComplete | Out-Null
 return $true
 }
 
@@ -8392,33 +8397,36 @@ if (-not $dohRunspace -or -not $dohAsync) {
 
 if ($script:DohTimer) { $script:DohTimer.Stop() }
 $script:DohTimer = $null
+# Preserve the operation-local values for the delayed shared-poller callbacks.
+$dohTestComplete = { $dohAsync -and $dohAsync.IsCompleted }.GetNewClosure()
+$dohOnComplete = {
+    try {
+        $rawResults = $dohRunspace.EndInvoke($dohAsync)
+        $res = $rawResults | Where-Object { $_ -is [PSCustomObject] -and $_.Psobject.Properties.Match('Count') } | Select-Object -Last 1
+        if ($res -and $res.Success) {
+            $c = $res.Count
+            $finMsg = if ($isEnableForTimer) { "Registered $c DoH templates." } else { "Removed or verified $c DoH templates." }
+            Write-GuiLog "Done. $finMsg"
+            if ($c -gt 0) {
+                [System.Windows.MessageBox]::Show($finMsg, "DoH Manager", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            }
+        }
+        else {
+            $failedText = if ($res -and $res.Failures) { " Failed: $($res.Failures -join ', ')" } else { "" }
+            Write-GuiLog "DoH operation failed or no changes were made.$failedText"
+        }
+    }
+    catch { Write-GuiLog "DoH Error: $($_.Exception.Message)" }
+    finally {
+        try { $dohRunspace.Dispose() } catch {}
+        if ([object]::ReferenceEquals($script:DohRunspace, $dohRunspace)) { $script:DohRunspace = $null }
+        if ([object]::ReferenceEquals($script:DohAsyncResult, $dohAsync)) { $script:DohAsyncResult = $null }
+        Set-WmtDnsActionButtonsEnabled $true
+    }
+}.GetNewClosure()
 Register-WmtUiPollOperation -Name "DohAction" `
-    -TestComplete { $dohAsync -and $dohAsync.IsCompleted } `
-    -OnComplete {
-        try {
-            $rawResults = $dohRunspace.EndInvoke($dohAsync)
-            $res = $rawResults | Where-Object { $_ -is [PSCustomObject] -and $_.Psobject.Properties.Match('Count') } | Select-Object -Last 1
-            if ($res -and $res.Success) {
-                $c = $res.Count
-                $finMsg = if ($isEnableForTimer) { "Registered $c DoH templates." } else { "Removed or verified $c DoH templates." }
-                Write-GuiLog "Done. $finMsg"
-                if ($c -gt 0) {
-                    [System.Windows.MessageBox]::Show($finMsg, "DoH Manager", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-                }
-            }
-            else {
-                $failedText = if ($res -and $res.Failures) { " Failed: $($res.Failures -join ', ')" } else { "" }
-                Write-GuiLog "DoH operation failed or no changes were made.$failedText"
-            }
-        }
-        catch { Write-GuiLog "DoH Error: $($_.Exception.Message)" }
-        finally {
-            try { $dohRunspace.Dispose() } catch {}
-            if ([object]::ReferenceEquals($script:DohRunspace, $dohRunspace)) { $script:DohRunspace = $null }
-            if ([object]::ReferenceEquals($script:DohAsyncResult, $dohAsync)) { $script:DohAsyncResult = $null }
-            Set-WmtDnsActionButtonsEnabled $true
-        }
-    } | Out-Null
+    -TestComplete $dohTestComplete `
+    -OnComplete $dohOnComplete | Out-Null
 }
 
 # Redirect existing function calls to the new Async handler
@@ -39311,6 +39319,7 @@ $script:WmtAutoInstallSuppressNextScan = $false
 $script:WmtAutoInstallActive = $false
 $script:WmtCompletedWindowsUpdateIds = @{}
 $script:WmtWindowsUpdateRebootPendingCount = 0
+$script:WmtSteamInstalledNameKeys = @{}
 
 $script:ScanTimer.Add_Tick({
     if ($script:ActiveScans.Count -gt 0) {
@@ -39328,7 +39337,16 @@ $script:ScanTimer.Add_Tick({
                     foreach ($item in $results) {
                         if ($null -eq $item) { continue }
 
-                        if ($item -is [string] -and $item -match "^STATE:WINDOWS_UPDATE_REBOOT_REQUIRED:(\d+)$") {
+                        if ($item -is [string] -and $item.StartsWith("STATE:STEAM_INSTALLED_NAME:")) {
+                            $steamInstalledName = $item.Substring("STATE:STEAM_INSTALLED_NAME:".Length).Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($steamInstalledName)) {
+                                $steamInstalledKey = ($steamInstalledName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+                                if (-not [string]::IsNullOrWhiteSpace($steamInstalledKey)) {
+                                    $script:WmtSteamInstalledNameKeys[$steamInstalledKey] = $true
+                                }
+                            }
+                        }
+                        elseif ($item -is [string] -and $item -match "^STATE:WINDOWS_UPDATE_REBOOT_REQUIRED:(\d+)$") {
                             $script:WmtWindowsUpdateRebootPendingCount = [Math]::Max(
                                 [int]$script:WmtWindowsUpdateRebootPendingCount,
                                 [int]$matches[1]
@@ -39388,6 +39406,36 @@ $script:ScanTimer.Add_Tick({
             $txtWingetSearch.ToolTip = ""
             if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
             $btnWingetUpdateSel.IsEnabled = $true
+
+            # --include-unknown deliberately asks winget to surface packages whose
+            # installed version cannot be determined. Games installed by Steam can
+            # therefore appear as false winget "updates" (for example Unknown -> 1.0.0).
+            # If the Steam worker confirmed the same installed app name, suppress only
+            # that unknown-version winget row and leave normal winget updates untouched.
+            $steamOwnedWingetRowsSuppressed = 0
+            if ($script:WmtSteamInstalledNameKeys -and $script:WmtSteamInstalledNameKeys.Count -gt 0) {
+                for ($rowIndex = $lstWinget.Items.Count - 1; $rowIndex -ge 0; $rowIndex--) {
+                    $candidate = $lstWinget.Items[$rowIndex]
+                    if (-not $candidate) { continue }
+                    if (([string]$candidate.Source).ToLowerInvariant() -ne "winget") { continue }
+                    if (([string]$candidate.Version).Trim() -ne "?") { continue }
+
+                    $candidateName = ([string]$candidate.Name).Trim()
+                    if ([string]::IsNullOrWhiteSpace($candidateName)) { continue }
+                    $candidateKey = ($candidateName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+                    if ([string]::IsNullOrWhiteSpace($candidateKey)) { continue }
+
+                    if ($script:WmtSteamInstalledNameKeys.ContainsKey($candidateKey)) {
+                        Write-GuiLog "[Winget] Suppressed unknown-version match for Steam-managed app: $candidateName ($([string]$candidate.Id))."
+                        $lstWinget.Items.RemoveAt($rowIndex)
+                        $steamOwnedWingetRowsSuppressed++
+                    }
+                }
+            }
+            if ($steamOwnedWingetRowsSuppressed -gt 0) {
+                Write-GuiLog "[Winget] Suppressed $steamOwnedWingetRowsSuppressed Steam-owned unknown-version false-positive update row(s)."
+            }
+
             $lstWinget.Items.Refresh()
             $lstWinget.UpdateLayout()
             Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
@@ -39514,6 +39562,7 @@ $btnWingetScan.Add_Click({
     $script:ActiveScans.Clear()
     $script:ScanCancelled = $false
     $script:ScanStartTime = Get-Date
+    $script:WmtSteamInstalledNameKeys = @{}
 
     # --- Global Timeout Timer (120 seconds) ---
     if ($script:GlobalScanTimer) {
@@ -41368,6 +41417,12 @@ $btnWingetScan.Add_Click({
 
                             $name = Get-SteamManifestValue -Text $text -Key "name"
                             if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
+
+                            # Let the UI-side scan aggregator distinguish unknown-version
+                            # winget matches from games actually owned by Steam. This marker
+                            # is emitted for every installed Steam app, not only pending ones.
+                            Write-Output "STATE:STEAM_INSTALLED_NAME:$name"
+
                             if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
 
                             $stateFlags = Get-SteamManifestNumber -Text $text -Key "StateFlags"
