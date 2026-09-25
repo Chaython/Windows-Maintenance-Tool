@@ -1987,117 +1987,90 @@ catch { return "" }
 }
 
 # ============================================================================
-# Shared RunspacePool for background jobs# ============================================================================
-# Shared RunspacePool for background jobs (My Device stats, Tweak States, etc.)
+# Shared runspace pools
+# Fast UI-support work is isolated from long-running provider/network jobs so
+# page status queries cannot be starved by package scans or library refreshes.
 # ============================================================================
-function Initialize-WmtBackgroundRunspacePool {
-if ($script:WmtBackgroundPool) { return $script:WmtBackgroundPool }
-
+function New-WmtRunspaceInitialState {
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
-# Pre-load My Device helper functions
 if ($script:MyDeviceCommonHelpers) {
     $helperFuncs = [regex]::Matches($script:MyDeviceCommonHelpers, '(?ms)^function\s+(\w[\w-]*)\s*\{.*?^\}')
     foreach ($m in $helperFuncs) {
-        $funcName = $m.Groups[1].Value
-        $funcBody = $m.Value
-        try {
-            $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($funcName, $funcBody))
-        }
+        try { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($m.Groups[1].Value, $m.Value)) }
         catch {}
     }
 }
-
-# Pre-load ConvertTo-Int, ConvertTo-Str, and Invoke-WmtCliText
-if (Get-Command ConvertTo-Int -ErrorAction SilentlyContinue) {
-    try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("ConvertTo-Int", ${function:ConvertTo-Int}.ToString())) } catch {}
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText")) {
+    try {
+        $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
+        if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
+    }
+    catch {}
 }
-if (Get-Command ConvertTo-Str -ErrorAction SilentlyContinue) {
-    try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("ConvertTo-Str", ${function:ConvertTo-Str}.ToString())) } catch {}
-}
-if (Get-Command Invoke-WmtProcess -ErrorAction SilentlyContinue) {
-    try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("Invoke-WmtProcess", ${function:Invoke-WmtProcess}.ToString())) } catch {}
-}
-if (Get-Command Invoke-WmtCliText -ErrorAction SilentlyContinue) {
-    try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("Invoke-WmtCliText", ${function:Invoke-WmtCliText}.ToString())) } catch {}
+return $iss
 }
 
-$pool = [runspacefactory]::CreateRunspacePool(1, 8, $iss, $Host)
+function Reset-WmtRunspacePool {
+param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
+$pool = if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool } else { $script:WmtBackgroundPool }
+if ($pool) {
+    try { $pool.Close() } catch {}
+    try { $pool.Dispose() } catch {}
+}
+if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool = $null } else { $script:WmtBackgroundPool = $null }
+}
+
+function Initialize-WmtRunspacePool {
+param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
+$existing = if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool } else { $script:WmtBackgroundPool }
+if ($existing -is [System.Management.Automation.Runspaces.RunspacePool]) { return $existing }
+if ($existing) { Reset-WmtRunspacePool -PoolKind $PoolKind }
+
+$iss = New-WmtRunspaceInitialState
+$maxWorkers = if ($PoolKind -eq "UiSupport") { 3 } else { 6 }
+$pool = [runspacefactory]::CreateRunspacePool(1, $maxWorkers, $iss, $Host)
 $pool.ApartmentState = "STA"
 $pool.ThreadOptions = "ReuseThread"
 $pool.Open()
-
-$script:WmtBackgroundPool = $pool
+if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool = $pool } else { $script:WmtBackgroundPool = $pool }
 return $pool
 }
 
+function Initialize-WmtBackgroundRunspacePool { return (Initialize-WmtRunspacePool -PoolKind Background) }
 function Get-WmtBackgroundRunspacePool {
-if (-not $script:WmtBackgroundPool) {
-    # Initialize RETURNS the pool object; discard it so this function emits
-    # exactly one object. The leaked return used to hand the first caller
-    # TWO pool objects (an array), which then tripped the old pool-health
-    # checks with reports like "state: Opened Opened" for a healthy pool.
-    $null = Initialize-WmtBackgroundRunspacePool
-}
+if (-not $script:WmtBackgroundPool) { $null = Initialize-WmtRunspacePool -PoolKind Background }
 return $script:WmtBackgroundPool
 }
-
+function Get-WmtUiSupportRunspacePool {
+if (-not $script:WmtUiSupportPool) { $null = Initialize-WmtRunspacePool -PoolKind UiSupport }
+return $script:WmtUiSupportPool
+}
 function Stop-WmtBackgroundRunspacePool {
-if ($script:WmtBackgroundPool) {
-    try {
-        $script:WmtBackgroundPool.Close()
-        $script:WmtBackgroundPool.Dispose()
-    }
-    catch {}
-    $script:WmtBackgroundPool = $null
-}
+Reset-WmtRunspacePool -PoolKind Background
+Reset-WmtRunspacePool -PoolKind UiSupport
 }
 
-# Helper: create a [PowerShell] instance bound to the shared runspace pool.
-# This avoids the overhead of a standalone runspace per invocation (~5-15MB each).
-# Falls back to standalone if the pool is unavailable or closed.
 function New-WmtPooledPowerShell {
+param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
 try {
-    $pool = $null
-    try { $pool = Get-WmtBackgroundRunspacePool } catch { $pool = $null }
+    $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
     if (-not $pool) { return [PowerShell]::Create() }
-
-    # Guard the stored value itself: anything that is not exactly one
-    # RunspacePool (a stray collection, for instance) makes every health
-    # guess below misfire - that is what once printed "state: Opened
-    # Opened" for a perfectly healthy pool and bounced every worker to a
-    # standalone runspace. Reset and rebuild instead of guessing.
     if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
-        try {
-            foreach ($item in @($pool)) {
-                if ($item -is [System.Management.Automation.Runspaces.RunspacePool]) { $item.Dispose() }
-            }
-        } catch {}
-        $script:WmtBackgroundPool = $null
-        try { $pool = Get-WmtBackgroundRunspacePool } catch { $pool = $null }
+        Reset-WmtRunspacePool -PoolKind $PoolKind
+        $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
         if (-not $pool) { return [PowerShell]::Create() }
     }
-
     $ps = [PowerShell]::Create()
-    try {
-        # Assigning the pool is itself the authoritative health check: a
-        # closed, broken or disposed pool raises right here, so no
-        # state-name string comparison is left to guess with.
-        $ps.RunspacePool = $pool
-        return $ps
-    }
+    try { $ps.RunspacePool = $pool; return $ps }
     catch {
-        try { Write-GuiLog "[RunspacePool] Pool rejected a worker ($($_.Exception.Message)); a fresh pool will be built for the next job." } catch {}
-        try { $pool.Close() } catch {}
-        try { $pool.Dispose() } catch {}
-        $script:WmtBackgroundPool = $null
+        try { Write-GuiLog "[RunspacePool:$PoolKind] Pool rejected a worker ($($_.Exception.Message)); rebuilding it for the next job." } catch {}
+        Reset-WmtRunspacePool -PoolKind $PoolKind
         try { $ps.Dispose() } catch {}
         return [PowerShell]::Create()
     }
 }
-catch {
-    return [PowerShell]::Create()
-}
+catch { return [PowerShell]::Create() }
 }
 
 # ============================================================================
@@ -2118,8 +2091,11 @@ if (-not $script:WmtUiPollTimer) {
             $op = $script:WmtUiPollOperations[$name]
             if (-not $op) { continue }
             try {
+                $nowUtc = [DateTime]::UtcNow
+                if ($op.IntervalMs -gt 0 -and $op.LastTickUtc -and (($nowUtc - $op.LastTickUtc).TotalMilliseconds -lt $op.IntervalMs)) { continue }
+                $op.LastTickUtc = $nowUtc
                 if ($op.OnTick) { & $op.OnTick $op }
-                $timedOut = ($op.TimeoutMs -gt 0 -and ((([DateTime]::UtcNow - $op.StartedAt).TotalMilliseconds) -ge $op.TimeoutMs))
+                $timedOut = ($op.TimeoutMs -gt 0 -and ((($nowUtc - $op.StartedAt).TotalMilliseconds) -ge $op.TimeoutMs))
                 if ($timedOut) {
                     [void]$script:WmtUiPollOperations.Remove($name)
                     if ($op.OnTimeout) { & $op.OnTimeout $op }
@@ -2150,6 +2126,7 @@ param(
     [Parameter(Mandatory = $true)][scriptblock]$TestComplete,
     [scriptblock]$OnComplete,
     [scriptblock]$OnTick,
+    [int]$IntervalMs = 200,
     [int]$TimeoutMs = 0,
     [scriptblock]$OnTimeout,
     [scriptblock]$OnError
@@ -2160,6 +2137,8 @@ $op = [PSCustomObject]@{
     Name = $Name
     StartedAt = [DateTime]::UtcNow
     TimeoutMs = [Math]::Max(0, $TimeoutMs)
+    IntervalMs = [Math]::Max(0, $IntervalMs)
+    LastTickUtc = $null
     TestComplete = $TestComplete
     OnComplete = $OnComplete
     OnTick = $OnTick
@@ -2169,6 +2148,11 @@ $op = [PSCustomObject]@{
 $script:WmtUiPollOperations[$Name] = $op
 Ensure-WmtUiPollTimer
 return $op
+}
+
+function Test-WmtUiPollOperation {
+param([Parameter(Mandatory = $true)][string]$Name)
+return [bool]($script:WmtUiPollOperations -and $script:WmtUiPollOperations.Contains($Name))
 }
 
 function Unregister-WmtUiPollOperation {
@@ -2187,7 +2171,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Name,
     [Parameter(Mandatory = $true)][string]$Body
 )
-$ps = New-WmtPooledPowerShell
+$ps = New-WmtPooledPowerShell -PoolKind UiSupport
 
 # Bulletproof fix: Inject the helper functions directly into the script block.
 # This completely bypasses the fragile regex parser that was failing to load them.
@@ -2302,15 +2286,13 @@ function Start-MyDeviceBitLockerStatusUpdate {
 $osText = Get-Ctrl "txtDeviceOS"
 if (-not $osText) { return }
 
-if ($script:BitLockerStatusTimer) {
-    try { $script:BitLockerStatusTimer.Stop() } catch {}
-}
+try { Unregister-WmtUiPollOperation -Name "BitLockerStatus" } catch {}
 if ($script:BitLockerStatusRunspace) {
     try { $script:BitLockerStatusRunspace.Stop() } catch {}
     try { $script:BitLockerStatusRunspace.Dispose() } catch {}
 }
 
-$script:BitLockerStatusRunspace = [PowerShell]::Create().AddScript({
+$script:BitLockerStatusRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
         function Get-BitLockerStatusTextFast {
             $systemDrive = $env:SystemDrive
             if ([string]::IsNullOrWhiteSpace($systemDrive)) { return "Unavailable" }
@@ -2357,12 +2339,11 @@ $script:BitLockerStatusRunspace = [PowerShell]::Create().AddScript({
 
 $script:BitLockerStatusAsyncResult = $script:BitLockerStatusRunspace.BeginInvoke()
 $script:BitLockerStatusStartedAt = Get-Date
-$script:BitLockerStatusTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:BitLockerStatusTimer.Interval = [TimeSpan]::FromMilliseconds(500)
-$script:BitLockerStatusTimer.Add_Tick({
+$script:BitLockerStatusTimer = $null
+Register-WmtUiPollOperation -Name "BitLockerStatus" -IntervalMs 500 -TestComplete { $false } -OnTick {
         $timedOut = $script:BitLockerStatusStartedAt -and (((Get-Date) - $script:BitLockerStatusStartedAt).TotalSeconds -gt 20)
         if (($script:BitLockerStatusAsyncResult -and $script:BitLockerStatusAsyncResult.IsCompleted) -or $timedOut) {
-            $script:BitLockerStatusTimer.Stop()
+            Unregister-WmtUiPollOperation -Name "BitLockerStatus"
             try {
                 if ($timedOut) {
                     try { $script:BitLockerStatusRunspace.Stop() } catch {}
@@ -2391,8 +2372,7 @@ $script:BitLockerStatusTimer.Add_Tick({
             $script:BitLockerStatusAsyncResult = $null
             $script:BitLockerStatusStartedAt = $null
         }
-    })
-$script:BitLockerStatusTimer.Start()
+    } | Out-Null
 }
 
 function Resolve-WmtThemeResourceKey {
@@ -6453,12 +6433,12 @@ try {
     $script:OptionalFeaturesCheckStarted = $false
     # Dispose tweak states background job if still running
     if ($script:TweakStatesBgPS) { try { $script:TweakStatesBgPS.Dispose() } catch {}; $script:TweakStatesBgPS = $null; $script:TweakStatesBgAsync = $null }
-    if ($script:TweakStatesBgTimer) { try { $script:TweakStatesBgTimer.Stop() } catch {}; $script:TweakStatesBgTimer = $null }
+    try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}; $script:TweakStatesBgTimer = $null
     if ($script:TweakStatesBgTimeout) { try { $script:TweakStatesBgTimeout.Stop() } catch {}; $script:TweakStatesBgTimeout = $null }
     if ($script:TweakStatesDebounceTimer) { try { $script:TweakStatesDebounceTimer.Stop() } catch {}; $script:TweakStatesDebounceTimer = $null }
     # Dispose optional features background job if still running
     if ($script:FeaturesCheckPS) { try { $script:FeaturesCheckPS.Dispose() } catch {}; $script:FeaturesCheckPS = $null; $script:FeaturesCheckAsync = $null }
-    if ($script:FeaturesCheckTimer) { try { $script:FeaturesCheckTimer.Stop() } catch {}; $script:FeaturesCheckTimer = $null }
+    try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}; $script:FeaturesCheckTimer = $null
 
     # Clear completed update ID tracking
     $script:WmtCompletedWindowsUpdateIds = $null
@@ -7199,7 +7179,7 @@ $runningAsExe = [bool]$script:WmtIsCompiledExe
 $scriptPathForUpdate = if ($runningAsExe) { $null } else { $script:WmtScriptPath }
 
 # 2. Start Background Thread (Runspace)
-$script:UpdateRunspace = [PowerShell]::Create().AddScript({
+$script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
         param($CurrentVer, $IsExe)
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -7329,17 +7309,14 @@ $script:UpdateRunspace = [PowerShell]::Create().AddScript({
 $script:UpdateAsyncResult = $script:UpdateRunspace.BeginInvoke()
 
 # 3. Setup Timer
-$script:UpdateTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:UpdateTimer.Interval = [TimeSpan]::FromMilliseconds(500)
-$script:UpdateTicks = 0
-
-$script:UpdateTimer.Add_Tick({
+$script:UpdateTimer = $null
+Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplete { $false } -OnTick {
         $lb = Get-Ctrl "LogBox"
         $script:UpdateTicks++
 
         # A. Timeout Check (20s)
         if ($script:UpdateTicks -gt 40) {
-            $script:UpdateTimer.Stop()
+            Unregister-WmtUiPollOperation -Name "SelfUpdateCheck"
             if ($script:UpdateRunspace) { $script:UpdateRunspace.Dispose() }
             if ($lb) { $lb.AppendText("[UPDATE] Error: Request timed out.`n"); $lb.ScrollToEnd() }
             return
@@ -7347,7 +7324,7 @@ $script:UpdateTimer.Add_Tick({
 
         # B. Check Job Status
         if ($script:UpdateAsyncResult.IsCompleted) {
-            $script:UpdateTimer.Stop()
+            Unregister-WmtUiPollOperation -Name "SelfUpdateCheck"
 
             try {
                 $jobResult = $script:UpdateRunspace.EndInvoke($script:UpdateAsyncResult)
@@ -7591,9 +7568,7 @@ $script:UpdateTimer.Add_Tick({
                 if ($lb) { $lb.AppendText("[UPDATE] Processing Error: $($_.Exception.Message)`n"); $lb.ScrollToEnd() }
             }
         }
-    })
-
-$script:UpdateTimer.Start()
+    } | Out-Null
 }
 
 function Start-UpdateRepair {
@@ -39154,7 +39129,7 @@ $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
         # Only release caches if no scan is actively running
         $scanBusy = $false
         if ($script:ScanTimer -and $script:ScanTimer.IsEnabled) { $scanBusy = $true }
-        if ($script:WmtLibraryScanTimer -and $script:WmtLibraryScanTimer.IsEnabled) { $scanBusy = $true }
+        if (Test-WmtUiPollOperation -Name "LibraryScan") { $scanBusy = $true }
         if ($script:WmtLibraryCacheRunspace) { $scanBusy = $true }
         if ($script:WmtRegistryCleanupActive -or ($script:WmtRegistryCleanupTimer -and $script:WmtRegistryCleanupTimer.IsEnabled)) { $scanBusy = $true }
         if (-not $scanBusy) {
@@ -39210,10 +39185,8 @@ if ($lblWingetStatus) {
     $lblWingetStatus.Visibility = "Visible"
 }
 
-if ($script:WingetSourcePreflightTimer) {
-    try { $script:WingetSourcePreflightTimer.Stop() } catch {}
-    $script:WingetSourcePreflightTimer = $null
-}
+try { Unregister-WmtUiPollOperation -Name "WingetSourcePreflight" } catch {}
+$script:WingetSourcePreflightTimer = $null
 if ($script:WingetSourcePreflightRunspace) {
     try { $script:WingetSourcePreflightRunspace.Stop() } catch {}
     try { $script:WingetSourcePreflightRunspace.Dispose() } catch {}
@@ -39273,13 +39246,12 @@ $script:WingetSourcePreflightRunspace = (New-WmtPooledPowerShell).AddScript({
     }).AddArgument([string[]]$script:WingetSourcePreflightSources)
 
 $script:WingetSourcePreflightAsyncResult = $script:WingetSourcePreflightRunspace.BeginInvoke()
-$script:WingetSourcePreflightTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:WingetSourcePreflightTimer.Interval = [TimeSpan]::FromMilliseconds(250)
-$script:WingetSourcePreflightTimer.Add_Tick({
+$script:WingetSourcePreflightTimer = $null
+Register-WmtUiPollOperation -Name "WingetSourcePreflight" -IntervalMs 250 -TestComplete { $false } -OnTick {
         if (-not $script:WingetSourcePreflightAsyncResult) { return }
         if (-not $script:WingetSourcePreflightAsyncResult.IsCompleted) { return }
 
-        $script:WingetSourcePreflightTimer.Stop()
+        Unregister-WmtUiPollOperation -Name "WingetSourcePreflight"
         try {
             $lines = $script:WingetSourcePreflightRunspace.EndInvoke($script:WingetSourcePreflightAsyncResult)
             foreach ($line in $lines) {
@@ -39302,8 +39274,7 @@ $script:WingetSourcePreflightTimer.Add_Tick({
             $btnWingetScan.IsEnabled = $true
             $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
         }
-    })
-$script:WingetSourcePreflightTimer.Start()
+    } | Out-Null
 }
 
 # ---------------------------------------------------------
@@ -43743,10 +43714,8 @@ if ($selectedName) {
 }
 
 function Stop-FirewallDetailLoad {
-if ($script:FirewallDetailTimer) {
-    try { $script:FirewallDetailTimer.Stop() } catch {}
-    $script:FirewallDetailTimer = $null
-}
+try { Unregister-WmtUiPollOperation -Name "FirewallDetailLoad" } catch {}
+$script:FirewallDetailTimer = $null
 if ($script:FirewallDetailJob) {
     try { $script:FirewallDetailJob.PowerShell.Stop() } catch {}
     try { $script:FirewallDetailJob.PowerShell.Dispose() } catch {}
@@ -43755,10 +43724,8 @@ if ($script:FirewallDetailJob) {
 }
 
 function Stop-FirewallRuleLoad {
-if ($script:FirewallLoadTimer) {
-    try { $script:FirewallLoadTimer.Stop() } catch {}
-    $script:FirewallLoadTimer = $null
-}
+try { Unregister-WmtUiPollOperation -Name "FirewallRuleLoad" } catch {}
+$script:FirewallLoadTimer = $null
 if ($script:FirewallLoadRunspace) {
     try { $script:FirewallLoadRunspace.Stop() } catch {}
     try { $script:FirewallLoadRunspace.Dispose() } catch {}
@@ -43797,7 +43764,7 @@ $script:FirewallDetailToken++
 $token = $script:FirewallDetailToken
 Set-FirewallStatus "Loading selected rule details..." -Visible $true
 
-$ps = [PowerShell]::Create().AddScript({
+$ps = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
         param([string]$RuleName)
         function Format-RuleValue {
             param([object[]]$Values)
@@ -43829,13 +43796,12 @@ $ps = [PowerShell]::Create().AddScript({
 
 $async = $ps.BeginInvoke()
 $script:FirewallDetailJob = [PSCustomObject]@{ Name = $name; PowerShell = $ps; Async = $async; Token = $token }
-$script:FirewallDetailTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:FirewallDetailTimer.Interval = [TimeSpan]::FromMilliseconds(150)
-$script:FirewallDetailTimer.Add_Tick({
+$script:FirewallDetailTimer = $null
+Register-WmtUiPollOperation -Name "FirewallDetailLoad" -IntervalMs 150 -TestComplete { $false } -OnTick {
         if (-not $script:FirewallDetailJob -or -not $script:FirewallDetailJob.Async.IsCompleted) { return }
 
         $job = $script:FirewallDetailJob
-        $script:FirewallDetailTimer.Stop()
+        Unregister-WmtUiPollOperation -Name "FirewallDetailLoad"
         try {
             $result = $job.PowerShell.EndInvoke($job.Async)
             if ($result -and $result.Count -eq 1) { $result = $result[0] }
@@ -43871,8 +43837,7 @@ $script:FirewallDetailTimer.Add_Tick({
             $script:FirewallDetailTimer = $null
             Set-FirewallStatus "" -Visible $false
         }
-    })
-$script:FirewallDetailTimer.Start()
+    } | Out-Null
 }
 
 function Initialize-FirewallRuleDetails {
@@ -43939,7 +43904,7 @@ if (-not $Preload) {
     Write-GuiLog "[Firewall] Loading base rule list..."
 }
 
-$script:FirewallLoadRunspace = [PowerShell]::Create().AddScript({
+$script:FirewallLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
         try {
             $rules = @(Get-NetFirewallRule -ErrorAction Stop | ForEach-Object {
                     $displayName = if ([string]::IsNullOrWhiteSpace([string]$_.DisplayName)) { $_.Name } else { $_.DisplayName }
@@ -43963,12 +43928,11 @@ $script:FirewallLoadRunspace = [PowerShell]::Create().AddScript({
     })
 $script:FirewallLoadAsyncResult = $script:FirewallLoadRunspace.BeginInvoke()
 
-$script:FirewallLoadTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:FirewallLoadTimer.Interval = [TimeSpan]::FromMilliseconds(150)
-$script:FirewallLoadTimer.Add_Tick({
+$script:FirewallLoadTimer = $null
+Register-WmtUiPollOperation -Name "FirewallRuleLoad" -IntervalMs 150 -TestComplete { $false } -OnTick {
         if (-not $script:FirewallLoadAsyncResult -or -not $script:FirewallLoadAsyncResult.IsCompleted) { return }
 
-        $script:FirewallLoadTimer.Stop()
+        Unregister-WmtUiPollOperation -Name "FirewallRuleLoad"
         try {
             $result = $script:FirewallLoadRunspace.EndInvoke($script:FirewallLoadAsyncResult)
             if ($result -and $result.Count -eq 1) { $result = $result[0] }
@@ -44010,8 +43974,7 @@ $script:FirewallLoadTimer.Add_Tick({
             $script:FirewallLoadTimer = $null
             if ($btnFwRefresh) { $btnFwRefresh.IsEnabled = $true }
         }
-    })
-$script:FirewallLoadTimer.Start()
+    } | Out-Null
 }
 
 if ($btnFwRefresh) { $btnFwRefresh.Add_Click({ Start-FirewallRuleLoad -Force }) }
@@ -44430,10 +44393,8 @@ foreach ($row in $script:DriverPackages) {
 }
 
 function Stop-DriverLoad {
-if ($script:DriverLoadTimer) {
-    try { $script:DriverLoadTimer.Stop() } catch {}
-    $script:DriverLoadTimer = $null
-}
+try { Unregister-WmtUiPollOperation -Name "DriverUsageLoad" } catch {}
+$script:DriverLoadTimer = $null
 if ($script:DriverLoadRunspace) {
     try { $script:DriverLoadRunspace.Stop() } catch {}
     try { $script:DriverLoadRunspace.Dispose() } catch {}
@@ -44501,7 +44462,7 @@ catch {
 # Phase 2 (slow, background): which present devices use each package, plus
 # which of each package's INF services exist / run in Windows.
 $drvInfList = @($script:DriverPackages | ForEach-Object { [string]$_.PublishedName })
-$script:DriverLoadRunspace = [PowerShell]::Create().AddScript({
+$script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
     param([string[]]$infs)
     $result = [PSCustomObject]@{ Success = $false; Usage = $null; Services = $null; Error = "" }
     try {
@@ -44566,12 +44527,11 @@ $script:DriverLoadRunspace = [PowerShell]::Create().AddScript({
 }).AddArgument($drvInfList)
 $script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
 
-$script:DriverLoadTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:DriverLoadTimer.Interval = [TimeSpan]::FromMilliseconds(150)
-$script:DriverLoadTimer.Add_Tick({
+$script:DriverLoadTimer = $null
+Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplete { $false } -OnTick {
     if (-not $script:DriverLoadAsyncResult -or -not $script:DriverLoadAsyncResult.IsCompleted) { return }
 
-    $script:DriverLoadTimer.Stop()
+    Unregister-WmtUiPollOperation -Name "DriverUsageLoad"
     try {
         $result = $script:DriverLoadRunspace.EndInvoke($script:DriverLoadAsyncResult)
         if ($result -and $result.Count -eq 1) { $result = $result[0] }
@@ -44612,8 +44572,7 @@ $script:DriverLoadTimer.Add_Tick({
         $script:DriverLoadInProgress = $false
         if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
     }
-})
-$script:DriverLoadTimer.Start()
+    } | Out-Null
 }
 
 function Get-DriverPackageDetailsText {
@@ -48145,14 +48104,13 @@ $script:WmtLibraryScanAsyncResult = $ps.BeginInvoke()
 
 # Polling timer to collect results. Use $script: scope so the Tick
 # handler can restart itself without closure capture issues.
-$script:WmtLibraryScanTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:WmtLibraryScanTimer.Interval = [TimeSpan]::FromMilliseconds(500)
-$script:WmtLibraryScanTimer.Add_Tick({
+$script:WmtLibraryScanTimer = $null
+Register-WmtUiPollOperation -Name "LibraryScan" -IntervalMs 500 -TestComplete { $false } -OnTick {
         if (-not $script:WmtLibraryScanTimer) { return }
-        try { $script:WmtLibraryScanTimer.Stop() } catch {}
+        
         if (-not $script:WmtLibraryScanAsyncResult) { return }
         if (-not $script:WmtLibraryScanAsyncResult.IsCompleted) {
-            try { $script:WmtLibraryScanTimer.Start() } catch {}
+            
             return
         }
         try {
@@ -48199,10 +48157,10 @@ $script:WmtLibraryScanTimer.Add_Tick({
         try { $script:WmtLibraryScanRunspace.Dispose() } catch {}
         $script:WmtLibraryScanRunspace = $null
         $script:WmtLibraryScanAsyncResult = $null
-        try { $script:WmtLibraryScanTimer.Stop() } catch {}
+        
+        Unregister-WmtUiPollOperation -Name "LibraryScan"
         $script:WmtLibraryScanTimer = $null
-    })
-$script:WmtLibraryScanTimer.Start()
+    } | Out-Null
 }
 
 if ($btnShowLibrary -and $btnBackToCatalog -and $btnLibraryRefresh -and $brdCatalogList -and $brdLibraryList -and $pnlCatalogActions -and $lstLibrary) {
@@ -49325,7 +49283,7 @@ function Start-TweakButtonStatesBackgroundUpdate {
 if ($script:TweakStatesBgStarted) { return }
 $script:TweakStatesBgStarted = $true
 
-$ps = New-WmtPooledPowerShell
+$ps = New-WmtPooledPowerShell -PoolKind UiSupport
 [void]$ps.AddScript({
         # Collect all unique registry paths that Update-TweakButtonStates queries.
         # Pre-loading them in background means the UI thread never blocks on registry I/O.
@@ -49596,11 +49554,10 @@ if ($null -eq $async -or $async.IsFaulted) {
 
 $script:TweakStatesBgAsync = $async
 $script:TweakStatesBgPS = $ps
-$script:TweakStatesBgTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:TweakStatesBgTimer.Interval = [TimeSpan]::FromMilliseconds(200)
-$script:TweakStatesBgTimer.Add_Tick({
+$script:TweakStatesBgTimer = $null
+Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplete { $false } -OnTick {
         if ($script:TweakStatesBgAsync -and $script:TweakStatesBgAsync.IsCompleted) {
-            $script:TweakStatesBgTimer.Stop()
+            Unregister-WmtUiPollOperation -Name "TweakStatesLoad"
             try {
                 $result = $script:TweakStatesBgPS.EndInvoke($script:TweakStatesBgAsync)
                 # EndInvoke's real return type is PSDataCollection[PSObject] — that's the
@@ -49665,8 +49622,7 @@ $script:TweakStatesBgTimer.Add_Tick({
             $script:TweakStatesBgAsync = $null
             $script:TweakStatesBgPS = $null
         }
-    })
-$script:TweakStatesBgTimer.Start()
+    } | Out-Null
 
 # Timeout guard: if the runspace pool is starved (e.g. My Device jobs filling
 # all slots), the background job may never start. After 30 seconds, hide the
@@ -49682,7 +49638,7 @@ $script:TweakStatesBgTimeout.Add_Tick({
             $script:TweakStatesBgAsync = $null
             $script:TweakStatesBgPS = $null
             # Stop polling timer too
-            try { if ($script:TweakStatesBgTimer) { $script:TweakStatesBgTimer.Stop() } } catch {}
+            try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
             # Apply whatever cache we have (may be empty) so buttons aren't stuck
             try {
                 Update-TweakButtonStates
@@ -49733,7 +49689,7 @@ $script:OptionalFeaturesCheckStarted = $true
 $featureMap = $script:OptionalFeaturesMap
 
 # Run in a background runspace (shared pool)
-$ps = New-WmtPooledPowerShell
+$ps = New-WmtPooledPowerShell -PoolKind UiSupport
 [void]$ps.AddScript({
         param($map)
         $results = @{}
@@ -49783,11 +49739,10 @@ $async = $ps.BeginInvoke()
 # Store in script scope so the timer tick can access them
 $script:FeaturesCheckAsync = $async
 $script:FeaturesCheckPS = $ps
-$script:FeaturesCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:FeaturesCheckTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
-$script:FeaturesCheckTimer.Add_Tick({
+$script:FeaturesCheckTimer = $null
+Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -TestComplete { $false } -OnTick {
         if ($script:FeaturesCheckAsync -and $script:FeaturesCheckAsync.IsCompleted) {
-            $script:FeaturesCheckTimer.Stop()
+            Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck"
             try {
                 $raw = $script:FeaturesCheckPS.EndInvoke($script:FeaturesCheckAsync)
                 $results = $null
@@ -49822,8 +49777,7 @@ $script:FeaturesCheckTimer.Add_Tick({
             $script:OptionalFeaturesReady = $true
             Sync-WmtTweakOverlayHide
         }
-    })
-$script:FeaturesCheckTimer.Start()
+    } | Out-Null
 }
 
 function Update-OptionalFeaturesSynchronously {
@@ -50762,7 +50716,7 @@ try { if ($script:WingetJob) { $script:WingetJob.Stop(); $script:WingetJob.Dispo
 $script:WingetAsyncResult = $null
 $script:WingetOutputQueue = $null
 Stop-WmtStartupBackgroundPreload
-if ($script:WingetSourcePreflightTimer) { $script:WingetSourcePreflightTimer.Stop() }
+try { Unregister-WmtUiPollOperation -Name "WingetSourcePreflight" } catch {}
 if ($script:WingetSourcePreflightRunspace) {
     try { $script:WingetSourcePreflightRunspace.Stop() } catch {}
     try { $script:WingetSourcePreflightRunspace.Dispose() } catch {}
@@ -50781,7 +50735,7 @@ if ($script:AsyncPowerShell) {
 }
 $script:AsyncSearch = $null
 # Clean up tweak states background preload
-if ($script:TweakStatesBgTimer) { try { $script:TweakStatesBgTimer.Stop() } catch {} }
+try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
 if ($script:TweakStatesBgPS) {
     try { $script:TweakStatesBgPS.Stop() } catch {}
     try { $script:TweakStatesBgPS.Dispose() } catch {}
@@ -50797,7 +50751,7 @@ if ($script:WmtRegistryCleanupRunspace) { try { $script:WmtRegistryCleanupRunspa
 $script:WmtRegistryCleanupAsync = $null
 $script:WmtRegistryCleanupSync = $null
 $script:WmtRegistryCleanupActive = $false
-if ($script:BitLockerStatusTimer) { $script:BitLockerStatusTimer.Stop() }
+try { Unregister-WmtUiPollOperation -Name "BitLockerStatus" } catch {}
 if ($script:BitLockerStatusRunspace) {
     try { $script:BitLockerStatusRunspace.Stop() } catch {}
     try { $script:BitLockerStatusRunspace.Dispose() } catch {}
@@ -50864,7 +50818,7 @@ try {
 catch {}
 try { if ($script:WmtLibrarySearchTimer) { $script:WmtLibrarySearchTimer.Stop(); $script:WmtLibrarySearchTimer = $null } } catch {}
 try { if ($script:StatsTimer) { $script:StatsTimer.Stop(); $script:StatsTimer = $null } } catch {}
-try { if ($script:UpdateTimer) { $script:UpdateTimer.Stop(); $script:UpdateTimer = $null } } catch {}
+try { Unregister-WmtUiPollOperation -Name "SelfUpdateCheck"; $script:UpdateTimer = $null } catch {}
 try { if ($script:WmtProviderMgrLibrarySearchTimer) { $script:WmtProviderMgrLibrarySearchTimer.Stop(); $script:WmtProviderMgrLibrarySearchTimer = $null } } catch {}
 try {
     if ($script:bootCacheTimer) {
