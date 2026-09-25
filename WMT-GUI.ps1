@@ -33897,7 +33897,7 @@ $wingetWorkerScript = {
         $Result.Value = $proc
     }
 
-    # Pip can remain alive indefinitely when launched with ProcessStartInfo from inside Start-Job.
+    # Pip can remain alive indefinitely when launched with ProcessStartInfo from inside a background PowerShell worker.
     # Direct native invocation lets the job host drain pip's output reliably while remaining headless.
     function Invoke-WmtPipDirect {
         param(
@@ -36470,28 +36470,13 @@ if ([string]::IsNullOrWhiteSpace($exe) -or -not (Test-Path -LiteralPath $exe -Pa
 
 try {
     # Try JSON output first (much more reliable than text parsing).
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    # --api-timeout 30 (a global, pre-subcommand option): the same patience for
-    # slow Epic routes as the update scan; failed fetches keep the old cache.
-    # --include-ue only while UE/Fab assets are actually shown: with the
-    # default "Fab Assets: Hidden" legendary itself omits every
-    # namespace-'ue' item, so no UE/Fab row can reach the cache even if
-    # a tag heuristic fails (this is upstream v6.6's default behavior).
+    # Drain stdout/stderr concurrently so provider output cannot fill one pipe
+    # and deadlock while WMT is waiting on the other.
     $ueFlag = ""
     try { if (-not (Get-WmtHideLegendaryUeAssets)) { $ueFlag = " --include-ue" } } catch {}
-    $psi.Arguments = "--api-timeout 30 list --json$ueFlag"
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    try { $proc.WaitForExit(30000) } catch {}
-    try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+    $procResult = Invoke-WmtProcess -FilePath $exe -Arguments "--api-timeout 30 list --json$ueFlag" -TimeoutMs 30000 -Encoding UTF8 -KillTree
+    $stdout = [string]$procResult.StdOut
+    $stderr = [string]$procResult.StdErr
 
     $parsed = $false
 
@@ -37057,19 +37042,8 @@ param(
     [int]$TimeoutMs = 15000
 )
 try {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath
-    $psi.Arguments = $Arguments
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    try { $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    try { $proc.WaitForExit($TimeoutMs) } catch {}
-    try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
-    return [string]$stdout
+    $result = Invoke-WmtProcess -FilePath $FilePath -Arguments $Arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+    return [string]$result.StdOut
 }
 catch { return "" }
 }
@@ -48321,17 +48295,8 @@ function Get-WmtLibraryItemInstallDir {
                 if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
             }
             if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = $legExe
-                $psi.Arguments = "info `"$id`""
-                $psi.RedirectStandardOutput = $true
-                $psi.UseShellExecute = $false
-                $psi.CreateNoWindow = $true
-                $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                $proc = [System.Diagnostics.Process]::Start($psi)
-                $stdout = $proc.StandardOutput.ReadToEnd()
-                try { $proc.WaitForExit(10000) } catch {}
-                try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                $procResult = Invoke-WmtProcess -FilePath $legExe -Arguments "info `"$id`"" -TimeoutMs 10000 -Encoding UTF8 -KillTree
+                $stdout = [string]$procResult.StdOut
                 # Look for "Install path:" line
                 foreach ($line in ($stdout -split "`r?`n")) {
                     if ($line -match "(?i)install\s*(?:path|location)\s*:?\s*(.+)") {
