@@ -47897,6 +47897,13 @@ $btnPerfServicesManual.Add_Click({
 })
 
 $btnPerfServicesRevert.Add_Click({
+    $done = {
+        param($results)
+        if ($btnToggleSuperfetch) {
+            $sm = Get-Service "SysMain" -ErrorAction SilentlyContinue
+            if ($sm) { Update-WmtTweakToggle $btnToggleSuperfetch ($sm.StartType -ne 'Disabled') "Enable Superfetch" "Disable Superfetch" }
+        }
+    }.GetNewClosure()
     Invoke-WmtUiBackgroundCommand -Name "RestoreServicesDefault" -Msg "Reverting services..." -Sb {
         Write-Output "Reverting services to default..."
         $services = @('DiagTrack', 'dmwappushservice', 'MapsBroker', 'WpnService', 'PcaSvc', 'WerSvc', 'SysMain', 'WSearch', 'XblAuthManager', 'XblGameSave', 'XboxNetApiSvc', 'iphlpsvc')
@@ -47908,8 +47915,7 @@ $btnPerfServicesRevert.Add_Click({
             catch {}
         }
         Write-Output "Services restored to default!"
-    } | Out-Null
-    if ($btnToggleSuperfetch) { $sm = Get-Service "SysMain" -EA Ignore; if ($sm) { Update-WmtTweakToggle $btnToggleSuperfetch ($sm.StartType -ne 'Disabled') "Enable Superfetch" "Disable Superfetch" } }
+    } -OnComplete $done | Out-Null
 })
 
 $btnToggleHibernate = Get-Ctrl "btnToggleHibernate"
@@ -47917,13 +47923,19 @@ if ($btnToggleHibernate) {
 $btnToggleHibernate.Add_Click({
         Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
         $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0)
-        if ($h -eq 1) {
-            Invoke-WmtUiBackgroundCommand -Name "DisableHibernate" -Msg "Disabling hibernation..." -Sb { powercfg /hibernate off | Out-Null; Write-Output "Hibernation disabled. Disk space freed." } | Out-Null
+        $enabling = ($h -ne 1)
+        $done = {
+            param($results)
+            Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
+            $actual = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0)
+            Update-WmtTweakToggle $btnToggleHibernate ($actual -ne 0) "Enable Hibernation" "Disable Hibernation"
+        }.GetNewClosure()
+        if ($enabling) {
+            Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb { powercfg /hibernate on | Out-Null; Write-Output "Hibernation enabled." } -OnComplete $done | Out-Null
         }
         else {
-            Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb { powercfg /hibernate on | Out-Null; Write-Output "Hibernation enabled." } | Out-Null
+            Invoke-WmtUiBackgroundCommand -Name "DisableHibernate" -Msg "Disabling hibernation..." -Sb { powercfg /hibernate off | Out-Null; Write-Output "Hibernation disabled. Disk space freed." } -OnComplete $done | Out-Null
         }
-        Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Enable Hibernation" "Disable Hibernation"
     })
 }
 
