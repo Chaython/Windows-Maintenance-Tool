@@ -7467,31 +7467,26 @@ $message += "."
 }
 
 function Show-DownloadStats {
-Invoke-UiCommand {
-    try {
-        $repo = "ios12checker/Windows-Maintenance-Tool"
-        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
-        if (-not $rel -or -not $rel.assets) { throw "No release data returned." }
-        $total = ($rel.assets | Measure-Object download_count -Sum).Sum
-        $lines = @()
-        $lines += "Release: $($rel.name)"
-        $lines += "Total downloads: $total"
-        $lines += ""
-        foreach ($a in $rel.assets) {
-            $lines += ("{0} : {1}" -f $a.name, $a.download_count)
-        }
-        $msg = $lines -join "`r`n"
-        Write-Output $msg
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show($msg, "Latest Release Downloads", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-    }
-    catch {
-        $err = "Failed to fetch download stats: $($_.Exception.Message)"
-        Write-Output $err
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show($err, "Latest Release Downloads", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
-    }
-} "Fetching latest release download counts..."
+$done = {
+    param($results)
+    $msg = [string](@($results | Select-Object -Last 1)[0])
+    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "No release data returned." }
+    Show-WmtMessageBox -Message $msg -Title "Latest Release Downloads" -Image Information | Out-Null
+}.GetNewClosure()
+$failed = {
+    param($errorRecord)
+    $msg = if ($errorRecord -and $errorRecord.Exception) { "Failed to fetch download stats: $($errorRecord.Exception.Message)" } else { "Failed to fetch download stats: $errorRecord" }
+    Show-WmtMessageBox -Message $msg -Title "Latest Release Downloads" -Image Error | Out-Null
+}.GetNewClosure()
+Invoke-WmtUiBackgroundCommand -Name "ReleaseDownloadStats" -Msg "Fetching latest release download counts..." -SuppressResultLog -Sb {
+    $repo = "ios12checker/Windows-Maintenance-Tool"
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -ErrorAction Stop
+    if (-not $rel -or -not $rel.assets) { throw "No release data returned." }
+    $total = ($rel.assets | Measure-Object download_count -Sum).Sum
+    $lines = @("Release: $($rel.name)", "Total downloads: $total", "")
+    foreach ($a in $rel.assets) { $lines += ("{0} : {1}" -f $a.name, $a.download_count) }
+    $lines -join "`r`n"
+} -OnComplete $done -OnError $failed | Out-Null
 }
 
 # --- UPDATE CHECKER ---
@@ -7963,41 +7958,29 @@ Invoke-WmtUiBackgroundCommand -Name "XboxCredentialCleanup" -Msg "Cleaning Xbox 
 }
 
 function Start-GpeditInstall {
-# Check for User Confirmation
 $msg = "Install Local Group Policy Editor?`n`nThis enables the Group Policy Editor (gpedit.msc) on Windows Home editions by installing the built-in system packages.`n`nContinue?"
 $res = Show-WmtMessageBox -Message $msg -Title "Confirm Install" -Button YesNo -Image Question
 if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-Invoke-UiCommand {
-    $packageRoot = Join-Path $env:SystemRoot "servicing\\Packages"
-
-    if (-not (Test-Path $packageRoot)) {
-        throw "Package directory not found: $packageRoot"
-    }
-
+Invoke-WmtUiBackgroundCommand -Name "GpeditInstall" -Msg "Installing Group Policy Editor..." -Sb {
+    $packageRoot = Join-Path $env:SystemRoot "servicing\Packages"
+    if (-not (Test-Path $packageRoot)) { throw "Package directory not found: $packageRoot" }
     Write-Output "Searching packages in $packageRoot..."
-
-    $clientTools = @(Get-WmtEnumeratedFiles -Path $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientTools-Package~*.mum" | ForEach-Object { [System.IO.FileInfo]::new($_) })
-    $clientExtensions = @(Get-WmtEnumeratedFiles -Path $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientExtensions-Package~*.mum" | ForEach-Object { [System.IO.FileInfo]::new($_) })
-
+    $clientTools = @(Get-ChildItem -LiteralPath $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientTools-Package~*.mum" -File -ErrorAction SilentlyContinue)
+    $clientExtensions = @(Get-ChildItem -LiteralPath $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientExtensions-Package~*.mum" -File -ErrorAction SilentlyContinue)
     if (-not $clientTools -or -not $clientExtensions) {
         Write-Output "WARNING: Required GroupPolicy packages were not found."
         Write-Output "Ensure you are on a compatible Windows 10/11 version."
         return
     }
-
     $packages = @($clientTools + $clientExtensions) | Sort-Object Name -Unique
-
     foreach ($pkg in $packages) {
         Write-Output "Installing: $($pkg.Name)..."
-        # Using DISM to add package
         $proc = Start-Process dism.exe -ArgumentList "/online", "/norestart", "/add-package:`"$($pkg.FullName)`"" -NoNewWindow -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            Write-Output " -> Failed (Exit Code: $($proc.ExitCode))"
-        }
+        if ($proc.ExitCode -ne 0) { Write-Output " -> Failed (Exit Code: $($proc.ExitCode))" }
     }
-    Write-Output "`nInstallation Complete. Try running 'gpedit.msc'. (A reboot may be required)."
-} "Installing Group Policy Editor..."
+    Write-Output "Installation Complete. Try running 'gpedit.msc'. (A reboot may be required)."
+} | Out-Null
 }
 
 # --- NETWORK / DNS HELPERS (from CLI) ---
@@ -23331,38 +23314,41 @@ if (-not $selectedPath) {
     if ([string]::IsNullOrWhiteSpace($selectedPath)) { return }
 }
 
-Invoke-UiCommand {
-    param($Path)
-    if (-not (Test-Path $Path)) {
-        Write-Output "Restore failed: path not found $Path"
-        Show-WmtMessageBox -Message "Restore failed: path not found.`n$Path" -Title "Restore Drivers" -Image Error | Out-Null
-        return
-    }
-
-    $firstInf = Find-WmtFirstEnumeratedFile -Path $Path -Filter "*.inf"
-    if (-not $firstInf) {
-        Write-Output "Restore aborted: no INF files found in $Path"
-        Show-WmtMessageBox -Message "No INF files found in:`n$Path" -Title "Restore Drivers" -Image Warning | Out-Null
-        return
-    }
-
-    $output = pnputil.exe /add-driver "$Path\*.inf" /subdirs 2>&1
-    $code = $LASTEXITCODE
-    Write-Output $output
-    if ($code -eq 0 -or $code -eq 3010) {
-        Write-Output "Drivers restored from $Path"
-        # Restore stages NEW packages into the driver store — the cached
-        # Drivers list no longer matches reality, so drop the cache and
-        # re-enumerate (a real change, unlike removals which edit in place).
+$restoreDone = {
+    param($results)
+    $result = @($results | Where-Object { $_ -and $_.PSObject.Properties["Status"] } | Select-Object -Last 1)[0]
+    if (-not $result) { return }
+    if ($result.Output) { Write-GuiLog ([string]$result.Output) }
+    if ($result.Status -eq "Success") {
         $script:DriverCacheLoaded = $false
-        Show-WmtMessageBox -Message "Drivers restored from:`n$Path" -Title "Restore Drivers" -Image Information | Out-Null
+        Show-WmtMessageBox -Message "Drivers restored from:`n$($result.Path)" -Title "Restore Drivers" -Image Information | Out-Null
+        if ($script:DriverPackages.Count -gt 0) { Start-DriverListLoad -Force }
+    }
+    elseif ($result.Status -eq "MissingInf") {
+        Show-WmtMessageBox -Message "No INF files found in:`n$($result.Path)" -Title "Restore Drivers" -Image Warning | Out-Null
     }
     else {
-        Write-Output "Restore failed (exit $code)."
-        $msg = "Restore failed (exit $code)." + "`n`nOutput:`n" + ($output | Out-String)
-        Show-WmtMessageBox -Message $msg -Title "Restore Drivers" -Image Error | Out-Null
+        Show-WmtMessageBox -Message "Restore failed (exit $($result.ExitCode)).`n`n$($result.Output)" -Title "Restore Drivers" -Image Error | Out-Null
     }
-} "Restoring drivers..." -ArgumentList $selectedPath
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Name "DriverRestore" -Msg "Restoring drivers..." -SuppressResultLog -Sb {
+    param($Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Restore path not found: $Path" }
+    $firstInf = Get-ChildItem -LiteralPath $Path -Filter "*.inf" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $firstInf) { return [PSCustomObject]@{ Status="MissingInf"; Path=$Path; ExitCode=-1; Output="" } }
+    $output = pnputil.exe /add-driver "$Path\*.inf" /subdirs 2>&1
+    $code = $LASTEXITCODE
+    [PSCustomObject]@{
+        Status = if ($code -eq 0 -or $code -eq 3010) { "Success" } else { "Failed" }
+        Path = $Path
+        ExitCode = $code
+        Output = ((@($output) | ForEach-Object { [string]$_ }) -join "`n")
+    }
+} -ArgumentList $selectedPath -OnComplete $restoreDone | Out-Null
+
+# If a cached list was on screen while restoring, reload it now so the newly
+
 # If a cached list was on screen while restoring, reload it now so the newly
 # staged packages appear; otherwise the next Drivers tab visit reloads.
 if (-not $script:DriverCacheLoaded -and $script:DriverPackages.Count -gt 0) {
@@ -23393,38 +23379,26 @@ $selectedFolder = Select-WmtFolder -Description "Select output folder for system
 if ([string]::IsNullOrWhiteSpace($selectedFolder)) { return }
 $outdir = Join-Path $selectedFolder ("SystemReports_{0}" -f (Get-Date -Format "yyyy-MM-dd_HHmm"))
 if (-not (Test-Path $outdir)) { New-Item -ItemType Directory -Path $outdir | Out-Null }
-
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "SystemReports" -Msg "Generating system reports..." -Sb {
     param($outdir)
     $date = Get-Date -Format "yyyy-MM-dd"
-    $sys = Join-Path $outdir "System_Info_$date.txt"
-    $net = Join-Path $outdir "Network_Info_$date.txt"
-    $drv = Join-Path $outdir "Driver_List_$date.txt"
-    Invoke-WmtCliText -FilePath "systeminfo" | Out-File -FilePath $sys -Encoding UTF8
-    Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/all" | Out-File -FilePath $net -Encoding UTF8
-    Invoke-WmtCliText -FilePath "driverquery" | Out-File -FilePath $drv -Encoding UTF8
+    Invoke-WmtCliText -FilePath "systeminfo" | Out-File -FilePath (Join-Path $outdir "System_Info_$date.txt") -Encoding UTF8
+    Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/all" | Out-File -FilePath (Join-Path $outdir "Network_Info_$date.txt") -Encoding UTF8
+    Invoke-WmtCliText -FilePath "driverquery" | Out-File -FilePath (Join-Path $outdir "Driver_List_$date.txt") -Encoding UTF8
     Write-Output "Reports saved to $outdir"
-    # CHANGE IS HERE: Passing the argument explicitly
-} "Generating system reports..." -ArgumentList $outdir
+} -ArgumentList $outdir | Out-Null
 }
 
 function Invoke-UpdateServiceReset {
-Invoke-UiCommand {
-    try {
-        $script:UpdateSvcResult = "OK"
-        Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
-        Stop-Service -Name cryptsvc -Force -ErrorAction SilentlyContinue
-        Start-Service -Name appidsvc -ErrorAction SilentlyContinue
-        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
-        Start-Service -Name cryptsvc -ErrorAction SilentlyContinue
-        Start-Service -Name bits -ErrorAction SilentlyContinue
-        Write-Output "Restarted Windows Update related services."
-    }
-    catch {
-        $script:UpdateSvcResult = "ERR: $($_.Exception.Message)"
-        throw
-    }
-} "Restarting Windows Update services..."
+Invoke-WmtUiBackgroundCommand -Name "UpdateServiceReset" -Msg "Restarting Windows Update services..." -Sb {
+    Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+    Stop-Service -Name cryptsvc -Force -ErrorAction SilentlyContinue
+    Start-Service -Name appidsvc -ErrorAction SilentlyContinue
+    Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+    Start-Service -Name cryptsvc -ErrorAction SilentlyContinue
+    Start-Service -Name bits -ErrorAction SilentlyContinue
+    Write-Output "Restarted Windows Update related services."
+} | Out-Null
 }
 
 function Set-DotNetRollForward {
@@ -43544,38 +43518,31 @@ $btnSFC.Add_Click({
     Start-Process -FilePath "powershell.exe" -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "sfc /scannow; Write-Host; Write-Host ''Execution Complete.'' -ForegroundColor Green; Write-Host ''Press Enter to close...'' -NoNewline -ForegroundColor Gray; Read-Host"' -Verb RunAs -WindowStyle Normal
 })
 $btnDISMCheck.Add_Click({
-    Invoke-UiCommand {
-        $text = Invoke-WmtCliText -FilePath "dism" -Arguments "/online /cleanup-image /checkhealth" -TimeoutMs 120000
-        if ($text) { Write-Output $text }
-
-        $message = "DISM Check completed."
-        $needsRepair = $false
-        if ($text -match "No component store corruption detected") {
-            $message = "DISM Check: no corruption detected."
-        }
-        elseif ($text -match "component store is repairable") {
-            $message = "DISM Check: corruption detected (repairable)."
-            $needsRepair = $true
-        }
-        elseif ($text -match "The operation completed successfully") {
-            $message = "DISM Check: completed successfully."
-        }
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show($message, "DISM CheckHealth", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-
-        if ($needsRepair) {
-            $prompt = [System.Windows.MessageBox]::Show(
-                "DISM found repairable corruption.`n`nRun DISM RestoreHealth now?",
-                "DISM CheckHealth",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Question
-            )
-            if ($prompt -eq "Yes") {
-                Write-Output "Launching DISM RestoreHealth..."
+    $done = {
+        param($results)
+        $r = @($results | Where-Object { $_ -and $_.PSObject.Properties["Message"] } | Select-Object -Last 1)[0]
+        if (-not $r) { return }
+        if ($r.Text) { Write-GuiLog ([string]$r.Text) }
+        Show-WmtMessageBox -Message ([string]$r.Message) -Title "DISM CheckHealth" -Image Information | Out-Null
+        if ([bool]$r.NeedsRepair) {
+            $prompt = Show-WmtMessageBox -Message "DISM found repairable corruption.`n`nRun DISM RestoreHealth now?" -Title "DISM CheckHealth" -Button YesNo -Image Question
+            if ($prompt -eq [System.Windows.MessageBoxResult]::Yes) {
                 Start-Process -FilePath "powershell.exe" -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "dism /online /cleanup-image /restorehealth; Write-Host; Write-Host ''Execution Complete.'' -ForegroundColor Green; Write-Host ''Press Enter to close...'' -NoNewline -ForegroundColor Gray; Read-Host"' -Verb RunAs -WindowStyle Normal
             }
         }
-    } "Running DISM CheckHealth..."
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name "DismCheckHealth" -Msg "Running DISM CheckHealth..." -SuppressResultLog -Sb {
+        $text = Invoke-WmtCliText -FilePath "dism" -Arguments "/online /cleanup-image /checkhealth" -TimeoutMs 120000
+        $message = "DISM Check completed."
+        $needsRepair = $false
+        if ($text -match "No component store corruption detected") { $message = "DISM Check: no corruption detected." }
+        elseif ($text -match "component store is repairable") { $message = "DISM Check: corruption detected (repairable)."; $needsRepair = $true }
+        elseif ($text -match "The operation completed successfully") { $message = "DISM Check: completed successfully." }
+        [PSCustomObject]@{ Text=[string]$text; Message=$message; NeedsRepair=$needsRepair }
+    } -OnComplete $done | Out-Null
+})
+$btnDISMRestore.Add_Click({
+
 })
 $btnDISMRestore.Add_Click({
     Start-Process -FilePath "powershell.exe" -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "dism /online /cleanup-image /restorehealth; Write-Host; Write-Host ''Execution Complete.'' -ForegroundColor Green; Write-Host ''Press Enter to close...'' -NoNewline -ForegroundColor Gray; Read-Host"' -Verb RunAs -WindowStyle Normal
@@ -47838,36 +47805,37 @@ return ($results | Sort-Object Name)
 }
 
 if ($btnAppxLoad) { $btnAppxLoad.Add_Click({
-    Invoke-UiCommand {
-        $lstAppxPackages.Items.Clear()
-        $apps = @(Get-WmtRemovableAppxPackages)
-        foreach ($app in $apps) {
-            $lstAppxPackages.Items.Add([PSCustomObject]@{
-                    Name    = [string]$app.Name
-                    Package = [string]$app.PackageFullName
-                }) | Out-Null
-        }
-        Write-GuiLog "Loaded $($apps.Count) removable UWP apps."
-    } "Loading UWP apps..."
+    Write-GuiLog "Loading removable UWP apps..."
+    Start-AppxBackgroundLoad
 }) }
 
 if ($btnAppxRemoveSel) { $btnAppxRemoveSel.Add_Click({
-    $selected = $lstAppxPackages.SelectedItems
+    $selected = @($lstAppxPackages.SelectedItems | ForEach-Object { [PSCustomObject]@{ Name=[string]$_.Name; Package=[string]$_.Package } })
     if ($selected.Count -eq 0) { return }
-    Invoke-UiCommand {
+    $done = {
+        param($results)
+        foreach ($r in @($results)) {
+            if (-not $r) { continue }
+            if ([bool]$r.Success) { Write-GuiLog "Removed: $($r.Name)" }
+            else { Write-GuiLog "Failed to remove: $($r.Name) - $($r.Error)" }
+        }
+        Start-AppxBackgroundLoad
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name "AppxRemoveSelected" -Msg "Removing selected apps..." -SuppressResultLog -Sb {
         param($apps)
-        foreach ($app in $apps) {
+        foreach ($app in @($apps)) {
             try {
-                # $app.Package already holds the full PackageFullName
-                Remove-AppxPackage -Package $app.Package -ErrorAction Stop
-                Write-GuiLog "Removed: $($app.Name)"
+                Remove-AppxPackage -Package ([string]$app.Package) -ErrorAction Stop
+                [PSCustomObject]@{ Name=[string]$app.Name; Success=$true; Error="" }
             }
             catch {
-                Write-GuiLog "Failed to remove: $($app.Name) - $($_.Exception.Message)"
+                [PSCustomObject]@{ Name=[string]$app.Name; Success=$false; Error=$_.Exception.Message }
             }
         }
-    } "Removing selected apps..." -ArgumentList $selected
+    } -ArgumentList $selected -OnComplete $done | Out-Null
 }) }
+
+if ($btnAppxRemoveAll) {
 
 if ($btnAppxRemoveAll) { $btnAppxRemoveAll.Add_Click({
     if ((Show-WmtMessageBox -Message "Remove ALL listed apps? This cannot be undone easily." -Title "Confirm" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
@@ -47932,54 +47900,46 @@ else {
 }
 
 function Switch-WindowsFeature($FeatureName, $DisplayName) {
-Invoke-UiCommand {
+$done = { param($results) Update-SingleFeatureButtonState -ButtonName $this.Name -FeatureName $FeatureName }.GetNewClosure()
+Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $DisplayName..." -Sb {
     param($fn, $dn)
     if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
-        Write-GuiLog "PowerShell feature cmdlets unavailable; trying DISM fallback..."
+        Write-Output "PowerShell feature cmdlets unavailable; trying DISM fallback..."
         $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn"
         if ($featureInfo -match 'State\s*:\s*Enabled') {
             dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Disabled: $dn (DISM)" }
-            else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
         }
         else {
             dism /Online /Enable-Feature /FeatureName:$fn /All /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Enabled: $dn (DISM)" }
-            else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Enabled: $dn (DISM)" } else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
         }
         return
     }
-
     $feature = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction SilentlyContinue
-
-    # Some systems report NetFx3 as unknown to PowerShell even when DISM can toggle it.
     if (-not $feature) {
         if ($fn -ne "NetFx3") { throw "Feature name $fn is unknown." }
-
-        Write-GuiLog "$dn not detected via PowerShell; trying DISM fallback..."
+        Write-Output "$dn not detected via PowerShell; trying DISM fallback..."
         $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn"
         if ($featureInfo -match 'State\s*:\s*Enabled') {
             dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Disabled: $dn (DISM)" }
-            else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
         }
         else {
             dism /Online /Enable-Feature /FeatureName:$fn /All /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Enabled: $dn (DISM)" }
-            else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Enabled: $dn (DISM)" } else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
         }
         return
     }
-
     if ($feature.State -eq "Enabled") {
         Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
-        Write-GuiLog "Disabled: $dn"
+        Write-Output "Disabled: $dn"
     }
     else {
         Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
-        Write-GuiLog "Enabled: $dn"
+        Write-Output "Enabled: $dn"
     }
-} "Toggling $DisplayName..." -ArgumentList $FeatureName, $DisplayName
+} -ArgumentList $FeatureName, $DisplayName -OnComplete $done | Out-Null
 }
 
 # --- SERVICES MANAGEMENT ---
