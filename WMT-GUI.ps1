@@ -39337,12 +39337,15 @@ $script:ScanTimer.Add_Tick({
                     foreach ($item in $results) {
                         if ($null -eq $item) { continue }
 
-                        if ($item -is [string] -and $item.StartsWith("STATE:STEAM_INSTALLED_NAME:")) {
-                            $steamInstalledName = $item.Substring("STATE:STEAM_INSTALLED_NAME:".Length).Trim()
+                        # Background PowerShell EndInvoke() returns PSObject wrappers.
+                        # Use a typed state object for Steam ownership rather than relying
+                        # on string type tests, which can miss wrapped string output.
+                        if ($item.PSObject.Properties["WmtStateType"] -and ([string]$item.WmtStateType) -eq "SteamInstalled") {
+                            $steamInstalledName = ([string]$item.Name).Trim()
                             if (-not [string]::IsNullOrWhiteSpace($steamInstalledName)) {
                                 $steamInstalledKey = ($steamInstalledName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
                                 if (-not [string]::IsNullOrWhiteSpace($steamInstalledKey)) {
-                                    $script:WmtSteamInstalledNameKeys[$steamInstalledKey] = $true
+                                    $script:WmtSteamInstalledNameKeys[$steamInstalledKey] = [string]$item.Id
                                 }
                             }
                         }
@@ -39418,7 +39421,12 @@ $script:ScanTimer.Add_Tick({
                     $candidate = $lstWinget.Items[$rowIndex]
                     if (-not $candidate) { continue }
                     if (([string]$candidate.Source).ToLowerInvariant() -ne "winget") { continue }
-                    if (([string]$candidate.Version).Trim() -ne "?") { continue }
+
+                    # Winget represents unresolved installed versions as Unknown (or
+                    # localized equivalents); WMT normally normalizes these to "?".
+                    # Treat blank/Unknown/? as the same unresolved-version condition.
+                    $candidateVersion = ([string]$candidate.Version).Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($candidateVersion) -and $candidateVersion -notmatch '^(?i:\?|unknown|inconnu)$') { continue }
 
                     $candidateName = ([string]$candidate.Name).Trim()
                     if ([string]::IsNullOrWhiteSpace($candidateName)) { continue }
@@ -39426,7 +39434,8 @@ $script:ScanTimer.Add_Tick({
                     if ([string]::IsNullOrWhiteSpace($candidateKey)) { continue }
 
                     if ($script:WmtSteamInstalledNameKeys.ContainsKey($candidateKey)) {
-                        Write-GuiLog "[Winget] Suppressed unknown-version match for Steam-managed app: $candidateName ($([string]$candidate.Id))."
+                        $steamAppId = [string]$script:WmtSteamInstalledNameKeys[$candidateKey]
+                        Write-GuiLog "[Winget] Suppressed unknown-version match for Steam-managed app: $candidateName ($([string]$candidate.Id)); Steam AppID $steamAppId."
                         $lstWinget.Items.RemoveAt($rowIndex)
                         $steamOwnedWingetRowsSuppressed++
                     }
@@ -41419,9 +41428,14 @@ $btnWingetScan.Add_Click({
                             if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
 
                             # Let the UI-side scan aggregator distinguish unknown-version
-                            # winget matches from games actually owned by Steam. This marker
-                            # is emitted for every installed Steam app, not only pending ones.
-                            Write-Output "STATE:STEAM_INSTALLED_NAME:$name"
+                            # winget matches from games actually owned by Steam. Use a typed
+                            # object because EndInvoke() wraps pipeline output in PSObject.
+                            # This is emitted for every installed Steam app, not only pending ones.
+                            [PSCustomObject]@{
+                                WmtStateType = "SteamInstalled"
+                                Name         = $name
+                                Id           = $appId
+                            }
 
                             if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
 
