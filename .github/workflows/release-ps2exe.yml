@@ -185,35 +185,35 @@ jobs:
           New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
 
           $nuspec = @"
-<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
-  <metadata>
-    <id>windows-maintenance-tool</id>
-    <version>$chocoVersion</version>
-    <title>Windows Maintenance Tool</title>
-    <authors>Chaython</authors>
-    <owners>Chaython</owners>
-    <projectUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectUrl>
-    <projectSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectSourceUrl>
-    <packageSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</packageSourceUrl>
-    <bugTrackerUrl>https://github.com/Chaython/Windows-Maintenance-Tool/issues</bugTrackerUrl>
-    <licenseUrl>https://github.com/Chaython/Windows-Maintenance-Tool/blob/Main/LICENSE</licenseUrl>
-    <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <description>WMT is an AIO GUI toolkit for repairing, cleaning, updating, and tuning Windows systems. It brings common maintenance tasks into one interface instead of spreading them across separate utilities.</description>
-    <summary>All-in-one Windows maintenance, repair, cleanup, update, and tuning GUI.</summary>
-    <releaseNotes>$releaseUrl</releaseNotes>
-    <tags>wmt maintenance system utility windows powershell</tags>
-  </metadata>
-</package>
-"@
+          <?xml version="1.0" encoding="utf-8"?>
+          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+            <metadata>
+              <id>windows-maintenance-tool</id>
+              <version>$chocoVersion</version>
+              <title>Windows Maintenance Tool</title>
+              <authors>Chaython</authors>
+              <owners>Chaython</owners>
+              <projectUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectUrl>
+              <projectSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectSourceUrl>
+              <packageSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</packageSourceUrl>
+              <bugTrackerUrl>https://github.com/Chaython/Windows-Maintenance-Tool/issues</bugTrackerUrl>
+              <licenseUrl>https://github.com/Chaython/Windows-Maintenance-Tool/blob/Main/LICENSE</licenseUrl>
+              <requireLicenseAcceptance>false</requireLicenseAcceptance>
+              <description>WMT is an AIO GUI toolkit for repairing, cleaning, updating, and tuning Windows systems. It brings common maintenance tasks into one interface instead of spreading them across separate utilities.</description>
+              <summary>All-in-one Windows maintenance, repair, cleanup, update, and tuning GUI.</summary>
+              <releaseNotes>$releaseUrl</releaseNotes>
+              <tags>wmt maintenance system utility windows powershell</tags>
+            </metadata>
+          </package>
+          "@
           [IO.File]::WriteAllText((Join-Path $packageRoot "windows-maintenance-tool.nuspec"), $nuspec, [Text.UTF8Encoding]::new($false))
 
           $installScript = @'
-$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$url = '__INSTALLER_URL__'
-$checksum = '__INSTALLER_SHA256__'
-Get-ChocolateyWebFile -PackageName 'windows-maintenance-tool' -FileFullPath (Join-Path $toolsDir 'wmt.exe') -Url $url -Checksum $checksum -ChecksumType 'sha256'
-'@
+          $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+          $url = '__INSTALLER_URL__'
+          $checksum = '__INSTALLER_SHA256__'
+          Get-ChocolateyWebFile -PackageName 'windows-maintenance-tool' -FileFullPath (Join-Path $toolsDir 'wmt.exe') -Url $url -Checksum $checksum -ChecksumType 'sha256'
+          '@
           $installScript = $installScript.Replace('__INSTALLER_URL__', $installerUrl).Replace('__INSTALLER_SHA256__', $env:RELEASE_SHA256)
           [IO.File]::WriteAllText((Join-Path $toolsDir "chocolateyInstall.ps1"), $installScript, [Text.UTF8Encoding]::new($false))
 
