@@ -2141,11 +2141,21 @@ return [Environment]::ExpandEnvironmentVariables($path)
 
 function Add-WmtUniqueSteamPath {
 param([System.Collections.Generic.List[string]]$Paths, [string]$Path)
-if (-not $Paths -or [string]::IsNullOrWhiteSpace($Path)) { return }
+# Do not use "-not $Paths" here: PowerShell coerces an empty generic list to
+# $false, which prevented the first Steam root from ever being inserted.
+if ($null -eq $Paths -or [string]::IsNullOrWhiteSpace($Path)) { return }
 $expanded = ConvertFrom-WmtSteamVdfPath -Value $Path
 try {
     $full = [System.IO.Path]::GetFullPath($expanded)
-    if ((Test-Path -LiteralPath $full) -and -not $Paths.Contains($full)) { [void]$Paths.Add($full) }
+    if (-not (Test-Path -LiteralPath $full)) { return }
+    $alreadyAdded = $false
+    foreach ($existingPath in $Paths) {
+        if ([string]::Equals([string]$existingPath, $full, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $alreadyAdded = $true
+            break
+        }
+    }
+    if (-not $alreadyAdded) { [void]$Paths.Add($full) }
 }
 catch {}
 }
@@ -40068,6 +40078,9 @@ $btnWingetScan.Add_Click({
         }
         if ($seededSteamOwners -gt 0) {
             Write-GuiLog "[Winget] Seeded $seededSteamOwners installed Steam ownership record(s) for cross-provider duplicate filtering."
+        }
+        else {
+            Write-GuiLog "[Winget] No installed Steam ownership records were discovered; cross-provider unknown-version suppression cannot match Steam games."
         }
     }
     catch {
