@@ -208,12 +208,13 @@ jobs:
 "@
           [IO.File]::WriteAllText((Join-Path $packageRoot "windows-maintenance-tool.nuspec"), $nuspec, [Text.UTF8Encoding]::new($false))
 
-          $installScript = @"
-\$toolsDir = Split-Path -Parent \$MyInvocation.MyCommand.Definition
-\$url = '$installerUrl'
-\$checksum = '$env:RELEASE_SHA256'
-Get-ChocolateyWebFile -PackageName 'windows-maintenance-tool' -FileFullPath (Join-Path \$toolsDir 'wmt.exe') -Url \$url -Checksum \$checksum -ChecksumType 'sha256'
-"@
+          $installScript = @'
+$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$url = '__INSTALLER_URL__'
+$checksum = '__INSTALLER_SHA256__'
+Get-ChocolateyWebFile -PackageName 'windows-maintenance-tool' -FileFullPath (Join-Path $toolsDir 'wmt.exe') -Url $url -Checksum $checksum -ChecksumType 'sha256'
+'@
+          $installScript = $installScript.Replace('__INSTALLER_URL__', $installerUrl).Replace('__INSTALLER_SHA256__', $env:RELEASE_SHA256)
           [IO.File]::WriteAllText((Join-Path $toolsDir "chocolateyInstall.ps1"), $installScript, [Text.UTF8Encoding]::new($false))
 
           Push-Location $packageRoot
