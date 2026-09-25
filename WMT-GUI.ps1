@@ -2127,6 +2127,157 @@ $result.Error = [string]$procResult.Error
 return $result
 }
 
+# Shared Steam parsing/discovery helpers. The same definitions are loaded into
+# main scope and injected into every pooled runspace to prevent parser drift.
+$script:WmtSteamCommonHelpers = @'
+function ConvertFrom-WmtSteamVdfPath {
+param([string]$Value)
+if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+$path = ([string]$Value).Trim()
+$path = $path -replace '\\\\', '\'
+$path = $path -replace '/', '\'
+return [Environment]::ExpandEnvironmentVariables($path)
+}
+
+function Add-WmtUniqueSteamPath {
+param([System.Collections.Generic.List[string]]$Paths, [string]$Path)
+if (-not $Paths -or [string]::IsNullOrWhiteSpace($Path)) { return }
+$expanded = ConvertFrom-WmtSteamVdfPath -Value $Path
+try {
+    $full = [System.IO.Path]::GetFullPath($expanded)
+    if ((Test-Path -LiteralPath $full) -and -not $Paths.Contains($full)) { [void]$Paths.Add($full) }
+}
+catch {}
+}
+
+function Get-WmtSteamManifestValue {
+param([string]$Text, [string]$Key)
+if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Key)) { return "" }
+$pattern = '"' + [regex]::Escape($Key) + '"\s+"([^"]*)"'
+$match = [regex]::Match($Text, $pattern)
+if ($match.Success) { return [string]$match.Groups[1].Value }
+return ""
+}
+
+function Get-WmtSteamManifestNumber {
+param([string]$Text, [string]$Key)
+$value = Get-WmtSteamManifestValue -Text $Text -Key $Key
+$number = [long]0
+if ([long]::TryParse(([string]$value), [ref]$number)) { return $number }
+return [long]0
+}
+
+function Get-WmtSteamInstallRoots {
+$paths = [System.Collections.Generic.List[string]]::new()
+foreach ($registryPath in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
+    try {
+        $props = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
+        foreach ($propName in @("SteamPath", "InstallPath")) {
+            if ($props.PSObject.Properties[$propName]) { Add-WmtUniqueSteamPath -Paths $paths -Path ([string]$props.$propName) }
+        }
+        if ($props.PSObject.Properties["SteamExe"] -and -not [string]::IsNullOrWhiteSpace([string]$props.SteamExe)) {
+            Add-WmtUniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$props.SteamExe))
+        }
+    }
+    catch {}
+}
+$pf86 = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+$pf = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+foreach ($candidate in @((Join-Path $pf86 "Steam"), (Join-Path $pf "Steam"), (Join-Path $env:SystemDrive "Steam"), (Join-Path $env:SystemDrive "steamcmd"))) {
+    Add-WmtUniqueSteamPath -Paths $paths -Path $candidate
+}
+foreach ($cmdName in @("steamcmd", "steamcmd.exe")) {
+    try {
+        $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) { Add-WmtUniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$cmd.Source)) }
+    }
+    catch {}
+}
+return $paths.ToArray()
+}
+
+function Get-WmtSteamLibraryRoots {
+$paths = [System.Collections.Generic.List[string]]::new()
+foreach ($root in @(Get-WmtSteamInstallRoots)) {
+    if ([string]::IsNullOrWhiteSpace($root)) { continue }
+    if (Test-Path -LiteralPath (Join-Path $root "steamapps")) { Add-WmtUniqueSteamPath -Paths $paths -Path $root }
+    $libraryFile = Join-Path $root "steamapps\libraryfolders.vdf"
+    if (-not (Test-Path -LiteralPath $libraryFile -PathType Leaf)) { continue }
+    $libraryText = Get-Content -LiteralPath $libraryFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($libraryText)) { continue }
+    foreach ($match in [regex]::Matches($libraryText, '"path"\s+"([^"]+)"')) { Add-WmtUniqueSteamPath -Paths $paths -Path $match.Groups[1].Value }
+    foreach ($match in [regex]::Matches($libraryText, '"\d+"\s+"([^"]+)"')) {
+        $candidate = ConvertFrom-WmtSteamVdfPath -Value $match.Groups[1].Value
+        if ($candidate -match '^[A-Za-z]:\\|^\\\\') { Add-WmtUniqueSteamPath -Paths $paths -Path $candidate }
+    }
+}
+return $paths.ToArray()
+}
+
+function Get-WmtSteamInstalledManifests {
+$result = [System.Collections.Generic.List[object]]::new()
+$seen = @{}
+foreach ($libraryRoot in @(Get-WmtSteamLibraryRoots)) {
+    $steamApps = Join-Path $libraryRoot "steamapps"
+    if (-not (Test-Path -LiteralPath $steamApps)) { continue }
+    foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
+        $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $appId = Get-WmtSteamManifestValue -Text $text -Key "appid"
+        if ([string]::IsNullOrWhiteSpace($appId)) { $appId = [regex]::Match($manifest.BaseName, '\d+').Value }
+        if ([string]::IsNullOrWhiteSpace($appId) -or $seen.ContainsKey($appId)) { continue }
+        $seen[$appId] = $true
+        $name = Get-WmtSteamManifestValue -Text $text -Key "name"
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
+        [void]$result.Add([PSCustomObject]@{
+            Id=$appId; Name=$name;
+            BuildId=(Get-WmtSteamManifestValue -Text $text -Key "buildid");
+            InstallDir=(Get-WmtSteamManifestValue -Text $text -Key "installdir");
+            LibraryRoot=$libraryRoot; ManifestPath=$manifest.FullName; Text=$text
+        })
+    }
+}
+return $result.ToArray()
+}
+
+function Get-WmtSteamOwnedAppIds {
+param([string]$SteamRoot)
+$result = [System.Collections.Generic.List[string]]::new()
+if ([string]::IsNullOrWhiteSpace($SteamRoot)) { $SteamRoot = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0] }
+if ([string]::IsNullOrWhiteSpace($SteamRoot)) { return $result.ToArray() }
+$userdataPath = Join-Path $SteamRoot "userdata"
+if (-not (Test-Path -LiteralPath $userdataPath)) { return $result.ToArray() }
+foreach ($userDir in @(Get-ChildItem -LiteralPath $userdataPath -Directory -ErrorAction SilentlyContinue)) {
+    $vdfPath = Join-Path $userDir.FullName "config\localconfig.vdf"
+    if (-not (Test-Path -LiteralPath $vdfPath -PathType Leaf)) { continue }
+    $vdfText = Get-Content -LiteralPath $vdfPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($vdfText)) { continue }
+    $appsIdx = $vdfText.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($appsIdx -lt 0) { continue }
+    $braceIdx = $vdfText.IndexOf('{', $appsIdx)
+    if ($braceIdx -lt 0) { continue }
+    $depth=0; $i=$braceIdx
+    while ($i -lt $vdfText.Length) {
+        $ch=$vdfText[$i]
+        if ($ch -eq '{') { $depth++; $i++ }
+        elseif ($ch -eq '}') { $depth--; if ($depth -le 0) { break }; $i++ }
+        elseif ($ch -eq '"') {
+            $endQ=$vdfText.IndexOf('"',$i+1); if ($endQ -lt 0) { break }
+            $value=$vdfText.Substring($i+1,$endQ-$i-1); $i=$endQ+1
+            if ($depth -eq 1) {
+                $j=$i; while ($j -lt $vdfText.Length -and [char]::IsWhiteSpace($vdfText[$j])) { $j++ }
+                if ($j -lt $vdfText.Length -and $vdfText[$j] -eq '{' -and -not $result.Contains($value)) { [void]$result.Add($value) }
+            }
+        }
+        else { $i++ }
+    }
+}
+return $result.ToArray()
+}
+'@
+
+Invoke-Expression $script:WmtSteamCommonHelpers
+
 # ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
@@ -2135,13 +2286,15 @@ return $result
 function New-WmtRunspaceInitialState {
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
-if ($script:MyDeviceCommonHelpers) {
-    $helperFuncs = [regex]::Matches($script:MyDeviceCommonHelpers, '(?ms)^function\s+(\w[\w-]*)\s*\{.*?^\}')
+foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommonHelpers)) {
+    if ([string]::IsNullOrWhiteSpace([string]$helperBlock)) { continue }
+    $helperFuncs = [regex]::Matches([string]$helperBlock, '(?ms)^function\s+(\w[\w-]*)\s*\{.*?^\}')
     foreach ($m in $helperFuncs) {
         try { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($m.Groups[1].Value, $m.Value)) }
         catch {}
     }
 }
+
 foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
@@ -36920,112 +37073,24 @@ if (-not $Force -and $script:WmtSteamLibraryCache) { return $script:WmtSteamLibr
 
 $result = [System.Collections.Generic.List[object]]::new()
 
-# Find Steam install path.
-$steamInstall = $null
-foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-    try {
-        $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-        if ($props) {
-            foreach ($p in @("SteamPath", "InstallPath")) {
-                if ($props.PSObject.Properties[$p]) {
-                    $v = [string]$props.$p
-                    if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $steamInstall = $v; break }
-                }
-            }
-        }
-    }
-    catch {}
-    if ($steamInstall) { break }
-}
-if (-not $steamInstall) {
-    foreach ($c in @("${env:ProgramFiles(x86)}\Steam", "${env:ProgramFiles}\Steam")) {
-        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) { $steamInstall = $c; break }
-    }
-}
+# Read Steam roots/manifests/ownership through the shared helper layer.
+$steamInstall = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0]
 if (-not $steamInstall) {
     $script:WmtSteamLibraryCache = $result.ToArray()
     return $script:WmtSteamLibraryCache
 }
 
 try {
-    # Step 1: Get installed game names from appmanifest files.
     $installedApps = @{}
-    $libraryRoots = [System.Collections.Generic.List[string]]::new()
-    if (Test-Path -LiteralPath (Join-Path $steamInstall "steamapps")) { [void]$libraryRoots.Add($steamInstall) }
-    $libFile = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
-    if (Test-Path -LiteralPath $libFile -PathType Leaf) {
-        $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if (-not [string]::IsNullOrWhiteSpace($libText)) {
-            foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-                $p = $m.Groups[1].Value -replace '\\\\', '\'
-                if ((Test-Path -LiteralPath $p) -and -not $libraryRoots.Contains($p)) { [void]$libraryRoots.Add($p) }
-            }
-        }
+    foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+        $installedApps[[string]$manifest.Id] = @{ Name=[string]$manifest.Name; BuildId=[string]$manifest.BuildId }
     }
-    foreach ($libRoot in $libraryRoots) {
-        $steamApps = Join-Path $libRoot "steamapps"
-        if (-not (Test-Path -LiteralPath $steamApps)) { continue }
-        foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-            $mtext = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if ([string]::IsNullOrWhiteSpace($mtext)) { continue }
-            $aid = ""
-            $am = [regex]::Match($mtext, '"appid"\s+"([^"]*)"')
-            if ($am.Success) { $aid = $am.Groups[1].Value }
-            if ([string]::IsNullOrWhiteSpace($aid)) { $aid = [regex]::Match($manifest.BaseName, '\d+').Value }
-            if ([string]::IsNullOrWhiteSpace($aid)) { continue }
-            $mname = ""
-            $nm = [regex]::Match($mtext, '"name"\s+"([^"]*)"')
-            if ($nm.Success) { $mname = $nm.Groups[1].Value }
-            if ([string]::IsNullOrWhiteSpace($mname)) { $mname = "Steam App $aid" }
-            $buildId = ""
-            $bm = [regex]::Match($mtext, '"buildid"\s+"([^"]*)"')
-            if ($bm.Success) { $buildId = $bm.Groups[1].Value }
-            $installedApps[$aid] = @{ Name = $mname; BuildId = $buildId }
-        }
-    }
-
-    # Step 2: Get owned app IDs from localconfig.vdf (case-insensitive "apps" search).
     $ownedAppIds = [System.Collections.Generic.List[string]]::new()
-    $userdataPath = Join-Path $steamInstall "userdata"
-    if (Test-Path -LiteralPath $userdataPath) {
-        foreach ($userDir in @(Get-ChildItem -LiteralPath $userdataPath -Directory -ErrorAction SilentlyContinue)) {
-            $vdfPath = Join-Path $userDir.FullName "config\localconfig.vdf"
-            if (-not (Test-Path -LiteralPath $vdfPath -PathType Leaf)) { continue }
-            $vdfText = Get-Content -LiteralPath $vdfPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if ([string]::IsNullOrWhiteSpace($vdfText)) { continue }
-
-            # Case-insensitive search for "apps"
-            $appsIdx = $vdfText.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
-            if ($appsIdx -lt 0) { continue }
-
-            $braceIdx = $vdfText.IndexOf('{', $appsIdx)
-            if ($braceIdx -lt 0) { continue }
-
-            # Brace-matching parser: at depth 1, quoted strings followed by
-            # '{' are app IDs.
-            $depth = 0
-            $i = $braceIdx
-            while ($i -lt $vdfText.Length) {
-                $ch = $vdfText[$i]
-                if ($ch -eq '{') { $depth++; $i++ }
-                elseif ($ch -eq '}') { $depth--; if ($depth -le 0) { break }; $i++ }
-                elseif ($ch -eq '"') {
-                    $endQ = $vdfText.IndexOf('"', $i + 1)
-                    if ($endQ -lt 0) { break }
-                    $str = $vdfText.Substring($i + 1, $endQ - $i - 1)
-                    $i = $endQ + 1
-                    if ($depth -eq 1) {
-                        $j = $i
-                        while ($j -lt $vdfText.Length -and [char]::IsWhiteSpace($vdfText[$j])) { $j++ }
-                        if ($j -lt $vdfText.Length -and $vdfText[$j] -eq '{') {
-                            if (-not $ownedAppIds.Contains($str)) { [void]$ownedAppIds.Add($str) }
-                        }
-                    }
-                }
-                else { $i++ }
-            }
-        }
+    foreach ($aid in @(Get-WmtSteamOwnedAppIds -SteamRoot $steamInstall)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$aid) -and -not $ownedAppIds.Contains([string]$aid)) { [void]$ownedAppIds.Add([string]$aid) }
     }
+
+    # Step 3: Resolve names for owned apps not in appmanifests.
 
     # Step 3: Resolve names for owned apps not in appmanifests.
     # Use the Steam GetAppList API cache (steam_applist.json) if available.
@@ -41548,139 +41613,15 @@ $btnWingetScan.Add_Click({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Steam game manifests..."
 
-                function Add-UniqueSteamPath {
-                    param(
-                        [System.Collections.Generic.List[string]]$Paths,
-                        [string]$Path
-                    )
-
-                    if ([string]::IsNullOrWhiteSpace($Path)) { return }
-                    $rawPathText = ([string]$Path).Trim()
-                    $expanded = [Environment]::ExpandEnvironmentVariables($rawPathText)
-                    $expanded = $expanded -replace '/', '\'
-                    $expanded = $expanded -replace '\\\\', '\'
-                    try {
-                        $full = [System.IO.Path]::GetFullPath($expanded)
-                        if ((Test-Path -LiteralPath $full) -and -not $Paths.Contains($full)) {
-                            [void]$Paths.Add($full)
-                        }
-                    }
-                    catch {}
-                }
-
-                function ConvertFrom-SteamVdfPath {
-                    param([string]$Value)
-                    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
-                    $path = ([string]$Value).Trim()
-                    $path = $path -replace '\\\\', '\'
-                    $path = $path -replace '/', '\'
-                    return [Environment]::ExpandEnvironmentVariables($path)
-                }
-
-                function Get-SteamManifestValue {
-                    param(
-                        [string]$Text,
-                        [string]$Key
-                    )
-
-                    if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Key)) { return "" }
-                    $pattern = '"' + [regex]::Escape($Key) + '"\s+"([^"]*)"'
-                    $match = [regex]::Match($Text, $pattern)
-                    if ($match.Success) { return [string]$match.Groups[1].Value }
-                    return ""
-                }
-
-                function Get-SteamManifestNumber {
-                    param(
-                        [string]$Text,
-                        [string]$Key
-                    )
-
-                    $value = Get-SteamManifestValue -Text $Text -Key $Key
-                    $number = [long]0
-                    if ([long]::TryParse(([string]$value), [ref]$number)) { return $number }
-                    return [long]0
-                }
-
-                function Get-SteamInstallRoots {
-                    $paths = [System.Collections.Generic.List[string]]::new()
-                    $registryPaths = @(
-                        "HKCU:\Software\Valve\Steam",
-                        "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam",
-                        "HKLM:\SOFTWARE\Valve\Steam"
-                    )
-
-                    foreach ($registryPath in $registryPaths) {
-                        try {
-                            $props = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
-                            foreach ($propName in @("SteamPath", "InstallPath")) {
-                                if ($props.PSObject.Properties[$propName]) {
-                                    Add-UniqueSteamPath -Paths $paths -Path ([string]$props.$propName)
-                                }
-                            }
-                            if ($props.PSObject.Properties["SteamExe"] -and -not [string]::IsNullOrWhiteSpace([string]$props.SteamExe)) {
-                                Add-UniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$props.SteamExe))
-                            }
-                        }
-                        catch {}
-                    }
-
-                    foreach ($candidate in @(
-                            "${env:ProgramFiles(x86)}\Steam",
-                            "${env:ProgramFiles}\Steam",
-                            "${env:SystemDrive}\Steam",
-                            "${env:SystemDrive}\steamcmd"
-                        )) {
-                        Add-UniqueSteamPath -Paths $paths -Path $candidate
-                    }
-
-                    foreach ($cmdName in @("steamcmd", "steamcmd.exe")) {
-                        try {
-                            $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
-                            if ($cmd -and $cmd.Source) {
-                                Add-UniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$cmd.Source))
-                            }
-                        }
-                        catch {}
-                    }
-
-                    return $paths.ToArray()
-                }
-
-                function Get-SteamLibraryRoots {
-                    $paths = [System.Collections.Generic.List[string]]::new()
-                    foreach ($root in @(Get-SteamInstallRoots)) {
-                        if ([string]::IsNullOrWhiteSpace($root)) { continue }
-                        if (Test-Path -LiteralPath (Join-Path $root "steamapps")) {
-                            Add-UniqueSteamPath -Paths $paths -Path $root
-                        }
-
-                        $libraryFile = Join-Path $root "steamapps\libraryfolders.vdf"
-                        if (-not (Test-Path -LiteralPath $libraryFile)) { continue }
-
-                        $libraryText = Get-Content -LiteralPath $libraryFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                        if ([string]::IsNullOrWhiteSpace($libraryText)) { continue }
-
-                        foreach ($match in [regex]::Matches($libraryText, '"path"\s+"([^"]+)"')) {
-                            Add-UniqueSteamPath -Paths $paths -Path (ConvertFrom-SteamVdfPath $match.Groups[1].Value)
-                        }
-                        foreach ($match in [regex]::Matches($libraryText, '"\d+"\s+"([^"]+)"')) {
-                            $candidate = ConvertFrom-SteamVdfPath $match.Groups[1].Value
-                            if ($candidate -match '^[A-Za-z]:\\|^\\\\') {
-                                Add-UniqueSteamPath -Paths $paths -Path $candidate
-                            }
-                        }
-                    }
-
-                    return $paths.ToArray()
-                }
+                # Shared Steam helpers are injected by New-WmtRunspaceInitialState.
+                $seenAppIds = @{}
 
                 $seenAppIds = @{}
                 $manifestCount = 0
                 $pendingCount = 0
 
                 try {
-                    $libraryRoots = @(Get-SteamLibraryRoots)
+                    $libraryRoots = @(Get-WmtSteamLibraryRoots)
                     if ($libraryRoots.Count -eq 0) {
                         Write-Output "LOG:Steam scan skipped: no Steam library folders were found."
                         return
@@ -41695,7 +41636,7 @@ $btnWingetScan.Add_Click({
                             $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                             if ([string]::IsNullOrWhiteSpace($text)) { continue }
 
-                            $appId = Get-SteamManifestValue -Text $text -Key "appid"
+                            $appId = Get-WmtSteamManifestValue -Text $text -Key "appid"
                             if ([string]::IsNullOrWhiteSpace($appId)) {
                                 $appId = [regex]::Match($manifest.BaseName, '\d+').Value
                             }
@@ -41703,9 +41644,9 @@ $btnWingetScan.Add_Click({
                             if ($seenAppIds.ContainsKey($appId)) { continue }
                             $seenAppIds[$appId] = $true
 
-                            $name = Get-SteamManifestValue -Text $text -Key "name"
+                            $name = Get-WmtSteamManifestValue -Text $text -Key "name"
                             if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
-                            $installDir = ConvertFrom-SteamVdfPath (Get-SteamManifestValue -Text $text -Key "installdir")
+                            $installDir = ConvertFrom-WmtSteamVdfPath (Get-WmtSteamManifestValue -Text $text -Key "installdir")
 
                             # Let the UI-side scan aggregator distinguish unknown-version
                             # winget matches from games actually owned by Steam. Use a typed
@@ -41721,13 +41662,13 @@ $btnWingetScan.Add_Click({
 
                             if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
 
-                            $stateFlags = Get-SteamManifestNumber -Text $text -Key "StateFlags"
-                            $bytesToDownload = Get-SteamManifestNumber -Text $text -Key "BytesToDownload"
-                            $bytesDownloaded = Get-SteamManifestNumber -Text $text -Key "BytesDownloaded"
-                            $bytesToStage = Get-SteamManifestNumber -Text $text -Key "BytesToStage"
-                            $bytesStaged = Get-SteamManifestNumber -Text $text -Key "BytesStaged"
-                            $buildId = Get-SteamManifestValue -Text $text -Key "buildid"
-                            $targetBuildId = Get-SteamManifestValue -Text $text -Key "TargetBuildID"
+                            $stateFlags = Get-WmtSteamManifestNumber -Text $text -Key "StateFlags"
+                            $bytesToDownload = Get-WmtSteamManifestNumber -Text $text -Key "BytesToDownload"
+                            $bytesDownloaded = Get-WmtSteamManifestNumber -Text $text -Key "BytesDownloaded"
+                            $bytesToStage = Get-WmtSteamManifestNumber -Text $text -Key "BytesToStage"
+                            $bytesStaged = Get-WmtSteamManifestNumber -Text $text -Key "BytesStaged"
+                            $buildId = Get-WmtSteamManifestValue -Text $text -Key "buildid"
+                            $targetBuildId = Get-WmtSteamManifestValue -Text $text -Key "TargetBuildID"
 
                             $downloadRemaining = [Math]::Max([long]0, $bytesToDownload - $bytesDownloaded)
                             $stageRemaining = [Math]::Max([long]0, $bytesToStage - $bytesStaged)
@@ -48988,74 +48929,13 @@ $script:WmtLibraryScanRunspace = $null
 $script:WmtLibraryScanAsyncResult = $null
 
 function Get-WmtSteamInstalledGames {
-# Read Steam appmanifest_*.acf files to get installed Steam games.
-# Returns array of [PSCustomObject]@{ Source; Name; Id; Version; Available }
 $result = [System.Collections.Generic.List[object]]::new()
-
-function Get-SteamManifestValue([string]$Text, [string]$Key) {
-    $m = [regex]::Match($Text, ('"' + $Key + '"\s+"([^"]*)"'))
-    if ($m.Success) { return $m.Groups[1].Value }
-    return ""
-}
-
-function Get-SteamInstallRoots {
-    $roots = @()
-    foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-        try {
-            $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-            if ($props) {
-                foreach ($p in @("SteamPath", "InstallPath")) {
-                    if ($props.PSObject.Properties[$p]) {
-                        $v = [string]$props.$p
-                        if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $roots += $v }
-                    }
-                }
-            }
-        }
-        catch {}
-    }
-    foreach ($c in @("${env:ProgramFiles(x86)}\Steam", "${env:ProgramFiles}\Steam")) {
-        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c) -and $roots -notcontains $c) { $roots += $c }
-    }
-    return $roots
-}
-
-$installRoots = @(Get-SteamInstallRoots)
-$libraryRoots = [System.Collections.Generic.List[string]]::new()
-foreach ($root in $installRoots) {
-    if (Test-Path -LiteralPath (Join-Path $root "steamapps")) { [void]$libraryRoots.Add($root) }
-    $libFile = Join-Path $root "steamapps\libraryfolders.vdf"
-    if (-not (Test-Path -LiteralPath $libFile)) { continue }
-    $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-    if ([string]::IsNullOrWhiteSpace($libText)) { continue }
-    foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-        $p = $m.Groups[1].Value -replace '\\\\', '\'
-        if ((Test-Path -LiteralPath $p) -and -not $libraryRoots.Contains($p)) { [void]$libraryRoots.Add($p) }
-    }
-}
-
-$seenIds = @{}
-foreach ($libRoot in $libraryRoots) {
-    $steamApps = Join-Path $libRoot "steamapps"
-    if (-not (Test-Path -LiteralPath $steamApps)) { continue }
-    foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-        $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if ([string]::IsNullOrWhiteSpace($text)) { continue }
-        $appId = Get-SteamManifestValue $text "appid"
-        if ([string]::IsNullOrWhiteSpace($appId)) { $appId = [regex]::Match($manifest.BaseName, '\d+').Value }
-        if ([string]::IsNullOrWhiteSpace($appId) -or $seenIds.ContainsKey($appId)) { continue }
-        $seenIds[$appId] = $true
-        $name = Get-SteamManifestValue $text "name"
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
-        $buildId = Get-SteamManifestValue $text "buildid"
-        $result.Add([PSCustomObject]@{
-                Source    = "Steam"
-                Name      = $name
-                Id        = $appId
-                Version   = if (-not [string]::IsNullOrWhiteSpace($buildId) -and $buildId -ne "0") { "Build $buildId" } else { "Installed" }
-                Available = "-"
-            })
-    }
+foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+    [void]$result.Add([PSCustomObject]@{
+        Source="Steam"; Name=[string]$manifest.Name; Id=[string]$manifest.Id;
+        Version=if (-not [string]::IsNullOrWhiteSpace([string]$manifest.BuildId) -and [string]$manifest.BuildId -ne "0") { "Build $($manifest.BuildId)" } else { "Installed" };
+        Available="-"
+    })
 }
 return $result.ToArray()
 }
@@ -49431,52 +49311,16 @@ function Get-WmtLibraryItemInstallDir {
     $id = [string]$Item.Id
 
     if ($source -eq "Steam") {
-        # Find the appmanifest for this app ID and get installdir.
-        $steamInstall = $null
-        foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-            try {
-                $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-                if ($props) {
-                    foreach ($p in @("SteamPath", "InstallPath")) {
-                        if ($props.PSObject.Properties[$p]) {
-                            $v = [string]$props.$p
-                            if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $steamInstall = $v; break }
-                        }
-                    }
-                }
-            }
-            catch {}
-            if ($steamInstall) { break }
-        }
-        if (-not $steamInstall) { return "" }
-
-        # Check all library folders for the appmanifest.
-        $libRoots = @($steamInstall)
-        $libFile = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
-        if (Test-Path -LiteralPath $libFile -PathType Leaf) {
-            $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if (-not [string]::IsNullOrWhiteSpace($libText)) {
-                foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-                    $p = $m.Groups[1].Value -replace '\\\\', '\'
-                    if ((Test-Path -LiteralPath $p) -and $libRoots -notcontains $p) { $libRoots += $p }
-                }
-            }
-        }
-
-        foreach ($libRoot in $libRoots) {
-            $manifestPath = Join-Path $libRoot "steamapps\appmanifest_$id.acf"
-            if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-                $mtext = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                if (-not [string]::IsNullOrWhiteSpace($mtext)) {
-                    $instDirMatch = [regex]::Match($mtext, '"installdir"\s+"([^"]*)"')
-                    if ($instDirMatch.Success) {
-                        $installDir = Join-Path (Join-Path $libRoot "steamapps\common") $instDirMatch.Groups[1].Value
-                        if (Test-Path -LiteralPath $installDir) { return $installDir }
-                    }
-                }
-            }
+        foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+            if ([string]$manifest.Id -ne $id) { continue }
+            $installDirName=[string]$manifest.InstallDir
+            if ([string]::IsNullOrWhiteSpace($installDirName)) { return "" }
+            $installDir=Join-Path (Join-Path ([string]$manifest.LibraryRoot) "steamapps\common") $installDirName
+            if (Test-Path -LiteralPath $installDir) { return $installDir }
+            return ""
         }
     }
+
     elseif ($source -eq "Epic") {
         # Check legendary installed games.
         try {
@@ -51598,102 +51442,19 @@ try {
                 try {
                     Write-Output "LOG:Fetching Steam library..."
 
-                    # Find Steam install path.
-                    $steamInstall = $null
-                    foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-                        try {
-                            $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-                            if ($props) {
-                                foreach ($p in @("SteamPath", "InstallPath")) {
-                                    if ($props.PSObject.Properties[$p]) {
-                                        $v = [string]$props.$p
-                                        if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $steamInstall = $v; break }
-                                    }
-                                }
-                            }
-                        }
-                        catch {}
-                        if ($steamInstall) { break }
-                    }
-                    if (-not $steamInstall) {
-                        foreach ($c in @("${env:ProgramFiles(x86)}\Steam", "${env:ProgramFiles}\Steam")) {
-                            if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) { $steamInstall = $c; break }
-                        }
-                    }
-
+                    # Reuse the same Steam helper layer as update and library scans.
+                    $steamInstall = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0]
                     if ($steamInstall) {
-                        # Get installed apps from manifests.
-                        $installedApps = @{}
-                        $libRoots = [System.Collections.Generic.List[string]]::new()
-                        if (Test-Path -LiteralPath (Join-Path $steamInstall "steamapps")) { [void]$libRoots.Add($steamInstall) }
-                        $libF = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
-                        if (Test-Path -LiteralPath $libF -PathType Leaf) {
-                            $libT = Get-Content -LiteralPath $libF -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                            if (-not [string]::IsNullOrWhiteSpace($libT)) {
-                                foreach ($m in [regex]::Matches($libT, '"path"\s+"([^"]+)"')) {
-                                    $p = $m.Groups[1].Value -replace '\\\\', '\'
-                                    if ((Test-Path -LiteralPath $p) -and -not $libRoots.Contains($p)) { [void]$libRoots.Add($p) }
-                                }
-                            }
+                        $installedApps=@{}
+                        foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+                            $installedApps[[string]$manifest.Id]=@{ Name=[string]$manifest.Name; BuildId=[string]$manifest.BuildId }
                         }
-                        foreach ($libRoot in $libRoots) {
-                            $sa = Join-Path $libRoot "steamapps"
-                            if (-not (Test-Path -LiteralPath $sa)) { continue }
-                            foreach ($man in @(Get-ChildItem -LiteralPath $sa -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-                                $mt = Get-Content -LiteralPath $man.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                                if ([string]::IsNullOrWhiteSpace($mt)) { continue }
-                                $aid = ""
-                                $am = [regex]::Match($mt, '"appid"\s+"([^"]*)"')
-                                if ($am.Success) { $aid = $am.Groups[1].Value }
-                                if ([string]::IsNullOrWhiteSpace($aid)) { $aid = [regex]::Match($man.BaseName, '\d+').Value }
-                                if ([string]::IsNullOrWhiteSpace($aid)) { continue }
-                                $mname = ""
-                                $nm = [regex]::Match($mt, '"name"\s+"([^"]*)"')
-                                if ($nm.Success) { $mname = $nm.Groups[1].Value }
-                                if ([string]::IsNullOrWhiteSpace($mname)) { $mname = "Steam App $aid" }
-                                $buildId = ""
-                                $bm = [regex]::Match($mt, '"buildid"\s+"([^"]*)"')
-                                if ($bm.Success) { $buildId = $bm.Groups[1].Value }
-                                $installedApps[$aid] = @{ Name = $mname; BuildId = $buildId }
-                            }
+                        $ownedIds=[System.Collections.Generic.List[string]]::new()
+                        foreach ($aid in @(Get-WmtSteamOwnedAppIds -SteamRoot $steamInstall)) {
+                            if (-not [string]::IsNullOrWhiteSpace([string]$aid) -and -not $ownedIds.Contains([string]$aid)) { [void]$ownedIds.Add([string]$aid) }
                         }
 
-                        # Get owned app IDs from localconfig.vdf (case-insensitive).
-                        $ownedIds = [System.Collections.Generic.List[string]]::new()
-                        $udPath = Join-Path $steamInstall "userdata"
-                        if (Test-Path -LiteralPath $udPath) {
-                            foreach ($ud in @(Get-ChildItem -LiteralPath $udPath -Directory -ErrorAction SilentlyContinue)) {
-                                $vdfP = Join-Path $ud.FullName "config\localconfig.vdf"
-                                if (-not (Test-Path -LiteralPath $vdfP -PathType Leaf)) { continue }
-                                $vdfT = Get-Content -LiteralPath $vdfP -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                                if ([string]::IsNullOrWhiteSpace($vdfT)) { continue }
-                                $aIdx = $vdfT.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
-                                if ($aIdx -lt 0) { continue }
-                                $bIdx = $vdfT.IndexOf('{', $aIdx)
-                                if ($bIdx -lt 0) { continue }
-                                $dep = 0
-                                $ii = $bIdx
-                                while ($ii -lt $vdfT.Length) {
-                                    $ch = $vdfT[$ii]
-                                    if ($ch -eq '{') { $dep++; $ii++ }
-                                    elseif ($ch -eq '}') { $dep--; if ($dep -le 0) { break }; $ii++ }
-                                    elseif ($ch -eq '"') {
-                                        $eQ = $vdfT.IndexOf('"', $ii + 1)
-                                        if ($eQ -lt 0) { break }
-                                        $s = $vdfT.Substring($ii + 1, $eQ - $ii - 1)
-                                        $ii = $eQ + 1
-                                        if ($dep -eq 1) {
-                                            $jj = $ii
-                                            while ($jj -lt $vdfT.Length -and [char]::IsWhiteSpace($vdfT[$jj])) { $jj++ }
-                                            if ($jj -lt $vdfT.Length -and $vdfT[$jj] -eq '{') {
-                                                if (-not $ownedIds.Contains($s)) { [void]$ownedIds.Add($s) }
-                                            }
-                                        }
-                                    }
-                                    else { $ii++ }
-                                }
-                            }
-                        }
+                        # Resolve names for ALL apps using the GitHub-hosted Steam app ID
 
                         # Resolve names for ALL apps using the GitHub-hosted Steam app ID
                         # list (single download, ~17MB for games + ~7.5MB for DLC).
