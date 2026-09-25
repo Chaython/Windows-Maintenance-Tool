@@ -7139,7 +7139,7 @@ try {
             }
         }
         catch {
-            Write-GuiLog "Tray shortcut failed to open \${PageName}: $($_.Exception.Message)"
+            Write-GuiLog "Tray shortcut failed to open ${PageName}: $($_.Exception.Message)"
         }
     }.GetNewClosure()
 
