@@ -45698,7 +45698,7 @@ function Get-WmtCompactTrackerPath {
 
 function Get-WmtCompactTrackerData {
     $result = [PSCustomObject]@{
-        Version  = 1
+        Version  = 2
         Schedule = "Off"
         Entries  = @()
     }
@@ -45742,6 +45742,10 @@ function Get-WmtCompactTrackerData {
                 LastAutoRunUtc        = if ($entry.PSObject.Properties["LastAutoRunUtc"]) { [string]$entry.LastAutoRunUtc } else { "" }
                 LastResult            = if ($entry.PSObject.Properties["LastResult"]) { [string]$entry.LastResult } else { "" }
                 LastExitCode          = if ($entry.PSObject.Properties["LastExitCode"]) { [int]$entry.LastExitCode } else { 0 }
+                LastAnalysisUtc       = if ($entry.PSObject.Properties["LastAnalysisUtc"]) { [string]$entry.LastAnalysisUtc } else { "" }
+                NeedsRecompress       = if ($entry.PSObject.Properties["NeedsRecompress"] -and $null -ne $entry.NeedsRecompress) { [bool]$entry.NeedsRecompress } else { $null }
+                LastChangePath        = if ($entry.PSObject.Properties["LastChangePath"]) { [string]$entry.LastChangePath } else { "" }
+                FilesScanned          = if ($entry.PSObject.Properties["FilesScanned"]) { [int64]$entry.FilesScanned } else { 0 }
             })
         }
         $result.Entries = $entries.ToArray()
@@ -45798,6 +45802,10 @@ function Set-WmtCompactTrackedTarget {
             LastAutoRunUtc    = ""
             LastResult        = ""
             LastExitCode      = 0
+            LastAnalysisUtc   = ""
+            NeedsRecompress   = $null
+            LastChangePath    = ""
+            FilesScanned      = 0
         }
         $data.Entries = @($data.Entries) + $item
     }
@@ -45862,10 +45870,18 @@ function Write-WmtCompactRecompressWorker {
     $logBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($logPath))
 
     $worker = @'
-param([switch]$AllTracked)
+param(
+    [switch]$AllTracked,
+    [switch]$AnalyzeOnly,
+    [string]$OnlyPathBase64 = ""
+)
 $ErrorActionPreference = "Continue"
 $TrackerPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__TRACKER__"))
 $LogPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__LOG__"))
+$OnlyPath = ""
+if (-not [string]::IsNullOrWhiteSpace($OnlyPathBase64)) {
+    try { $OnlyPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($OnlyPathBase64)) } catch {}
+}
 $compactExe = Join-Path $env:SystemRoot "System32\compact.exe"
 if (-not (Test-Path -LiteralPath $compactExe -PathType Leaf)) { $compactExe = "compact.exe" }
 
@@ -45881,24 +45897,154 @@ function Write-WorkerLog {
     try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
 }
 
+function Test-TargetChanged {
+    param([string]$Path, [string]$LastCompressedUtc)
+
+    $result = [PSCustomObject]@{
+        Exists          = $false
+        NeedsRecompress = $true
+        FilesScanned    = [int64]0
+        ChangedPath     = ""
+        Error           = ""
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        $result.NeedsRecompress = $false
+        $result.Error = "Target no longer exists."
+        return $result
+    }
+    $result.Exists = $true
+
+    if ([string]::IsNullOrWhiteSpace($LastCompressedUtc)) {
+        $result.NeedsRecompress = $true
+        return $result
+    }
+
+    try { $cutoff = ([DateTimeOffset]::Parse($LastCompressedUtc)).UtcDateTime.AddSeconds(2) }
+    catch {
+        $result.NeedsRecompress = $true
+        $result.Error = "Last compression timestamp could not be parsed."
+        return $result
+    }
+
+    try {
+        $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $pending = [System.Collections.Generic.Stack[string]]::new()
+        $pending.Push([System.IO.DirectoryInfo]::new($Path).FullName)
+
+        while ($pending.Count -gt 0) {
+            $dir = $pending.Pop()
+            try {
+                $dirInfo = [System.IO.DirectoryInfo]::new($dir)
+                $dirKey = $dirInfo.FullName.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+                if (-not $visited.Add($dirKey)) { continue }
+                if (($dirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            }
+            catch { continue }
+
+            try {
+                foreach ($file in [System.IO.Directory]::EnumerateFiles($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
+                    $result.FilesScanned++
+                    try {
+                        $fi = [System.IO.FileInfo]::new($file)
+                        $stamp = if ($fi.CreationTimeUtc -gt $fi.LastWriteTimeUtc) { $fi.CreationTimeUtc } else { $fi.LastWriteTimeUtc }
+                        if ($stamp -gt $cutoff) {
+                            $result.NeedsRecompress = $true
+                            $result.ChangedPath = $fi.FullName
+                            return $result
+                        }
+                    }
+                    catch {}
+                }
+            }
+            catch {}
+
+            try {
+                foreach ($child in [System.IO.Directory]::EnumerateDirectories($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
+                    try {
+                        $attrs = [System.IO.Directory]::GetAttributes($child)
+                        if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                        $pending.Push($child)
+                    }
+                    catch {}
+                }
+            }
+            catch {}
+        }
+
+        $result.NeedsRecompress = $false
+    }
+    catch {
+        # If analysis itself fails, let compact.exe be the fallback authority.
+        $result.NeedsRecompress = $true
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
 if (-not (Test-Path -LiteralPath $TrackerPath -PathType Leaf)) { exit 0 }
 
 try {
     $data = Get-Content -LiteralPath $TrackerPath -Raw | ConvertFrom-Json -ErrorAction Stop
     if (-not $data.PSObject.Properties["Entries"]) { exit 0 }
 
+    $processedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
     foreach ($entry in @($data.Entries)) {
         if (-not $entry) { continue }
-        if (-not $AllTracked -and -not [bool]$entry.AutoRecompress) { continue }
-        if ([string]$entry.State -eq "Decompressed") { continue }
 
         $target = ([string]$entry.Path).Trim()
         if ([string]::IsNullOrWhiteSpace($target)) { continue }
-        if (-not (Test-Path -LiteralPath $target -PathType Container)) {
-            Set-EntryValue $entry "LastAutoRunUtc" ([DateTime]::UtcNow.ToString("o"))
+        if (-not [string]::IsNullOrWhiteSpace($OnlyPath) -and $target -ine $OnlyPath) { continue }
+        if ([string]::IsNullOrWhiteSpace($OnlyPath) -and -not $AllTracked -and -not [bool]$entry.AutoRecompress) { continue }
+
+        [void]$processedPaths.Add($target)
+        $nowUtc = [DateTime]::UtcNow.ToString("o")
+
+        if ([string]$entry.State -eq "Decompressed") {
+            Set-EntryValue $entry "LastAnalysisUtc" $nowUtc
+            Set-EntryValue $entry "NeedsRecompress" $false
+            Set-EntryValue $entry "FilesScanned" 0
+            Set-EntryValue $entry "LastChangePath" ""
+            Set-EntryValue $entry "LastResult" "Target is intentionally decompressed."
+            continue
+        }
+
+        $analysis = Test-TargetChanged -Path $target -LastCompressedUtc ([string]$entry.LastCompressedUtc)
+        Set-EntryValue $entry "LastAnalysisUtc" $nowUtc
+        Set-EntryValue $entry "NeedsRecompress" ([bool]$analysis.NeedsRecompress)
+        Set-EntryValue $entry "FilesScanned" ([int64]$analysis.FilesScanned)
+        Set-EntryValue $entry "LastChangePath" ([string]$analysis.ChangedPath)
+
+        if (-not $analysis.Exists) {
+            Set-EntryValue $entry "State" "Missing"
             Set-EntryValue $entry "LastResult" "Skipped: target no longer exists."
             Set-EntryValue $entry "LastExitCode" 3
+            if (-not $AnalyzeOnly) { Set-EntryValue $entry "LastAutoRunUtc" $nowUtc }
             Write-WorkerLog "Skipped missing target: $target"
+            continue
+        }
+
+        if ($AnalyzeOnly) {
+            if ($analysis.NeedsRecompress) {
+                $reason = if ([string]::IsNullOrWhiteSpace([string]$entry.LastCompressedUtc)) { "No successful compression recorded." } elseif ($analysis.ChangedPath) { "Changed file: $($analysis.ChangedPath)" } elseif ($analysis.Error) { "Analysis warning: $($analysis.Error)" } else { "Changes detected." }
+                Set-EntryValue $entry "State" "Changed"
+                Set-EntryValue $entry "LastResult" $reason
+            }
+            else {
+                Set-EntryValue $entry "State" "Current"
+                Set-EntryValue $entry "LastResult" "No file changes detected since the last compression."
+            }
+            continue
+        }
+
+        Set-EntryValue $entry "LastAutoRunUtc" $nowUtc
+        if (-not $analysis.NeedsRecompress) {
+            Set-EntryValue $entry "State" "Current"
+            Set-EntryValue $entry "LastExitCode" 0
+            Set-EntryValue $entry "LastResult" "No changes since last compression; recompression skipped."
+            Write-WorkerLog "Unchanged; skipped $target after checking $($analysis.FilesScanned) file(s)."
             continue
         }
 
@@ -45912,25 +46058,29 @@ try {
             $compactArgs = @("/C", "/S", "/I", "/A")
             if ($algorithm -ne "NTFS") { $compactArgs += "/EXE:$algorithm" }
 
-            Write-WorkerLog "Recompressing $target with $algorithm"
+            Write-WorkerLog "Recompressing changed target $target with $algorithm"
             & $compactExe @compactArgs 2>&1 | Add-Content -LiteralPath $LogPath -Encoding UTF8
             $code = $LASTEXITCODE
 
-            Set-EntryValue $entry "LastAutoRunUtc" ([DateTime]::UtcNow.ToString("o"))
             Set-EntryValue $entry "LastExitCode" ([int]$code)
             if ($code -eq 0) {
-                Set-EntryValue $entry "State" "Compressed"
+                Set-EntryValue $entry "State" "Current"
                 Set-EntryValue $entry "LastCompressedUtc" ([DateTime]::UtcNow.ToString("o"))
-                Set-EntryValue $entry "LastResult" "Automatic recompression completed."
+                Set-EntryValue $entry "NeedsRecompress" $false
+                Set-EntryValue $entry "LastChangePath" ""
+                Set-EntryValue $entry "LastResult" "Automatic recompression completed after changes were detected."
                 Write-WorkerLog "Completed $target"
             }
             else {
+                Set-EntryValue $entry "State" "Error"
+                Set-EntryValue $entry "NeedsRecompress" $true
                 Set-EntryValue $entry "LastResult" "Automatic recompression exit code $code."
                 Write-WorkerLog "compact.exe returned $code for $target"
             }
         }
         catch {
-            Set-EntryValue $entry "LastAutoRunUtc" ([DateTime]::UtcNow.ToString("o"))
+            Set-EntryValue $entry "State" "Error"
+            Set-EntryValue $entry "NeedsRecompress" $true
             Set-EntryValue $entry "LastResult" ("Automatic recompression failed: " + $_.Exception.Message)
             Set-EntryValue $entry "LastExitCode" 1
             Write-WorkerLog "Failed $target : $($_.Exception.Message)"
@@ -45940,8 +46090,27 @@ try {
         }
     }
 
+    # Re-read the tracker before saving and merge only worker result fields.
+    # This prevents a background run from overwriting UI edits made while it ran.
+    $latest = Get-Content -LiteralPath $TrackerPath -Raw | ConvertFrom-Json -ErrorAction Stop
+    if (-not $latest.PSObject.Properties["Entries"]) { exit 0 }
+    $resultFields = @("State", "LastCompressedUtc", "LastAutoRunUtc", "LastResult", "LastExitCode", "LastAnalysisUtc", "NeedsRecompress", "LastChangePath", "FilesScanned")
+
+    foreach ($latestEntry in @($latest.Entries)) {
+        if (-not $latestEntry) { continue }
+        $latestPath = ([string]$latestEntry.Path).Trim()
+        if (-not $processedPaths.Contains($latestPath)) { continue }
+        $source = @($data.Entries | Where-Object { [string]$_.Path -ieq $latestPath } | Select-Object -First 1)
+        if ($source.Count -eq 0) { continue }
+        foreach ($field in $resultFields) {
+            if ($source[0].PSObject.Properties[$field]) {
+                Set-EntryValue $latestEntry $field $source[0].$field
+            }
+        }
+    }
+
     $temp = "$TrackerPath.worker.tmp"
-    $json = $data | ConvertTo-Json -Depth 6
+    $json = $latest | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temp -Destination $TrackerPath -Force
 }
@@ -45970,7 +46139,11 @@ catch {
 }
 
 function Start-WmtCompactRecompressWorker {
-    param([switch]$AllTracked)
+    param(
+        [switch]$AllTracked,
+        [switch]$AnalyzeOnly,
+        [string]$Path = ""
+    )
 
     $workerPath = Write-WmtCompactRecompressWorker
     $quote = [char]34
@@ -45978,10 +46151,21 @@ function Start-WmtCompactRecompressWorker {
     $psi.FileName = "powershell.exe"
     $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + $quote + $workerPath + $quote
     if ($AllTracked) { $psi.Arguments += " -AllTracked" }
+    if ($AnalyzeOnly) { $psi.Arguments += " -AnalyzeOnly" }
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        $pathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Path))
+        $psi.Arguments += " -OnlyPathBase64 " + $pathBase64
+    }
     $psi.UseShellExecute = $true
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     [void][System.Diagnostics.Process]::Start($psi)
-    Write-GuiLog "[Compact] Background recompression worker started."
+
+    if ($AnalyzeOnly) {
+        Write-GuiLog "[Compact] Background change analysis started for '$Path'."
+    }
+    else {
+        Write-GuiLog "[Compact] Background recompression worker started."
+    }
 }
 
 function Set-WmtCompactRecompressSchedule {
@@ -46111,13 +46295,19 @@ function Update-TrackerResult {
         Set-TrackerValue $item "LastExitCode" ([int]$exitCode)
         if ($exitCode -eq 0) {
             if ($Mode -eq "Compress") {
-                Set-TrackerValue $item "State" "Compressed"
+                Set-TrackerValue $item "State" "Current"
                 Set-TrackerValue $item "LastCompressedUtc" ([DateTime]::UtcNow.ToString("o"))
+                Set-TrackerValue $item "LastAnalysisUtc" ([DateTime]::UtcNow.ToString("o"))
+                Set-TrackerValue $item "NeedsRecompress" $false
+                Set-TrackerValue $item "LastChangePath" ""
                 Set-TrackerValue $item "LastResult" "Manual compression completed."
             }
             else {
                 Set-TrackerValue $item "State" "Decompressed"
                 Set-TrackerValue $item "AutoRecompress" $false
+                Set-TrackerValue $item "LastAnalysisUtc" ([DateTime]::UtcNow.ToString("o"))
+                Set-TrackerValue $item "NeedsRecompress" $false
+                Set-TrackerValue $item "LastChangePath" ""
                 Set-TrackerValue $item "LastResult" "Manual decompression completed."
             }
         }
@@ -46531,15 +46721,17 @@ function Show-WmtCompactManager {
                         <DataGridTextColumn Header="Target" Binding="{Binding Path}" Width="2.4*"/>
                         <DataGridTextColumn Header="Method" Binding="{Binding Algorithm}" Width="95"/>
                         <DataGridTextColumn Header="Auto" Binding="{Binding AutoText}" Width="55"/>
+                        <DataGridTextColumn Header="Needs" Binding="{Binding NeedsText}" Width="72"/>
                         <DataGridTextColumn Header="State" Binding="{Binding State}" Width="85"/>
                         <DataGridTextColumn Header="Last compressed" Binding="{Binding LastCompressedText}" Width="135"/>
-                        <DataGridTextColumn Header="Last auto run" Binding="{Binding LastAutoRunText}" Width="135"/>
-                        <DataGridTextColumn Header="Result" Binding="{Binding LastResult}" Width="1.7*"/>
+                        <DataGridTextColumn Header="Last analyzed" Binding="{Binding LastAnalysisText}" Width="135"/>
+                        <DataGridTextColumn Header="Result" Binding="{Binding LastResult}" Width="1.6*"/>
                     </DataGrid.Columns>
                 </DataGrid>
 
                 <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,9,0,0">
                     <Button Name="btnCompactRefreshTracked" Content="Refresh" MinWidth="78" Margin="0,0,7,0"/>
+                    <Button Name="btnCompactAnalyzeSelected" Content="Analyze Selected" MinWidth="118" Margin="0,0,7,0"/>
                     <Button Name="btnCompactToggleAuto" Content="Toggle Auto" MinWidth="92" Margin="0,0,7,0"/>
                     <Button Name="btnCompactRecompressSelected" Content="Recompress Selected" MinWidth="138" Margin="0,0,7,0"/>
                     <Button Name="btnCompactRunAutoNow" Content="Run Auto Now" MinWidth="105" Margin="0,0,7,0"/>
@@ -46548,7 +46740,7 @@ function Show-WmtCompactManager {
             </Grid>
         </Border>
 
-        <TextBlock Grid.Row="5" Text="Scheduled recompression uses compact.exe without /F, so already-compressed files are skipped while new or decompressed files are picked up. The secured worker log is stored under ProgramData\WindowsMaintenanceTool."
+        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, then invoke compact.exe only when recompression is needed. Reparse points are skipped during analysis. The secured worker log is stored under ProgramData\WindowsMaintenanceTool."
                    Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
 
         <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
@@ -46575,6 +46767,7 @@ function Show-WmtCompactManager {
     $txtTrackerSummary = $dialog.FindName("txtCompactTrackerSummary")
     $btnTrackCurrent = $dialog.FindName("btnCompactTrackCurrent")
     $btnRefreshTracked = $dialog.FindName("btnCompactRefreshTracked")
+    $btnAnalyzeSelected = $dialog.FindName("btnCompactAnalyzeSelected")
     $btnToggleAuto = $dialog.FindName("btnCompactToggleAuto")
     $btnRecompressSelected = $dialog.FindName("btnCompactRecompressSelected")
     $btnRunAutoNow = $dialog.FindName("btnCompactRunAutoNow")
@@ -46634,15 +46827,18 @@ function Show-WmtCompactManager {
                 Algorithm          = [string]$entry.Algorithm
                 AutoText           = if ([bool]$entry.AutoRecompress) { "Yes" } else { "No" }
                 AutoRecompress     = [bool]$entry.AutoRecompress
+                NeedsRecompress    = if ($entry.PSObject.Properties["NeedsRecompress"]) { $entry.NeedsRecompress } else { $null }
+                NeedsText          = if (-not $entry.PSObject.Properties["NeedsRecompress"] -or $null -eq $entry.NeedsRecompress) { "Unknown" } elseif ([bool]$entry.NeedsRecompress) { "Yes" } else { "No" }
                 State              = [string]$entry.State
                 LastCompressedText = Format-WmtCompactTrackerDate ([string]$entry.LastCompressedUtc)
-                LastAutoRunText    = Format-WmtCompactTrackerDate ([string]$entry.LastAutoRunUtc)
+                LastAnalysisText   = Format-WmtCompactTrackerDate ([string]$entry.LastAnalysisUtc)
                 LastResult         = [string]$entry.LastResult
             })
         }
         $dgTracked.ItemsSource = $rows.ToArray()
         $autoCount = @($data.Entries | Where-Object { [bool]$_.AutoRecompress }).Count
-        $txtTrackerSummary.Text = "$($rows.Count) tracked target(s), $autoCount enabled for automatic recompression."
+        $needsCount = @($data.Entries | Where-Object { $_.PSObject.Properties["NeedsRecompress"] -and $null -ne $_.NeedsRecompress -and [bool]$_.NeedsRecompress }).Count
+        $txtTrackerSummary.Text = "$($rows.Count) tracked target(s), $autoCount automatic, $needsCount currently flagged for recompression."
         & $selectSchedule ([string]$data.Schedule)
         $txtScheduleStatus.Text = if ([string]$data.Schedule -eq "Off") { "No scheduled recompression task." } else { "Schedule: $([string]$data.Schedule)." }
     }.GetNewClosure()
@@ -46728,6 +46924,16 @@ function Show-WmtCompactManager {
 
     $btnRefreshTracked.Add_Click({ & $refreshTracker }.GetNewClosure())
 
+    $btnAnalyzeSelected.Add_Click({
+        if (-not $dgTracked.SelectedItem) {
+            Show-WmtMessageBox -Message "Select a tracked target first." -Title "Compact Compression" -Image Information | Out-Null
+            return
+        }
+        $row = $dgTracked.SelectedItem
+        Start-WmtCompactRecompressWorker -AnalyzeOnly -Path ([string]$row.Path)
+        $txtScheduleStatus.Text = "Background analysis started. Refresh shortly to see the result."
+    }.GetNewClosure())
+
     $btnToggleAuto.Add_Click({
         if (-not $dgTracked.SelectedItem) {
             Show-WmtMessageBox -Message "Select a tracked target first." -Title "Compact Compression" -Image Information | Out-Null
@@ -46765,7 +46971,7 @@ function Show-WmtCompactManager {
             return
         }
         Start-WmtCompactRecompressWorker
-        $txtScheduleStatus.Text = "Background recompression started. Use Refresh to update results."
+        $txtScheduleStatus.Text = "Background change scan started; changed targets will be recompressed. Use Refresh to update results."
     }.GetNewClosure())
 
     $btnRemoveTracked.Add_Click({
