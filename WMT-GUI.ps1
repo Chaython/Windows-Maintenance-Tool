@@ -1895,40 +1895,99 @@ catch { return $Default }
 # accented characters (e.g. ì, à, è) to be garbled.  This helper uses
 # System.Diagnostics.Process with explicit OEM encoding to avoid that.
 # ============================================================================
+function Invoke-WmtProcess {
+param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string]$Arguments = "",
+    [int]$TimeoutMs = 60000,
+    [ValidateSet("OEM", "UTF8", "Unicode", "Default")][string]$Encoding = "OEM",
+    [bool]$CreateNoWindow = $true,
+    [switch]$KillTree
+)
+
+$result = [PSCustomObject]@{
+    ExitCode  = -1
+    StdOut    = ""
+    StdErr    = ""
+    Combined  = ""
+    TimedOut  = $false
+    ProcessId = 0
+    Error     = ""
+}
+
+$proc = $null
+try {
+    $textEncoding = switch ($Encoding) {
+        "UTF8"    { [System.Text.UTF8Encoding]::new($false) }
+        "Unicode" { [System.Text.Encoding]::Unicode }
+        "Default" { [System.Text.Encoding]::Default }
+        default   { [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) }
+    }
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $CreateNoWindow
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    try { $psi.StandardOutputEncoding = $textEncoding } catch {}
+    try { $psi.StandardErrorEncoding = $textEncoding } catch {}
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw "Process failed to start." }
+
+    $result.ProcessId = $proc.Id
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $exited = $proc.WaitForExit([Math]::Max(1, $TimeoutMs))
+
+    if (-not $exited) {
+        $result.TimedOut = $true
+        if ($KillTree) {
+            try {
+                $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+                if (Test-Path -LiteralPath $taskkill) {
+                    Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -Wait -ErrorAction Stop | Out-Null
+                }
+                else { $proc.Kill() }
+            }
+            catch { try { $proc.Kill() } catch {} }
+        }
+        else { try { $proc.Kill() } catch {} }
+        try { [void]$proc.WaitForExit(2000) } catch {}
+    }
+    else { try { [void]$proc.WaitForExit() } catch {} }
+
+    try { $result.StdOut = [string]$stdoutTask.GetAwaiter().GetResult() } catch {}
+    try { $result.StdErr = [string]$stderrTask.GetAwaiter().GetResult() } catch {}
+    try { if ($proc.HasExited) { $result.ExitCode = [int]$proc.ExitCode } } catch {}
+    $result.Combined = "$($result.StdOut)$($result.StdErr)"
+}
+catch { $result.Error = $_.Exception.Message }
+finally { if ($proc) { try { $proc.Dispose() } catch {} } }
+return $result
+}
+
 function Invoke-WmtCliText {
 param(
     [Parameter(Mandatory = $true)][string]$FilePath,
     [string]$Arguments = "",
-    [int]$TimeoutMs = 60000
+    [int]$TimeoutMs = 60000,
+    [ValidateSet("OEM", "UTF8", "Unicode", "Default")][string]$Encoding = "OEM"
 )
 try {
-    $oem = [System.Text.Encoding]::GetEncoding(
-        [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName               = $FilePath
-    $psi.Arguments              = $Arguments
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.StandardOutputEncoding = $oem
-    $psi.StandardErrorEncoding  = $oem
-
-    $proc   = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    if (-not $proc.WaitForExit($TimeoutMs)) {
-        try { $proc.Kill() } catch {}
-    }
-    $global:LASTEXITCODE = $proc.ExitCode
-    $combined = "$stdout$stderr"
-    if ($combined.Length -gt 0) { return $combined.TrimEnd() }
+    $result = Invoke-WmtProcess -FilePath $FilePath -Arguments $Arguments -TimeoutMs $TimeoutMs -Encoding $Encoding -KillTree
+    $global:LASTEXITCODE = [int]$result.ExitCode
+    if (-not [string]::IsNullOrEmpty([string]$result.Combined)) { return ([string]$result.Combined).TrimEnd() }
     return ""
 }
 catch { return "" }
 }
 
 # ============================================================================
+# Shared RunspacePool for background jobs# ============================================================================
 # Shared RunspacePool for background jobs (My Device stats, Tweak States, etc.)
 # ============================================================================
 function Initialize-WmtBackgroundRunspacePool {
@@ -1955,6 +2014,9 @@ if (Get-Command ConvertTo-Int -ErrorAction SilentlyContinue) {
 }
 if (Get-Command ConvertTo-Str -ErrorAction SilentlyContinue) {
     try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("ConvertTo-Str", ${function:ConvertTo-Str}.ToString())) } catch {}
+}
+if (Get-Command Invoke-WmtProcess -ErrorAction SilentlyContinue) {
+    try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("Invoke-WmtProcess", ${function:Invoke-WmtProcess}.ToString())) } catch {}
 }
 if (Get-Command Invoke-WmtCliText -ErrorAction SilentlyContinue) {
     try { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("Invoke-WmtCliText", ${function:Invoke-WmtCliText}.ToString())) } catch {}
@@ -2036,6 +2098,88 @@ try {
 catch {
     return [PowerShell]::Create()
 }
+}
+
+# ============================================================================
+# Shared UI async-operation poller
+# Replaces one DispatcherTimer per background operation with one 200ms timer.
+# Debounce, animation, and one-shot timers remain independent by design.
+# ============================================================================
+$script:WmtUiPollOperations = [ordered]@{}
+$script:WmtUiPollTimer = $null
+
+function Ensure-WmtUiPollTimer {
+if (-not $script:WmtUiPollTimer) {
+    $script:WmtUiPollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:WmtUiPollTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+    $script:WmtUiPollTimer.Add_Tick({
+        foreach ($name in @($script:WmtUiPollOperations.Keys)) {
+            if (-not $script:WmtUiPollOperations.Contains($name)) { continue }
+            $op = $script:WmtUiPollOperations[$name]
+            if (-not $op) { continue }
+            try {
+                if ($op.OnTick) { & $op.OnTick $op }
+                $timedOut = ($op.TimeoutMs -gt 0 -and ((([DateTime]::UtcNow - $op.StartedAt).TotalMilliseconds) -ge $op.TimeoutMs))
+                if ($timedOut) {
+                    [void]$script:WmtUiPollOperations.Remove($name)
+                    if ($op.OnTimeout) { & $op.OnTimeout $op }
+                    continue
+                }
+                $complete = $false
+                if ($op.TestComplete) { $complete = [bool](& $op.TestComplete $op) }
+                if ($complete) {
+                    [void]$script:WmtUiPollOperations.Remove($name)
+                    if ($op.OnComplete) { & $op.OnComplete $op }
+                }
+            }
+            catch {
+                [void]$script:WmtUiPollOperations.Remove($name)
+                try { Write-GuiLog "[Async] $name monitor failed: $($_.Exception.Message)" } catch {}
+                if ($op.OnError) { try { & $op.OnError $op $_ } catch {} }
+            }
+        }
+        if ($script:WmtUiPollOperations.Count -eq 0 -and $script:WmtUiPollTimer) { $script:WmtUiPollTimer.Stop() }
+    })
+}
+if (-not $script:WmtUiPollTimer.IsEnabled) { $script:WmtUiPollTimer.Start() }
+}
+
+function Register-WmtUiPollOperation {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][scriptblock]$TestComplete,
+    [scriptblock]$OnComplete,
+    [scriptblock]$OnTick,
+    [int]$TimeoutMs = 0,
+    [scriptblock]$OnTimeout,
+    [scriptblock]$OnError
+)
+if ([string]::IsNullOrWhiteSpace($Name)) { throw "Async operation name cannot be empty." }
+if ($script:WmtUiPollOperations.Contains($Name)) { [void]$script:WmtUiPollOperations.Remove($Name) }
+$op = [PSCustomObject]@{
+    Name = $Name
+    StartedAt = [DateTime]::UtcNow
+    TimeoutMs = [Math]::Max(0, $TimeoutMs)
+    TestComplete = $TestComplete
+    OnComplete = $OnComplete
+    OnTick = $OnTick
+    OnTimeout = $OnTimeout
+    OnError = $OnError
+}
+$script:WmtUiPollOperations[$Name] = $op
+Ensure-WmtUiPollTimer
+return $op
+}
+
+function Unregister-WmtUiPollOperation {
+param([Parameter(Mandatory = $true)][string]$Name)
+if ($script:WmtUiPollOperations -and $script:WmtUiPollOperations.Contains($Name)) { [void]$script:WmtUiPollOperations.Remove($Name) }
+if ($script:WmtUiPollOperations.Count -eq 0 -and $script:WmtUiPollTimer) { $script:WmtUiPollTimer.Stop() }
+}
+
+function Stop-WmtUiPoller {
+if ($script:WmtUiPollTimer) { try { $script:WmtUiPollTimer.Stop() } catch {} }
+if ($script:WmtUiPollOperations) { $script:WmtUiPollOperations.Clear() }
 }
 
 function Start-MyDeviceSectionJob {
@@ -12690,44 +12834,46 @@ function Invoke-WmtOutOfProcessAnalyze {
     foreach ($task in $tasks) { $queue.Enqueue($task) }
 
     $running = @{}
+    $nextWorkerId = 0
     $completed = 0
     $total = $tasks.Count
-    Write-GuiLog "Analyze scanner: starting $total task(s), up to $maxParallel out-of-process worker(s)."
+    Write-GuiLog "Analyze scanner: starting $total task(s), up to $maxParallel pooled worker(s)."
 
     while ($queue.Count -gt 0 -or $running.Count -gt 0) {
         while ($queue.Count -gt 0 -and $running.Count -lt $maxParallel) {
             $task = $queue.Dequeue()
-            $job = Start-Job -ScriptBlock $jobScript -ArgumentList @($task)
-            $running[[int]$job.Id] = [PSCustomObject]@{ Job = $job; Task = $task }
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript($jobScript.ToString()).AddArgument($task)
+            $async = $ps.BeginInvoke()
+            $nextWorkerId++
+            $running[$nextWorkerId] = [PSCustomObject]@{ PowerShell = $ps; Async = $async; Task = $task }
             $pStatus.Text = "Scanning: $($task.RuleName)"
         }
 
         foreach ($entry in @($running.GetEnumerator())) {
-            $job = $entry.Value.Job
-            if ($job.State -notin @("Completed", "Failed", "Stopped")) { continue }
-
-            $task = $entry.Value.Task
+            $worker = $entry.Value
+            if (-not $worker.Async -or -not $worker.Async.IsCompleted) { continue }
+            $task = $worker.Task
             $rows = @()
-            try { $rows = @(Receive-Job -Job $job -ErrorAction SilentlyContinue) } catch {}
+            try { $rows = @($worker.PowerShell.EndInvoke($worker.Async)) }
+            catch { Write-GuiLog "Analyze scanner worker failed for $($task.RuleName): $($_.Exception.Message)" }
             foreach ($row in $rows) {
                 if (-not $row.FilePath) { continue }
                 $rawBytes = [int64]0
                 try { $rawBytes = [int64]$row.RawBytes } catch {}
                 $previewList.Add([PSCustomObject]@{
-                        RuleName         = [string]$row.RuleName
-                        FilePath         = [string]$row.FilePath
-                        RawBytes         = $rawBytes
-                        IsProtected      = [bool]$row.IsProtected
+                        RuleName = [string]$row.RuleName
+                        FilePath = [string]$row.FilePath
+                        RawBytes = $rawBytes
+                        IsProtected = [bool]$row.IsProtected
                         ProtectionReason = [string]$row.ProtectionReason
                     })
                 $stats.Deleted++
                 $stats.Bytes += $rawBytes
             }
-
-            try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
+            try { $worker.PowerShell.Dispose() } catch {}
             $running.Remove($entry.Key)
             $completed++
-
             $stats.Progress = (100.0 * $completed / [Math]::Max(1, $total))
             $pBar.Value = [Math]::Min(100, [int]$stats.Progress)
             $mb = [math]::Round($stats.Bytes / 1MB, 2)
@@ -12736,16 +12882,17 @@ function Invoke-WmtOutOfProcessAnalyze {
         }
 
         Invoke-WmtDispatcherPump -Dispatcher $pForm.Dispatcher
-        Start-Sleep -Milliseconds 120
-
+        Start-Sleep -Milliseconds 80
         if ($progressState.Closed) {
             foreach ($entry in @($running.GetEnumerator())) {
-                try { Stop-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue } catch {}
-                try { Remove-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue } catch {}
+                try { $entry.Value.PowerShell.Stop() } catch {}
+                try { $entry.Value.PowerShell.Dispose() } catch {}
             }
+            $running.Clear()
             break
         }
     }
+
 }
 
 # 4. MAIN EXECUTION LOOP
