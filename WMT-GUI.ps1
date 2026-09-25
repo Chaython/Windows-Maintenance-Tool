@@ -7171,7 +7171,7 @@ $message += "."
 function Show-DownloadStats {
 Invoke-UiCommand {
     try {
-        $repo = "ios12checker/Windows-Maintenance-Tool"
+        $repo = "Chaython/Windows-Maintenance-Tool"
         $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
         if (-not $rel -or -not $rel.assets) { throw "No release data returned." }
         $total = ($rel.assets | Measure-Object download_count -Sum).Sum
@@ -7219,7 +7219,7 @@ $script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript
         try {
             if ($IsExe) {
                 # For EXE: Check GitHub releases API
-                $url = "https://api.github.com/repos/ios12checker/Windows-Maintenance-Tool/releases/latest"
+                $url = "https://api.github.com/repos/Chaython/Windows-Maintenance-Tool/releases/latest"
                 $req = Invoke-RestMethod -Uri $url -UseBasicParsing -TimeoutSec 10
 
                 if ($req -and $req.tag_name) {
@@ -7282,7 +7282,7 @@ $script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript
             else {
                 # For Script: Download and parse WMT-GUI.ps1
                 $time = Get-Date -Format "yyyyMMddHHmmss"
-                $url = "https://raw.githubusercontent.com/ios12checker/Windows-Maintenance-Tool/main/WMT-GUI.ps1?t=$time"
+                $url = "https://raw.githubusercontent.com/Chaython/Windows-Maintenance-Tool/Main/WMT-GUI.ps1?t=$time"
 
                 # Shorter timeout for UI responsiveness
                 $req = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
@@ -7341,6 +7341,9 @@ $script:UpdateAsyncResult = $script:UpdateRunspace.BeginInvoke()
 
 # 3. Setup Timer
 $script:UpdateTimer = $null
+# Reset the per-check timeout counter. The shared poller persists across checks,
+# so carrying this value forward causes later checks to time out prematurely.
+$script:UpdateTicks = 0
 Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplete { $false } -OnTick {
         $lb = Get-Ctrl "LogBox"
         $script:UpdateTicks++
@@ -7384,7 +7387,9 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                             $lb.ScrollToEnd()
                         }
 
-                        if ($runningAsExe) {
+                        # This callback runs after Start-UpdateCheckBackground returns;
+                        # use persistent script state instead of a dead local closure.
+                        if ($script:WmtIsCompiledExe) {
                             if ($lb) {
                                 $lb.AppendText("[UPDATE] Newer EXE release available. Prompting user...`n")
                                 if ($jobResult.ChecksumStatus -eq "Found" -and $jobResult.ExeSha256) { $lb.AppendText("[UPDATE] Release publishes a SHA256 checksum - the download will be verified against it.`n") }
@@ -7517,7 +7522,11 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                             throw "Downloaded update does not look like a WMT script (safety check failed)."
                                         }
 
-                                        $scriptPath = $scriptPathForUpdate
+                                        # The shared UI poll callback runs after Start-UpdateCheckBackground
+                                        # returns, so do not depend on its local $scriptPathForUpdate variable.
+                                        # $script:WmtScriptPath is captured at startup and remains valid when
+                                        # WMT-GUI.ps1 is launched directly with powershell.exe -File (issue #161).
+                                        $scriptPath = $script:WmtScriptPath
                                         if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path $scriptPath)) {
                                             throw "Could not resolve script path for self-update."
                                         }
@@ -7581,7 +7590,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                             [System.Windows.MessageBoxImage]::Warning
                                         )
                                         if ($fallback -eq [System.Windows.MessageBoxResult]::Yes) {
-                                            Start-Process "https://github.com/ios12checker/Windows-Maintenance-Tool/releases"
+                                            Start-Process "https://github.com/Chaython/Windows-Maintenance-Tool/releases"
                                         }
                                     }
                                 }
@@ -46274,7 +46283,7 @@ if ($btnCtxBuilder) { $btnCtxBuilder.Add_Click({ Show-ContextMenuBuilder }) }
 
 # --- Support ---
 if ($btnSupportDiscord) { $btnSupportDiscord.Add_Click({ Start-Process "https://discord.gg/bCQqKHGxja" }) }
-if ($btnSupportIssue) { $btnSupportIssue.Add_Click({ Start-Process "https://github.com/ios12checker/Windows-Maintenance-Tool/issues/new/choose" }) }
+if ($btnSupportIssue) { $btnSupportIssue.Add_Click({ Start-Process "https://github.com/Chaython/Windows-Maintenance-Tool/issues/new/choose" }) }
 if ($btnDonateIos12) { $btnDonateIos12.Add_Click({ Start-Process "https://github.com/sponsors/ios12checker" }) }
 if ($btnCreditLilBatti) { $btnCreditLilBatti.Add_Click({ Start-Process "https://github.com/ios12checker" }) }
 if ($btnCreditChaython) { $btnCreditChaython.Add_Click({ Start-Process "https://github.com/Chaython" }) }
@@ -48161,12 +48170,11 @@ $ps = New-WmtPooledPowerShell
 $script:WmtLibraryScanRunspace = $ps
 $script:WmtLibraryScanAsyncResult = $ps.BeginInvoke()
 
-# Polling timer to collect results. Use $script: scope so the Tick
-# handler can restart itself without closure capture issues.
+# Collect results through the shared UI poller. There is no dedicated
+# DispatcherTimer object anymore, so the legacy timer-null guard must not be
+# used as an activity test (it would make every poll return immediately).
 $script:WmtLibraryScanTimer = $null
 Register-WmtUiPollOperation -Name "LibraryScan" -IntervalMs 500 -TestComplete { $false } -OnTick {
-        if (-not $script:WmtLibraryScanTimer) { return }
-        
         if (-not $script:WmtLibraryScanAsyncResult) { return }
         if (-not $script:WmtLibraryScanAsyncResult.IsCompleted) {
             
