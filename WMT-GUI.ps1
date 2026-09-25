@@ -50164,7 +50164,18 @@ param([bool]$Visible, [string]$ErrorMessage = "")
 try {
     $overlay = Get-Ctrl "tweaksLoadingOverlay"
     if ($overlay) {
-        $overlay.Visibility = if ($Visible) { "Visible" } else { "Collapsed" }
+        # The overlay sits outside pnlTweaks in the root content Grid so it can cover
+        # the full Tweaks viewport. Async tweak/feature jobs may finish after the user
+        # has switched tabs; never let those delayed callbacks re-show it elsewhere.
+        $tweaksPanel = Get-Ctrl "pnlTweaks"
+        $isTweaksVisible = ($tweaksPanel -and $tweaksPanel.Visibility -eq "Visible")
+        $showOverlay = ($Visible -and $isTweaksVisible)
+        $overlay.Visibility = if ($showOverlay) { "Visible" } else { "Collapsed" }
+
+        # If Tweaks is no longer active, visibility is all we need to update. Keep
+        # the loading/error text untouched so returning to Tweaks can resume cleanly.
+        if (-not $showOverlay) { return }
+
         # Reset error state when showing overlay fresh, or restore error text
         $errText = Get-Ctrl "txtTweakOverlayError"
         $errTitle = Get-Ctrl "txtTweakOverlayTitle"
