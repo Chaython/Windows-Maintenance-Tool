@@ -45691,6 +45691,313 @@ function Resolve-WmtCompactTarget {
     return $fullPath
 }
 
+
+function Get-WmtCompactTrackerPath {
+    return (Join-Path (Get-DataPath) "compact-tracker.json")
+}
+
+function Get-WmtCompactTrackerData {
+    $result = [PSCustomObject]@{
+        Version  = 1
+        Schedule = "Off"
+        Entries  = @()
+    }
+
+    $path = Get-WmtCompactTrackerPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $result }
+
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $result }
+        $json = $raw | ConvertFrom-Json -ErrorAction Stop
+
+        if ($json -is [System.Array]) {
+            $sourceEntries = @($json)
+        }
+        elseif ($json.PSObject.Properties["Entries"]) {
+            $sourceEntries = @($json.Entries)
+            if ($json.PSObject.Properties["Schedule"] -and -not [string]::IsNullOrWhiteSpace([string]$json.Schedule)) {
+                $result.Schedule = [string]$json.Schedule
+            }
+        }
+        else {
+            $sourceEntries = @()
+        }
+
+        $entries = [System.Collections.Generic.List[object]]::new()
+        foreach ($entry in $sourceEntries) {
+            if (-not $entry) { continue }
+            $entryPath = ([string]$entry.Path).Trim()
+            if ([string]::IsNullOrWhiteSpace($entryPath)) { continue }
+
+            $algorithm = ([string]$entry.Algorithm).Trim().ToUpperInvariant()
+            if ($algorithm -notin @("NTFS", "XPRESS4K", "XPRESS8K", "XPRESS16K", "LZX")) { $algorithm = "XPRESS8K" }
+
+            [void]$entries.Add([PSCustomObject]@{
+                Path                  = $entryPath
+                Algorithm             = $algorithm
+                AutoRecompress        = if ($entry.PSObject.Properties["AutoRecompress"]) { [bool]$entry.AutoRecompress } else { $false }
+                State                 = if ($entry.PSObject.Properties["State"] -and $entry.State) { [string]$entry.State } else { "Tracked" }
+                LastCompressedUtc     = if ($entry.PSObject.Properties["LastCompressedUtc"]) { [string]$entry.LastCompressedUtc } else { "" }
+                LastAutoRunUtc        = if ($entry.PSObject.Properties["LastAutoRunUtc"]) { [string]$entry.LastAutoRunUtc } else { "" }
+                LastResult            = if ($entry.PSObject.Properties["LastResult"]) { [string]$entry.LastResult } else { "" }
+                LastExitCode          = if ($entry.PSObject.Properties["LastExitCode"]) { [int]$entry.LastExitCode } else { 0 }
+            })
+        }
+        $result.Entries = $entries.ToArray()
+    }
+    catch {
+        Write-GuiLog "[Compact] Tracker could not be read: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Save-WmtCompactTrackerData {
+    param([Parameter(Mandatory = $true)]$Data)
+
+    $path = Get-WmtCompactTrackerPath
+    $temp = "$path.tmp"
+    try {
+        $json = $Data | ConvertTo-Json -Depth 6
+        [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temp -Destination $path -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temp -PathType Leaf) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Set-WmtCompactTrackedTarget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateSet("NTFS", "XPRESS4K", "XPRESS8K", "XPRESS16K", "LZX")][string]$Algorithm = "XPRESS8K",
+        [string]$State = "",
+        [string]$LastResult = "",
+        [switch]$TouchCompressed,
+        [Nullable[bool]]$AutoRecompress = $null
+    )
+
+    try { $target = Resolve-WmtCompactTarget -Path $Path }
+    catch { $target = [System.IO.Path]::GetFullPath($Path) }
+
+    $data = Get-WmtCompactTrackerData
+    $entry = @($data.Entries | Where-Object { [string]$_.Path -ieq $target } | Select-Object -First 1)
+    if ($entry.Count -gt 0) {
+        $item = $entry[0]
+    }
+    else {
+        $item = [PSCustomObject]@{
+            Path              = $target
+            Algorithm         = $Algorithm
+            AutoRecompress    = $false
+            State             = "Tracked"
+            LastCompressedUtc = ""
+            LastAutoRunUtc    = ""
+            LastResult        = ""
+            LastExitCode      = 0
+        }
+        $data.Entries = @($data.Entries) + $item
+    }
+
+    $item.Algorithm = $Algorithm
+    if (-not [string]::IsNullOrWhiteSpace($State)) { $item.State = $State }
+    if (-not [string]::IsNullOrWhiteSpace($LastResult)) { $item.LastResult = $LastResult }
+    if ($TouchCompressed) { $item.LastCompressedUtc = [DateTime]::UtcNow.ToString("o") }
+    if ($null -ne $AutoRecompress) { $item.AutoRecompress = [bool]$AutoRecompress }
+
+    Save-WmtCompactTrackerData -Data $data
+    return $item
+}
+
+function Set-WmtCompactTargetAutoRecompress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][bool]$Enabled
+    )
+
+    $data = Get-WmtCompactTrackerData
+    $entry = @($data.Entries | Where-Object { [string]$_.Path -ieq $Path } | Select-Object -First 1)
+    if ($entry.Count -eq 0) { throw "The selected target is not tracked." }
+
+    $entry[0].AutoRecompress = $Enabled
+    if ($Enabled -and [string]$entry[0].State -eq "Decompressed") {
+        $entry[0].State = "Tracked"
+        $entry[0].LastResult = "Auto recompression enabled."
+    }
+    Save-WmtCompactTrackerData -Data $data
+}
+
+function Remove-WmtCompactTrackedTarget {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $data = Get-WmtCompactTrackerData
+    $data.Entries = @($data.Entries | Where-Object { [string]$_.Path -ine $Path })
+    Save-WmtCompactTrackerData -Data $data
+}
+
+function Format-WmtCompactTrackerDate {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "Never" }
+    try { return ([DateTime]::Parse($Value).ToLocalTime().ToString("yyyy-MM-dd HH:mm")) }
+    catch { return $Value }
+}
+
+function Write-WmtCompactRecompressWorker {
+    $trackerPath = Get-WmtCompactTrackerPath
+    $workerPath = Join-Path (Get-DataPath) "compact-recompress.ps1"
+    $logPath = Join-Path (Get-DataPath) "compact-recompress.log"
+    $trackerBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($trackerPath))
+    $logBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($logPath))
+
+    $worker = @'
+param([switch]$AllTracked)
+$ErrorActionPreference = "Continue"
+$TrackerPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__TRACKER__"))
+$LogPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__LOG__"))
+$compactExe = Join-Path $env:SystemRoot "System32\compact.exe"
+if (-not (Test-Path -LiteralPath $compactExe -PathType Leaf)) { $compactExe = "compact.exe" }
+
+function Set-EntryValue {
+    param($Entry, [string]$Name, $Value)
+    if ($Entry.PSObject.Properties[$Name]) { $Entry.$Name = $Value }
+    else { $Entry | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force }
+}
+
+function Write-WorkerLog {
+    param([string]$Text)
+    $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Text
+    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
+}
+
+if (-not (Test-Path -LiteralPath $TrackerPath -PathType Leaf)) { exit 0 }
+
+try {
+    $data = Get-Content -LiteralPath $TrackerPath -Raw | ConvertFrom-Json -ErrorAction Stop
+    if (-not $data.PSObject.Properties["Entries"]) { exit 0 }
+
+    foreach ($entry in @($data.Entries)) {
+        if (-not $entry) { continue }
+        if (-not $AllTracked -and -not [bool]$entry.AutoRecompress) { continue }
+        if ([string]$entry.State -eq "Decompressed") { continue }
+
+        $target = ([string]$entry.Path).Trim()
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
+        if (-not (Test-Path -LiteralPath $target -PathType Container)) {
+            Set-EntryValue $entry "LastAutoRunUtc" ([DateTime]::UtcNow.ToString("o"))
+            Set-EntryValue $entry "LastResult" "Skipped: target no longer exists."
+            Set-EntryValue $entry "LastExitCode" 3
+            Write-WorkerLog "Skipped missing target: $target"
+            continue
+        }
+
+        $algorithm = ([string]$entry.Algorithm).Trim().ToUpperInvariant()
+        if ($algorithm -notin @("NTFS", "XPRESS4K", "XPRESS8K", "XPRESS16K", "LZX")) { $algorithm = "XPRESS8K" }
+
+        $pushed = $false
+        try {
+            Push-Location -LiteralPath $target -ErrorAction Stop
+            $pushed = $true
+            $compactArgs = @("/C", "/S", "/I", "/A")
+            if ($algorithm -ne "NTFS") { $compactArgs += "/EXE:$algorithm" }
+
+            Write-WorkerLog "Recompressing $target with $algorithm"
+            & $compactExe @compactArgs 2>&1 | Add-Content -LiteralPath $LogPath -Encoding UTF8
+            $code = $LASTEXITCODE
+
+            Set-EntryValue $entry "LastAutoRunUtc" ([DateTime]::UtcNow.ToString("o"))
+            Set-EntryValue $entry "LastExitCode" ([int]$code)
+            if ($code -eq 0) {
+                Set-EntryValue $entry "State" "Compressed"
+                Set-EntryValue $entry "LastCompressedUtc" ([DateTime]::UtcNow.ToString("o"))
+                Set-EntryValue $entry "LastResult" "Automatic recompression completed."
+                Write-WorkerLog "Completed $target"
+            }
+            else {
+                Set-EntryValue $entry "LastResult" "Automatic recompression exit code $code."
+                Write-WorkerLog "compact.exe returned $code for $target"
+            }
+        }
+        catch {
+            Set-EntryValue $entry "LastAutoRunUtc" ([DateTime]::UtcNow.ToString("o"))
+            Set-EntryValue $entry "LastResult" ("Automatic recompression failed: " + $_.Exception.Message)
+            Set-EntryValue $entry "LastExitCode" 1
+            Write-WorkerLog "Failed $target : $($_.Exception.Message)"
+        }
+        finally {
+            if ($pushed) { try { Pop-Location } catch {} }
+        }
+    }
+
+    $temp = "$TrackerPath.worker.tmp"
+    $json = $data | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temp -Destination $TrackerPath -Force
+}
+catch {
+    Write-WorkerLog ("Worker failed: " + $_.Exception.Message)
+    exit 1
+}
+'@
+
+    $worker = $worker.Replace("__TRACKER__", $trackerBase64).Replace("__LOG__", $logBase64)
+    [System.IO.File]::WriteAllText($workerPath, $worker, [System.Text.UTF8Encoding]::new($true))
+    return $workerPath
+}
+
+function Start-WmtCompactRecompressWorker {
+    param([switch]$AllTracked)
+
+    $workerPath = Write-WmtCompactRecompressWorker
+    $quote = [char]34
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + $quote + $workerPath + $quote
+    if ($AllTracked) { $psi.Arguments += " -AllTracked" }
+    $psi.UseShellExecute = $true
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    [void][System.Diagnostics.Process]::Start($psi)
+    Write-GuiLog "[Compact] Background recompression worker started."
+}
+
+function Set-WmtCompactRecompressSchedule {
+    param([ValidateSet("Off", "OnIdle", "AtLogon", "Daily", "Weekly")][string]$Mode)
+
+    $taskName = "Windows Maintenance Tool - Compact Recompress"
+    $data = Get-WmtCompactTrackerData
+
+    if ($Mode -eq "Off") {
+        & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+        $data.Schedule = "Off"
+        Save-WmtCompactTrackerData -Data $data
+        Write-GuiLog "[Compact] Automatic recompression schedule disabled."
+        return
+    }
+
+    $workerPath = Write-WmtCompactRecompressWorker
+    $taskCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $workerPath + '"'
+    $taskArgs = @("/Create", "/F", "/TN", $taskName, "/TR", $taskCommand, "/RU", "SYSTEM", "/RL", "HIGHEST")
+
+    switch ($Mode) {
+        "OnIdle"  { $taskArgs += @("/SC", "ONIDLE", "/I", "10") }
+        "AtLogon" { $taskArgs += @("/SC", "ONLOGON") }
+        "Daily"   { $taskArgs += @("/SC", "DAILY", "/ST", "03:00") }
+        "Weekly"  { $taskArgs += @("/SC", "WEEKLY", "/D", "SUN", "/ST", "03:00") }
+    }
+
+    $output = & schtasks.exe @taskArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create automatic recompression task. $($output -join ' ')"
+    }
+
+    $data.Schedule = $Mode
+    Save-WmtCompactTrackerData -Data $data
+    Write-GuiLog "[Compact] Automatic recompression schedule set to $Mode."
+}
+
+
 function Start-WmtCompactConsole {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -45786,6 +46093,13 @@ try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyConti
         $psi.UseShellExecute = $true
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
         [void][System.Diagnostics.Process]::Start($psi)
+
+        if ($Mode -eq "Compress") {
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressed" -TouchCompressed -LastResult "Manual compression started.")
+        }
+        else {
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Decompressed" -AutoRecompress:$false -LastResult "Manual decompression started.")
+        }
 
         Write-GuiLog "[Compact] Started $Mode on '$target' using $Algorithm."
     }
@@ -46031,11 +46345,11 @@ function Show-WmtCompactManager {
     [xml]$compactXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Compact Compression" Width="660" Height="590"
-        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        Title="Compact Compression" Width="980" Height="790" MinWidth="840" MinHeight="680"
+        ResizeMode="CanResizeWithGrip" WindowStartupLocation="CenterOwner"
         Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
         FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13">
-    <Grid Margin="22">
+    <Grid Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -46043,65 +46357,132 @@ function Show-WmtCompactManager {
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <StackPanel Grid.Row="0" Margin="0,0,0,18">
+        <StackPanel Grid.Row="0" Margin="0,0,0,14">
             <TextBlock Text="Compact Compression" FontSize="22" FontWeight="SemiBold"/>
-            <TextBlock Text="Compress a folder or an entire NTFS drive with Windows compact.exe. XPRESS and LZX are optimized for executables and mostly read-only data."
-                       Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Margin="0,6,0,0" LineHeight="19"/>
+            <TextBlock Text="Compress folders or local NTFS drives and keep a persistent watch list for later recompression."
+                       Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Margin="0,5,0,0"/>
         </StackPanel>
 
-        <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="16" Margin="0,0,0,12">
-            <StackPanel>
-                <TextBlock Text="TARGET" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
-                <StackPanel Orientation="Horizontal" Margin="0,6,0,10">
-                    <RadioButton Name="rbCompactFolder" Content="Folder" IsChecked="True" Margin="0,0,22,0"/>
-                    <RadioButton Name="rbCompactDrive" Content="Whole drive"/>
+        <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="14" Margin="0,0,0,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*"/>
+                    <ColumnDefinition Width="16"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0">
+                    <TextBlock Text="TARGET" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,9">
+                        <RadioButton Name="rbCompactFolder" Content="Folder" IsChecked="True" Margin="0,0,22,0"/>
+                        <RadioButton Name="rbCompactDrive" Content="Whole drive"/>
+                    </StackPanel>
+                    <Grid Name="pnlCompactFolder">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox Name="txtCompactFolder" Grid.Column="0" MinHeight="32" VerticalContentAlignment="Center" Margin="0,0,8,0"/>
+                        <Button Name="btnCompactBrowse" Grid.Column="1" Content="Browse..." Width="92"/>
+                    </Grid>
+                    <ComboBox Name="cmbCompactDrive" Visibility="Collapsed" MinHeight="32" Margin="0,2,0,0"/>
                 </StackPanel>
 
-                <Grid Name="pnlCompactFolder">
+                <StackPanel Grid.Column="2">
+                    <TextBlock Text="COMPRESSION METHOD" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
+                    <ComboBox Name="cmbCompactAlgorithm" SelectedIndex="2" MinHeight="32" Margin="0,6,0,7">
+                        <ComboBoxItem Content="Standard NTFS" Tag="NTFS"/>
+                        <ComboBoxItem Content="XPRESS4K - fastest" Tag="XPRESS4K"/>
+                        <ComboBoxItem Content="XPRESS8K - balanced" Tag="XPRESS8K"/>
+                        <ComboBoxItem Content="XPRESS16K - higher compression" Tag="XPRESS16K"/>
+                        <ComboBoxItem Content="LZX - highest compression" Tag="LZX"/>
+                    </ComboBox>
+                    <TextBlock Text="XPRESS8K is a good default. LZX favors maximum savings on mostly read-only data."
+                               Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="2" Background="{DynamicResource BgElevated}" BorderBrush="{DynamicResource Warning}" BorderThickness="1"
+                CornerRadius="6" Padding="10" Margin="0,0,0,10">
+            <TextBlock Text="Whole-drive compression can take a long time. LZX/XPRESS files modified by installers or game updates may lose compression; tracked targets can be recompressed automatically."
+                       TextWrapping="Wrap"/>
+        </Border>
+
+        <Border Grid.Row="3" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="170"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="AUTO RECOMPRESS" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <ComboBox Grid.Column="1" Name="cmbCompactSchedule" MinHeight="30">
+                    <ComboBoxItem Content="Off" Tag="Off"/>
+                    <ComboBoxItem Content="When idle (10 min)" Tag="OnIdle"/>
+                    <ComboBoxItem Content="At logon" Tag="AtLogon"/>
+                    <ComboBoxItem Content="Daily at 3:00 AM" Tag="Daily"/>
+                    <ComboBoxItem Content="Weekly Sunday 3:00 AM" Tag="Weekly"/>
+                </ComboBox>
+                <Button Grid.Column="2" Name="btnCompactApplySchedule" Content="Apply" MinWidth="78" Margin="8,0,0,0"/>
+                <TextBlock Grid.Column="3" Name="txtCompactScheduleStatus" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap"/>
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="4" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="12">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0" Margin="0,0,0,8">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <TextBox Name="txtCompactFolder" Grid.Column="0" MinHeight="32" VerticalContentAlignment="Center" Margin="0,0,8,0"
-                             ToolTip="Choose a local folder on an NTFS volume."/>
-                    <Button Name="btnCompactBrowse" Grid.Column="1" Content="Browse..." Width="92" Margin="0"/>
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Text="TRACKED TARGETS" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
+                        <TextBlock Name="txtCompactTrackerSummary" Foreground="{DynamicResource TextMuted}" Margin="0,3,0,0"/>
+                    </StackPanel>
+                    <Button Grid.Column="1" Name="btnCompactTrackCurrent" Content="Track current target" MinWidth="130"/>
                 </Grid>
 
-                <ComboBox Name="cmbCompactDrive" Visibility="Collapsed" MinHeight="32" Margin="0,2,0,0"
-                          ToolTip="Only fixed NTFS volumes are listed."/>
-            </StackPanel>
+                <DataGrid Grid.Row="1" Name="dgCompactTracked" AutoGenerateColumns="False" IsReadOnly="True"
+                          CanUserAddRows="False" CanUserDeleteRows="False" SelectionMode="Single"
+                          HeadersVisibility="Column" GridLinesVisibility="Horizontal" MinHeight="190">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Target" Binding="{Binding Path}" Width="2.4*"/>
+                        <DataGridTextColumn Header="Method" Binding="{Binding Algorithm}" Width="95"/>
+                        <DataGridTextColumn Header="Auto" Binding="{Binding AutoText}" Width="55"/>
+                        <DataGridTextColumn Header="State" Binding="{Binding State}" Width="85"/>
+                        <DataGridTextColumn Header="Last compressed" Binding="{Binding LastCompressedText}" Width="135"/>
+                        <DataGridTextColumn Header="Last auto run" Binding="{Binding LastAutoRunText}" Width="135"/>
+                        <DataGridTextColumn Header="Result" Binding="{Binding LastResult}" Width="1.7*"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+
+                <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,9,0,0">
+                    <Button Name="btnCompactRefreshTracked" Content="Refresh" MinWidth="78" Margin="0,0,7,0"/>
+                    <Button Name="btnCompactToggleAuto" Content="Toggle Auto" MinWidth="92" Margin="0,0,7,0"/>
+                    <Button Name="btnCompactRecompressSelected" Content="Recompress Selected" MinWidth="138" Margin="0,0,7,0"/>
+                    <Button Name="btnCompactRunAutoNow" Content="Run Auto Now" MinWidth="105" Margin="0,0,7,0"/>
+                    <Button Name="btnCompactRemoveTracked" Content="Remove" MinWidth="78"/>
+                </WrapPanel>
+            </Grid>
         </Border>
 
-        <Border Grid.Row="2" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="16" Margin="0,0,0,12">
-            <StackPanel>
-                <TextBlock Text="COMPRESSION METHOD" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}"/>
-                <ComboBox Name="cmbCompactAlgorithm" SelectedIndex="2" MinHeight="32" Margin="0,6,0,8">
-                    <ComboBoxItem Content="Standard NTFS - best for writable data" Tag="NTFS"/>
-                    <ComboBoxItem Content="XPRESS4K - fastest Compact compression" Tag="XPRESS4K"/>
-                    <ComboBoxItem Content="XPRESS8K - balanced" Tag="XPRESS8K"/>
-                    <ComboBoxItem Content="XPRESS16K - higher compression" Tag="XPRESS16K"/>
-                    <ComboBoxItem Content="LZX - highest compression, slowest" Tag="LZX"/>
-                </ComboBox>
-                <TextBlock Text="XPRESS8K is a good general-purpose default. LZX favors maximum space savings for files that are rarely modified."
-                           Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" LineHeight="18"/>
-            </StackPanel>
-        </Border>
+        <TextBlock Grid.Row="5" Text="Scheduled recompression uses compact.exe without /F, so already-compressed files are skipped while new or decompressed files are picked up. The worker log is saved under WMT's data folder."
+                   Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
 
-        <Border Grid.Row="3" Background="{DynamicResource BgElevated}" BorderBrush="{DynamicResource Warning}" BorderThickness="1"
-                CornerRadius="6" Padding="12" Margin="0,0,0,12">
-            <TextBlock Text="Whole-drive compression can take a long time. Some locked, encrypted, sparse, or unsupported files may be skipped. LZX/XPRESS files that are modified later may be decompressed by Windows and require recompression."
-                       Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap" LineHeight="18"/>
-        </Border>
-
-        <TextBlock Grid.Row="4" Text="Decompress runs both Compact /EXE and standard NTFS decompression passes so either compression type can be removed."
-                   Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" VerticalAlignment="Top"/>
-
-        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
             <Button Name="btnCompactDecompress" Content="Decompress" MinWidth="112" Margin="0,0,8,0" Background="{DynamicResource Warning}" Foreground="{DynamicResource WarningText}"/>
             <Button Name="btnCompactCompress" Content="Compress" MinWidth="112" Margin="0,0,8,0" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}"/>
-            <Button Name="btnCompactClose" Content="Close" MinWidth="90" Margin="0"/>
+            <Button Name="btnCompactClose" Content="Close" MinWidth="90"/>
         </StackPanel>
     </Grid>
 </Window>
@@ -46115,6 +46496,17 @@ function Show-WmtCompactManager {
     $btnBrowse = $dialog.FindName("btnCompactBrowse")
     $cmbDrive = $dialog.FindName("cmbCompactDrive")
     $cmbAlgorithm = $dialog.FindName("cmbCompactAlgorithm")
+    $cmbSchedule = $dialog.FindName("cmbCompactSchedule")
+    $btnApplySchedule = $dialog.FindName("btnCompactApplySchedule")
+    $txtScheduleStatus = $dialog.FindName("txtCompactScheduleStatus")
+    $dgTracked = $dialog.FindName("dgCompactTracked")
+    $txtTrackerSummary = $dialog.FindName("txtCompactTrackerSummary")
+    $btnTrackCurrent = $dialog.FindName("btnCompactTrackCurrent")
+    $btnRefreshTracked = $dialog.FindName("btnCompactRefreshTracked")
+    $btnToggleAuto = $dialog.FindName("btnCompactToggleAuto")
+    $btnRecompressSelected = $dialog.FindName("btnCompactRecompressSelected")
+    $btnRunAutoNow = $dialog.FindName("btnCompactRunAutoNow")
+    $btnRemoveTracked = $dialog.FindName("btnCompactRemoveTracked")
     $btnCompress = $dialog.FindName("btnCompactCompress")
     $btnDecompress = $dialog.FindName("btnCompactDecompress")
     $btnClose = $dialog.FindName("btnCompactClose")
@@ -46126,6 +46518,62 @@ function Show-WmtCompactManager {
         [void]$cmbDrive.Items.Add($item)
     }
     if ($cmbDrive.Items.Count -gt 0) { $cmbDrive.SelectedIndex = 0 }
+
+    $getCurrentTarget = {
+        if ([bool]$rbFolder.IsChecked) { return ([string]$txtFolder.Text).Trim() }
+        if ($cmbDrive.SelectedItem) { return [string]$cmbDrive.SelectedItem.Tag }
+        return ""
+    }.GetNewClosure()
+
+    $getCurrentAlgorithm = {
+        if ($cmbAlgorithm.SelectedItem -and $cmbAlgorithm.SelectedItem.Tag) {
+            return [string]$cmbAlgorithm.SelectedItem.Tag
+        }
+        return "XPRESS8K"
+    }.GetNewClosure()
+
+    $selectAlgorithm = {
+        param([string]$Algorithm)
+        for ($i = 0; $i -lt $cmbAlgorithm.Items.Count; $i++) {
+            if ([string]$cmbAlgorithm.Items[$i].Tag -eq $Algorithm) {
+                $cmbAlgorithm.SelectedIndex = $i
+                break
+            }
+        }
+    }.GetNewClosure()
+
+    $selectSchedule = {
+        param([string]$Mode)
+        for ($i = 0; $i -lt $cmbSchedule.Items.Count; $i++) {
+            if ([string]$cmbSchedule.Items[$i].Tag -eq $Mode) {
+                $cmbSchedule.SelectedIndex = $i
+                return
+            }
+        }
+        $cmbSchedule.SelectedIndex = 0
+    }.GetNewClosure()
+
+    $refreshTracker = {
+        $data = Get-WmtCompactTrackerData
+        $rows = [System.Collections.Generic.List[object]]::new()
+        foreach ($entry in @($data.Entries)) {
+            [void]$rows.Add([PSCustomObject]@{
+                Path               = [string]$entry.Path
+                Algorithm          = [string]$entry.Algorithm
+                AutoText           = if ([bool]$entry.AutoRecompress) { "Yes" } else { "No" }
+                AutoRecompress     = [bool]$entry.AutoRecompress
+                State              = [string]$entry.State
+                LastCompressedText = Format-WmtCompactTrackerDate ([string]$entry.LastCompressedUtc)
+                LastAutoRunText    = Format-WmtCompactTrackerDate ([string]$entry.LastAutoRunUtc)
+                LastResult         = [string]$entry.LastResult
+            })
+        }
+        $dgTracked.ItemsSource = $rows.ToArray()
+        $autoCount = @($data.Entries | Where-Object { [bool]$_.AutoRecompress }).Count
+        $txtTrackerSummary.Text = "$($rows.Count) tracked target(s), $autoCount enabled for automatic recompression."
+        & $selectSchedule ([string]$data.Schedule)
+        $txtScheduleStatus.Text = if ([string]$data.Schedule -eq "Off") { "No scheduled recompression task." } else { "Schedule: $([string]$data.Schedule)." }
+    }.GetNewClosure()
 
     $setTargetMode = {
         $folderMode = [bool]$rbFolder.IsChecked
@@ -46145,46 +46593,134 @@ function Show-WmtCompactManager {
     $runOperation = {
         param([string]$Mode)
 
-        $target = $null
-        if ([bool]$rbFolder.IsChecked) {
-            $target = [string]$txtFolder.Text
-        }
-        elseif ($cmbDrive.SelectedItem) {
-            $target = [string]$cmbDrive.SelectedItem.Tag
-        }
-
+        $target = & $getCurrentTarget
         if ([string]::IsNullOrWhiteSpace($target)) {
             Show-WmtMessageBox -Message "Select a folder or NTFS drive first." -Title "Compact Compression" -Image Warning | Out-Null
             return
         }
 
-        $algorithm = "XPRESS8K"
-        if ($cmbAlgorithm.SelectedItem -and $cmbAlgorithm.SelectedItem.Tag) {
-            $algorithm = [string]$cmbAlgorithm.SelectedItem.Tag
-        }
-
+        $algorithm = & $getCurrentAlgorithm
         $scopeText = if ([bool]$rbDrive.IsChecked) { "the entire drive $target" } else { "'$target' and all subfolders" }
         if ($Mode -eq "Compress") {
-            $detail = "Compress $scopeText using $algorithm?" + [Environment]::NewLine + [Environment]::NewLine + "The operation runs in a separate live console and can take a long time."
+            $detail = "Compress $scopeText using $algorithm?" + [Environment]::NewLine + [Environment]::NewLine + "The target will also be added to the tracker."
             if ([bool]$rbDrive.IsChecked -and -not [string]::IsNullOrWhiteSpace($env:SystemDrive) -and $target.StartsWith($env:SystemDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $detail += [Environment]::NewLine + [Environment]::NewLine + "WARNING: This is the Windows system drive. Whole-drive compression affects Windows and installed applications. Use only if you accept the performance and compatibility tradeoffs."
+                $detail += [Environment]::NewLine + [Environment]::NewLine + "WARNING: This is the Windows system drive. Whole-drive compression affects Windows and installed applications."
             }
         }
         else {
-            $detail = "Decompress $scopeText?" + [Environment]::NewLine + [Environment]::NewLine + "Both Compact /EXE and standard NTFS compression will be removed where possible."
+            $detail = "Decompress $scopeText?" + [Environment]::NewLine + [Environment]::NewLine + "Automatic recompression will be disabled for this target."
         }
 
         $confirm = Show-WmtMessageBox -Message $detail -Title "Compact Compression" -Button YesNo -Image Warning
         if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
         Start-WmtCompactConsole -Path $target -Mode $Mode -Algorithm $algorithm
+        & $refreshTracker
     }.GetNewClosure()
 
     $btnCompress.Add_Click({ & $runOperation "Compress" }.GetNewClosure())
     $btnDecompress.Add_Click({ & $runOperation "Decompress" }.GetNewClosure())
+
+    $btnTrackCurrent.Add_Click({
+        $target = & $getCurrentTarget
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            Show-WmtMessageBox -Message "Select a folder or NTFS drive first." -Title "Compact Compression" -Image Warning | Out-Null
+            return
+        }
+        try {
+            $resolved = Resolve-WmtCompactTarget -Path $target
+            [void](Set-WmtCompactTrackedTarget -Path $resolved -Algorithm (& $getCurrentAlgorithm) -State "Tracked" -LastResult "Added to tracker.")
+            & $refreshTracker
+        }
+        catch {
+            Show-WmtMessageBox -Message $_.Exception.Message -Title "Compact Compression" -Image Error | Out-Null
+        }
+    }.GetNewClosure())
+
+    $dgTracked.Add_MouseDoubleClick({
+        if (-not $dgTracked.SelectedItem) { return }
+        $row = $dgTracked.SelectedItem
+        $path = [string]$row.Path
+        if ($path -match '^[A-Za-z]:\\$') {
+            $rbDrive.IsChecked = $true
+            for ($i = 0; $i -lt $cmbDrive.Items.Count; $i++) {
+                if ([string]$cmbDrive.Items[$i].Tag -ieq $path) { $cmbDrive.SelectedIndex = $i; break }
+            }
+        }
+        else {
+            $rbFolder.IsChecked = $true
+            $txtFolder.Text = $path
+        }
+        & $selectAlgorithm ([string]$row.Algorithm)
+    }.GetNewClosure())
+
+    $btnRefreshTracked.Add_Click({ & $refreshTracker }.GetNewClosure())
+
+    $btnToggleAuto.Add_Click({
+        if (-not $dgTracked.SelectedItem) {
+            Show-WmtMessageBox -Message "Select a tracked target first." -Title "Compact Compression" -Image Information | Out-Null
+            return
+        }
+        $row = $dgTracked.SelectedItem
+        $enable = -not [bool]$row.AutoRecompress
+        if ($enable -and [string]$row.Path -match '^[A-Za-z]:\\$' -and -not [string]::IsNullOrWhiteSpace($env:SystemDrive) -and [string]$row.Path -ieq ([System.IO.Path]::GetPathRoot($env:SystemDrive))) {
+            $confirm = Show-WmtMessageBox -Message "Enable automatic recompression for the Windows system drive? This can periodically scan a very large number of files." -Title "Compact Compression" -Button YesNo -Image Warning
+            if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
+        }
+        try {
+            Set-WmtCompactTargetAutoRecompress -Path ([string]$row.Path) -Enabled $enable
+            & $refreshTracker
+        }
+        catch {
+            Show-WmtMessageBox -Message $_.Exception.Message -Title "Compact Compression" -Image Error | Out-Null
+        }
+    }.GetNewClosure())
+
+    $btnRecompressSelected.Add_Click({
+        if (-not $dgTracked.SelectedItem) {
+            Show-WmtMessageBox -Message "Select a tracked target first." -Title "Compact Compression" -Image Information | Out-Null
+            return
+        }
+        $row = $dgTracked.SelectedItem
+        Start-WmtCompactConsole -Path ([string]$row.Path) -Mode Compress -Algorithm ([string]$row.Algorithm)
+        & $refreshTracker
+    }.GetNewClosure())
+
+    $btnRunAutoNow.Add_Click({
+        $data = Get-WmtCompactTrackerData
+        if (@($data.Entries | Where-Object { [bool]$_.AutoRecompress }).Count -eq 0) {
+            Show-WmtMessageBox -Message "No tracked targets have automatic recompression enabled." -Title "Compact Compression" -Image Information | Out-Null
+            return
+        }
+        Start-WmtCompactRecompressWorker
+        $txtScheduleStatus.Text = "Background recompression started. Use Refresh to update results."
+    }.GetNewClosure())
+
+    $btnRemoveTracked.Add_Click({
+        if (-not $dgTracked.SelectedItem) {
+            Show-WmtMessageBox -Message "Select a tracked target first." -Title "Compact Compression" -Image Information | Out-Null
+            return
+        }
+        Remove-WmtCompactTrackedTarget -Path ([string]$dgTracked.SelectedItem.Path)
+        & $refreshTracker
+    }.GetNewClosure())
+
+    $btnApplySchedule.Add_Click({
+        if (-not $cmbSchedule.SelectedItem) { return }
+        $mode = [string]$cmbSchedule.SelectedItem.Tag
+        try {
+            Set-WmtCompactRecompressSchedule -Mode $mode
+            & $refreshTracker
+        }
+        catch {
+            Show-WmtMessageBox -Message $_.Exception.Message -Title "Compact Compression" -Image Error | Out-Null
+        }
+    }.GetNewClosure())
+
     $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
 
     & $setTargetMode
+    & $refreshTracker
     $dialog.ShowDialog() | Out-Null
 }
 
