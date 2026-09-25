@@ -45109,15 +45109,19 @@ if ($disable) {
 }
 
 $action = if ($disable) { "disable-device" } else { "enable-device" }
-Invoke-UiCommand {
-    param($devId, $name, $disable, $Inf)
-    $result = Invoke-DriverDevicePowerCommand -DeviceId $devId -Enable (-not $disable)
-    if ($result.ExitCode -eq 3010) {
-        Write-GuiLog "[Drivers] pnputil $(if ($disable) { '/disable-device' } else { '/enable-device' }) for '$name' needs a reboot to finish — the cached list is left unchanged; use Refresh after rebooting."
+$toggleDone = {
+    param($results)
+    $result = @($results | Where-Object { $_ -and $_.PSObject.Properties["ExitCode"] } | Select-Object -Last 1)
+    if (-not $result) {
+        Write-GuiLog "ERROR: pnputil /$action returned no result for '$name'."
         return
     }
-    if (-not $result.Success) {
-        Write-GuiLog "ERROR: pnputil $(if ($disable) { '/disable-device' } else { '/enable-device' }) failed for '$name' (exit $($result.ExitCode)): $($result.Output)"
+    if ([int]$result.ExitCode -eq 3010) {
+        Write-GuiLog "[Drivers] pnputil /$action for '$name' needs a reboot to finish — the cached list is left unchanged; use Refresh after rebooting."
+        return
+    }
+    if (-not [bool]$result.Success) {
+        Write-GuiLog "ERROR: pnputil /$action failed for '$name' (exit $($result.ExitCode)): $($result.Output)"
         return
     }
     $newState = if ($disable) { "Problem" } else { "OK" }
@@ -45130,7 +45134,18 @@ Invoke-UiCommand {
     else {
         Write-GuiLog "[Drivers] Enabled device '$name' — package ${Inf} is marked In Use again.$note"
     }
-} "Toggling device '$name' ($action)..." -ArgumentList $devId, $name, $disable, $Inf
+}.GetNewClosure()
+Invoke-WmtUiBackgroundCommand -Name ("DriverDevice_" + [guid]::NewGuid().ToString("N")) -Msg "Toggling device '$name' ($action)..." -SuppressResultLog -Sb {
+    param($devId, $disable)
+    $arg = if ($disable) { "/disable-device" } else { "/enable-device" }
+    $out = @(& pnputil.exe $arg $devId 2>&1)
+    $exit = $LASTEXITCODE
+    [PSCustomObject]@{
+        Success  = ($exit -eq 0)
+        ExitCode = $exit
+        Output   = ((@($out) | ForEach-Object { [string]$_ }) -join "`n")
+    }
+} -ArgumentList $devId, $disable -OnComplete $toggleDone | Out-Null
 return $true
 }
 
@@ -45192,55 +45207,70 @@ if ($inUseTargets.Count -gt 0) {
 $choice = Show-WmtMessageBox -Message $warn -Title "Remove Driver Package(s)" -Button YesNo -Image Warning
 if ($choice -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-$failed = [System.Collections.Generic.List[object]]::new()
-$removed = [System.Collections.Generic.List[string]]::new()
-Invoke-UiCommand {
-    param($targets, $failed, $removed)
-    foreach ($row in $targets) {
-        $inf = [string]$row.PublishedName
-        Write-GuiLog "[Drivers] pnputil /delete-driver $inf /uninstall"
-        $out = pnputil.exe /delete-driver $inf /uninstall 2>&1
-        $exit = $LASTEXITCODE
-        $outText = (@($out) | ForEach-Object { [string]$_ }) -join "`n"
-        if ($exit -eq 0 -or $exit -eq 3010) {
-            if ($exit -eq 3010) { Write-GuiLog "[Drivers] Removed $inf (reboot required to finish the removal)." }
-            else { Write-GuiLog "[Drivers] Removed $inf." }
-            [void]$removed.Add($inf)
+$targetInfs = @($targets | ForEach-Object { [string]$_.PublishedName })
+
+$applyResults = {
+    param($results, [bool]$AllowForce)
+    $records = @($results | Where-Object { $_ -and $_.PSObject.Properties["Inf"] })
+    $removed = @($records | Where-Object { [bool]$_.Success } | ForEach-Object { [string]$_.Inf })
+    $failed = @($records | Where-Object { -not [bool]$_.Success })
+
+    foreach ($item in $records) {
+        if ([bool]$item.Success) {
+            if ([int]$item.ExitCode -eq 3010) { Write-GuiLog "[Drivers] Removed $($item.Inf) (reboot required to finish the removal)." }
+            else { Write-GuiLog "[Drivers] Removed $($item.Inf)." }
         }
         else {
-            Write-GuiLog "[Drivers] Failed to remove ${inf}: (exit $exit) $outText"
-            [void]$failed.Add([PSCustomObject]@{ Inf = $inf; ExitCode = $exit; Output = $outText })
+            Write-GuiLog "[Drivers] Failed to remove $($item.Inf): (exit $($item.ExitCode)) $($item.Output)"
         }
     }
-} "Removing $($targets.Count) driver package(s)..." -ArgumentList $targets, $failed, $removed
 
-if ($failed.Count -gt 0) {
-    $failText = (@($failed) | ForEach-Object { "$($_.Inf) (exit $($_.ExitCode)):`n$($_.Output)" }) -join "`n`n"
-    $force = Show-WmtMessageBox -Message "Failed to remove $($failed.Count) package(s):`n`n$failText`n`nForce delete? This also removes packages Windows considers in use." -Title "Force Delete Driver Packages" -Button YesNo -Image Error
-    if ($force -eq [System.Windows.MessageBoxResult]::Yes) {
-        Invoke-UiCommand {
-            param($failed, $removed)
-            foreach ($item in $failed) {
-                Write-GuiLog "[Drivers] pnputil /delete-driver $($item.Inf) /uninstall /force"
-                $out = pnputil.exe /delete-driver $item.Inf /uninstall /force 2>&1
-                $exit = $LASTEXITCODE
-                if ($exit -eq 0 -or $exit -eq 3010) {
-                    if ($exit -eq 3010) { Write-GuiLog "[Drivers] Force-removed $($item.Inf) (reboot required to finish the removal)." }
-                    else { Write-GuiLog "[Drivers] Force-removed $($item.Inf)." }
-                    [void]$removed.Add([string]$item.Inf)
+    if ($removed.Count -gt 0) { Remove-DriverRowsFromCache -RemovedInfs $removed }
+
+    if ($AllowForce -and $failed.Count -gt 0) {
+        $failText = (@($failed) | ForEach-Object { "$($_.Inf) (exit $($_.ExitCode)):`n$($_.Output)" }) -join "`n`n"
+        $force = Show-WmtMessageBox -Message "Failed to remove $($failed.Count) package(s):`n`n$failText`n`nForce delete? This also removes packages Windows considers in use." -Title "Force Delete Driver Packages" -Button YesNo -Image Error
+        if ($force -eq [System.Windows.MessageBoxResult]::Yes) {
+            $failedInfs = @($failed | ForEach-Object { [string]$_.Inf })
+            $forceDone = {
+                param($forceResults)
+                & $applyResults $forceResults $false
+            }.GetNewClosure()
+            Invoke-WmtUiBackgroundCommand -Name ("ForceDeleteDrivers_" + [guid]::NewGuid().ToString("N")) -Msg "Force-deleting $($failedInfs.Count) driver package(s)..." -SuppressResultLog -Sb {
+                param($infs)
+                foreach ($inf in @($infs)) {
+                    $out = @(& pnputil.exe /delete-driver $inf /uninstall /force 2>&1)
+                    $exit = $LASTEXITCODE
+                    [PSCustomObject]@{
+                        Inf      = [string]$inf
+                        Success  = ($exit -eq 0 -or $exit -eq 3010)
+                        ExitCode = $exit
+                        Output   = ((@($out) | ForEach-Object { [string]$_ }) -join "`n")
+                    }
                 }
-                else {
-                    $outText = (@($out) | ForEach-Object { [string]$_ }) -join "`n"
-                    Write-GuiLog "[Drivers] Force delete failed for $($item.Inf): (exit $exit) $outText"
-                }
-            }
-        } "Force-deleting $($failed.Count) driver package(s)..." -ArgumentList $failed, $removed
+            } -ArgumentList (, $failedInfs) -OnComplete $forceDone | Out-Null
+        }
     }
-}
+}.GetNewClosure()
 
-# Update the cached list in place — only lines pnputil removed disappear;
-# no full driver-store recheck. Refresh still forces a complete reload.
-Remove-DriverRowsFromCache -RemovedInfs @($removed)
+$done = {
+    param($results)
+    & $applyResults $results $true
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Name ("DeleteDrivers_" + [guid]::NewGuid().ToString("N")) -Msg "Removing $($targetInfs.Count) driver package(s)..." -SuppressResultLog -Sb {
+    param($infs)
+    foreach ($inf in @($infs)) {
+        $out = @(& pnputil.exe /delete-driver $inf /uninstall 2>&1)
+        $exit = $LASTEXITCODE
+        [PSCustomObject]@{
+            Inf      = [string]$inf
+            Success  = ($exit -eq 0 -or $exit -eq 3010)
+            ExitCode = $exit
+            Output   = ((@($out) | ForEach-Object { [string]$_ }) -join "`n")
+        }
+    }
+} -ArgumentList (, $targetInfs) -OnComplete $done | Out-Null
 }
 
 # --- DRIVER LIST SORTING ---
