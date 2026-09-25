@@ -33527,7 +33527,7 @@ $wingetWorkerScript = {
         }
 
         try {
-            $text = Get-Content -LiteralPath $ManifestPath -Raw -ErrorAction Stop
+            $text = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 -ErrorAction Stop
             if ([string]::IsNullOrWhiteSpace($text)) { throw "Steam app manifest is empty." }
 
             $stateFlags = Get-WmtSteamActionManifestNumber -Text $text -Key "StateFlags"
@@ -36787,7 +36787,7 @@ try {
     if (Test-Path -LiteralPath (Join-Path $steamInstall "steamapps")) { [void]$libraryRoots.Add($steamInstall) }
     $libFile = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
     if (Test-Path -LiteralPath $libFile -PathType Leaf) {
-        $libText = Get-Content -LiteralPath $libFile -Raw -ErrorAction SilentlyContinue
+        $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         if (-not [string]::IsNullOrWhiteSpace($libText)) {
             foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
                 $p = $m.Groups[1].Value -replace '\\\\', '\'
@@ -36799,7 +36799,7 @@ try {
         $steamApps = Join-Path $libRoot "steamapps"
         if (-not (Test-Path -LiteralPath $steamApps)) { continue }
         foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-            $mtext = Get-Content -LiteralPath $manifest.FullName -Raw -ErrorAction SilentlyContinue
+            $mtext = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
             if ([string]::IsNullOrWhiteSpace($mtext)) { continue }
             $aid = ""
             $am = [regex]::Match($mtext, '"appid"\s+"([^"]*)"')
@@ -36824,7 +36824,7 @@ try {
         foreach ($userDir in @(Get-ChildItem -LiteralPath $userdataPath -Directory -ErrorAction SilentlyContinue)) {
             $vdfPath = Join-Path $userDir.FullName "config\localconfig.vdf"
             if (-not (Test-Path -LiteralPath $vdfPath -PathType Leaf)) { continue }
-            $vdfText = Get-Content -LiteralPath $vdfPath -Raw -ErrorAction SilentlyContinue
+            $vdfText = Get-Content -LiteralPath $vdfPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
             if ([string]::IsNullOrWhiteSpace($vdfText)) { continue }
 
             # Case-insensitive search for "apps"
@@ -41491,7 +41491,7 @@ $btnWingetScan.Add_Click({
                         $libraryFile = Join-Path $root "steamapps\libraryfolders.vdf"
                         if (-not (Test-Path -LiteralPath $libraryFile)) { continue }
 
-                        $libraryText = Get-Content -LiteralPath $libraryFile -Raw -ErrorAction SilentlyContinue
+                        $libraryText = Get-Content -LiteralPath $libraryFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                         if ([string]::IsNullOrWhiteSpace($libraryText)) { continue }
 
                         foreach ($match in [regex]::Matches($libraryText, '"path"\s+"([^"]+)"')) {
@@ -41525,7 +41525,7 @@ $btnWingetScan.Add_Click({
 
                         foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
                             $manifestCount++
-                            $text = Get-Content -LiteralPath $manifest.FullName -Raw -ErrorAction SilentlyContinue
+                            $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                             if ([string]::IsNullOrWhiteSpace($text)) { continue }
 
                             $appId = Get-SteamManifestValue -Text $text -Key "appid"
@@ -48859,7 +48859,7 @@ foreach ($root in $installRoots) {
     if (Test-Path -LiteralPath (Join-Path $root "steamapps")) { [void]$libraryRoots.Add($root) }
     $libFile = Join-Path $root "steamapps\libraryfolders.vdf"
     if (-not (Test-Path -LiteralPath $libFile)) { continue }
-    $libText = Get-Content -LiteralPath $libFile -Raw -ErrorAction SilentlyContinue
+    $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
     if ([string]::IsNullOrWhiteSpace($libText)) { continue }
     foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
         $p = $m.Groups[1].Value -replace '\\\\', '\'
@@ -48872,7 +48872,7 @@ foreach ($libRoot in $libraryRoots) {
     $steamApps = Join-Path $libRoot "steamapps"
     if (-not (Test-Path -LiteralPath $steamApps)) { continue }
     foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-        $text = Get-Content -LiteralPath $manifest.FullName -Raw -ErrorAction SilentlyContinue
+        $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         if ([string]::IsNullOrWhiteSpace($text)) { continue }
         $appId = Get-SteamManifestValue $text "appid"
         if ([string]::IsNullOrWhiteSpace($appId)) { $appId = [regex]::Match($manifest.BaseName, '\d+').Value }
@@ -49287,7 +49287,7 @@ function Get-WmtLibraryItemInstallDir {
         $libRoots = @($steamInstall)
         $libFile = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
         if (Test-Path -LiteralPath $libFile -PathType Leaf) {
-            $libText = Get-Content -LiteralPath $libFile -Raw -ErrorAction SilentlyContinue
+            $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
             if (-not [string]::IsNullOrWhiteSpace($libText)) {
                 foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
                     $p = $m.Groups[1].Value -replace '\\\\', '\'
@@ -49299,7 +49299,7 @@ function Get-WmtLibraryItemInstallDir {
         foreach ($libRoot in $libRoots) {
             $manifestPath = Join-Path $libRoot "steamapps\appmanifest_$id.acf"
             if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-                $mtext = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction SilentlyContinue
+                $mtext = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                 if (-not [string]::IsNullOrWhiteSpace($mtext)) {
                     $instDirMatch = [regex]::Match($mtext, '"installdir"\s+"([^"]*)"')
                     if ($instDirMatch.Success) {
@@ -51443,7 +51443,7 @@ try {
                         if (Test-Path -LiteralPath (Join-Path $steamInstall "steamapps")) { [void]$libRoots.Add($steamInstall) }
                         $libF = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
                         if (Test-Path -LiteralPath $libF -PathType Leaf) {
-                            $libT = Get-Content -LiteralPath $libF -Raw -ErrorAction SilentlyContinue
+                            $libT = Get-Content -LiteralPath $libF -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                             if (-not [string]::IsNullOrWhiteSpace($libT)) {
                                 foreach ($m in [regex]::Matches($libT, '"path"\s+"([^"]+)"')) {
                                     $p = $m.Groups[1].Value -replace '\\\\', '\'
@@ -51455,7 +51455,7 @@ try {
                             $sa = Join-Path $libRoot "steamapps"
                             if (-not (Test-Path -LiteralPath $sa)) { continue }
                             foreach ($man in @(Get-ChildItem -LiteralPath $sa -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-                                $mt = Get-Content -LiteralPath $man.FullName -Raw -ErrorAction SilentlyContinue
+                                $mt = Get-Content -LiteralPath $man.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                                 if ([string]::IsNullOrWhiteSpace($mt)) { continue }
                                 $aid = ""
                                 $am = [regex]::Match($mt, '"appid"\s+"([^"]*)"')
@@ -51480,7 +51480,7 @@ try {
                             foreach ($ud in @(Get-ChildItem -LiteralPath $udPath -Directory -ErrorAction SilentlyContinue)) {
                                 $vdfP = Join-Path $ud.FullName "config\localconfig.vdf"
                                 if (-not (Test-Path -LiteralPath $vdfP -PathType Leaf)) { continue }
-                                $vdfT = Get-Content -LiteralPath $vdfP -Raw -ErrorAction SilentlyContinue
+                                $vdfT = Get-Content -LiteralPath $vdfP -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                                 if ([string]::IsNullOrWhiteSpace($vdfT)) { continue }
                                 $aIdx = $vdfT.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
                                 if ($aIdx -lt 0) { continue }
