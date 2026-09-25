@@ -50924,14 +50924,41 @@ if ($script:WmtAppxLoadRunspace) {
 
 $ps = New-WmtPooledPowerShell -PoolKind UiSupport
 [void]$ps.AddScript({
-    $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
-    foreach ($pkg in @($allPkgs | Sort-Object Name)) {
-        if ($pkg.NonRemovable -eq $true) { continue }
-        [PSCustomObject]@{
-            Name            = [string]$pkg.Name
-            PackageFullName = [string]$pkg.PackageFullName
+    $results = [System.Collections.Generic.List[object]]::new()
+    $usedCmdlet = $false
+
+    if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+        try {
+            $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
+            foreach ($pkg in @($allPkgs | Sort-Object Name)) {
+                if ($pkg.NonRemovable -eq $true) { continue }
+                [void]$results.Add([PSCustomObject]@{
+                    Name            = [string]$pkg.Name
+                    PackageFullName = [string]$pkg.PackageFullName
+                })
+            }
+            $usedCmdlet = ($results.Count -gt 0)
+        }
+        catch {}
+    }
+
+    if (-not $usedCmdlet) {
+        $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-ProvisionedAppxPackages" -TimeoutMs 120000
+        foreach ($block in @($output -split '(?=Package Identity\s*:)')) {
+            $pkgId = ""
+            $displayName = ""
+            if ($block -match 'Package Identity\s*:\s*(.+)') { $pkgId = $Matches[1].Trim() }
+            if ($block -match 'DisplayName\s*:\s*(.+)') { $displayName = $Matches[1].Trim() }
+            if ([string]::IsNullOrWhiteSpace($pkgId)) { continue }
+            if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $pkgId }
+            [void]$results.Add([PSCustomObject]@{
+                Name            = $displayName
+                PackageFullName = $pkgId
+            })
         }
     }
+
+    $results.ToArray()
 })
 
 $script:WmtAppxLoadRunspace = $ps
