@@ -39609,24 +39609,32 @@ $btnWingetScan.Add_Click({
     # when the Steam provider itself is not being scanned for pending updates.
     try {
         $steamOwnership = @()
-        if ($script:WmtSteamLibraryCache) {
-            $steamOwnership = @($script:WmtSteamLibraryCache)
-        }
-        else {
-            $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
-            if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
-                try {
-                    $steamOwnership = @([System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+
+        # Prefer the live appmanifest files. This is both faster and more reliable
+        # than trusting steam_library.json, which may be up to 24 hours old and
+        # can therefore miss a newly installed Steam game such as Warframe.
+        try { $steamOwnership = @(Get-WmtSteamInstalledGames) } catch {}
+
+        # Fall back to the in-memory/on-disk library cache only when live Steam
+        # discovery is unavailable (for example if Steam is temporarily missing).
+        if ($steamOwnership.Count -eq 0) {
+            if ($script:WmtSteamLibraryCache) {
+                $steamOwnership = @($script:WmtSteamLibraryCache)
+            }
+            else {
+                $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
+                if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
+                    try {
+                        $steamOwnership = @([System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+                    }
+                    catch {}
                 }
-                catch {}
             }
         }
 
-        # If the background library cache has not been built yet, fall back to
-        # the local Steam manifests. Get-WmtSteamLibrary caches the result, so
-        # subsequent scans avoid repeating the work.
+        # Last resort: rebuild WMT's Steam library model from local Steam data.
         if ($steamOwnership.Count -eq 0) {
-            try { $steamOwnership = @(Get-WmtSteamLibrary) } catch {}
+            try { $steamOwnership = @(Get-WmtSteamLibrary -Force) } catch {}
         }
 
         $seededSteamOwners = 0
@@ -48854,7 +48862,7 @@ foreach ($root in $installRoots) {
     $libText = Get-Content -LiteralPath $libFile -Raw -ErrorAction SilentlyContinue
     if ([string]::IsNullOrWhiteSpace($libText)) { continue }
     foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-        $p = $m.Groups[1].Value -replace '\\', ''
+        $p = $m.Groups[1].Value -replace '\\\\', '\'
         if ((Test-Path -LiteralPath $p) -and -not $libraryRoots.Contains($p)) { [void]$libraryRoots.Add($p) }
     }
 }
