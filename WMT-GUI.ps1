@@ -46138,18 +46138,22 @@ try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyConti
         $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File " + $quote + $tmpScript + $quote
         $psi.UseShellExecute = $true
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
-        [void][System.Diagnostics.Process]::Start($psi)
 
         if ($Mode -eq "Compress") {
-            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressing" -LastResult "Manual compression started.")
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressing" -LastResult "Manual compression starting.")
         }
         else {
-            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Decompressing" -AutoRecompress:$false -LastResult "Manual decompression started.")
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Decompressing" -AutoRecompress:$false -LastResult "Manual decompression starting.")
         }
 
+        [void][System.Diagnostics.Process]::Start($psi)
         Write-GuiLog "[Compact] Started $Mode on '$target' using $Algorithm."
     }
     catch {
+        try {
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Error" -LastResult ("Failed to launch: " + $_.Exception.Message))
+        }
+        catch {}
         Write-GuiLog "[Compact] Failed to launch: $($_.Exception.Message)"
         Show-WmtMessageBox -Message ("Failed to launch compact.exe operation." + [Environment]::NewLine + $_.Exception.Message) -Title "Compact Compression" -Image Error | Out-Null
     }
