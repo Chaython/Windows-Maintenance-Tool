@@ -1986,6 +1986,37 @@ try {
 catch { return "" }
 }
 
+function Invoke-WmtLegendaryLibraryJson {
+param(
+    [Parameter(Mandatory = $true)][string]$LegendaryExe,
+    [bool]$IncludeUe = $false,
+    [int]$TimeoutMs = 30000
+)
+
+$result = [PSCustomObject]@{ ExitCode = -1; Json = ""; StdErr = ""; TimedOut = $false; Error = "" }
+if ([string]::IsNullOrWhiteSpace($LegendaryExe) -or -not (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
+    $result.Error = "legendary executable was not found."
+    return $result
+}
+
+$ueFlag = if ($IncludeUe) { " --include-ue" } else { "" }
+$arguments = "--api-timeout 30 list --json$ueFlag"
+$procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments $arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+
+# Legendary versions before 0.20.27 do not support --api-timeout.
+if ($procResult.ExitCode -eq 2 -and ([string]$procResult.StdErr) -match '(?i)unrecognized arguments[^\r\n]*--api-timeout') {
+    $arguments = "list --json$ueFlag"
+    $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments $arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+}
+
+$result.ExitCode = [int]$procResult.ExitCode
+$result.Json = [string]$procResult.StdOut
+$result.StdErr = [string]$procResult.StdErr
+$result.TimedOut = [bool]$procResult.TimedOut
+$result.Error = [string]$procResult.Error
+return $result
+}
+
 # ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
@@ -2001,7 +2032,7 @@ if ($script:MyDeviceCommonHelpers) {
         catch {}
     }
 }
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -22866,25 +22897,17 @@ $doRemove = {
             $name = [string]$item.PublishedName
             $dialog.Title = "Removing $name..."
             Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
-            $p = [System.Diagnostics.Process]::new()
-            $p.StartInfo.FileName = "pnputil.exe"
-            $p.StartInfo.Arguments = "/delete-driver $name /uninstall"
-            $p.StartInfo.RedirectStandardOutput = $true
-            $p.StartInfo.RedirectStandardError = $true
-            $p.StartInfo.UseShellExecute = $false
-            $p.StartInfo.CreateNoWindow = $true
-            $p.StartInfo.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-            $p.StartInfo.StandardErrorEncoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-            $p.Start() | Out-Null
-            $stdOut = $p.StandardOutput.ReadToEnd()
-            $stdErr = $p.StandardError.ReadToEnd()
-            $p.WaitForExit()
-            if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { $deleted++; [void]$removedInfs.Add($name) }
+            $driverDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments "/delete-driver $name /uninstall" -TimeoutMs 120000 -Encoding OEM -KillTree
+            $stdOut = [string]$driverDelete.StdOut
+            $stdErr = [string]$driverDelete.StdErr
+            $driverExitCode = [int]$driverDelete.ExitCode
+            if ($driverExitCode -eq 0 -or $driverExitCode -eq 3010) { $deleted++; [void]$removedInfs.Add($name) }
             else {
+                if ($driverDelete.TimedOut) { $stdErr = (($stdErr + "`nDriver removal timed out.").Trim()) }
                 $warnMsg = "Driver: $($item.OriginalName) ($name)`n`nError:`n$($stdOut)`n$($stdErr)`n`nForce delete?"
                 if ((Show-WmtMessageBox -Owner $dialog -Message $warnMsg -Title "Deletion Failed" -Button YesNo -Image Error) -eq [System.Windows.MessageBoxResult]::Yes) {
-                    $procForce = Start-Process pnputil.exe -ArgumentList "/delete-driver $name /uninstall /force" -NoNewWindow -Wait -PassThru
-                    if ($procForce.ExitCode -eq 0 -or $procForce.ExitCode -eq 3010) { $deleted++; [void]$removedInfs.Add($name) } else { $failed++ }
+                    $forceDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments "/delete-driver $name /uninstall /force" -TimeoutMs 120000 -Encoding OEM -KillTree
+                    if ($forceDelete.ExitCode -eq 0 -or $forceDelete.ExitCode -eq 3010) { $deleted++; [void]$removedInfs.Add($name) } else { $failed++ }
                 }
                 else { $failed++ }
             }
@@ -39291,6 +39314,11 @@ $script:WmtAutoInstallActive = $false
 $script:WmtCompletedWindowsUpdateIds = @{}
 $script:WmtWindowsUpdateRebootPendingCount = 0
 $script:WmtSteamInstalledNameKeys = @{}
+$script:WmtProviderOwnershipIndex = @{
+    Name = @{}
+    Id   = @{}
+    Path = @{}
+}
 
 $script:ScanTimer.Add_Tick({
     if ($script:ActiveScans.Count -gt 0) {
@@ -39311,13 +39339,29 @@ $script:ScanTimer.Add_Tick({
                         # Background PowerShell EndInvoke() returns PSObject wrappers.
                         # Use a typed state object for Steam ownership rather than relying
                         # on string type tests, which can miss wrapped string output.
-                        if ($item.PSObject.Properties["WmtStateType"] -and ([string]$item.WmtStateType) -eq "SteamInstalled") {
-                            $steamInstalledName = ([string]$item.Name).Trim()
-                            if (-not [string]::IsNullOrWhiteSpace($steamInstalledName)) {
-                                $steamInstalledKey = ($steamInstalledName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
-                                if (-not [string]::IsNullOrWhiteSpace($steamInstalledKey)) {
-                                    $script:WmtSteamInstalledNameKeys[$steamInstalledKey] = [string]$item.Id
+                        if ($item.PSObject.Properties["WmtStateType"] -and ([string]$item.WmtStateType) -eq "ProviderOwnership") {
+                            $provider = ([string]$item.Provider).Trim().ToLowerInvariant()
+                            $ownedName = ([string]$item.Name).Trim()
+                            $ownedId = ([string]$item.Id).Trim()
+                            $ownedPath = ([string]$item.InstallDir).Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($ownedName)) {
+                                $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+                                if (-not [string]::IsNullOrWhiteSpace($nameKey)) {
+                                    $script:WmtProviderOwnershipIndex.Name[$nameKey] = [PSCustomObject]@{ Provider = $provider; Id = $ownedId; Path = $ownedPath; Name = $ownedName }
+                                    if ($provider -eq "steam") { $script:WmtSteamInstalledNameKeys[$nameKey] = $ownedId }
                                 }
+                            }
+                            if (-not [string]::IsNullOrWhiteSpace($ownedId)) {
+                                $script:WmtProviderOwnershipIndex.Id["$provider|$($ownedId.ToLowerInvariant())"] = $true
+                            }
+                            if (-not [string]::IsNullOrWhiteSpace($ownedPath)) {
+                                try {
+                                    $pathKey = [System.IO.Path]::GetFullPath($ownedPath).TrimEnd('\').ToLowerInvariant()
+                                    if (-not [string]::IsNullOrWhiteSpace($pathKey)) {
+                                        $script:WmtProviderOwnershipIndex.Path[$pathKey] = [PSCustomObject]@{ Provider = $provider; Id = $ownedId; Name = $ownedName }
+                                    }
+                                }
+                                catch {}
                             }
                         }
                         elseif ($item -is [string] -and $item -match "^STATE:WINDOWS_UPDATE_REBOOT_REQUIRED:(\d+)$") {
@@ -39386,16 +39430,16 @@ $script:ScanTimer.Add_Tick({
             # therefore appear as false winget "updates" (for example Unknown -> 1.0.0).
             # If the Steam worker confirmed the same installed app name, suppress only
             # that unknown-version winget row and leave normal winget updates untouched.
-            $steamOwnedWingetRowsSuppressed = 0
-            if ($script:WmtSteamInstalledNameKeys -and $script:WmtSteamInstalledNameKeys.Count -gt 0) {
+            $providerOwnedWingetRowsSuppressed = 0
+            if ($script:WmtProviderOwnershipIndex -and $script:WmtProviderOwnershipIndex.Name.Count -gt 0) {
                 for ($rowIndex = $lstWinget.Items.Count - 1; $rowIndex -ge 0; $rowIndex--) {
                     $candidate = $lstWinget.Items[$rowIndex]
                     if (-not $candidate) { continue }
                     if (([string]$candidate.Source).ToLowerInvariant() -ne "winget") { continue }
 
-                    # Winget represents unresolved installed versions as Unknown (or
-                    # localized equivalents); WMT normally normalizes these to "?".
-                    # Treat blank/Unknown/? as the same unresolved-version condition.
+                    # Only suppress unresolved-version winget rows. Verified winget
+                    # upgrades remain visible even when another provider owns an app
+                    # with the same display name.
                     $candidateVersion = ([string]$candidate.Version).Trim()
                     if (-not [string]::IsNullOrWhiteSpace($candidateVersion) -and $candidateVersion -notmatch '^(?i:\?|unknown|inconnu)$') { continue }
 
@@ -39404,16 +39448,16 @@ $script:ScanTimer.Add_Tick({
                     $candidateKey = ($candidateName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
                     if ([string]::IsNullOrWhiteSpace($candidateKey)) { continue }
 
-                    if ($script:WmtSteamInstalledNameKeys.ContainsKey($candidateKey)) {
-                        $steamAppId = [string]$script:WmtSteamInstalledNameKeys[$candidateKey]
-                        Write-GuiLog "[Winget] Suppressed unknown-version match for Steam-managed app: $candidateName ($([string]$candidate.Id)); Steam AppID $steamAppId."
+                    if ($script:WmtProviderOwnershipIndex.Name.ContainsKey($candidateKey)) {
+                        $owner = $script:WmtProviderOwnershipIndex.Name[$candidateKey]
+                        Write-GuiLog "[Winget] Suppressed unknown-version duplicate for $candidateName ($([string]$candidate.Id)); owned by $($owner.Provider) ($($owner.Id))."
                         $lstWinget.Items.RemoveAt($rowIndex)
-                        $steamOwnedWingetRowsSuppressed++
+                        $providerOwnedWingetRowsSuppressed++
                     }
                 }
             }
-            if ($steamOwnedWingetRowsSuppressed -gt 0) {
-                Write-GuiLog "[Winget] Suppressed $steamOwnedWingetRowsSuppressed Steam-owned unknown-version false-positive update row(s)."
+            if ($providerOwnedWingetRowsSuppressed -gt 0) {
+                Write-GuiLog "[Winget] Suppressed $providerOwnedWingetRowsSuppressed cross-provider unknown-version duplicate row(s)."
             }
 
             $lstWinget.Items.Refresh()
@@ -39543,6 +39587,11 @@ $btnWingetScan.Add_Click({
     $script:ScanCancelled = $false
     $script:ScanStartTime = Get-Date
     $script:WmtSteamInstalledNameKeys = @{}
+    $script:WmtProviderOwnershipIndex = @{
+        Name = @{}
+        Id   = @{}
+        Path = @{}
+    }
 
     # --- Global Timeout Timer (120 seconds) ---
     if ($script:GlobalScanTimer) {
@@ -40819,6 +40868,13 @@ $btnWingetScan.Add_Click({
                         if ([string]::IsNullOrWhiteSpace($appName)) { continue }
                         $installedCount++
                         if ([string]::IsNullOrWhiteSpace($title)) { $title = $appName }
+                        [PSCustomObject]@{
+                            WmtStateType = "ProviderOwnership"
+                            Provider     = "legendary"
+                            Name         = $title
+                            Id           = $appName
+                            InstallDir   = $installPath
+                        }
                         $hasUpdate = ($updateFlag -match '^(?i:true|yes|1)$')
                         if (-not $hasUpdate -and -not [string]::IsNullOrWhiteSpace($availableVersion) -and $availableVersion -ne $installedVersion) {
                             $hasUpdate = $true
@@ -41043,6 +41099,13 @@ $btnWingetScan.Add_Click({
                         $installPath = ([string]$metadata.InstallPath).Trim()
                         $installedBuild = ([string]$metadata.BuildID).Trim()
                         if ([string]::IsNullOrWhiteSpace($title)) { $title = $gameId }
+                        [PSCustomObject]@{
+                            WmtStateType = "ProviderOwnership"
+                            Provider     = "gogdl"
+                            Name         = $title
+                            Id           = $gameId
+                            InstallDir   = $installPath
+                        }
                         if ([string]::IsNullOrWhiteSpace($gameId) -or [string]::IsNullOrWhiteSpace($installedBuild)) {
                             $missingMetadataCount++
                             continue
@@ -41403,9 +41466,11 @@ $btnWingetScan.Add_Click({
                             # object because EndInvoke() wraps pipeline output in PSObject.
                             # This is emitted for every installed Steam app, not only pending ones.
                             [PSCustomObject]@{
-                                WmtStateType = "SteamInstalled"
+                                WmtStateType = "ProviderOwnership"
+                                Provider     = "steam"
                                 Name         = $name
                                 Id           = $appId
+                                InstallDir   = $installDir
                             }
 
                             if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
@@ -42379,8 +42444,6 @@ $script:InvokeWingetSearch = {
                     try {
                         $result = New-Object System.Collections.Generic.List[object]
                         if ($LegendaryExe -and (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
-                            $psi = New-Object System.Diagnostics.ProcessStartInfo
-                            $psi.FileName = $LegendaryExe
                             # --include-ue only while UE/Fab assets are shown;
                             # this runspace cannot call the settings helper,
                             # so read the persisted flag from settings.json.
@@ -42393,16 +42456,12 @@ $script:InvokeWingetSearch = {
                                 }
                             }
                             catch {}
-                            $psi.Arguments = "--api-timeout 30 list --json$ueFlag"
-                            $psi.RedirectStandardOutput = $true
-                            $psi.RedirectStandardError = $true
-                            $psi.UseShellExecute = $false
-                            $psi.CreateNoWindow = $true
-                            $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                            $proc = [System.Diagnostics.Process]::Start($psi)
-                            $stdout = $proc.StandardOutput.ReadToEnd()
-                            try { $proc.WaitForExit(30000) } catch {}
-                            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                            $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -TimeoutMs 30000
+                            $stdout = [string]$legendaryResult.Json
+                            if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
+                            elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
+                                Write-Output "LOG:Legendary library fetch failed: $(([string]$legendaryResult.StdErr).Trim())"
+                            }
                             $parsed = $false
                             if (-not $parsed -and -not [string]::IsNullOrWhiteSpace($stdout)) {
                                 try {
@@ -50158,8 +50217,6 @@ try {
                     $result = New-Object System.Collections.Generic.List[object]
 
                     if ($LegendaryExe -and (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
-                        $psi = New-Object System.Diagnostics.ProcessStartInfo
-                        $psi.FileName = $LegendaryExe
                         # --include-ue only while UE/Fab assets are shown;
                         # this runspace cannot call the settings helper,
                         # so read the persisted flag from settings.json.
@@ -50172,16 +50229,12 @@ try {
                             }
                         }
                         catch {}
-                        $psi.Arguments = "--api-timeout 30 list --json$ueFlag"
-                        $psi.RedirectStandardOutput = $true
-                        $psi.RedirectStandardError = $true
-                        $psi.UseShellExecute = $false
-                        $psi.CreateNoWindow = $true
-                        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                        $proc = [System.Diagnostics.Process]::Start($psi)
-                        $stdout = $proc.StandardOutput.ReadToEnd()
-                        try { $proc.WaitForExit(30000) } catch {}
-                        try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                        $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -TimeoutMs 30000
+                        $stdout = [string]$legendaryResult.Json
+                        if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
+                        elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
+                            Write-Output "LOG:Legendary library fetch failed: $(([string]$legendaryResult.StdErr).Trim())"
+                        }
 
                         $parsed = $false
 
@@ -50628,38 +50681,27 @@ try {
     $script:WmtLibraryCacheRunspace = $ps
     $script:WmtLibraryCacheAsyncResult = $ps.BeginInvoke()
 
-    # Polling timer to collect log output and dispose the runspace when done.
-    $timer = New-Object System.Windows.Threading.DispatcherTimer
-    $timer.Interval = [TimeSpan]::FromSeconds(2)
-    $timer.Add_Tick({
-            try { $timer.Stop() } catch {}
-            if (-not $script:WmtLibraryCacheAsyncResult) { return }
-            if (-not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
-                try { $timer.Start() } catch {}
-                return
-            }
+    # Collect completion through the shared UI poller rather than allocating a
+    # dedicated DispatcherTimer for this one background job.
+    Register-WmtUiPollOperation -Name "LibraryCacheBuilder" -IntervalMs 1000 `
+        -TestComplete { $script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult.IsCompleted } `
+        -OnComplete {
             try {
                 $results = $script:WmtLibraryCacheRunspace.EndInvoke($script:WmtLibraryCacheAsyncResult)
                 foreach ($line in @($results)) {
-                    if ($line -is [string] -and $line.StartsWith("LOG:")) {
-                        Write-GuiLog ($line.Substring(4))
-                    }
+                    if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog ($line.Substring(4)) }
                 }
             }
             catch {}
-            try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
-            $script:WmtLibraryCacheRunspace = $null
-            $script:WmtLibraryCacheAsyncResult = $null
-            # If the library view is open, refresh it from the rebuilt
-            # cache (covers the Fab-assets toggle: the rebuild flips the
-            # --include-ue flag and the open view picks the change up
-            # immediately; the boot-time build finds the view closed and
-            # skips this).
+            finally {
+                try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
+                $script:WmtLibraryCacheRunspace = $null
+                $script:WmtLibraryCacheAsyncResult = $null
+            }
             if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
                 try { Start-WmtLibraryScan -Silent } catch {}
             }
-        }.GetNewClosure())
-    $timer.Start()
+        } | Out-Null
 }
 catch {
     Write-GuiLog "Library cache builder failed to start: $($_.Exception.Message)"
