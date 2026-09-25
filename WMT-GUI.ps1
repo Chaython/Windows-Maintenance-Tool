@@ -23347,13 +23347,6 @@ Invoke-WmtUiBackgroundCommand -Name "DriverRestore" -Msg "Restoring drivers..." 
     }
 } -ArgumentList $selectedPath -OnComplete $restoreDone | Out-Null
 
-# If a cached list was on screen while restoring, reload it now so the newly
-
-# If a cached list was on screen while restoring, reload it now so the newly
-# staged packages appear; otherwise the next Drivers tab visit reloads.
-if (-not $script:DriverCacheLoaded -and $script:DriverPackages.Count -gt 0) {
-    Start-DriverListLoad -Force
-}
 }
 
 # --- UPDATE / REPORT TOOLS ---
@@ -47832,10 +47825,8 @@ if ($btnAppxRemoveSel) { $btnAppxRemoveSel.Add_Click({
                 [PSCustomObject]@{ Name=[string]$app.Name; Success=$false; Error=$_.Exception.Message }
             }
         }
-    } -ArgumentList $selected -OnComplete $done | Out-Null
+    } -ArgumentList (, $selected) -OnComplete $done | Out-Null
 }) }
-
-if ($btnAppxRemoveAll) {
 
 if ($btnAppxRemoveAll) { $btnAppxRemoveAll.Add_Click({
     if ((Show-WmtMessageBox -Message "Remove ALL listed apps? This cannot be undone easily." -Title "Confirm" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
@@ -47900,7 +47891,32 @@ else {
 }
 
 function Switch-WindowsFeature($FeatureName, $DisplayName) {
-$done = { param($results) Update-SingleFeatureButtonState -ButtonName $this.Name -FeatureName $FeatureName }.GetNewClosure()
+$buttonName = switch ($FeatureName) {
+    "Microsoft-Hyper-V-All" { "btnFeatHyperV" }
+    "Microsoft-Windows-Subsystem-Linux" { "btnFeatWSL" }
+    "Containers-DisposableClientVM" { "btnFeatSandbox" }
+    "NetFx3" { "btnFeatDotNet35" }
+    "ServicesForNFS-ClientOnly" { "btnFeatNFS" }
+    "TelnetClient" { "btnFeatTelnet" }
+    "IIS-WebServerRole" { "btnFeatIIS" }
+    "WindowsMediaPlayer" { "btnFeatLegacy" }
+    "VirtualMachinePlatform" { "btnFeatVMP" }
+    "HypervisorPlatform" { "btnFeatWHP" }
+    "OpenSSH.Client" { "btnFeatSSHClient" }
+    "OpenSSH.Server" { "btnFeatSSHServer" }
+    "Windows-Defender-ApplicationGuard" { "btnFeatAppGuard" }
+    "WirelessDisplay" { "btnFeatMiracast" }
+    "QuickAssist" { "btnFeatQuickAssist" }
+    "XpsViewer" { "btnFeatXPS" }
+    "TIFFIFilter" { "btnFeatTIFF" }
+    default { "" }
+}
+$done = {
+    param($results)
+    if (-not [string]::IsNullOrWhiteSpace($buttonName)) {
+        Update-SingleFeatureButtonState -ButtonName $buttonName -FeatureName $FeatureName
+    }
+}.GetNewClosure()
 Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $DisplayName..." -Sb {
     param($fn, $dn)
     if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
