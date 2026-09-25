@@ -7171,7 +7171,7 @@ $message += "."
 function Show-DownloadStats {
 Invoke-UiCommand {
     try {
-        $repo = "Chaython/Windows-Maintenance-Tool"
+        $repo = "ios12checker/Windows-Maintenance-Tool"
         $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
         if (-not $rel -or -not $rel.assets) { throw "No release data returned." }
         $total = ($rel.assets | Measure-Object download_count -Sum).Sum
@@ -7219,7 +7219,7 @@ $script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript
         try {
             if ($IsExe) {
                 # For EXE: Check GitHub releases API
-                $url = "https://api.github.com/repos/Chaython/Windows-Maintenance-Tool/releases/latest"
+                $url = "https://api.github.com/repos/ios12checker/Windows-Maintenance-Tool/releases/latest"
                 $req = Invoke-RestMethod -Uri $url -UseBasicParsing -TimeoutSec 10
 
                 if ($req -and $req.tag_name) {
@@ -7282,7 +7282,7 @@ $script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript
             else {
                 # For Script: Download and parse WMT-GUI.ps1
                 $time = Get-Date -Format "yyyyMMddHHmmss"
-                $url = "https://raw.githubusercontent.com/Chaython/Windows-Maintenance-Tool/Main/WMT-GUI.ps1?t=$time"
+                $url = "https://raw.githubusercontent.com/ios12checker/Windows-Maintenance-Tool/main/WMT-GUI.ps1?t=$time"
 
                 # Shorter timeout for UI responsiveness
                 $req = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
@@ -7590,7 +7590,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                             [System.Windows.MessageBoxImage]::Warning
                                         )
                                         if ($fallback -eq [System.Windows.MessageBoxResult]::Yes) {
-                                            Start-Process "https://github.com/Chaython/Windows-Maintenance-Tool/releases"
+                                            Start-Process "https://github.com/ios12checker/Windows-Maintenance-Tool/releases"
                                         }
                                     }
                                 }
@@ -46283,7 +46283,7 @@ if ($btnCtxBuilder) { $btnCtxBuilder.Add_Click({ Show-ContextMenuBuilder }) }
 
 # --- Support ---
 if ($btnSupportDiscord) { $btnSupportDiscord.Add_Click({ Start-Process "https://discord.gg/bCQqKHGxja" }) }
-if ($btnSupportIssue) { $btnSupportIssue.Add_Click({ Start-Process "https://github.com/Chaython/Windows-Maintenance-Tool/issues/new/choose" }) }
+if ($btnSupportIssue) { $btnSupportIssue.Add_Click({ Start-Process "https://github.com/ios12checker/Windows-Maintenance-Tool/issues/new/choose" }) }
 if ($btnDonateIos12) { $btnDonateIos12.Add_Click({ Start-Process "https://github.com/sponsors/ios12checker" }) }
 if ($btnCreditLilBatti) { $btnCreditLilBatti.Add_Click({ Start-Process "https://github.com/ios12checker" }) }
 if ($btnCreditChaython) { $btnCreditChaython.Add_Click({ Start-Process "https://github.com/Chaython" }) }
