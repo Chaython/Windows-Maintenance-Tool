@@ -16100,24 +16100,23 @@ try {
 catch {}
 
 if ($Action -eq "BackupHKLM") {
-    Invoke-UiCommand {
+    $backupDone = {
+        param($results)
+        $bkFile = [string](@($results | Where-Object { $_ -and $_.PSObject.Properties["BackupFile"] } | Select-Object -Last 1).BackupFile)
+        if (-not [string]::IsNullOrWhiteSpace($bkFile)) {
+            Show-WmtMessageBox -Message "HKLM export saved to:`n$bkFile" -Title "Registry Export" -Image Information | Out-Null
+        }
+    }
+    Invoke-WmtUiBackgroundCommand -Name "RegistryBackupHKLM" -Msg "Exporting HKLM hive..." -SuppressResultLog -Sb {
         param($BackupDirectory)
-
-        if (-not (Test-Path -LiteralPath $BackupDirectory)) {
-            New-Item -Path $BackupDirectory -ItemType Directory -Force | Out-Null
-        }
-
+        if (-not (Test-Path -LiteralPath $BackupDirectory)) { New-Item -Path $BackupDirectory -ItemType Directory -Force | Out-Null }
         $bkFile = Join-Path $BackupDirectory ("HKLM_Backup_{0}.reg" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-        Write-Output "Exporting HKLM to: $bkFile"
-        & reg.exe export "HKLM" $bkFile /y 2>&1 | ForEach-Object { Write-Output $_ }
-
+        $out = @(& reg.exe export "HKLM" $bkFile /y 2>&1)
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $bkFile)) {
-            throw "HKLM backup failed. reg.exe exit code: $LASTEXITCODE"
+            throw "HKLM backup failed. reg.exe exit code: $LASTEXITCODE`n$((@($out) -join "`n"))"
         }
-
-        Set-WmtBusyCursor
-        Show-WmtMessageBox -Message "HKLM export saved to:`n$bkFile" -Title "Registry Export" -Image Information | Out-Null
-    } "Exporting HKLM hive..." -ArgumentList $bkDir
+        [PSCustomObject]@{ BackupFile = $bkFile }
+    } -ArgumentList $bkDir -OnComplete $backupDone | Out-Null
     return
 }
 
@@ -16135,22 +16134,20 @@ if ($Action -eq "Restore") {
     $confirm = Show-WmtMessageBox -Message "Import this registry backup?`n`n$restoreFile`n`nThis can overwrite current registry values." -Title "Import Registry Backup" -Button YesNo -Image Warning
     if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-    Invoke-UiCommand {
+    $restoreDone = {
+        param($results)
+        $file = [string](@($results | Where-Object { $_ -and $_.PSObject.Properties["BackupFile"] } | Select-Object -Last 1).BackupFile)
+        if (-not [string]::IsNullOrWhiteSpace($file)) {
+            Show-WmtMessageBox -Message "Registry backup imported from:`n$file" -Title "Registry Import" -Image Information | Out-Null
+        }
+    }
+    Invoke-WmtUiBackgroundCommand -Name "RegistryRestoreHKLM" -Msg "Importing registry backup..." -SuppressResultLog -Sb {
         param($BackupFile)
-
-        if (-not (Test-Path -LiteralPath $BackupFile)) {
-            throw "Backup file not found: $BackupFile"
-        }
-
-        Write-Output "Importing registry backup: $BackupFile"
-        & reg.exe import $BackupFile 2>&1 | ForEach-Object { Write-Output $_ }
-        if ($LASTEXITCODE -ne 0) {
-            throw "Registry restore failed. reg.exe exit code: $LASTEXITCODE"
-        }
-
-        Set-WmtBusyCursor
-        Show-WmtMessageBox -Message "Registry backup imported from:`n$BackupFile" -Title "Registry Import" -Image Information | Out-Null
-    } "Importing registry backup..." -ArgumentList $restoreFile
+        if (-not (Test-Path -LiteralPath $BackupFile)) { throw "Backup file not found: $BackupFile" }
+        $out = @(& reg.exe import $BackupFile 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Registry restore failed. reg.exe exit code: $LASTEXITCODE`n$((@($out) -join "`n"))" }
+        [PSCustomObject]@{ BackupFile = $BackupFile }
+    } -ArgumentList $restoreFile -OnComplete $restoreDone | Out-Null
     return
 }
 
@@ -23613,7 +23610,15 @@ return $state.Result
 
 # --- WINRE STATUS CHECK ---
 function Invoke-WinREStatusCheck {
-Invoke-UiCommand {
+$done = {
+    param($results)
+    $r = @($results | Where-Object { $_ -and $_.PSObject.Properties["Message"] } | Select-Object -Last 1)
+    if (-not $r) { return }
+    $icon = if ([bool]$r.HasWarnings) { [System.Windows.MessageBoxImage]::Warning } else { [System.Windows.MessageBoxImage]::Information }
+    $res = Show-WmtMessageBox -Message "$($r.Headline)`r`n`r`n$($r.Message)`r`n`r`nShow technical details?" -Title "WinRE Status" -Button YesNo -Image $icon
+    if ($res -eq [System.Windows.MessageBoxResult]::Yes) { Show-TextDialog -Title "WinRE Technical Details" -Text ([string]$r.TechnicalText) }
+}
+Invoke-WmtUiBackgroundCommand -Name "WinREStatus" -Msg "Checking WinRE status..." -SuppressResultLog -Sb {
     $text = Invoke-WmtCliText -FilePath "reagentc.exe" -Arguments "/info"
     if ([string]::IsNullOrWhiteSpace($text)) {
         $text = "No output returned from reagentc /info."
@@ -23688,22 +23693,13 @@ Invoke-UiCommand {
     }
 
     $msg = ($summary -join "`r`n")
-    Write-Output $msg
-
-    $icon = if ($warnings.Count -eq 0) {
-        [System.Windows.MessageBoxImage]::Information
+    [PSCustomObject]@{
+        Headline = $headline
+        Message = $msg
+        TechnicalText = $text
+        HasWarnings = ($warnings.Count -gt 0)
     }
-    else {
-        [System.Windows.MessageBoxImage]::Warning
-    }
-
-    Set-WmtBusyCursor
-    $res = Show-WmtMessageBox -Message "$headline`r`n`r`n$msg`r`n`r`nShow technical details?" -Title "WinRE Status" -Button YesNo -Image $icon
-
-    if ($res -eq [System.Windows.MessageBoxResult]::Yes) {
-        Show-TextDialog -Title "WinRE Technical Details" -Text $text
-    }
-} "Checking WinRE status..."
+} -OnComplete $done | Out-Null
 }
 
 function Invoke-QuickFixSuite {
@@ -43545,47 +43541,36 @@ $btnCHKDSK.Add_Click({ Invoke-ChkdskAll })
 
 # --- NETWORK ---
 $btnNetInfo.Add_Click({
-    Invoke-UiCommand {
-        $txt = Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/all"
-        Write-Output $txt
-        Set-WmtBusyCursor
-        Show-TextDialog -Title "IP Configuration" -Text $txt
-    } "Showing IP configuration..."
+    $done = { param($results) Show-TextDialog -Title "IP Configuration" -Text ((@($results) | ForEach-Object { [string]$_ }) -join "`r`n") }
+    Invoke-WmtUiBackgroundCommand -Name "NetworkIpConfig" -Msg "Showing IP configuration..." -SuppressResultLog -Sb {
+        Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/all"
+    } -OnComplete $done | Out-Null
 })
 $btnFlushDNS.Add_Click({
-    Invoke-UiCommand {
-        $txt = Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/flushdns"
-        if ($txt) { Write-Output $txt }
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show("DNS cache flushed.", "Flush DNS", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-    } "Flushing DNS cache..."
+    $done = { param($results) [System.Windows.MessageBox]::Show("DNS cache flushed.", "Flush DNS", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
+    Invoke-WmtUiBackgroundCommand -Name "FlushDns" -Msg "Flushing DNS cache..." -Sb {
+        Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/flushdns"
+    } -OnComplete $done | Out-Null
 })
 $btnResetWifi.Add_Click({
-    Invoke-UiCommand {
+    $done = {
+        param($results)
+        $r = @($results | Where-Object { $_ -and $_.PSObject.Properties["Message"] } | Select-Object -Last 1)
+        if ($r) { [System.Windows.MessageBox]::Show([string]$r.Message, "Restart Wi-Fi", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
+    }
+    Invoke-WmtUiBackgroundCommand -Name "RestartWifiAdapters" -Msg "Restarting Wi-Fi adapters..." -SuppressResultLog -Sb {
         $wifi = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -match "Wi-Fi|Wireless" }
         $eth = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch "Wi-Fi|Wireless" -and $_.InterfaceDescription -notmatch "Bluetooth" }
-
         if (-not $wifi) {
             $msg = "No active Wi-Fi adapters found."
-            if ($eth) {
-                $ethNames = $eth | Select-Object -ExpandProperty Name
-                $msg += "`nYou appear to be on Ethernet: " + ($ethNames -join ", ")
-            }
-            Set-WmtBusyCursor
-            [System.Windows.MessageBox]::Show($msg, "Restart Wi-Fi", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-            Write-Output $msg
+            if ($eth) { $msg += "`nYou appear to be on Ethernet: " + (($eth | Select-Object -ExpandProperty Name) -join ", ") }
+            [PSCustomObject]@{ Message = $msg }
             return
         }
-
-        $names = $wifi | Select-Object -ExpandProperty Name
-        foreach ($n in $names) {
-            Restart-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Output "Restarted Wi-Fi adapter: $n"
-        }
-
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show("Restarted Wi-Fi adapter(s): " + ($names -join ", "), "Restart Wi-Fi", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-    } "Restarting Wi-Fi adapters..."
+        $names = @($wifi | Select-Object -ExpandProperty Name)
+        foreach ($n in $names) { Restart-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue }
+        [PSCustomObject]@{ Message = "Restarted Wi-Fi adapter(s): " + ($names -join ", ") }
+    } -OnComplete $done | Out-Null
 })
 
 $btnNetRepair.Add_Click({
@@ -43603,14 +43588,12 @@ $btnNetRepair.Add_Click({
     }
 })
 
-$btnRouteTable.Add_Click({ Invoke-UiCommand { $path = Join-Path (Get-DataPath) "RouteTable.txt"; Invoke-WmtCliText -FilePath "route" -Arguments "print" | Out-File -FilePath $path -Encoding UTF8; Write-Output "Saved to $path" } "Saving routing table..." })
+$btnRouteTable.Add_Click({ $path = Join-Path (Get-DataPath) "RouteTable.txt"; Invoke-WmtUiBackgroundCommand -Name "SaveRouteTable" -Msg "Saving routing table..." -Sb { param($path) Invoke-WmtCliText -FilePath "route" -Arguments "print" | Out-File -FilePath $path -Encoding UTF8; Write-Output "Saved to $path" } -ArgumentList $path | Out-Null })
 $btnRouteView.Add_Click({
-    Invoke-UiCommand {
-        $txt = Invoke-WmtCliText -FilePath "route" -Arguments "print"
-        Write-Output $txt
-        Set-WmtBusyCursor
-        Show-TextDialog -Title "Route Table" -Text $txt
-    } "Routing table"
+    $done = { param($results) Show-TextDialog -Title "Route Table" -Text ((@($results) | ForEach-Object { [string]$_ }) -join "`r`n") }
+    Invoke-WmtUiBackgroundCommand -Name "ViewRouteTable" -Msg "Routing table" -SuppressResultLog -Sb {
+        Invoke-WmtCliText -FilePath "route" -Arguments "print"
+    } -OnComplete $done | Out-Null
 })
 
 $btnDnsGoogle.Add_Click({
@@ -48637,11 +48620,11 @@ $btnToggleFastStartup.Add_Click({
         Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1) 0)) -eq 0)
         if ($currentlyOn) {
-            Invoke-UiCommand {
-                powercfg /hibernate on
-                Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
-                Write-GuiLog "Fast Startup enabled. Hibernation was enabled because Fast Startup depends on it."
-            } "Enabling Fast Startup..."
+            Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
+            Invoke-WmtUiBackgroundCommand -Name "EnableFastStartupHibernate" -Msg "Enabling Fast Startup..." -Sb {
+                powercfg /hibernate on | Out-Null
+                Write-Output "Fast Startup enabled. Hibernation was enabled because Fast Startup depends on it."
+            } | Out-Null
         }
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0; Write-GuiLog "Fast Startup disabled." } "Disabling Fast Startup..."
