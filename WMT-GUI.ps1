@@ -247,6 +247,116 @@ finally {
 }
 }
 
+$script:WmtUiBackgroundCommands = @{}
+
+function Invoke-WmtUiBackgroundCommand {
+param(
+    [Parameter(Mandatory = $true)][scriptblock]$Sb,
+    [string]$Msg = "Processing...",
+    [object[]]$ArgumentList = @(),
+    [string]$Name = "",
+    [int]$IntervalMs = 200,
+    [int]$TimeoutMs = 0,
+    [scriptblock]$OnComplete,
+    [scriptblock]$OnError,
+    [switch]$SuppressResultLog
+)
+
+if (-not $script:WmtUiBackgroundCommands) { $script:WmtUiBackgroundCommands = @{} }
+if ([string]::IsNullOrWhiteSpace($Name)) { $Name = "UiCommand_" + [guid]::NewGuid().ToString("N") }
+if ($script:WmtUiBackgroundCommands.ContainsKey($Name)) {
+    Write-GuiLog "Background operation '$Name' is already running."
+    return $null
+}
+
+$ps = New-WmtPooledPowerShell -PoolKind Background
+try {
+    [void]$ps.AddScript($Sb.ToString())
+    foreach ($arg in @($ArgumentList)) { [void]$ps.AddArgument($arg) }
+    Write-GuiLog $Msg
+    $async = $ps.BeginInvoke()
+    $job = [PSCustomObject]@{
+        Name              = $Name
+        PowerShell        = $ps
+        Async             = $async
+        OnComplete        = $OnComplete
+        OnError           = $OnError
+        SuppressResultLog = [bool]$SuppressResultLog
+    }
+    $script:WmtUiBackgroundCommands[$Name] = $job
+
+    $testComplete = {
+        param($Operation)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        return [bool]($current -and $current.Async -and $current.Async.IsCompleted)
+    }.GetNewClosure()
+
+    $finish = {
+        param($Operation)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        if (-not $current) { return }
+        try {
+            $results = @($current.PowerShell.EndInvoke($current.Async))
+            if (-not $current.SuppressResultLog) {
+                $wroteOutput = $false
+                foreach ($item in $results) {
+                    if ($null -eq $item) { continue }
+                    $text = if ($item -is [string]) { [string]$item } else { (($item | Out-String).Trim()) }
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        Write-GuiLog $text
+                        $wroteOutput = $true
+                    }
+                }
+                if (-not $wroteOutput) { Write-GuiLog "Done." }
+            }
+            elseif (-not $current.OnComplete) {
+                Write-GuiLog "Done."
+            }
+            if ($current.OnComplete) { & $current.OnComplete $results }
+        }
+        catch {
+            Write-GuiLog "ERROR: $($_.Exception.Message)"
+            if ($current.OnError) { try { & $current.OnError $_ } catch {} }
+        }
+        finally {
+            try { $current.PowerShell.Dispose() } catch {}
+            [void]$script:WmtUiBackgroundCommands.Remove($Name)
+        }
+    }.GetNewClosure()
+
+    $timeout = {
+        param($Operation)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        if (-not $current) { return }
+        try { $current.PowerShell.Stop() } catch {}
+        Write-GuiLog "ERROR: Background operation '$Name' timed out."
+        if ($current.OnError) { try { & $current.OnError ([System.TimeoutException]::new("Background operation '$Name' timed out.")) } catch {} }
+        try { $current.PowerShell.Dispose() } catch {}
+        [void]$script:WmtUiBackgroundCommands.Remove($Name)
+    }.GetNewClosure()
+
+    $pollError = {
+        param($Operation, $ErrorRecord)
+        $current = $script:WmtUiBackgroundCommands[$Name]
+        if ($current) {
+            try { $current.PowerShell.Stop() } catch {}
+            try { $current.PowerShell.Dispose() } catch {}
+            if ($current.OnError) { try { & $current.OnError $ErrorRecord } catch {} }
+            [void]$script:WmtUiBackgroundCommands.Remove($Name)
+        }
+    }.GetNewClosure()
+
+    Register-WmtUiPollOperation -Name ("UiCommand:" + $Name) -IntervalMs $IntervalMs -TimeoutMs $TimeoutMs -TestComplete $testComplete -OnComplete $finish -OnTimeout $timeout -OnError $pollError | Out-Null
+    return $job
+}
+catch {
+    try { $ps.Dispose() } catch {}
+    Write-GuiLog "ERROR: $($_.Exception.Message)"
+    if ($OnError) { try { & $OnError $_ } catch {} }
+    return $null
+}
+}
+
 function Enable-WmtWpfItemsVirtualization {
 param([System.Windows.Controls.ItemsControl]$Control)
 if (-not $Control) { return }
@@ -2017,6 +2127,157 @@ $result.Error = [string]$procResult.Error
 return $result
 }
 
+# Shared Steam parsing/discovery helpers. The same definitions are loaded into
+# main scope and injected into every pooled runspace to prevent parser drift.
+$script:WmtSteamCommonHelpers = @'
+function ConvertFrom-WmtSteamVdfPath {
+param([string]$Value)
+if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+$path = ([string]$Value).Trim()
+$path = $path -replace '\\\\', '\'
+$path = $path -replace '/', '\'
+return [Environment]::ExpandEnvironmentVariables($path)
+}
+
+function Add-WmtUniqueSteamPath {
+param([System.Collections.Generic.List[string]]$Paths, [string]$Path)
+if (-not $Paths -or [string]::IsNullOrWhiteSpace($Path)) { return }
+$expanded = ConvertFrom-WmtSteamVdfPath -Value $Path
+try {
+    $full = [System.IO.Path]::GetFullPath($expanded)
+    if ((Test-Path -LiteralPath $full) -and -not $Paths.Contains($full)) { [void]$Paths.Add($full) }
+}
+catch {}
+}
+
+function Get-WmtSteamManifestValue {
+param([string]$Text, [string]$Key)
+if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Key)) { return "" }
+$pattern = '"' + [regex]::Escape($Key) + '"\s+"([^"]*)"'
+$match = [regex]::Match($Text, $pattern)
+if ($match.Success) { return [string]$match.Groups[1].Value }
+return ""
+}
+
+function Get-WmtSteamManifestNumber {
+param([string]$Text, [string]$Key)
+$value = Get-WmtSteamManifestValue -Text $Text -Key $Key
+$number = [long]0
+if ([long]::TryParse(([string]$value), [ref]$number)) { return $number }
+return [long]0
+}
+
+function Get-WmtSteamInstallRoots {
+$paths = [System.Collections.Generic.List[string]]::new()
+foreach ($registryPath in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
+    try {
+        $props = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
+        foreach ($propName in @("SteamPath", "InstallPath")) {
+            if ($props.PSObject.Properties[$propName]) { Add-WmtUniqueSteamPath -Paths $paths -Path ([string]$props.$propName) }
+        }
+        if ($props.PSObject.Properties["SteamExe"] -and -not [string]::IsNullOrWhiteSpace([string]$props.SteamExe)) {
+            Add-WmtUniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$props.SteamExe))
+        }
+    }
+    catch {}
+}
+$pf86 = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+$pf = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+foreach ($candidate in @((Join-Path $pf86 "Steam"), (Join-Path $pf "Steam"), (Join-Path $env:SystemDrive "Steam"), (Join-Path $env:SystemDrive "steamcmd"))) {
+    Add-WmtUniqueSteamPath -Paths $paths -Path $candidate
+}
+foreach ($cmdName in @("steamcmd", "steamcmd.exe")) {
+    try {
+        $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) { Add-WmtUniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$cmd.Source)) }
+    }
+    catch {}
+}
+return $paths.ToArray()
+}
+
+function Get-WmtSteamLibraryRoots {
+$paths = [System.Collections.Generic.List[string]]::new()
+foreach ($root in @(Get-WmtSteamInstallRoots)) {
+    if ([string]::IsNullOrWhiteSpace($root)) { continue }
+    if (Test-Path -LiteralPath (Join-Path $root "steamapps")) { Add-WmtUniqueSteamPath -Paths $paths -Path $root }
+    $libraryFile = Join-Path $root "steamapps\libraryfolders.vdf"
+    if (-not (Test-Path -LiteralPath $libraryFile -PathType Leaf)) { continue }
+    $libraryText = Get-Content -LiteralPath $libraryFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($libraryText)) { continue }
+    foreach ($match in [regex]::Matches($libraryText, '"path"\s+"([^"]+)"')) { Add-WmtUniqueSteamPath -Paths $paths -Path $match.Groups[1].Value }
+    foreach ($match in [regex]::Matches($libraryText, '"\d+"\s+"([^"]+)"')) {
+        $candidate = ConvertFrom-WmtSteamVdfPath -Value $match.Groups[1].Value
+        if ($candidate -match '^[A-Za-z]:\\|^\\\\') { Add-WmtUniqueSteamPath -Paths $paths -Path $candidate }
+    }
+}
+return $paths.ToArray()
+}
+
+function Get-WmtSteamInstalledManifests {
+$result = [System.Collections.Generic.List[object]]::new()
+$seen = @{}
+foreach ($libraryRoot in @(Get-WmtSteamLibraryRoots)) {
+    $steamApps = Join-Path $libraryRoot "steamapps"
+    if (-not (Test-Path -LiteralPath $steamApps)) { continue }
+    foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
+        $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $appId = Get-WmtSteamManifestValue -Text $text -Key "appid"
+        if ([string]::IsNullOrWhiteSpace($appId)) { $appId = [regex]::Match($manifest.BaseName, '\d+').Value }
+        if ([string]::IsNullOrWhiteSpace($appId) -or $seen.ContainsKey($appId)) { continue }
+        $seen[$appId] = $true
+        $name = Get-WmtSteamManifestValue -Text $text -Key "name"
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
+        [void]$result.Add([PSCustomObject]@{
+            Id=$appId; Name=$name;
+            BuildId=(Get-WmtSteamManifestValue -Text $text -Key "buildid");
+            InstallDir=(Get-WmtSteamManifestValue -Text $text -Key "installdir");
+            LibraryRoot=$libraryRoot; ManifestPath=$manifest.FullName; Text=$text
+        })
+    }
+}
+return $result.ToArray()
+}
+
+function Get-WmtSteamOwnedAppIds {
+param([string]$SteamRoot)
+$result = [System.Collections.Generic.List[string]]::new()
+if ([string]::IsNullOrWhiteSpace($SteamRoot)) { $SteamRoot = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0] }
+if ([string]::IsNullOrWhiteSpace($SteamRoot)) { return $result.ToArray() }
+$userdataPath = Join-Path $SteamRoot "userdata"
+if (-not (Test-Path -LiteralPath $userdataPath)) { return $result.ToArray() }
+foreach ($userDir in @(Get-ChildItem -LiteralPath $userdataPath -Directory -ErrorAction SilentlyContinue)) {
+    $vdfPath = Join-Path $userDir.FullName "config\localconfig.vdf"
+    if (-not (Test-Path -LiteralPath $vdfPath -PathType Leaf)) { continue }
+    $vdfText = Get-Content -LiteralPath $vdfPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($vdfText)) { continue }
+    $appsIdx = $vdfText.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($appsIdx -lt 0) { continue }
+    $braceIdx = $vdfText.IndexOf('{', $appsIdx)
+    if ($braceIdx -lt 0) { continue }
+    $depth=0; $i=$braceIdx
+    while ($i -lt $vdfText.Length) {
+        $ch=$vdfText[$i]
+        if ($ch -eq '{') { $depth++; $i++ }
+        elseif ($ch -eq '}') { $depth--; if ($depth -le 0) { break }; $i++ }
+        elseif ($ch -eq '"') {
+            $endQ=$vdfText.IndexOf('"',$i+1); if ($endQ -lt 0) { break }
+            $value=$vdfText.Substring($i+1,$endQ-$i-1); $i=$endQ+1
+            if ($depth -eq 1) {
+                $j=$i; while ($j -lt $vdfText.Length -and [char]::IsWhiteSpace($vdfText[$j])) { $j++ }
+                if ($j -lt $vdfText.Length -and $vdfText[$j] -eq '{' -and -not $result.Contains($value)) { [void]$result.Add($value) }
+            }
+        }
+        else { $i++ }
+    }
+}
+return $result.ToArray()
+}
+'@
+
+Invoke-Expression $script:WmtSteamCommonHelpers
+
 # ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
@@ -2025,13 +2286,15 @@ return $result
 function New-WmtRunspaceInitialState {
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
-if ($script:MyDeviceCommonHelpers) {
-    $helperFuncs = [regex]::Matches($script:MyDeviceCommonHelpers, '(?ms)^function\s+(\w[\w-]*)\s*\{.*?^\}')
+foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommonHelpers)) {
+    if ([string]::IsNullOrWhiteSpace([string]$helperBlock)) { continue }
+    $helperFuncs = [regex]::Matches([string]$helperBlock, '(?ms)^function\s+(\w[\w-]*)\s*\{.*?^\}')
     foreach ($m in $helperFuncs) {
         try { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($m.Groups[1].Value, $m.Value)) }
         catch {}
     }
 }
+
 foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
@@ -5504,12 +5767,51 @@ finally {
 # Initialize cache variable
 $script:WmtSettingsCache = $null
 
+function Copy-WmtSettingsValue {
+param([AllowNull()]$Value)
+
+if ($null -eq $Value) { return $null }
+if ($Value -is [string] -or $Value.GetType().IsValueType) { return $Value }
+
+if ($Value -is [System.Collections.IDictionary]) {
+    $copy = @{}
+    foreach ($key in @($Value.Keys)) {
+        $copy[$key] = Copy-WmtSettingsValue -Value $Value[$key]
+    }
+    return $copy
+}
+
+if ($Value -is [System.Management.Automation.PSCustomObject]) {
+    $copy = [ordered]@{}
+    foreach ($prop in @($Value.PSObject.Properties)) {
+        $copy[$prop.Name] = Copy-WmtSettingsValue -Value $prop.Value
+    }
+    return [PSCustomObject]$copy
+}
+
+if ($Value -is [System.Collections.IEnumerable]) {
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $Value) {
+        [void]$items.Add((Copy-WmtSettingsValue -Value $item))
+    }
+    return ,$items.ToArray()
+}
+
+return $Value
+}
+
+function Copy-WmtSettings {
+param($Settings)
+if ($null -eq $Settings) { return $null }
+return (Copy-WmtSettingsValue -Value $Settings)
+}
+
 function Save-WmtSettings {
 param($Settings)
 $path = Join-Path (Get-DataPath) "settings.json"
 try {
     # Update the memory cache immediately
-    $script:WmtSettingsCache = $Settings
+    $script:WmtSettingsCache = Copy-WmtSettings -Settings $Settings
 
     # Convert Hashtable/OrderedDictionary to generic Object for cleaner JSON
     $saveObj = [PSCustomObject]@{
@@ -5554,13 +5856,9 @@ catch {
 
 function Get-WmtSettings {
 # OPTIMIZATION: Return cached settings if available to avoid disk I/O.
-# Return a shallow clone so callers can't mutate the cache by reference.
+# Return a deep clone so callers cannot mutate nested cache structures by reference.
 if ($script:WmtSettingsCache) {
-    $clone = @{}
-    foreach ($k in @($script:WmtSettingsCache.Keys)) {
-        $clone[$k] = $script:WmtSettingsCache[$k]
-    }
-    return $clone
+    return (Copy-WmtSettings -Settings $script:WmtSettingsCache)
 }
 
 $path = Join-Path (Get-DataPath) "settings.json"
@@ -5703,9 +6001,9 @@ if ($normalizedProviders.Count -eq 0) {
 }
 $defaults.EnabledProviders = $normalizedProviders.ToArray()
 
-# Cache the result
-$script:WmtSettingsCache = $defaults
-return $defaults
+# Cache an isolated copy and return a second copy to preserve clone semantics.
+$script:WmtSettingsCache = Copy-WmtSettings -Settings $defaults
+return (Copy-WmtSettings -Settings $script:WmtSettingsCache)
 }
 
 function Get-WmtWingetIncludeUnknown {
@@ -7169,31 +7467,26 @@ $message += "."
 }
 
 function Show-DownloadStats {
-Invoke-UiCommand {
-    try {
-        $repo = "ios12checker/Windows-Maintenance-Tool"
-        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
-        if (-not $rel -or -not $rel.assets) { throw "No release data returned." }
-        $total = ($rel.assets | Measure-Object download_count -Sum).Sum
-        $lines = @()
-        $lines += "Release: $($rel.name)"
-        $lines += "Total downloads: $total"
-        $lines += ""
-        foreach ($a in $rel.assets) {
-            $lines += ("{0} : {1}" -f $a.name, $a.download_count)
-        }
-        $msg = $lines -join "`r`n"
-        Write-Output $msg
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show($msg, "Latest Release Downloads", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-    }
-    catch {
-        $err = "Failed to fetch download stats: $($_.Exception.Message)"
-        Write-Output $err
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show($err, "Latest Release Downloads", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
-    }
-} "Fetching latest release download counts..."
+$done = {
+    param($results)
+    $msg = [string](@($results | Select-Object -Last 1)[0])
+    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "No release data returned." }
+    Show-WmtMessageBox -Message $msg -Title "Latest Release Downloads" -Image Information | Out-Null
+}.GetNewClosure()
+$failed = {
+    param($errorRecord)
+    $msg = if ($errorRecord -and $errorRecord.Exception) { "Failed to fetch download stats: $($errorRecord.Exception.Message)" } else { "Failed to fetch download stats: $errorRecord" }
+    Show-WmtMessageBox -Message $msg -Title "Latest Release Downloads" -Image Error | Out-Null
+}.GetNewClosure()
+Invoke-WmtUiBackgroundCommand -Name "ReleaseDownloadStats" -Msg "Fetching latest release download counts..." -SuppressResultLog -Sb {
+    $repo = "ios12checker/Windows-Maintenance-Tool"
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -ErrorAction Stop
+    if (-not $rel -or -not $rel.assets) { throw "No release data returned." }
+    $total = ($rel.assets | Measure-Object download_count -Sum).Sum
+    $lines = @("Release: $($rel.name)", "Total downloads: $total", "")
+    foreach ($a in $rel.assets) { $lines += ("{0} : {1}" -f $a.name, $a.download_count) }
+    $lines -join "`r`n"
+} -OnComplete $done -OnError $failed | Out-Null
 }
 
 # --- UPDATE CHECKER ---
@@ -7612,24 +7905,26 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
 }
 
 function Start-UpdateRepair {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairQuick" -Msg "Repairing Windows Update..." -Sb {
     Stop-Service -Name wuauserv, bits, cryptsvc, msiserver -Force -ErrorAction SilentlyContinue
     $rnd = Get-Random
     if (Test-Path "$env:windir\SoftwareDistribution") { Rename-Item "$env:windir\SoftwareDistribution" "$env:windir\SoftwareDistribution.bak_$rnd" -ErrorAction SilentlyContinue }
     if (Test-Path "$env:windir\System32\catroot2") { Rename-Item "$env:windir\System32\catroot2" "$env:windir\System32\catroot2.bak_$rnd" -ErrorAction SilentlyContinue }
     netsh winsock reset | Out-Null
     Start-Service -Name wuauserv, bits, cryptsvc, msiserver -ErrorAction SilentlyContinue
-} "Repairing Windows Update..."
+    Write-Output "Windows Update repair completed."
+} | Out-Null
 }
 
 function Start-NetRepair {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Sb {
     ipconfig /release | Out-Null
     ipconfig /renew | Out-Null
     ipconfig /flushdns | Out-Null
     netsh winsock reset | Out-Null
     netsh int ip reset | Out-Null
-} "Running Full Network Repair..."
+    Write-Output "Network repair completed."
+} | Out-Null
 }
 
 function Start-RegClean {
@@ -7645,67 +7940,47 @@ Invoke-UiCommand {
 }
 
 function Start-XboxClean {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "XboxCredentialCleanup" -Msg "Cleaning Xbox Credentials..." -Sb {
     Write-Output "Stopping Xbox Auth Manager..."
     Stop-Service -Name "XblAuthManager" -Force -ErrorAction SilentlyContinue
-
-    $allCreds = (cmdkey /list) -split "`r?`n"
+    $allCreds = (cmdkey /list) -split "\r?\n"
     $targets = @()
     foreach ($line in $allCreds) {
         if ($line -match '^\s*Target:.*(Xbl.*)$') { $targets += $matches[1] }
     }
-
-    if ($targets.Count -eq 0) {
-        Write-Output "No Xbox Live credentials found."
-    }
+    if ($targets.Count -eq 0) { Write-Output "No Xbox Live credentials found." }
     else {
-        foreach ($t in $targets) {
-            Write-Output "Deleting credential: $t"
-            cmdkey /delete:$t 2>$null
-        }
+        foreach ($t in $targets) { Write-Output "Deleting credential: $t"; cmdkey /delete:$t 2>$null }
         Write-Output "Deleted $($targets.Count) credential(s)."
     }
-
     Start-Service -Name "XblAuthManager" -ErrorAction SilentlyContinue
-} "Cleaning Xbox Credentials..."
+} | Out-Null
 }
 
 function Start-GpeditInstall {
-# Check for User Confirmation
 $msg = "Install Local Group Policy Editor?`n`nThis enables the Group Policy Editor (gpedit.msc) on Windows Home editions by installing the built-in system packages.`n`nContinue?"
 $res = Show-WmtMessageBox -Message $msg -Title "Confirm Install" -Button YesNo -Image Question
 if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-Invoke-UiCommand {
-    $packageRoot = Join-Path $env:SystemRoot "servicing\\Packages"
-
-    if (-not (Test-Path $packageRoot)) {
-        throw "Package directory not found: $packageRoot"
-    }
-
+Invoke-WmtUiBackgroundCommand -Name "GpeditInstall" -Msg "Installing Group Policy Editor..." -Sb {
+    $packageRoot = Join-Path $env:SystemRoot "servicing\Packages"
+    if (-not (Test-Path $packageRoot)) { throw "Package directory not found: $packageRoot" }
     Write-Output "Searching packages in $packageRoot..."
-
-    $clientTools = @(Get-WmtEnumeratedFiles -Path $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientTools-Package~*.mum" | ForEach-Object { [System.IO.FileInfo]::new($_) })
-    $clientExtensions = @(Get-WmtEnumeratedFiles -Path $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientExtensions-Package~*.mum" | ForEach-Object { [System.IO.FileInfo]::new($_) })
-
+    $clientTools = @(Get-ChildItem -LiteralPath $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientTools-Package~*.mum" -File -ErrorAction SilentlyContinue)
+    $clientExtensions = @(Get-ChildItem -LiteralPath $packageRoot -Filter "Microsoft-Windows-GroupPolicy-ClientExtensions-Package~*.mum" -File -ErrorAction SilentlyContinue)
     if (-not $clientTools -or -not $clientExtensions) {
         Write-Output "WARNING: Required GroupPolicy packages were not found."
         Write-Output "Ensure you are on a compatible Windows 10/11 version."
         return
     }
-
     $packages = @($clientTools + $clientExtensions) | Sort-Object Name -Unique
-
     foreach ($pkg in $packages) {
         Write-Output "Installing: $($pkg.Name)..."
-        # Using DISM to add package
         $proc = Start-Process dism.exe -ArgumentList "/online", "/norestart", "/add-package:`"$($pkg.FullName)`"" -NoNewWindow -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            Write-Output " -> Failed (Exit Code: $($proc.ExitCode))"
-        }
+        if ($proc.ExitCode -ne 0) { Write-Output " -> Failed (Exit Code: $($proc.ExitCode))" }
     }
-    Write-Output "`nInstallation Complete. Try running 'gpedit.msc'. (A reboot may be required)."
-} "Installing Group Policy Editor..."
+    Write-Output "Installation Complete. Try running 'gpedit.msc'. (A reboot may be required)."
+} | Out-Null
 }
 
 # --- NETWORK / DNS HELPERS (from CLI) ---
@@ -22391,7 +22666,7 @@ Invoke-UiCommand {
 # --- FIREWALL TOOLS ---
 function Invoke-FirewallExport {
 $target = Join-Path (Get-DataPath) ("firewall_rules_{0}.wfw" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-Invoke-UiCommand { param($target) netsh advfirewall export "$target" } "Exporting firewall rules..." -ArgumentList $target
+Invoke-WmtUiBackgroundCommand -Name "FirewallExport" -Msg "Exporting firewall rules..." -Sb { param($target) netsh advfirewall export "$target" } -ArgumentList $target | Out-Null
 }
 
 function Invoke-FirewallImport {
@@ -22399,64 +22674,34 @@ $dlg = [Microsoft.Win32.OpenFileDialog]::new()
 $dlg.Filter = "Windows Firewall Policy (*.wfw)|*.wfw"
 if ($dlg.ShowDialog() -ne $true) { return }
 $file = $dlg.FileName
-Invoke-UiCommand { param($file) netsh advfirewall import "$file" } "Importing firewall rules..." -ArgumentList $file
+Invoke-WmtUiBackgroundCommand -Name "FirewallImport" -Msg "Importing firewall rules..." -Sb { param($file) netsh advfirewall import "$file" } -ArgumentList $file | Out-Null
 }
 
 function Invoke-FirewallDefaults {
 $confirm = [System.Windows.MessageBox]::Show("Restore default Windows Firewall rules? Custom rules will be removed.", "Restore Defaults", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
-Invoke-UiCommand { netsh advfirewall reset } "Restoring default firewall rules..."
+Invoke-WmtUiBackgroundCommand -Name "FirewallReset" -Msg "Restoring default firewall rules..." -Sb { netsh advfirewall reset } | Out-Null
 }
 
 function Invoke-FirewallPurge {
 $confirm = [System.Windows.MessageBox]::Show("Delete ALL firewall rules? This is destructive.", "Delete All Rules", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
-Invoke-UiCommand { Remove-NetFirewallRule -All } "Deleting all firewall rules..."
+Invoke-WmtUiBackgroundCommand -Name "FirewallPurge" -Msg "Deleting all firewall rules..." -Sb { Remove-NetFirewallRule -All } | Out-Null
 }
 
 # --- DRIVER TOOLS ---
 function Invoke-DriverReport {
-Invoke-UiCommand {
-    $outfile = Join-Path (Get-DataPath) "Installed_Drivers.txt"
+$outfile = Join-Path (Get-DataPath) "Installed_Drivers.txt"
+Invoke-WmtUiBackgroundCommand -Name "DriverReport" -Msg "Creating driver report..." -Sb {
+    param($outfile)
     driverquery /v > $outfile
     Write-Output "Driver report saved to $outfile"
-} "Creating driver report..."
+} -ArgumentList $outfile | Out-Null
 }
 
 function Invoke-ExportDrivers {
 Write-GuiLog "Starting Driver Export Tool..."
 $dataPath = try { Get-DataPath } catch { Join-Path $env:PUBLIC "WMT_Exports" }
-
-Set-WmtBusyCursor -Busy
-try {
-    $drivers = @()
-    foreach ($d in @(Get-WindowsDriver -Online -All | Where-Object { $_.Inbox -eq $false })) {
-        $classProbe = "$($d.ClassName) $($d.ProviderName)".ToLowerInvariant()
-        $class = "Other"
-        if ($classProbe -match "display|graphics|nvidia|amd|intel.*graphics") { $class = "Display" }
-        elseif ($classProbe -match "net|network|wifi|ethernet|realtek|broadcom|intel.*network") { $class = "Network" }
-        elseif ($classProbe -match "audio|sound") { $class = "Audio" }
-        elseif ($classProbe -match "storage|sata|nvme|raid|disk") { $class = "Storage" }
-        elseif ($classProbe -match "usb") { $class = "USB" }
-        elseif ($classProbe -match "print") { $class = "Printer" }
-        elseif ($classProbe -match "system|chipset|acpi") { $class = "System" }
-
-        $drivers += [PSCustomObject]@{
-            PublishedName = [string]$d.Driver
-            OriginalName  = [string]$d.OriginalFileName
-            Class         = $class
-            Provider      = [string]$d.ProviderName
-            Version       = [string]$d.Version
-            Date          = if ($d.Date) { $d.Date.ToString("yyyy-MM-dd") } else { "" }
-        }
-    }
-}
-finally { Set-WmtBusyCursor }
-
-if (-not $drivers -or $drivers.Count -eq 0) {
-    Show-WmtMessageBox -Message "No 3rd-party drivers found to export." -Title "Driver Export Tool" -Image Information | Out-Null
-    return
-}
 
 $content = @"
 <Grid Margin="16">
@@ -22476,10 +22721,10 @@ $content = @"
         <DataGrid Name="dgDrivers" Grid.Column="2" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
     </Grid>
     <Grid Grid.Row="2" Margin="0,12,0,0">
-        <TextBlock Name="lblStatus" Text="Ready" VerticalAlignment="Center" Foreground="{DynamicResource Accent}"/>
+        <TextBlock Name="lblStatus" Text="Loading drivers..." VerticalAlignment="Center" Foreground="{DynamicResource Accent}"/>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnExportSel" Content="Export Selected" MinWidth="128" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
-            <Button Name="btnExportAll" Content="Export All" MinWidth="104" Margin="0,0,8,0"/>
+            <Button Name="btnExportSel" Content="Export Selected" MinWidth="128" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0" IsEnabled="False"/>
+            <Button Name="btnExportAll" Content="Export All" MinWidth="104" Margin="0,0,8,0" IsEnabled="False"/>
             <Button Name="btnClose" Content="Close" Width="90" IsCancel="True"/>
         </StackPanel>
     </Grid>
@@ -22497,24 +22742,27 @@ $btnClose = $dialog.FindName("btnClose")
 Set-WmtDataGridColumns -DataGrid $dg -Columns @("PublishedName", "OriginalName", "Provider", "Version", "Date", "Class") -Widths @{ PublishedName = 130; OriginalName = "*"; Provider = 160; Version = 110; Date = 90; Class = 90 }
 $rows = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $dg.ItemsSource = $rows
-
-$classes = @([PSCustomObject]@{ Display = "All ($($drivers.Count))"; Class = "" })
-$classes += @($drivers | Group-Object Class | Sort-Object Name | ForEach-Object { [PSCustomObject]@{ Display = "$($_.Name) ($($_.Count))"; Class = $_.Name } })
-$lstClasses.DisplayMemberPath = "Display"
-$lstClasses.ItemsSource = $classes
-$lstClasses.SelectedIndex = 0
+$state = [PSCustomObject]@{ Drivers = @() }
 
 $refresh = {
     $rows.Clear()
     $selectedClass = if ($lstClasses.SelectedItem) { [string]$lstClasses.SelectedItem.Class } else { "" }
     $search = ([string]$txtSearch.Text).Trim().ToLowerInvariant()
-    foreach ($d in @($drivers)) {
+    foreach ($d in @($state.Drivers)) {
         if ($selectedClass -and $d.Class -ne $selectedClass) { continue }
         $haystack = "$($d.PublishedName) $($d.OriginalName) $($d.Provider) $($d.Version)".ToLowerInvariant()
         if ($search -and -not $haystack.Contains($search)) { continue }
         [void]$rows.Add($d)
     }
-    $lblStatus.Text = "$($rows.Count) shown / $($drivers.Count) drivers"
+    $lblStatus.Text = "$($rows.Count) shown / $(@($state.Drivers).Count) drivers"
+}.GetNewClosure()
+
+$rebuildClasses = {
+    $classes = @([PSCustomObject]@{ Display = "All ($(@($state.Drivers).Count))"; Class = "" })
+    $classes += @($state.Drivers | Group-Object Class | Sort-Object Name | ForEach-Object { [PSCustomObject]@{ Display = "$($_.Name) ($($_.Count))"; Class = $_.Name } })
+    $lstClasses.DisplayMemberPath = "Display"
+    $lstClasses.ItemsSource = $classes
+    $lstClasses.SelectedIndex = 0
 }.GetNewClosure()
 
 $exportDrivers = {
@@ -22524,41 +22772,101 @@ $exportDrivers = {
         Show-WmtMessageBox -Owner $dialog -Message "Please select at least one driver to export." -Title "Driver Export Tool" -Image Warning | Out-Null
         return
     }
-
-    $exportPath = Join-Path $dataPath "Drivers_Backup_$(Get-Date -Format yyyyMMdd_HHmm)"
-    New-Item -ItemType Directory -Path $exportPath -Force | Out-Null
-    Set-WmtBusyCursor -Busy
+    $payload = [PSCustomObject]@{
+        Targets    = $targets
+        ExportPath = (Join-Path $dataPath "Drivers_Backup_$(Get-Date -Format yyyyMMdd_HHmm)")
+    }
     $dialog.IsEnabled = $false
-    try {
-        $done = 0
-        foreach ($drv in $targets) {
-            $done++
-            $lblStatus.Text = "Exporting $done / $($targets.Count): $($drv.PublishedName)"
-            Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
-            $dir = Join-Path $exportPath $drv.Class
-            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            $process = Start-Process pnputil -ArgumentList "/export-driver", $drv.PublishedName, "`"$dir`"" -NoNewWindow -Wait -PassThru
-            if ($process.ExitCode -ne 0) { Write-GuiLog "Driver export failed for $($drv.PublishedName) (exit $($process.ExitCode))." }
-        }
-        $lblStatus.Text = "Done"
-        Show-WmtMessageBox -Owner $dialog -Message "Export Complete!`n`nSaved to:`n$exportPath" -Title "Success" -Image Information | Out-Null
-    }
-    catch {
-        $lblStatus.Text = "Error"
-        Show-WmtMessageBox -Owner $dialog -Message "An error occurred during export:`n`n$($_.Exception.Message)" -Title "Error" -Image Error | Out-Null
-    }
-    finally {
+    $lblStatus.Text = "Exporting $($targets.Count) driver(s)..."
+
+    $complete = {
+        param($results)
+        if (-not $dialog.IsLoaded) { return }
         $dialog.IsEnabled = $true
-        Set-WmtBusyCursor
-    }
+        $summary = @($results | Where-Object { $_ -and $_.PSObject.Properties["ExportPath"] } | Select-Object -Last 1)[0]
+        if ($summary) {
+            $failedCount = @($summary.Failed).Count
+            $lblStatus.Text = if ($failedCount -gt 0) { "Completed with $failedCount failure(s)" } else { "Done" }
+            $message = if ($failedCount -gt 0) { "Driver export completed with $failedCount failure(s). Saved to: $($summary.ExportPath)" } else { "Export Complete. Saved to: $($summary.ExportPath)" }
+            $image = if ($failedCount -gt 0) { "Warning" } else { "Information" }
+            Show-WmtMessageBox -Owner $dialog -Message $message -Title "Driver Export" -Image $image | Out-Null
+        }
+    }.GetNewClosure()
+
+    $failed = {
+        param($errorRecord)
+        if (-not $dialog.IsLoaded) { return }
+        $dialog.IsEnabled = $true
+        $lblStatus.Text = "Error"
+        $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+        Show-WmtMessageBox -Owner $dialog -Message "An error occurred during export: $message" -Title "Error" -Image Error | Out-Null
+    }.GetNewClosure()
+
+    Invoke-WmtUiBackgroundCommand -Msg "Exporting $($targets.Count) driver package(s)..." -SuppressResultLog -Sb {
+        param($payload)
+        $failedItems = [System.Collections.Generic.List[object]]::new()
+        foreach ($drv in @($payload.Targets)) {
+            $dir = Join-Path ([string]$payload.ExportPath) ([string]$drv.Class)
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            $process = Start-Process pnputil -ArgumentList "/export-driver", ([string]$drv.PublishedName), ('"' + $dir + '"') -NoNewWindow -Wait -PassThru
+            if ($process.ExitCode -ne 0) { [void]$failedItems.Add([PSCustomObject]@{ Driver = [string]$drv.PublishedName; ExitCode = [int]$process.ExitCode }) }
+        }
+        [PSCustomObject]@{ ExportPath = [string]$payload.ExportPath; Failed = $failedItems.ToArray() }
+    } -ArgumentList $payload -OnComplete $complete -OnError $failed | Out-Null
 }.GetNewClosure()
 
 if ($lstClasses) { $lstClasses.Add_SelectionChanged({ & $refresh }.GetNewClosure()) }
 if ($txtSearch) { $txtSearch.Add_TextChanged({ & $refresh }.GetNewClosure()) }
 if ($btnExportSel) { $btnExportSel.Add_Click({ & $exportDrivers -DriversToExport @($dg.SelectedItems) }.GetNewClosure()) }
-if ($btnExportAll) { $btnExportAll.Add_Click({ & $exportDrivers -DriversToExport @($drivers) }.GetNewClosure()) }
+if ($btnExportAll) { $btnExportAll.Add_Click({ & $exportDrivers -DriversToExport @($state.Drivers) }.GetNewClosure()) }
 if ($btnClose) { $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure()) }
-& $refresh
+
+$loadComplete = {
+    param($results)
+    if (-not $dialog.IsLoaded) { return }
+    $state.Drivers = @($results)
+    & $rebuildClasses
+    & $refresh
+    $btnExportSel.IsEnabled = ($state.Drivers.Count -gt 0)
+    $btnExportAll.IsEnabled = ($state.Drivers.Count -gt 0)
+    if ($state.Drivers.Count -eq 0) {
+        $lblStatus.Text = "No 3rd-party drivers found."
+        Show-WmtMessageBox -Owner $dialog -Message "No 3rd-party drivers found to export." -Title "Driver Export Tool" -Image Information | Out-Null
+    }
+}.GetNewClosure()
+
+$loadError = {
+    param($errorRecord)
+    if (-not $dialog.IsLoaded) { return }
+    $lblStatus.Text = "Failed to load drivers"
+    $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+    Show-WmtMessageBox -Owner $dialog -Message "Unable to enumerate third-party drivers: $message" -Title "Driver Export Tool" -Image Error | Out-Null
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Msg "Loading third-party drivers..." -SuppressResultLog -Sb {
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in @(Get-WindowsDriver -Online -All | Where-Object { $_.Inbox -eq $false })) {
+        $classProbe = "$($d.ClassName) $($d.ProviderName)".ToLowerInvariant()
+        $class = "Other"
+        if ($classProbe -match "display|graphics|nvidia|amd|intel.*graphics") { $class = "Display" }
+        elseif ($classProbe -match "net|network|wifi|ethernet|realtek|broadcom|intel.*network") { $class = "Network" }
+        elseif ($classProbe -match "audio|sound") { $class = "Audio" }
+        elseif ($classProbe -match "storage|sata|nvme|raid|disk") { $class = "Storage" }
+        elseif ($classProbe -match "usb") { $class = "USB" }
+        elseif ($classProbe -match "print") { $class = "Printer" }
+        elseif ($classProbe -match "system|chipset|acpi") { $class = "System" }
+        [void]$items.Add([PSCustomObject]@{
+            PublishedName = [string]$d.Driver
+            OriginalName  = [string]$d.OriginalFileName
+            Class         = $class
+            Provider      = [string]$d.ProviderName
+            Version       = [string]$d.Version
+            Date          = if ($d.Date) { $d.Date.ToString("yyyy-MM-dd") } else { "" }
+        })
+    }
+    $items.ToArray()
+} -OnComplete $loadComplete -OnError $loadError | Out-Null
+
 $dialog.ShowDialog() | Out-Null
 }
 
@@ -23006,48 +23314,44 @@ if (-not $selectedPath) {
     if ([string]::IsNullOrWhiteSpace($selectedPath)) { return }
 }
 
-Invoke-UiCommand {
-    param($Path)
-    if (-not (Test-Path $Path)) {
-        Write-Output "Restore failed: path not found $Path"
-        Show-WmtMessageBox -Message "Restore failed: path not found.`n$Path" -Title "Restore Drivers" -Image Error | Out-Null
-        return
-    }
-
-    $firstInf = Find-WmtFirstEnumeratedFile -Path $Path -Filter "*.inf"
-    if (-not $firstInf) {
-        Write-Output "Restore aborted: no INF files found in $Path"
-        Show-WmtMessageBox -Message "No INF files found in:`n$Path" -Title "Restore Drivers" -Image Warning | Out-Null
-        return
-    }
-
-    $output = pnputil.exe /add-driver "$Path\*.inf" /subdirs 2>&1
-    $code = $LASTEXITCODE
-    Write-Output $output
-    if ($code -eq 0 -or $code -eq 3010) {
-        Write-Output "Drivers restored from $Path"
-        # Restore stages NEW packages into the driver store — the cached
-        # Drivers list no longer matches reality, so drop the cache and
-        # re-enumerate (a real change, unlike removals which edit in place).
+$restoreDone = {
+    param($results)
+    $result = @($results | Where-Object { $_ -and $_.PSObject.Properties["Status"] } | Select-Object -Last 1)[0]
+    if (-not $result) { return }
+    if ($result.Output) { Write-GuiLog ([string]$result.Output) }
+    if ($result.Status -eq "Success") {
         $script:DriverCacheLoaded = $false
-        Show-WmtMessageBox -Message "Drivers restored from:`n$Path" -Title "Restore Drivers" -Image Information | Out-Null
+        Show-WmtMessageBox -Message "Drivers restored from:`n$($result.Path)" -Title "Restore Drivers" -Image Information | Out-Null
+        if ($script:DriverPackages.Count -gt 0) { Start-DriverListLoad -Force }
+    }
+    elseif ($result.Status -eq "MissingInf") {
+        Show-WmtMessageBox -Message "No INF files found in:`n$($result.Path)" -Title "Restore Drivers" -Image Warning | Out-Null
     }
     else {
-        Write-Output "Restore failed (exit $code)."
-        $msg = "Restore failed (exit $code)." + "`n`nOutput:`n" + ($output | Out-String)
-        Show-WmtMessageBox -Message $msg -Title "Restore Drivers" -Image Error | Out-Null
+        Show-WmtMessageBox -Message "Restore failed (exit $($result.ExitCode)).`n`n$($result.Output)" -Title "Restore Drivers" -Image Error | Out-Null
     }
-} "Restoring drivers..." -ArgumentList $selectedPath
-# If a cached list was on screen while restoring, reload it now so the newly
-# staged packages appear; otherwise the next Drivers tab visit reloads.
-if (-not $script:DriverCacheLoaded -and $script:DriverPackages.Count -gt 0) {
-    Start-DriverListLoad -Force
-}
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Name "DriverRestore" -Msg "Restoring drivers..." -SuppressResultLog -Sb {
+    param($Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Restore path not found: $Path" }
+    $firstInf = Get-ChildItem -LiteralPath $Path -Filter "*.inf" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $firstInf) { return [PSCustomObject]@{ Status="MissingInf"; Path=$Path; ExitCode=-1; Output="" } }
+    $output = pnputil.exe /add-driver "$Path\*.inf" /subdirs 2>&1
+    $code = $LASTEXITCODE
+    [PSCustomObject]@{
+        Status = if ($code -eq 0 -or $code -eq 3010) { "Success" } else { "Failed" }
+        Path = $Path
+        ExitCode = $code
+        Output = ((@($output) | ForEach-Object { [string]$_ }) -join "`n")
+    }
+} -ArgumentList $selectedPath -OnComplete $restoreDone | Out-Null
+
 }
 
 # --- UPDATE / REPORT TOOLS ---
 function Invoke-WindowsUpdateRepairFull {
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairFull" -Msg "Running full Windows Update repair..." -Sb {
     $services = @('wuauserv', 'bits', 'cryptsvc', 'msiserver', 'usosvc', 'trustedinstaller')
     foreach ($svc in $services) { try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue } catch {} }
     try { Get-BitsTransfer -AllUsers | Remove-BitsTransfer -Confirm:$false } catch {}
@@ -23060,7 +23364,7 @@ Invoke-UiCommand {
     try { netsh winhttp reset proxy | Out-Null } catch {}
     foreach ($svc in $services) { try { Start-Service -Name $svc -ErrorAction SilentlyContinue } catch {} }
     Write-Output "Windows Update repair completed."
-} "Running full Windows Update repair..."
+} | Out-Null
 }
 
 function Invoke-SystemReports {
@@ -23068,38 +23372,26 @@ $selectedFolder = Select-WmtFolder -Description "Select output folder for system
 if ([string]::IsNullOrWhiteSpace($selectedFolder)) { return }
 $outdir = Join-Path $selectedFolder ("SystemReports_{0}" -f (Get-Date -Format "yyyy-MM-dd_HHmm"))
 if (-not (Test-Path $outdir)) { New-Item -ItemType Directory -Path $outdir | Out-Null }
-
-Invoke-UiCommand {
+Invoke-WmtUiBackgroundCommand -Name "SystemReports" -Msg "Generating system reports..." -Sb {
     param($outdir)
     $date = Get-Date -Format "yyyy-MM-dd"
-    $sys = Join-Path $outdir "System_Info_$date.txt"
-    $net = Join-Path $outdir "Network_Info_$date.txt"
-    $drv = Join-Path $outdir "Driver_List_$date.txt"
-    Invoke-WmtCliText -FilePath "systeminfo" | Out-File -FilePath $sys -Encoding UTF8
-    Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/all" | Out-File -FilePath $net -Encoding UTF8
-    Invoke-WmtCliText -FilePath "driverquery" | Out-File -FilePath $drv -Encoding UTF8
+    Invoke-WmtCliText -FilePath "systeminfo" | Out-File -FilePath (Join-Path $outdir "System_Info_$date.txt") -Encoding UTF8
+    Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/all" | Out-File -FilePath (Join-Path $outdir "Network_Info_$date.txt") -Encoding UTF8
+    Invoke-WmtCliText -FilePath "driverquery" | Out-File -FilePath (Join-Path $outdir "Driver_List_$date.txt") -Encoding UTF8
     Write-Output "Reports saved to $outdir"
-    # CHANGE IS HERE: Passing the argument explicitly
-} "Generating system reports..." -ArgumentList $outdir
+} -ArgumentList $outdir | Out-Null
 }
 
 function Invoke-UpdateServiceReset {
-Invoke-UiCommand {
-    try {
-        $script:UpdateSvcResult = "OK"
-        Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
-        Stop-Service -Name cryptsvc -Force -ErrorAction SilentlyContinue
-        Start-Service -Name appidsvc -ErrorAction SilentlyContinue
-        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
-        Start-Service -Name cryptsvc -ErrorAction SilentlyContinue
-        Start-Service -Name bits -ErrorAction SilentlyContinue
-        Write-Output "Restarted Windows Update related services."
-    }
-    catch {
-        $script:UpdateSvcResult = "ERR: $($_.Exception.Message)"
-        throw
-    }
-} "Restarting Windows Update services..."
+Invoke-WmtUiBackgroundCommand -Name "UpdateServiceReset" -Msg "Restarting Windows Update services..." -Sb {
+    Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+    Stop-Service -Name cryptsvc -Force -ErrorAction SilentlyContinue
+    Start-Service -Name appidsvc -ErrorAction SilentlyContinue
+    Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+    Start-Service -Name cryptsvc -ErrorAction SilentlyContinue
+    Start-Service -Name bits -ErrorAction SilentlyContinue
+    Write-Output "Restarted Windows Update related services."
+} | Out-Null
 }
 
 function Set-DotNetRollForward {
@@ -29674,8 +29966,8 @@ try {
     $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
     $ta = & $getRegValue $ap "TaskbarAl";
 
-    $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"; $taskbarLeft = ($ta -ne 0 -and $null -ne $ta); Update-WmtTweakToggle $btnToggleTaskbarAlign $taskbarLeft "Align Taskbar Center" "Align Taskbar Left"
-    $tc = & $getRegValue $ap "TaskbarGlomLevel"; $neverCombine = ($tc -eq 2); Update-WmtTweakToggle $btnToggleCombine $neverCombine "Always Combine" "Never Combine"
+    $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"; $taskbarLeft = ($ta -eq 0); Update-WmtTweakToggle $btnToggleTaskbarAlign $taskbarLeft "Align Taskbar Left" "Align Taskbar Center"
+    $tc = & $getRegValue $ap "TaskbarGlomLevel"; $neverCombine = ($tc -eq 2); Update-WmtTweakToggle $btnToggleCombine $neverCombine "Never Combine" "Always Combine"
     $is24 = ((ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\International" "sShortTime") "") -cmatch "H")
     $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"; Update-WmtTweakToggle $btnToggleClockFormat $is24 "12-Hour Clock" "24-Hour Clock"
     $cs = & $getRegValue $ap "ShowSecondsInSystemClock"; $clockSecsOn = ($cs -eq 1); Update-WmtTweakToggle $btnToggleClockSecs $clockSecsOn "Hide Clock Seconds" "Show Clock Seconds"
@@ -30268,15 +30560,10 @@ if ($btnDrvReport) { $btnDrvReport.Add_Click({ Invoke-DriverReport }) }
 
 $btnDrvBackup = Get-Ctrl "btnDrvBackup"
 if ($btnDrvBackup) { 
-$btnDrvBackup.Add_Click({ 
-        # Disable button immediately to prevent double-clicks
-        $this.IsEnabled = $false 
-
-        Invoke-ExportDrivers 
-
-        # Freeze this specific UI thread for 1 second, then re-enable
-        Start-Sleep -Seconds 1
-        $this.IsEnabled = $true
+$btnDrvBackup.Add_Click({
+        $this.IsEnabled = $false
+        try { Invoke-ExportDrivers }
+        finally { $this.IsEnabled = $true }
     }) 
 }
 
@@ -36753,111 +37040,21 @@ if (-not $Force -and $script:WmtSteamLibraryCache) { return $script:WmtSteamLibr
 
 $result = [System.Collections.Generic.List[object]]::new()
 
-# Find Steam install path.
-$steamInstall = $null
-foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-    try {
-        $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-        if ($props) {
-            foreach ($p in @("SteamPath", "InstallPath")) {
-                if ($props.PSObject.Properties[$p]) {
-                    $v = [string]$props.$p
-                    if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $steamInstall = $v; break }
-                }
-            }
-        }
-    }
-    catch {}
-    if ($steamInstall) { break }
-}
-if (-not $steamInstall) {
-    foreach ($c in @("${env:ProgramFiles(x86)}\Steam", "${env:ProgramFiles}\Steam")) {
-        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) { $steamInstall = $c; break }
-    }
-}
+# Read Steam roots/manifests/ownership through the shared helper layer.
+$steamInstall = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0]
 if (-not $steamInstall) {
     $script:WmtSteamLibraryCache = $result.ToArray()
     return $script:WmtSteamLibraryCache
 }
 
 try {
-    # Step 1: Get installed game names from appmanifest files.
     $installedApps = @{}
-    $libraryRoots = [System.Collections.Generic.List[string]]::new()
-    if (Test-Path -LiteralPath (Join-Path $steamInstall "steamapps")) { [void]$libraryRoots.Add($steamInstall) }
-    $libFile = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
-    if (Test-Path -LiteralPath $libFile -PathType Leaf) {
-        $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if (-not [string]::IsNullOrWhiteSpace($libText)) {
-            foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-                $p = $m.Groups[1].Value -replace '\\\\', '\'
-                if ((Test-Path -LiteralPath $p) -and -not $libraryRoots.Contains($p)) { [void]$libraryRoots.Add($p) }
-            }
-        }
+    foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+        $installedApps[[string]$manifest.Id] = @{ Name=[string]$manifest.Name; BuildId=[string]$manifest.BuildId }
     }
-    foreach ($libRoot in $libraryRoots) {
-        $steamApps = Join-Path $libRoot "steamapps"
-        if (-not (Test-Path -LiteralPath $steamApps)) { continue }
-        foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-            $mtext = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if ([string]::IsNullOrWhiteSpace($mtext)) { continue }
-            $aid = ""
-            $am = [regex]::Match($mtext, '"appid"\s+"([^"]*)"')
-            if ($am.Success) { $aid = $am.Groups[1].Value }
-            if ([string]::IsNullOrWhiteSpace($aid)) { $aid = [regex]::Match($manifest.BaseName, '\d+').Value }
-            if ([string]::IsNullOrWhiteSpace($aid)) { continue }
-            $mname = ""
-            $nm = [regex]::Match($mtext, '"name"\s+"([^"]*)"')
-            if ($nm.Success) { $mname = $nm.Groups[1].Value }
-            if ([string]::IsNullOrWhiteSpace($mname)) { $mname = "Steam App $aid" }
-            $buildId = ""
-            $bm = [regex]::Match($mtext, '"buildid"\s+"([^"]*)"')
-            if ($bm.Success) { $buildId = $bm.Groups[1].Value }
-            $installedApps[$aid] = @{ Name = $mname; BuildId = $buildId }
-        }
-    }
-
-    # Step 2: Get owned app IDs from localconfig.vdf (case-insensitive "apps" search).
     $ownedAppIds = [System.Collections.Generic.List[string]]::new()
-    $userdataPath = Join-Path $steamInstall "userdata"
-    if (Test-Path -LiteralPath $userdataPath) {
-        foreach ($userDir in @(Get-ChildItem -LiteralPath $userdataPath -Directory -ErrorAction SilentlyContinue)) {
-            $vdfPath = Join-Path $userDir.FullName "config\localconfig.vdf"
-            if (-not (Test-Path -LiteralPath $vdfPath -PathType Leaf)) { continue }
-            $vdfText = Get-Content -LiteralPath $vdfPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if ([string]::IsNullOrWhiteSpace($vdfText)) { continue }
-
-            # Case-insensitive search for "apps"
-            $appsIdx = $vdfText.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
-            if ($appsIdx -lt 0) { continue }
-
-            $braceIdx = $vdfText.IndexOf('{', $appsIdx)
-            if ($braceIdx -lt 0) { continue }
-
-            # Brace-matching parser: at depth 1, quoted strings followed by
-            # '{' are app IDs.
-            $depth = 0
-            $i = $braceIdx
-            while ($i -lt $vdfText.Length) {
-                $ch = $vdfText[$i]
-                if ($ch -eq '{') { $depth++; $i++ }
-                elseif ($ch -eq '}') { $depth--; if ($depth -le 0) { break }; $i++ }
-                elseif ($ch -eq '"') {
-                    $endQ = $vdfText.IndexOf('"', $i + 1)
-                    if ($endQ -lt 0) { break }
-                    $str = $vdfText.Substring($i + 1, $endQ - $i - 1)
-                    $i = $endQ + 1
-                    if ($depth -eq 1) {
-                        $j = $i
-                        while ($j -lt $vdfText.Length -and [char]::IsWhiteSpace($vdfText[$j])) { $j++ }
-                        if ($j -lt $vdfText.Length -and $vdfText[$j] -eq '{') {
-                            if (-not $ownedAppIds.Contains($str)) { [void]$ownedAppIds.Add($str) }
-                        }
-                    }
-                }
-                else { $i++ }
-            }
-        }
+    foreach ($aid in @(Get-WmtSteamOwnedAppIds -SteamRoot $steamInstall)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$aid) -and -not $ownedAppIds.Contains([string]$aid)) { [void]$ownedAppIds.Add([string]$aid) }
     }
 
     # Step 3: Resolve names for owned apps not in appmanifests.
@@ -41381,225 +41578,71 @@ $btnWingetScan.Add_Click({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Steam game manifests..."
 
-                function Add-UniqueSteamPath {
-                    param(
-                        [System.Collections.Generic.List[string]]$Paths,
-                        [string]$Path
-                    )
-
-                    if ([string]::IsNullOrWhiteSpace($Path)) { return }
-                    $rawPathText = ([string]$Path).Trim()
-                    $expanded = [Environment]::ExpandEnvironmentVariables($rawPathText)
-                    $expanded = $expanded -replace '/', '\'
-                    $expanded = $expanded -replace '\\\\', '\'
-                    try {
-                        $full = [System.IO.Path]::GetFullPath($expanded)
-                        if ((Test-Path -LiteralPath $full) -and -not $Paths.Contains($full)) {
-                            [void]$Paths.Add($full)
-                        }
-                    }
-                    catch {}
-                }
-
-                function ConvertFrom-SteamVdfPath {
-                    param([string]$Value)
-                    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
-                    $path = ([string]$Value).Trim()
-                    $path = $path -replace '\\\\', '\'
-                    $path = $path -replace '/', '\'
-                    return [Environment]::ExpandEnvironmentVariables($path)
-                }
-
-                function Get-SteamManifestValue {
-                    param(
-                        [string]$Text,
-                        [string]$Key
-                    )
-
-                    if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Key)) { return "" }
-                    $pattern = '"' + [regex]::Escape($Key) + '"\s+"([^"]*)"'
-                    $match = [regex]::Match($Text, $pattern)
-                    if ($match.Success) { return [string]$match.Groups[1].Value }
-                    return ""
-                }
-
-                function Get-SteamManifestNumber {
-                    param(
-                        [string]$Text,
-                        [string]$Key
-                    )
-
-                    $value = Get-SteamManifestValue -Text $Text -Key $Key
-                    $number = [long]0
-                    if ([long]::TryParse(([string]$value), [ref]$number)) { return $number }
-                    return [long]0
-                }
-
-                function Get-SteamInstallRoots {
-                    $paths = [System.Collections.Generic.List[string]]::new()
-                    $registryPaths = @(
-                        "HKCU:\Software\Valve\Steam",
-                        "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam",
-                        "HKLM:\SOFTWARE\Valve\Steam"
-                    )
-
-                    foreach ($registryPath in $registryPaths) {
-                        try {
-                            $props = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
-                            foreach ($propName in @("SteamPath", "InstallPath")) {
-                                if ($props.PSObject.Properties[$propName]) {
-                                    Add-UniqueSteamPath -Paths $paths -Path ([string]$props.$propName)
-                                }
-                            }
-                            if ($props.PSObject.Properties["SteamExe"] -and -not [string]::IsNullOrWhiteSpace([string]$props.SteamExe)) {
-                                Add-UniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$props.SteamExe))
-                            }
-                        }
-                        catch {}
-                    }
-
-                    foreach ($candidate in @(
-                            "${env:ProgramFiles(x86)}\Steam",
-                            "${env:ProgramFiles}\Steam",
-                            "${env:SystemDrive}\Steam",
-                            "${env:SystemDrive}\steamcmd"
-                        )) {
-                        Add-UniqueSteamPath -Paths $paths -Path $candidate
-                    }
-
-                    foreach ($cmdName in @("steamcmd", "steamcmd.exe")) {
-                        try {
-                            $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
-                            if ($cmd -and $cmd.Source) {
-                                Add-UniqueSteamPath -Paths $paths -Path (Split-Path -Parent ([string]$cmd.Source))
-                            }
-                        }
-                        catch {}
-                    }
-
-                    return $paths.ToArray()
-                }
-
-                function Get-SteamLibraryRoots {
-                    $paths = [System.Collections.Generic.List[string]]::new()
-                    foreach ($root in @(Get-SteamInstallRoots)) {
-                        if ([string]::IsNullOrWhiteSpace($root)) { continue }
-                        if (Test-Path -LiteralPath (Join-Path $root "steamapps")) {
-                            Add-UniqueSteamPath -Paths $paths -Path $root
-                        }
-
-                        $libraryFile = Join-Path $root "steamapps\libraryfolders.vdf"
-                        if (-not (Test-Path -LiteralPath $libraryFile)) { continue }
-
-                        $libraryText = Get-Content -LiteralPath $libraryFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                        if ([string]::IsNullOrWhiteSpace($libraryText)) { continue }
-
-                        foreach ($match in [regex]::Matches($libraryText, '"path"\s+"([^"]+)"')) {
-                            Add-UniqueSteamPath -Paths $paths -Path (ConvertFrom-SteamVdfPath $match.Groups[1].Value)
-                        }
-                        foreach ($match in [regex]::Matches($libraryText, '"\d+"\s+"([^"]+)"')) {
-                            $candidate = ConvertFrom-SteamVdfPath $match.Groups[1].Value
-                            if ($candidate -match '^[A-Za-z]:\\|^\\\\') {
-                                Add-UniqueSteamPath -Paths $paths -Path $candidate
-                            }
-                        }
-                    }
-
-                    return $paths.ToArray()
-                }
-
-                $seenAppIds = @{}
+                # Shared Steam helpers are injected by New-WmtRunspaceInitialState.
                 $manifestCount = 0
                 $pendingCount = 0
 
                 try {
-                    $libraryRoots = @(Get-SteamLibraryRoots)
+                    $libraryRoots = @(Get-WmtSteamLibraryRoots)
                     if ($libraryRoots.Count -eq 0) {
                         Write-Output "LOG:Steam scan skipped: no Steam library folders were found."
                         return
                     }
 
-                    foreach ($libraryRoot in $libraryRoots) {
-                        $steamApps = Join-Path $libraryRoot "steamapps"
-                        if (-not (Test-Path -LiteralPath $steamApps)) { continue }
+                    $installedManifests = @(Get-WmtSteamInstalledManifests)
+                    $manifestCount = $installedManifests.Count
+                    foreach ($manifestInfo in $installedManifests) {
+                        $appId = [string]$manifestInfo.Id
+                        $name = [string]$manifestInfo.Name
+                        $text = [string]$manifestInfo.Text
+                        $installDir = ConvertFrom-WmtSteamVdfPath ([string]$manifestInfo.InstallDir)
 
-                        foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-                            $manifestCount++
-                            $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                        [PSCustomObject]@{
+                            WmtStateType = "ProviderOwnership"
+                            Provider     = "steam"
+                            Name         = $name
+                            Id           = $appId
+                            InstallDir   = $installDir
+                        }
 
-                            $appId = Get-SteamManifestValue -Text $text -Key "appid"
-                            if ([string]::IsNullOrWhiteSpace($appId)) {
-                                $appId = [regex]::Match($manifest.BaseName, '\d+').Value
-                            }
-                            if ([string]::IsNullOrWhiteSpace($appId)) { continue }
-                            if ($seenAppIds.ContainsKey($appId)) { continue }
-                            $seenAppIds[$appId] = $true
+                        if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
 
-                            $name = Get-SteamManifestValue -Text $text -Key "name"
-                            if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
-                            $installDir = ConvertFrom-SteamVdfPath (Get-SteamManifestValue -Text $text -Key "installdir")
+                        $stateFlags = Get-WmtSteamManifestNumber -Text $text -Key "StateFlags"
+                        $bytesToDownload = Get-WmtSteamManifestNumber -Text $text -Key "BytesToDownload"
+                        $bytesDownloaded = Get-WmtSteamManifestNumber -Text $text -Key "BytesDownloaded"
+                        $bytesToStage = Get-WmtSteamManifestNumber -Text $text -Key "BytesToStage"
+                        $bytesStaged = Get-WmtSteamManifestNumber -Text $text -Key "BytesStaged"
+                        $buildId = [string]$manifestInfo.BuildId
+                        $targetBuildId = Get-WmtSteamManifestValue -Text $text -Key "TargetBuildID"
 
-                            # Let the UI-side scan aggregator distinguish unknown-version
-                            # winget matches from games actually owned by Steam. Use a typed
-                            # object because EndInvoke() wraps pipeline output in PSObject.
-                            # This is emitted for every installed Steam app, not only pending ones.
-                            [PSCustomObject]@{
-                                WmtStateType = "ProviderOwnership"
-                                Provider     = "steam"
-                                Name         = $name
-                                Id           = $appId
-                                InstallDir   = $installDir
-                            }
+                        $downloadRemaining = [Math]::Max([long]0, $bytesToDownload - $bytesDownloaded)
+                        $stageRemaining = [Math]::Max([long]0, $bytesToStage - $bytesStaged)
+                        $hasTargetBuild = (-not [string]::IsNullOrWhiteSpace($targetBuildId) -and $targetBuildId -ne "0" -and $targetBuildId -ne $buildId)
+                        $needsAttention = (
+                            ($stateFlags -ne 0 -and $stateFlags -ne 4) -or
+                            $downloadRemaining -gt 0 -or
+                            $stageRemaining -gt 0 -or
+                            $hasTargetBuild
+                        )
+                        if (-not $needsAttention) { continue }
 
-                            if ($IgnoreList -and ($IgnoreList -contains $name -or $IgnoreList -contains $appId)) { continue }
+                        $pendingCount++
+                        $versionText = if (-not [string]::IsNullOrWhiteSpace($buildId) -and $buildId -ne "0") { "Build $buildId" } else { "State $stateFlags" }
+                        $availableText = "Steam pending"
+                        if ($hasTargetBuild) { $availableText = "Build $targetBuildId" }
+                        elseif ($downloadRemaining -gt 0) { $availableText = "{0:N1} MB pending" -f ($downloadRemaining / 1MB) }
+                        elseif ($stageRemaining -gt 0) { $availableText = "{0:N1} MB staging" -f ($stageRemaining / 1MB) }
+                        elseif ($stateFlags -ne 4) { $availableText = "State $stateFlags" }
 
-                            $stateFlags = Get-SteamManifestNumber -Text $text -Key "StateFlags"
-                            $bytesToDownload = Get-SteamManifestNumber -Text $text -Key "BytesToDownload"
-                            $bytesDownloaded = Get-SteamManifestNumber -Text $text -Key "BytesDownloaded"
-                            $bytesToStage = Get-SteamManifestNumber -Text $text -Key "BytesToStage"
-                            $bytesStaged = Get-SteamManifestNumber -Text $text -Key "BytesStaged"
-                            $buildId = Get-SteamManifestValue -Text $text -Key "buildid"
-                            $targetBuildId = Get-SteamManifestValue -Text $text -Key "TargetBuildID"
-
-                            $downloadRemaining = [Math]::Max([long]0, $bytesToDownload - $bytesDownloaded)
-                            $stageRemaining = [Math]::Max([long]0, $bytesToStage - $bytesStaged)
-                            $hasTargetBuild = (-not [string]::IsNullOrWhiteSpace($targetBuildId) -and $targetBuildId -ne "0" -and $targetBuildId -ne $buildId)
-                            $needsAttention = (
-                                ($stateFlags -ne 0 -and $stateFlags -ne 4) -or
-                                $downloadRemaining -gt 0 -or
-                                $stageRemaining -gt 0 -or
-                                $hasTargetBuild
-                            )
-
-                            if (-not $needsAttention) { continue }
-
-                            $pendingCount++
-                            $versionText = if (-not [string]::IsNullOrWhiteSpace($buildId) -and $buildId -ne "0") { "Build $buildId" } else { "State $stateFlags" }
-                            $availableText = "Steam pending"
-                            if ($hasTargetBuild) {
-                                $availableText = "Build $targetBuildId"
-                            }
-                            elseif ($downloadRemaining -gt 0) {
-                                $availableText = "{0:N1} MB pending" -f ($downloadRemaining / 1MB)
-                            }
-                            elseif ($stageRemaining -gt 0) {
-                                $availableText = "{0:N1} MB staging" -f ($stageRemaining / 1MB)
-                            }
-                            elseif ($stateFlags -ne 4) {
-                                $availableText = "State $stateFlags"
-                            }
-
-                            [PSCustomObject]@{
-                                Source       = "steam"
-                                Name         = $name
-                                Id           = $appId
-                                Version      = $versionText
-                                Available    = $availableText
-                                LibraryPath  = $libraryRoot
-                                InstallDir   = $installDir
-                                ManifestPath = $manifest.FullName
-                            }
+                        [PSCustomObject]@{
+                            Source       = "steam"
+                            Name         = $name
+                            Id           = $appId
+                            Version      = $versionText
+                            Available    = $availableText
+                            LibraryPath  = [string]$manifestInfo.LibraryRoot
+                            InstallDir   = $installDir
+                            ManifestPath = [string]$manifestInfo.ManifestPath
                         }
                     }
 
@@ -43466,38 +43509,31 @@ $btnSFC.Add_Click({
     Start-Process -FilePath "powershell.exe" -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "sfc /scannow; Write-Host; Write-Host ''Execution Complete.'' -ForegroundColor Green; Write-Host ''Press Enter to close...'' -NoNewline -ForegroundColor Gray; Read-Host"' -Verb RunAs -WindowStyle Normal
 })
 $btnDISMCheck.Add_Click({
-    Invoke-UiCommand {
-        $text = Invoke-WmtCliText -FilePath "dism" -Arguments "/online /cleanup-image /checkhealth" -TimeoutMs 120000
-        if ($text) { Write-Output $text }
-
-        $message = "DISM Check completed."
-        $needsRepair = $false
-        if ($text -match "No component store corruption detected") {
-            $message = "DISM Check: no corruption detected."
-        }
-        elseif ($text -match "component store is repairable") {
-            $message = "DISM Check: corruption detected (repairable)."
-            $needsRepair = $true
-        }
-        elseif ($text -match "The operation completed successfully") {
-            $message = "DISM Check: completed successfully."
-        }
-        Set-WmtBusyCursor
-        [System.Windows.MessageBox]::Show($message, "DISM CheckHealth", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-
-        if ($needsRepair) {
-            $prompt = [System.Windows.MessageBox]::Show(
-                "DISM found repairable corruption.`n`nRun DISM RestoreHealth now?",
-                "DISM CheckHealth",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Question
-            )
-            if ($prompt -eq "Yes") {
-                Write-Output "Launching DISM RestoreHealth..."
+    $done = {
+        param($results)
+        $r = @($results | Where-Object { $_ -and $_.PSObject.Properties["Message"] } | Select-Object -Last 1)[0]
+        if (-not $r) { return }
+        if ($r.Text) { Write-GuiLog ([string]$r.Text) }
+        Show-WmtMessageBox -Message ([string]$r.Message) -Title "DISM CheckHealth" -Image Information | Out-Null
+        if ([bool]$r.NeedsRepair) {
+            $prompt = Show-WmtMessageBox -Message "DISM found repairable corruption.`n`nRun DISM RestoreHealth now?" -Title "DISM CheckHealth" -Button YesNo -Image Question
+            if ($prompt -eq [System.Windows.MessageBoxResult]::Yes) {
                 Start-Process -FilePath "powershell.exe" -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "dism /online /cleanup-image /restorehealth; Write-Host; Write-Host ''Execution Complete.'' -ForegroundColor Green; Write-Host ''Press Enter to close...'' -NoNewline -ForegroundColor Gray; Read-Host"' -Verb RunAs -WindowStyle Normal
             }
         }
-    } "Running DISM CheckHealth..."
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name "DismCheckHealth" -Msg "Running DISM CheckHealth..." -SuppressResultLog -Sb {
+        $text = Invoke-WmtCliText -FilePath "dism" -Arguments "/online /cleanup-image /checkhealth" -TimeoutMs 120000
+        $message = "DISM Check completed."
+        $needsRepair = $false
+        if ($text -match "No component store corruption detected") { $message = "DISM Check: no corruption detected." }
+        elseif ($text -match "component store is repairable") { $message = "DISM Check: corruption detected (repairable)."; $needsRepair = $true }
+        elseif ($text -match "The operation completed successfully") { $message = "DISM Check: completed successfully." }
+        [PSCustomObject]@{ Text=[string]$text; Message=$message; NeedsRepair=$needsRepair }
+    } -OnComplete $done | Out-Null
+})
+$btnDISMRestore.Add_Click({
+
 })
 $btnDISMRestore.Add_Click({
     Start-Process -FilePath "powershell.exe" -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "dism /online /cleanup-image /restorehealth; Write-Host; Write-Host ''Execution Complete.'' -ForegroundColor Green; Write-Host ''Press Enter to close...'' -NoNewline -ForegroundColor Gray; Read-Host"' -Verb RunAs -WindowStyle Normal
@@ -47760,35 +47796,34 @@ return ($results | Sort-Object Name)
 }
 
 if ($btnAppxLoad) { $btnAppxLoad.Add_Click({
-    Invoke-UiCommand {
-        $lstAppxPackages.Items.Clear()
-        $apps = @(Get-WmtRemovableAppxPackages)
-        foreach ($app in $apps) {
-            $lstAppxPackages.Items.Add([PSCustomObject]@{
-                    Name    = [string]$app.Name
-                    Package = [string]$app.PackageFullName
-                }) | Out-Null
-        }
-        Write-GuiLog "Loaded $($apps.Count) removable UWP apps."
-    } "Loading UWP apps..."
+    Write-GuiLog "Loading removable UWP apps..."
+    Start-AppxBackgroundLoad
 }) }
 
 if ($btnAppxRemoveSel) { $btnAppxRemoveSel.Add_Click({
-    $selected = $lstAppxPackages.SelectedItems
+    $selected = @($lstAppxPackages.SelectedItems | ForEach-Object { [PSCustomObject]@{ Name=[string]$_.Name; Package=[string]$_.Package } })
     if ($selected.Count -eq 0) { return }
-    Invoke-UiCommand {
+    $done = {
+        param($results)
+        foreach ($r in @($results)) {
+            if (-not $r) { continue }
+            if ([bool]$r.Success) { Write-GuiLog "Removed: $($r.Name)" }
+            else { Write-GuiLog "Failed to remove: $($r.Name) - $($r.Error)" }
+        }
+        Start-AppxBackgroundLoad
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name "AppxRemoveSelected" -Msg "Removing selected apps..." -SuppressResultLog -Sb {
         param($apps)
-        foreach ($app in $apps) {
+        foreach ($app in @($apps)) {
             try {
-                # $app.Package already holds the full PackageFullName
-                Remove-AppxPackage -Package $app.Package -ErrorAction Stop
-                Write-GuiLog "Removed: $($app.Name)"
+                Remove-AppxPackage -Package ([string]$app.Package) -ErrorAction Stop
+                [PSCustomObject]@{ Name=[string]$app.Name; Success=$true; Error="" }
             }
             catch {
-                Write-GuiLog "Failed to remove: $($app.Name) - $($_.Exception.Message)"
+                [PSCustomObject]@{ Name=[string]$app.Name; Success=$false; Error=$_.Exception.Message }
             }
         }
-    } "Removing selected apps..." -ArgumentList $selected
+    } -ArgumentList (, $selected) -OnComplete $done | Out-Null
 }) }
 
 if ($btnAppxRemoveAll) { $btnAppxRemoveAll.Add_Click({
@@ -47854,54 +47889,71 @@ else {
 }
 
 function Switch-WindowsFeature($FeatureName, $DisplayName) {
-Invoke-UiCommand {
+$buttonName = switch ($FeatureName) {
+    "Microsoft-Hyper-V-All" { "btnFeatHyperV" }
+    "Microsoft-Windows-Subsystem-Linux" { "btnFeatWSL" }
+    "Containers-DisposableClientVM" { "btnFeatSandbox" }
+    "NetFx3" { "btnFeatDotNet35" }
+    "ServicesForNFS-ClientOnly" { "btnFeatNFS" }
+    "TelnetClient" { "btnFeatTelnet" }
+    "IIS-WebServerRole" { "btnFeatIIS" }
+    "WindowsMediaPlayer" { "btnFeatLegacy" }
+    "VirtualMachinePlatform" { "btnFeatVMP" }
+    "HypervisorPlatform" { "btnFeatWHP" }
+    "OpenSSH.Client" { "btnFeatSSHClient" }
+    "OpenSSH.Server" { "btnFeatSSHServer" }
+    "Windows-Defender-ApplicationGuard" { "btnFeatAppGuard" }
+    "WirelessDisplay" { "btnFeatMiracast" }
+    "QuickAssist" { "btnFeatQuickAssist" }
+    "XpsViewer" { "btnFeatXPS" }
+    "TIFFIFilter" { "btnFeatTIFF" }
+    default { "" }
+}
+$done = {
+    param($results)
+    if (-not [string]::IsNullOrWhiteSpace($buttonName)) {
+        Update-SingleFeatureButtonState -ButtonName $buttonName -FeatureName $FeatureName
+    }
+}.GetNewClosure()
+Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $DisplayName..." -Sb {
     param($fn, $dn)
     if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
-        Write-GuiLog "PowerShell feature cmdlets unavailable; trying DISM fallback..."
+        Write-Output "PowerShell feature cmdlets unavailable; trying DISM fallback..."
         $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn"
         if ($featureInfo -match 'State\s*:\s*Enabled') {
             dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Disabled: $dn (DISM)" }
-            else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
         }
         else {
             dism /Online /Enable-Feature /FeatureName:$fn /All /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Enabled: $dn (DISM)" }
-            else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Enabled: $dn (DISM)" } else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
         }
         return
     }
-
     $feature = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction SilentlyContinue
-
-    # Some systems report NetFx3 as unknown to PowerShell even when DISM can toggle it.
     if (-not $feature) {
         if ($fn -ne "NetFx3") { throw "Feature name $fn is unknown." }
-
-        Write-GuiLog "$dn not detected via PowerShell; trying DISM fallback..."
+        Write-Output "$dn not detected via PowerShell; trying DISM fallback..."
         $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn"
         if ($featureInfo -match 'State\s*:\s*Enabled') {
             dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Disabled: $dn (DISM)" }
-            else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
         }
         else {
             dism /Online /Enable-Feature /FeatureName:$fn /All /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-GuiLog "Enabled: $dn (DISM)" }
-            else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
+            if ($LASTEXITCODE -eq 0) { Write-Output "Enabled: $dn (DISM)" } else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
         }
         return
     }
-
     if ($feature.State -eq "Enabled") {
         Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
-        Write-GuiLog "Disabled: $dn"
+        Write-Output "Disabled: $dn"
     }
     else {
         Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
-        Write-GuiLog "Enabled: $dn"
+        Write-Output "Enabled: $dn"
     }
-} "Toggling $DisplayName..." -ArgumentList $FeatureName, $DisplayName
+} -ArgumentList $FeatureName, $DisplayName -OnComplete $done | Out-Null
 }
 
 # --- SERVICES MANAGEMENT ---
@@ -48821,74 +48873,13 @@ $script:WmtLibraryScanRunspace = $null
 $script:WmtLibraryScanAsyncResult = $null
 
 function Get-WmtSteamInstalledGames {
-# Read Steam appmanifest_*.acf files to get installed Steam games.
-# Returns array of [PSCustomObject]@{ Source; Name; Id; Version; Available }
 $result = [System.Collections.Generic.List[object]]::new()
-
-function Get-SteamManifestValue([string]$Text, [string]$Key) {
-    $m = [regex]::Match($Text, ('"' + $Key + '"\s+"([^"]*)"'))
-    if ($m.Success) { return $m.Groups[1].Value }
-    return ""
-}
-
-function Get-SteamInstallRoots {
-    $roots = @()
-    foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-        try {
-            $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-            if ($props) {
-                foreach ($p in @("SteamPath", "InstallPath")) {
-                    if ($props.PSObject.Properties[$p]) {
-                        $v = [string]$props.$p
-                        if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $roots += $v }
-                    }
-                }
-            }
-        }
-        catch {}
-    }
-    foreach ($c in @("${env:ProgramFiles(x86)}\Steam", "${env:ProgramFiles}\Steam")) {
-        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c) -and $roots -notcontains $c) { $roots += $c }
-    }
-    return $roots
-}
-
-$installRoots = @(Get-SteamInstallRoots)
-$libraryRoots = [System.Collections.Generic.List[string]]::new()
-foreach ($root in $installRoots) {
-    if (Test-Path -LiteralPath (Join-Path $root "steamapps")) { [void]$libraryRoots.Add($root) }
-    $libFile = Join-Path $root "steamapps\libraryfolders.vdf"
-    if (-not (Test-Path -LiteralPath $libFile)) { continue }
-    $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-    if ([string]::IsNullOrWhiteSpace($libText)) { continue }
-    foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-        $p = $m.Groups[1].Value -replace '\\\\', '\'
-        if ((Test-Path -LiteralPath $p) -and -not $libraryRoots.Contains($p)) { [void]$libraryRoots.Add($p) }
-    }
-}
-
-$seenIds = @{}
-foreach ($libRoot in $libraryRoots) {
-    $steamApps = Join-Path $libRoot "steamapps"
-    if (-not (Test-Path -LiteralPath $steamApps)) { continue }
-    foreach ($manifest in @(Get-ChildItem -LiteralPath $steamApps -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-        $text = Get-Content -LiteralPath $manifest.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if ([string]::IsNullOrWhiteSpace($text)) { continue }
-        $appId = Get-SteamManifestValue $text "appid"
-        if ([string]::IsNullOrWhiteSpace($appId)) { $appId = [regex]::Match($manifest.BaseName, '\d+').Value }
-        if ([string]::IsNullOrWhiteSpace($appId) -or $seenIds.ContainsKey($appId)) { continue }
-        $seenIds[$appId] = $true
-        $name = Get-SteamManifestValue $text "name"
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
-        $buildId = Get-SteamManifestValue $text "buildid"
-        $result.Add([PSCustomObject]@{
-                Source    = "Steam"
-                Name      = $name
-                Id        = $appId
-                Version   = if (-not [string]::IsNullOrWhiteSpace($buildId) -and $buildId -ne "0") { "Build $buildId" } else { "Installed" }
-                Available = "-"
-            })
-    }
+foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+    [void]$result.Add([PSCustomObject]@{
+        Source="Steam"; Name=[string]$manifest.Name; Id=[string]$manifest.Id;
+        Version=if (-not [string]::IsNullOrWhiteSpace([string]$manifest.BuildId) -and [string]$manifest.BuildId -ne "0") { "Build $($manifest.BuildId)" } else { "Installed" };
+        Available="-"
+    })
 }
 return $result.ToArray()
 }
@@ -49264,52 +49255,16 @@ function Get-WmtLibraryItemInstallDir {
     $id = [string]$Item.Id
 
     if ($source -eq "Steam") {
-        # Find the appmanifest for this app ID and get installdir.
-        $steamInstall = $null
-        foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-            try {
-                $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-                if ($props) {
-                    foreach ($p in @("SteamPath", "InstallPath")) {
-                        if ($props.PSObject.Properties[$p]) {
-                            $v = [string]$props.$p
-                            if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $steamInstall = $v; break }
-                        }
-                    }
-                }
-            }
-            catch {}
-            if ($steamInstall) { break }
-        }
-        if (-not $steamInstall) { return "" }
-
-        # Check all library folders for the appmanifest.
-        $libRoots = @($steamInstall)
-        $libFile = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
-        if (Test-Path -LiteralPath $libFile -PathType Leaf) {
-            $libText = Get-Content -LiteralPath $libFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if (-not [string]::IsNullOrWhiteSpace($libText)) {
-                foreach ($m in [regex]::Matches($libText, '"path"\s+"([^"]+)"')) {
-                    $p = $m.Groups[1].Value -replace '\\\\', '\'
-                    if ((Test-Path -LiteralPath $p) -and $libRoots -notcontains $p) { $libRoots += $p }
-                }
-            }
-        }
-
-        foreach ($libRoot in $libRoots) {
-            $manifestPath = Join-Path $libRoot "steamapps\appmanifest_$id.acf"
-            if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-                $mtext = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                if (-not [string]::IsNullOrWhiteSpace($mtext)) {
-                    $instDirMatch = [regex]::Match($mtext, '"installdir"\s+"([^"]*)"')
-                    if ($instDirMatch.Success) {
-                        $installDir = Join-Path (Join-Path $libRoot "steamapps\common") $instDirMatch.Groups[1].Value
-                        if (Test-Path -LiteralPath $installDir) { return $installDir }
-                    }
-                }
-            }
+        foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+            if ([string]$manifest.Id -ne $id) { continue }
+            $installDirName=[string]$manifest.InstallDir
+            if ([string]::IsNullOrWhiteSpace($installDirName)) { return "" }
+            $installDir=Join-Path (Join-Path ([string]$manifest.LibraryRoot) "steamapps\common") $installDirName
+            if (Test-Path -LiteralPath $installDir) { return $installDir }
+            return ""
         }
     }
+
     elseif ($source -eq "Epic") {
         # Check legendary installed games.
         try {
@@ -49961,12 +49916,12 @@ $btnToggleCombine.Add_Click({
         Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $tc = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0) 0)
         if ($tc -eq 2) {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0; Write-GuiLog "Taskbar set to Never Combine." } "Setting taskbar to Never Combine..."
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0; Write-GuiLog "Taskbar set to Always Combine." } "Setting taskbar to Always Combine..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 2; Write-GuiLog "Taskbar set to Always Combine." } "Setting taskbar to Always Combine..."
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 2; Write-GuiLog "Taskbar set to Never Combine." } "Setting taskbar to Never Combine..."
         }
-        Update-WmtTweakToggle $btnToggleCombine ($tc -ne 2) "Always Combine" "Never Combine"
+        Update-WmtTweakToggle $btnToggleCombine ($tc -ne 2) "Never Combine" "Always Combine"
     })
 }
 
@@ -49975,13 +49930,13 @@ if ($btnToggleTaskbarAlign) {
 $btnToggleTaskbarAlign.Add_Click({
         Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $ta = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0) 0)
-        if ($ta -ne 0) {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0; Write-GuiLog "Taskbar aligned to center." } "Aligning taskbar to center..."
+        if ($ta -eq 0) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 1; Write-GuiLog "Taskbar aligned to center." } "Aligning taskbar to center..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 1; Write-GuiLog "Taskbar aligned to left." } "Aligning taskbar to left..."
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0; Write-GuiLog "Taskbar aligned to left." } "Aligning taskbar to left..."
         }
-        Update-WmtTweakToggle $btnToggleTaskbarAlign ($ta -eq 0) "Align Taskbar Center" "Align Taskbar Left"
+        Update-WmtTweakToggle $btnToggleTaskbarAlign ($ta -ne 0) "Align Taskbar Left" "Align Taskbar Center"
     })
 }
 
@@ -50952,49 +50907,94 @@ Update-TweaksResponsiveLayout
 [void]$window.Add_SizeChanged($onMainWindowSizeChanged)
 
 # --- Background AppX Load (no busy cursor, no UI thread blocking) ---
+$script:WmtAppxLoadRunspace = $null
+$script:WmtAppxLoadAsyncResult = $null
+
 function Start-AppxBackgroundLoad {
-$ps = New-WmtPooledPowerShell
-[void]$ps.AddScript({
-    # Inline AppX query — no dependency on script-scope functions
-    $results = @()
-    try {
-        $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
-        foreach ($pkg in $allPkgs) {
-            if ($pkg.NonRemovable -ne $true) {
-                $results += [PSCustomObject]@{
-                    Name           = [string]$pkg.Name
-                    PackageFullName = [string]$pkg.PackageFullName
-                }
-            }
-        }
-        $results = @($results | Sort-Object Name)
-    } catch {}
-    return ,$results
-})
-[void]$ps.BeginInvoke()
-# Poll for completion and dispatch to UI thread
-$null = Register-ObjectEvent -InputObject $ps -EventName InvocationStateChanged -Action {
-    if ($Event.SourceEventArgs.State -eq 'Completed') {
-        try {
-            $results = $Event.SourceEventArgs.Result.EndInvoke($Event.Source)
-            $window.Dispatcher.Invoke({
-                $lst = Get-Ctrl "lstAppxPackages"
-                if ($lst) {
-                    $lst.Items.Clear()
-                    foreach ($app in $results) {
-                        [void]$lst.Items.Add([PSCustomObject]@{
-                            Name    = $app.Name
-                            Package = $app.PackageFullName
-                        })
-                    }
-                    Write-GuiLog "Loaded $($results.Count) removable UWP apps."
-                }
-            })
-        } catch {}
-        try { Unregister-Event -SourceIdentifier $Event.SourceEventArgs.AsyncOperation.GetHashCode() -ErrorAction SilentlyContinue } catch {}
-        try { $Event.Source.Dispose() } catch {}
-    }
+if ($script:WmtAppxLoadAsyncResult -and -not $script:WmtAppxLoadAsyncResult.IsCompleted) { return }
+
+try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
+if ($script:WmtAppxLoadRunspace) {
+    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
 }
+
+$ps = New-WmtPooledPowerShell -PoolKind UiSupport
+[void]$ps.AddScript({
+    $results = [System.Collections.Generic.List[object]]::new()
+    $usedCmdlet = $false
+
+    if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+        try {
+            $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
+            foreach ($pkg in @($allPkgs | Sort-Object Name)) {
+                if ($pkg.NonRemovable -eq $true) { continue }
+                [void]$results.Add([PSCustomObject]@{
+                    Name            = [string]$pkg.Name
+                    PackageFullName = [string]$pkg.PackageFullName
+                })
+            }
+            $usedCmdlet = ($results.Count -gt 0)
+        }
+        catch {}
+    }
+
+    if (-not $usedCmdlet) {
+        $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-ProvisionedAppxPackages" -TimeoutMs 120000
+        foreach ($block in @($output -split '(?=Package Identity\s*:)')) {
+            $pkgId = ""
+            $displayName = ""
+            if ($block -match 'Package Identity\s*:\s*(.+)') { $pkgId = $Matches[1].Trim() }
+            if ($block -match 'DisplayName\s*:\s*(.+)') { $displayName = $Matches[1].Trim() }
+            if ([string]::IsNullOrWhiteSpace($pkgId)) { continue }
+            if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $pkgId }
+            [void]$results.Add([PSCustomObject]@{
+                Name            = $displayName
+                PackageFullName = $pkgId
+            })
+        }
+    }
+
+    $results.ToArray()
+})
+
+$script:WmtAppxLoadRunspace = $ps
+$script:WmtAppxLoadAsyncResult = $ps.BeginInvoke()
+
+Register-WmtUiPollOperation -Name "AppxBackgroundLoad" -IntervalMs 250 -TestComplete {
+    $script:WmtAppxLoadAsyncResult -and $script:WmtAppxLoadAsyncResult.IsCompleted
+} -OnComplete {
+    try {
+        $results = @($script:WmtAppxLoadRunspace.EndInvoke($script:WmtAppxLoadAsyncResult))
+        $lst = Get-Ctrl "lstAppxPackages"
+        if ($lst) {
+            $lst.Items.Clear()
+            foreach ($app in $results) {
+                [void]$lst.Items.Add([PSCustomObject]@{
+                    Name    = [string]$app.Name
+                    Package = [string]$app.PackageFullName
+                })
+            }
+            Write-GuiLog "Loaded $($results.Count) removable UWP apps."
+        }
+    }
+    catch {
+        Write-GuiLog "AppX background load failed: $($_.Exception.Message)"
+    }
+    finally {
+        try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+        $script:WmtAppxLoadRunspace = $null
+        $script:WmtAppxLoadAsyncResult = $null
+    }
+} -OnError {
+    param($Operation, $ErrorRecord)
+    Write-GuiLog "AppX background monitor failed: $($ErrorRecord.Exception.Message)"
+    try { $script:WmtAppxLoadRunspace.Stop() } catch {}
+    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
+} | Out-Null
 }
 
 # Start background library cache builder for Legendary/GOGDL on boot
@@ -51413,101 +51413,16 @@ try {
                 try {
                     Write-Output "LOG:Fetching Steam library..."
 
-                    # Find Steam install path.
-                    $steamInstall = $null
-                    foreach ($reg in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
-                        try {
-                            $props = Get-ItemProperty -LiteralPath $reg -ErrorAction SilentlyContinue
-                            if ($props) {
-                                foreach ($p in @("SteamPath", "InstallPath")) {
-                                    if ($props.PSObject.Properties[$p]) {
-                                        $v = [string]$props.$p
-                                        if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) { $steamInstall = $v; break }
-                                    }
-                                }
-                            }
-                        }
-                        catch {}
-                        if ($steamInstall) { break }
-                    }
-                    if (-not $steamInstall) {
-                        foreach ($c in @("${env:ProgramFiles(x86)}\Steam", "${env:ProgramFiles}\Steam")) {
-                            if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) { $steamInstall = $c; break }
-                        }
-                    }
-
+                    # Reuse the same Steam helper layer as update and library scans.
+                    $steamInstall = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0]
                     if ($steamInstall) {
-                        # Get installed apps from manifests.
-                        $installedApps = @{}
-                        $libRoots = [System.Collections.Generic.List[string]]::new()
-                        if (Test-Path -LiteralPath (Join-Path $steamInstall "steamapps")) { [void]$libRoots.Add($steamInstall) }
-                        $libF = Join-Path $steamInstall "steamapps\libraryfolders.vdf"
-                        if (Test-Path -LiteralPath $libF -PathType Leaf) {
-                            $libT = Get-Content -LiteralPath $libF -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                            if (-not [string]::IsNullOrWhiteSpace($libT)) {
-                                foreach ($m in [regex]::Matches($libT, '"path"\s+"([^"]+)"')) {
-                                    $p = $m.Groups[1].Value -replace '\\\\', '\'
-                                    if ((Test-Path -LiteralPath $p) -and -not $libRoots.Contains($p)) { [void]$libRoots.Add($p) }
-                                }
-                            }
+                        $installedApps=@{}
+                        foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+                            $installedApps[[string]$manifest.Id]=@{ Name=[string]$manifest.Name; BuildId=[string]$manifest.BuildId }
                         }
-                        foreach ($libRoot in $libRoots) {
-                            $sa = Join-Path $libRoot "steamapps"
-                            if (-not (Test-Path -LiteralPath $sa)) { continue }
-                            foreach ($man in @(Get-ChildItem -LiteralPath $sa -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue)) {
-                                $mt = Get-Content -LiteralPath $man.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                                if ([string]::IsNullOrWhiteSpace($mt)) { continue }
-                                $aid = ""
-                                $am = [regex]::Match($mt, '"appid"\s+"([^"]*)"')
-                                if ($am.Success) { $aid = $am.Groups[1].Value }
-                                if ([string]::IsNullOrWhiteSpace($aid)) { $aid = [regex]::Match($man.BaseName, '\d+').Value }
-                                if ([string]::IsNullOrWhiteSpace($aid)) { continue }
-                                $mname = ""
-                                $nm = [regex]::Match($mt, '"name"\s+"([^"]*)"')
-                                if ($nm.Success) { $mname = $nm.Groups[1].Value }
-                                if ([string]::IsNullOrWhiteSpace($mname)) { $mname = "Steam App $aid" }
-                                $buildId = ""
-                                $bm = [regex]::Match($mt, '"buildid"\s+"([^"]*)"')
-                                if ($bm.Success) { $buildId = $bm.Groups[1].Value }
-                                $installedApps[$aid] = @{ Name = $mname; BuildId = $buildId }
-                            }
-                        }
-
-                        # Get owned app IDs from localconfig.vdf (case-insensitive).
-                        $ownedIds = [System.Collections.Generic.List[string]]::new()
-                        $udPath = Join-Path $steamInstall "userdata"
-                        if (Test-Path -LiteralPath $udPath) {
-                            foreach ($ud in @(Get-ChildItem -LiteralPath $udPath -Directory -ErrorAction SilentlyContinue)) {
-                                $vdfP = Join-Path $ud.FullName "config\localconfig.vdf"
-                                if (-not (Test-Path -LiteralPath $vdfP -PathType Leaf)) { continue }
-                                $vdfT = Get-Content -LiteralPath $vdfP -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                                if ([string]::IsNullOrWhiteSpace($vdfT)) { continue }
-                                $aIdx = $vdfT.IndexOf('"apps"', [System.StringComparison]::OrdinalIgnoreCase)
-                                if ($aIdx -lt 0) { continue }
-                                $bIdx = $vdfT.IndexOf('{', $aIdx)
-                                if ($bIdx -lt 0) { continue }
-                                $dep = 0
-                                $ii = $bIdx
-                                while ($ii -lt $vdfT.Length) {
-                                    $ch = $vdfT[$ii]
-                                    if ($ch -eq '{') { $dep++; $ii++ }
-                                    elseif ($ch -eq '}') { $dep--; if ($dep -le 0) { break }; $ii++ }
-                                    elseif ($ch -eq '"') {
-                                        $eQ = $vdfT.IndexOf('"', $ii + 1)
-                                        if ($eQ -lt 0) { break }
-                                        $s = $vdfT.Substring($ii + 1, $eQ - $ii - 1)
-                                        $ii = $eQ + 1
-                                        if ($dep -eq 1) {
-                                            $jj = $ii
-                                            while ($jj -lt $vdfT.Length -and [char]::IsWhiteSpace($vdfT[$jj])) { $jj++ }
-                                            if ($jj -lt $vdfT.Length -and $vdfT[$jj] -eq '{') {
-                                                if (-not $ownedIds.Contains($s)) { [void]$ownedIds.Add($s) }
-                                            }
-                                        }
-                                    }
-                                    else { $ii++ }
-                                }
-                            }
+                        $ownedIds=[System.Collections.Generic.List[string]]::new()
+                        foreach ($aid in @(Get-WmtSteamOwnedAppIds -SteamRoot $steamInstall)) {
+                            if (-not [string]::IsNullOrWhiteSpace([string]$aid) -and -not $ownedIds.Contains([string]$aid)) { [void]$ownedIds.Add([string]$aid) }
                         }
 
                         # Resolve names for ALL apps using the GitHub-hosted Steam app ID
