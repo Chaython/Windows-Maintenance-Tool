@@ -1,0 +1,80 @@
+name: Validate PowerShell
+
+on:
+  push:
+    branches:
+      - Main
+    paths:
+      - "WMT-GUI.ps1"
+      - "PS2EXE/**/*.ps1"
+      - ".github/workflows/validate-powershell.yml"
+  pull_request:
+    branches:
+      - Main
+    paths:
+      - "WMT-GUI.ps1"
+      - "PS2EXE/**/*.ps1"
+      - ".github/workflows/validate-powershell.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out exact commit
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          git init .
+          git remote add origin "https://x-access-token:$env:GH_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin "$env:GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+
+      - name: Parse PowerShell sources
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $files = @(
+              ".\WMT-GUI.ps1",
+              ".\PS2EXE\Build-Exe.ps1"
+          )
+
+          $failed = $false
+          foreach ($file in $files) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+                  Write-Error "Missing expected PowerShell file: $file"
+                  $failed = $true
+                  continue
+              }
+
+              $tokens = $null
+              $parseErrors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                  (Resolve-Path -LiteralPath $file).Path,
+                  [ref]$tokens,
+                  [ref]$parseErrors
+              )
+
+              if ($parseErrors -and $parseErrors.Count -gt 0) {
+                  $failed = $true
+                  Write-Host ""
+                  Write-Host "Parse errors in $file" -ForegroundColor Red
+                  foreach ($err in $parseErrors) {
+                      Write-Host ("{0}:{1}: {2}" -f $err.Extent.StartLineNumber, $err.Extent.StartColumnNumber, $err.Message) -ForegroundColor Red
+                  }
+              }
+              else {
+                  Write-Host "OK: $file"
+              }
+          }
+
+          if ($failed) {
+              throw "PowerShell syntax validation failed."
+          }
