@@ -8,6 +8,16 @@ on:
         required: false
         default: false
         type: boolean
+      submit_winget:
+        description: "Submit a WinGet package update after the release"
+        required: false
+        default: true
+        type: boolean
+      push_chocolatey:
+        description: "Push a Chocolatey package update after the release"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -15,7 +25,7 @@ permissions:
 jobs:
   build-release:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -63,6 +73,7 @@ jobs:
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
           Write-Host "Release version: $version"
           Write-Host "SHA256: $hash"
@@ -104,4 +115,118 @@ jobs:
 
               & gh @args
               if ($LASTEXITCODE -ne 0) { throw "Failed to create GitHub release." }
+          }
+
+      - name: Submit WinGet update
+        if: ${{ !inputs.prerelease && inputs.submit_winget }}
+        shell: powershell
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+              Write-Warning "WINGET_TOKEN is not configured; skipping WinGet submission."
+              exit 0
+          }
+
+          $manifestApi = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Chaython/WindowsMaintenanceTool?ref=master"
+          try {
+              Invoke-RestMethod -Uri $manifestApi -Headers @{ "User-Agent" = "Windows-Maintenance-Tool-release" } | Out-Null
+          }
+          catch {
+              $statusCode = $null
+              try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+              if ($statusCode -eq 404) {
+                  Write-Warning "Chaython.WindowsMaintenanceTool is not merged into winget-pkgs yet; skipping automated update."
+                  exit 0
+              }
+              throw
+          }
+
+          Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile ".\wingetcreate.exe" -UseBasicParsing
+          $installerUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/WindowsMaintenanceTool.exe"
+
+          & ".\wingetcreate.exe" update Chaython.WindowsMaintenanceTool --urls "$installerUrl|x64" --version $env:RELEASE_VERSION --submit --no-open
+          if ($LASTEXITCODE -ne 0) {
+              throw "WingetCreate submission failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Push Chocolatey update
+        if: ${{ !inputs.prerelease && inputs.push_chocolatey }}
+        shell: powershell
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA256: ${{ steps.version.outputs.sha256 }}
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+              Write-Warning "CHOCOLATEY_API_KEY is not configured; skipping Chocolatey submission."
+              exit 0
+          }
+
+          if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+              throw "Chocolatey CLI is not available on this runner."
+          }
+
+          $parts = @($env:RELEASE_VERSION.Split("."))
+          while ($parts.Count -lt 3) { $parts += "0" }
+          $chocoVersion = ($parts[0..2] -join ".")
+          $installerUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/WindowsMaintenanceTool.exe"
+          $releaseUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+
+          $packageRoot = Join-Path $env:RUNNER_TEMP "wmt-chocolatey"
+          $toolsDir = Join-Path $packageRoot "tools"
+          New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+
+          $nuspec = @"
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>windows-maintenance-tool</id>
+    <version>$chocoVersion</version>
+    <title>Windows Maintenance Tool</title>
+    <authors>Chaython</authors>
+    <owners>Chaython</owners>
+    <projectUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectUrl>
+    <projectSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectSourceUrl>
+    <packageSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</packageSourceUrl>
+    <bugTrackerUrl>https://github.com/Chaython/Windows-Maintenance-Tool/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/Chaython/Windows-Maintenance-Tool/blob/Main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>WMT is an AIO GUI toolkit for repairing, cleaning, updating, and tuning Windows systems. It brings common maintenance tasks into one interface instead of spreading them across separate utilities.</description>
+    <summary>All-in-one Windows maintenance, repair, cleanup, update, and tuning GUI.</summary>
+    <releaseNotes>$releaseUrl</releaseNotes>
+    <tags>wmt maintenance system utility windows powershell</tags>
+  </metadata>
+</package>
+"@
+          [IO.File]::WriteAllText((Join-Path $packageRoot "windows-maintenance-tool.nuspec"), $nuspec, [Text.UTF8Encoding]::new($false))
+
+          $installScript = @"
+\$toolsDir = Split-Path -Parent \$MyInvocation.MyCommand.Definition
+\$url = '$installerUrl'
+\$checksum = '$env:RELEASE_SHA256'
+Get-ChocolateyWebFile -PackageName 'windows-maintenance-tool' -FileFullPath (Join-Path \$toolsDir 'wmt.exe') -Url \$url -Checksum \$checksum -ChecksumType 'sha256'
+"@
+          [IO.File]::WriteAllText((Join-Path $toolsDir "chocolateyInstall.ps1"), $installScript, [Text.UTF8Encoding]::new($false))
+
+          Push-Location $packageRoot
+          try {
+              choco pack ".\windows-maintenance-tool.nuspec" --yes
+              if ($LASTEXITCODE -ne 0) { throw "choco pack failed with exit code $LASTEXITCODE." }
+
+              $nupkg = Get-ChildItem -LiteralPath $packageRoot -Filter "windows-maintenance-tool.$chocoVersion.nupkg" | Select-Object -First 1
+              if (-not $nupkg) { throw "Chocolatey package was not created." }
+
+              choco push $nupkg.FullName --source "https://push.chocolatey.org/" --api-key $env:CHOCOLATEY_API_KEY
+              if ($LASTEXITCODE -ne 0) { throw "choco push failed with exit code $LASTEXITCODE." }
+          }
+          finally {
+              Pop-Location
           }
