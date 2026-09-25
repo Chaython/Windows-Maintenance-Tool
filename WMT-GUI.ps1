@@ -28133,7 +28133,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <WrapPanel>
                             <Button Name="btnUtilSysInfo" Content="System Report" Style="{StaticResource ActionBtn}" ToolTip="Generate detailed system report"/>
                             <Button Name="btnUtilTrim" Content="Trim SSD" Style="{StaticResource ActionBtn}" ToolTip="Optimize SSD performance"/>
-                            <Button Name="btnUtilCompact" Content="Compact Compression" Style="{StaticResource ActionBtn}" ToolTip="Compress or decompress an NTFS folder or whole drive using compact.exe with NTFS, XPRESS, or LZX compression"/>
+                            <Button Name="btnUtilCompact" Content="Compact Compression" Style="{StaticResource ActionBtn}" ToolTip="Compress/decompress NTFS folders or drives, track them, and schedule independent recompression through Windows Task Scheduler. WMT does not need to stay open."/>
                             <Button Name="btnUtilWinRE" Content="Check WinRE" Style="{StaticResource ActionBtn}" ToolTip="Checks Windows Recovery Environment status via reagentc /info"/>
                             <Button Name="btnUtilRestoreMgr" Content="Restore Manager" Style="{StaticResource ActionBtn}" ToolTip="List, create, and delete system restore points"/>
                             <Button Name="btnUtilStartupMgr" Content="Startup Manager" Style="{StaticResource ActionBtn}" ToolTip="Manage startup apps, tasks, context menu entries, and services"/>
@@ -39602,6 +39602,67 @@ $btnWingetScan.Add_Click({
         Path = @{}
     }
 
+    # Seed Steam ownership independently of the Steam update-scan toggle.
+    # Winget --include-unknown can surface Steam-installed games as fake
+    # "Unknown -> version" upgrades (Warframe is a known example). The
+    # suppression pass must therefore know about installed Steam games even
+    # when the Steam provider itself is not being scanned for pending updates.
+    try {
+        $steamOwnership = @()
+        if ($script:WmtSteamLibraryCache) {
+            $steamOwnership = @($script:WmtSteamLibraryCache)
+        }
+        else {
+            $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
+            if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
+                try {
+                    $steamOwnership = @([System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+                }
+                catch {}
+            }
+        }
+
+        # If the background library cache has not been built yet, fall back to
+        # the local Steam manifests. Get-WmtSteamLibrary caches the result, so
+        # subsequent scans avoid repeating the work.
+        if ($steamOwnership.Count -eq 0) {
+            try { $steamOwnership = @(Get-WmtSteamLibrary) } catch {}
+        }
+
+        $seededSteamOwners = 0
+        foreach ($owned in @($steamOwnership)) {
+            if (-not $owned) { continue }
+            if ($owned.PSObject.Properties["IsInstalled"] -and -not [bool]$owned.IsInstalled) { continue }
+
+            $ownedName = ""
+            if ($owned.PSObject.Properties["Title"]) { $ownedName = ([string]$owned.Title).Trim() }
+            elseif ($owned.PSObject.Properties["Name"]) { $ownedName = ([string]$owned.Name).Trim() }
+            if ([string]::IsNullOrWhiteSpace($ownedName)) { continue }
+
+            $ownedId = if ($owned.PSObject.Properties["Id"]) { ([string]$owned.Id).Trim() } else { "" }
+            $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+            if ([string]::IsNullOrWhiteSpace($nameKey)) { continue }
+
+            $script:WmtProviderOwnershipIndex.Name[$nameKey] = [PSCustomObject]@{
+                Provider = "steam"
+                Id       = $ownedId
+                Path     = ""
+                Name     = $ownedName
+            }
+            $script:WmtSteamInstalledNameKeys[$nameKey] = $ownedId
+            if (-not [string]::IsNullOrWhiteSpace($ownedId)) {
+                $script:WmtProviderOwnershipIndex.Id["steam|$($ownedId.ToLowerInvariant())"] = $true
+            }
+            $seededSteamOwners++
+        }
+        if ($seededSteamOwners -gt 0) {
+            Write-GuiLog "[Winget] Seeded $seededSteamOwners installed Steam ownership record(s) for cross-provider duplicate filtering."
+        }
+    }
+    catch {
+        Write-GuiLog "[Winget] Steam ownership pre-seed failed: $($_.Exception.Message)"
+    }
+
     # --- Global Timeout Timer (120 seconds) ---
     if ($script:GlobalScanTimer) {
         try { $script:GlobalScanTimer.Stop() } catch {}
@@ -41469,6 +41530,7 @@ $btnWingetScan.Add_Click({
 
                             $name = Get-SteamManifestValue -Text $text -Key "name"
                             if ([string]::IsNullOrWhiteSpace($name)) { $name = "Steam App $appId" }
+                            $installDir = ConvertFrom-SteamVdfPath (Get-SteamManifestValue -Text $text -Key "installdir")
 
                             # Let the UI-side scan aggregator distinguish unknown-version
                             # winget matches from games actually owned by Steam. Use a typed
@@ -41491,7 +41553,6 @@ $btnWingetScan.Add_Click({
                             $bytesStaged = Get-SteamManifestNumber -Text $text -Key "BytesStaged"
                             $buildId = Get-SteamManifestValue -Text $text -Key "buildid"
                             $targetBuildId = Get-SteamManifestValue -Text $text -Key "TargetBuildID"
-                            $installDir = ConvertFrom-SteamVdfPath (Get-SteamManifestValue -Text $text -Key "installdir")
 
                             $downloadRemaining = [Math]::Max([long]0, $bytesToDownload - $bytesDownloaded)
                             $stageRemaining = [Math]::Max([long]0, $bytesToStage - $bytesStaged)
@@ -46666,6 +46727,8 @@ function Show-WmtCompactManager {
             <TextBlock Text="Compact Compression" FontSize="22" FontWeight="SemiBold"/>
             <TextBlock Text="Compress folders or local NTFS drives and keep a persistent watch list for later recompression."
                        Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Margin="0,5,0,0"/>
+            <TextBlock Text="Scheduled recompression is handled by Windows Task Scheduler as SYSTEM. After you enable a schedule, WMT does not need to remain open or running."
+                       Foreground="{DynamicResource Accent}" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,5,0,0"/>
         </StackPanel>
 
         <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="14" Margin="0,0,0,10">
@@ -46780,7 +46843,7 @@ function Show-WmtCompactManager {
             </Grid>
         </Border>
 
-        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, then invoke compact.exe only when recompression is needed. Reparse points are skipped during analysis. Tracker state and the worker log are secured under ProgramData\WindowsMaintenanceTool."
+        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, then invoke compact.exe only when recompression is needed. Reparse points are skipped during analysis. The schedule is a standalone Windows Scheduled Task running as SYSTEM, so it continues to work after WMT is closed. Tracker state, worker script, and log are secured under ProgramData\WindowsMaintenanceTool."
                    Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
 
         <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
@@ -46880,7 +46943,12 @@ function Show-WmtCompactManager {
         $needsCount = @($data.Entries | Where-Object { $_.PSObject.Properties["NeedsRecompress"] -and $null -ne $_.NeedsRecompress -and [bool]$_.NeedsRecompress }).Count
         $txtTrackerSummary.Text = "$($rows.Count) tracked target(s), $autoCount automatic, $needsCount currently flagged for recompression."
         & $selectSchedule ([string]$data.Schedule)
-        $txtScheduleStatus.Text = if ([string]$data.Schedule -eq "Off") { "No scheduled recompression task." } else { "Schedule: $([string]$data.Schedule)." }
+        $txtScheduleStatus.Text = if ([string]$data.Schedule -eq "Off") {
+            "No scheduled task. Enable one to run independently of WMT."
+        }
+        else {
+            "Windows Scheduled Task: $([string]$data.Schedule). Runs as SYSTEM even when WMT is closed."
+        }
     }.GetNewClosure()
 
     $setTargetMode = {
