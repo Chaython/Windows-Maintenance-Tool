@@ -5614,12 +5614,51 @@ finally {
 # Initialize cache variable
 $script:WmtSettingsCache = $null
 
+function Copy-WmtSettingsValue {
+param([AllowNull()]$Value)
+
+if ($null -eq $Value) { return $null }
+if ($Value -is [string] -or $Value.GetType().IsValueType) { return $Value }
+
+if ($Value -is [System.Collections.IDictionary]) {
+    $copy = @{}
+    foreach ($key in @($Value.Keys)) {
+        $copy[$key] = Copy-WmtSettingsValue -Value $Value[$key]
+    }
+    return $copy
+}
+
+if ($Value -is [System.Management.Automation.PSCustomObject]) {
+    $copy = [ordered]@{}
+    foreach ($prop in @($Value.PSObject.Properties)) {
+        $copy[$prop.Name] = Copy-WmtSettingsValue -Value $prop.Value
+    }
+    return [PSCustomObject]$copy
+}
+
+if ($Value -is [System.Collections.IEnumerable]) {
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $Value) {
+        [void]$items.Add((Copy-WmtSettingsValue -Value $item))
+    }
+    return ,$items.ToArray()
+}
+
+return $Value
+}
+
+function Copy-WmtSettings {
+param($Settings)
+if ($null -eq $Settings) { return $null }
+return (Copy-WmtSettingsValue -Value $Settings)
+}
+
 function Save-WmtSettings {
 param($Settings)
 $path = Join-Path (Get-DataPath) "settings.json"
 try {
     # Update the memory cache immediately
-    $script:WmtSettingsCache = $Settings
+    $script:WmtSettingsCache = Copy-WmtSettings -Settings $Settings
 
     # Convert Hashtable/OrderedDictionary to generic Object for cleaner JSON
     $saveObj = [PSCustomObject]@{
@@ -5664,13 +5703,9 @@ catch {
 
 function Get-WmtSettings {
 # OPTIMIZATION: Return cached settings if available to avoid disk I/O.
-# Return a shallow clone so callers can't mutate the cache by reference.
+# Return a deep clone so callers cannot mutate nested cache structures by reference.
 if ($script:WmtSettingsCache) {
-    $clone = @{}
-    foreach ($k in @($script:WmtSettingsCache.Keys)) {
-        $clone[$k] = $script:WmtSettingsCache[$k]
-    }
-    return $clone
+    return (Copy-WmtSettings -Settings $script:WmtSettingsCache)
 }
 
 $path = Join-Path (Get-DataPath) "settings.json"
@@ -5813,9 +5848,9 @@ if ($normalizedProviders.Count -eq 0) {
 }
 $defaults.EnabledProviders = $normalizedProviders.ToArray()
 
-# Cache the result
-$script:WmtSettingsCache = $defaults
-return $defaults
+# Cache an isolated copy and return a second copy to preserve clone semantics.
+$script:WmtSettingsCache = Copy-WmtSettings -Settings $defaults
+return (Copy-WmtSettings -Settings $script:WmtSettingsCache)
 }
 
 function Get-WmtWingetIncludeUnknown {
@@ -29811,8 +29846,8 @@ try {
     $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
     $ta = & $getRegValue $ap "TaskbarAl";
 
-    $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"; $taskbarLeft = ($ta -ne 0 -and $null -ne $ta); Update-WmtTweakToggle $btnToggleTaskbarAlign $taskbarLeft "Align Taskbar Center" "Align Taskbar Left"
-    $tc = & $getRegValue $ap "TaskbarGlomLevel"; $neverCombine = ($tc -eq 2); Update-WmtTweakToggle $btnToggleCombine $neverCombine "Always Combine" "Never Combine"
+    $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"; $taskbarLeft = ($ta -eq 0); Update-WmtTweakToggle $btnToggleTaskbarAlign $taskbarLeft "Align Taskbar Left" "Align Taskbar Center"
+    $tc = & $getRegValue $ap "TaskbarGlomLevel"; $neverCombine = ($tc -eq 2); Update-WmtTweakToggle $btnToggleCombine $neverCombine "Never Combine" "Always Combine"
     $is24 = ((ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\International" "sShortTime") "") -cmatch "H")
     $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"; Update-WmtTweakToggle $btnToggleClockFormat $is24 "12-Hour Clock" "24-Hour Clock"
     $cs = & $getRegValue $ap "ShowSecondsInSystemClock"; $clockSecsOn = ($cs -eq 1); Update-WmtTweakToggle $btnToggleClockSecs $clockSecsOn "Hide Clock Seconds" "Show Clock Seconds"
@@ -50093,12 +50128,12 @@ $btnToggleCombine.Add_Click({
         Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $tc = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0) 0)
         if ($tc -eq 2) {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0; Write-GuiLog "Taskbar set to Never Combine." } "Setting taskbar to Never Combine..."
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0; Write-GuiLog "Taskbar set to Always Combine." } "Setting taskbar to Always Combine..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 2; Write-GuiLog "Taskbar set to Always Combine." } "Setting taskbar to Always Combine..."
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 2; Write-GuiLog "Taskbar set to Never Combine." } "Setting taskbar to Never Combine..."
         }
-        Update-WmtTweakToggle $btnToggleCombine ($tc -ne 2) "Always Combine" "Never Combine"
+        Update-WmtTweakToggle $btnToggleCombine ($tc -ne 2) "Never Combine" "Always Combine"
     })
 }
 
@@ -50107,13 +50142,13 @@ if ($btnToggleTaskbarAlign) {
 $btnToggleTaskbarAlign.Add_Click({
         Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $ta = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0) 0)
-        if ($ta -ne 0) {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0; Write-GuiLog "Taskbar aligned to center." } "Aligning taskbar to center..."
+        if ($ta -eq 0) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 1; Write-GuiLog "Taskbar aligned to center." } "Aligning taskbar to center..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 1; Write-GuiLog "Taskbar aligned to left." } "Aligning taskbar to left..."
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0; Write-GuiLog "Taskbar aligned to left." } "Aligning taskbar to left..."
         }
-        Update-WmtTweakToggle $btnToggleTaskbarAlign ($ta -eq 0) "Align Taskbar Center" "Align Taskbar Left"
+        Update-WmtTweakToggle $btnToggleTaskbarAlign ($ta -ne 0) "Align Taskbar Left" "Align Taskbar Center"
     })
 }
 
@@ -51084,49 +51119,67 @@ Update-TweaksResponsiveLayout
 [void]$window.Add_SizeChanged($onMainWindowSizeChanged)
 
 # --- Background AppX Load (no busy cursor, no UI thread blocking) ---
+$script:WmtAppxLoadRunspace = $null
+$script:WmtAppxLoadAsyncResult = $null
+
 function Start-AppxBackgroundLoad {
-$ps = New-WmtPooledPowerShell
-[void]$ps.AddScript({
-    # Inline AppX query — no dependency on script-scope functions
-    $results = @()
-    try {
-        $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
-        foreach ($pkg in $allPkgs) {
-            if ($pkg.NonRemovable -ne $true) {
-                $results += [PSCustomObject]@{
-                    Name           = [string]$pkg.Name
-                    PackageFullName = [string]$pkg.PackageFullName
-                }
-            }
-        }
-        $results = @($results | Sort-Object Name)
-    } catch {}
-    return ,$results
-})
-[void]$ps.BeginInvoke()
-# Poll for completion and dispatch to UI thread
-$null = Register-ObjectEvent -InputObject $ps -EventName InvocationStateChanged -Action {
-    if ($Event.SourceEventArgs.State -eq 'Completed') {
-        try {
-            $results = $Event.SourceEventArgs.Result.EndInvoke($Event.Source)
-            $window.Dispatcher.Invoke({
-                $lst = Get-Ctrl "lstAppxPackages"
-                if ($lst) {
-                    $lst.Items.Clear()
-                    foreach ($app in $results) {
-                        [void]$lst.Items.Add([PSCustomObject]@{
-                            Name    = $app.Name
-                            Package = $app.PackageFullName
-                        })
-                    }
-                    Write-GuiLog "Loaded $($results.Count) removable UWP apps."
-                }
-            })
-        } catch {}
-        try { Unregister-Event -SourceIdentifier $Event.SourceEventArgs.AsyncOperation.GetHashCode() -ErrorAction SilentlyContinue } catch {}
-        try { $Event.Source.Dispose() } catch {}
-    }
+if ($script:WmtAppxLoadAsyncResult -and -not $script:WmtAppxLoadAsyncResult.IsCompleted) { return }
+
+try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
+if ($script:WmtAppxLoadRunspace) {
+    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
 }
+
+$ps = New-WmtPooledPowerShell -PoolKind UiSupport
+[void]$ps.AddScript({
+    $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
+    foreach ($pkg in @($allPkgs | Sort-Object Name)) {
+        if ($pkg.NonRemovable -eq $true) { continue }
+        [PSCustomObject]@{
+            Name            = [string]$pkg.Name
+            PackageFullName = [string]$pkg.PackageFullName
+        }
+    }
+})
+
+$script:WmtAppxLoadRunspace = $ps
+$script:WmtAppxLoadAsyncResult = $ps.BeginInvoke()
+
+Register-WmtUiPollOperation -Name "AppxBackgroundLoad" -IntervalMs 250 -TestComplete {
+    $script:WmtAppxLoadAsyncResult -and $script:WmtAppxLoadAsyncResult.IsCompleted
+} -OnComplete {
+    try {
+        $results = @($script:WmtAppxLoadRunspace.EndInvoke($script:WmtAppxLoadAsyncResult))
+        $lst = Get-Ctrl "lstAppxPackages"
+        if ($lst) {
+            $lst.Items.Clear()
+            foreach ($app in $results) {
+                [void]$lst.Items.Add([PSCustomObject]@{
+                    Name    = [string]$app.Name
+                    Package = [string]$app.PackageFullName
+                })
+            }
+            Write-GuiLog "Loaded $($results.Count) removable UWP apps."
+        }
+    }
+    catch {
+        Write-GuiLog "AppX background load failed: $($_.Exception.Message)"
+    }
+    finally {
+        try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+        $script:WmtAppxLoadRunspace = $null
+        $script:WmtAppxLoadAsyncResult = $null
+    }
+} -OnError {
+    param($Operation, $ErrorRecord)
+    Write-GuiLog "AppX background monitor failed: $($ErrorRecord.Exception.Message)"
+    try { $script:WmtAppxLoadRunspace.Stop() } catch {}
+    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
+} | Out-Null
 }
 
 # Start background library cache builder for Legendary/GOGDL on boot
