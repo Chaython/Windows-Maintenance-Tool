@@ -41647,8 +41647,6 @@ $btnWingetScan.Add_Click({
                     }
 
                     if ($pendingCount -eq 0) {
-
-                    if ($pendingCount -eq 0) {
                         Write-Output "LOG:Steam scan found $manifestCount installed Steam app manifest(s), with no manifest-marked pending updates."
                     }
                     else {
