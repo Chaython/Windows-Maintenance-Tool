@@ -277,6 +277,9 @@ if ([string]::IsNullOrWhiteSpace($Name)) { $Name = "UiCommand_" + [guid]::NewGui
 # closures therefore points at the closure module rather than this script, which
 # made the monitor see a null job table ("Cannot index into a null array").
 # Capture the actual shared hashtable by reference and use that in every closure.
+# The same rule applies elsewhere: a GetNewClosure callback must not read/write
+# mutable main-script state through $script:; capture the object/PSVariable or
+# keep the callback in the original script session state instead.
 $jobTable = $script:WmtUiBackgroundCommands
 if ($jobTable.ContainsKey($Name)) {
     Write-GuiLog "Background operation '$Name' is already running."
@@ -7605,12 +7608,13 @@ try {
 
     $disposeTimer = New-Object System.Windows.Threading.DispatcherTimer
     $disposeTimer.Interval = [TimeSpan]::FromSeconds(12)
+    $notificationFallbackTimers = $script:WmtNotificationFallbackTimers
     $disposeTimer.Add_Tick({
             try { $this.Stop() } catch {}
             try { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } catch {}
-            try { [void]$script:WmtNotificationFallbackTimers.Remove($this) } catch {}
+            try { [void]$notificationFallbackTimers.Remove($this) } catch {}
         }.GetNewClosure())
-    [void]$script:WmtNotificationFallbackTimers.Add($disposeTimer)
+    [void]$notificationFallbackTimers.Add($disposeTimer)
     $disposeTimer.Start()
     return $true
 }
@@ -8539,6 +8543,8 @@ catch {
 
 $dnsRunspace = $script:DnsRunspace
 $dnsAsync = $script:DnsAsyncResult
+$dnsRunspaceState = Get-Variable -Name DnsRunspace -Scope Script
+$dnsAsyncState = Get-Variable -Name DnsAsyncResult -Scope Script
 $script:DnsTimer = $null
 # The shared poller invokes these after this function returns, so preserve the
 # per-operation runspace/result/completion values exactly as the old timer
@@ -8560,8 +8566,8 @@ $dnsOnComplete = {
     catch { Write-GuiLog "DNS Error: $($_.Exception.Message)" }
     finally {
         try { $dnsRunspace.Dispose() } catch {}
-        if ([object]::ReferenceEquals($script:DnsRunspace, $dnsRunspace)) { $script:DnsRunspace = $null }
-        if ([object]::ReferenceEquals($script:DnsAsyncResult, $dnsAsync)) { $script:DnsAsyncResult = $null }
+        if ([object]::ReferenceEquals($dnsRunspaceState.Value, $dnsRunspace)) { $dnsRunspaceState.Value = $null }
+        if ([object]::ReferenceEquals($dnsAsyncState.Value, $dnsAsync)) { $dnsAsyncState.Value = $null }
         Set-WmtDnsActionButtonsEnabled $true
     }
     if ($completion) {
@@ -8938,6 +8944,8 @@ catch {
 
 $dohRunspace = $script:DohRunspace
 $dohAsync = $script:DohAsyncResult
+$dohRunspaceState = Get-Variable -Name DohRunspace -Scope Script
+$dohAsyncState = Get-Variable -Name DohAsyncResult -Scope Script
 if (-not $dohRunspace -or -not $dohAsync) {
     Write-GuiLog "Failed to start DoH runspace."
     Set-WmtDnsActionButtonsEnabled $true
@@ -8968,8 +8976,8 @@ $dohOnComplete = {
     catch { Write-GuiLog "DoH Error: $($_.Exception.Message)" }
     finally {
         try { $dohRunspace.Dispose() } catch {}
-        if ([object]::ReferenceEquals($script:DohRunspace, $dohRunspace)) { $script:DohRunspace = $null }
-        if ([object]::ReferenceEquals($script:DohAsyncResult, $dohAsync)) { $script:DohAsyncResult = $null }
+        if ([object]::ReferenceEquals($dohRunspaceState.Value, $dohRunspace)) { $dohRunspaceState.Value = $null }
+        if ([object]::ReferenceEquals($dohAsyncState.Value, $dohAsync)) { $dohAsyncState.Value = $null }
         Set-WmtDnsActionButtonsEnabled $true
     }
 }.GetNewClosure()
@@ -11251,8 +11259,9 @@ catch {
 }
 
 $script:WmtCleanerDialogActive = $true
+$cleanerDialogActiveState = Get-Variable -Name WmtCleanerDialogActive -Scope Script
 $dialog.Add_Closed({
-        $script:WmtCleanerDialogActive = $false
+        $cleanerDialogActiveState.Value = $false
     }.GetNewClosure())
 
 $chkToggleWinapp2 = $dialog.FindName("chkToggleWinapp2")
@@ -11958,9 +11967,9 @@ $searchDelayTimer.Add_Tick({
         & $applyCleanerSearch
     }.GetNewClosure())
 
-$script:CleanerSearchBorder = $txtSearch.Parent
-if ($script:CleanerSearchBorder -and $script:CleanerSearchBorder.Parent -is [System.Windows.Controls.Border]) {
-    $script:CleanerSearchBorder = $script:CleanerSearchBorder.Parent
+$cleanerSearchBorder = $txtSearch.Parent
+if ($cleanerSearchBorder -and $cleanerSearchBorder.Parent -is [System.Windows.Controls.Border]) {
+    $cleanerSearchBorder = $cleanerSearchBorder.Parent
 }
 
 $txtSearch.Add_GotFocus({
@@ -11968,9 +11977,9 @@ $txtSearch.Add_GotFocus({
         $txtSearch.Text = ""
         $txtSearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextPrimary")
     }
-    if ($script:CleanerSearchBorder) {
-        $script:CleanerSearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "Accent")
-        $script:CleanerSearchBorder.BorderThickness = [System.Windows.Thickness]::new(2)
+    if ($cleanerSearchBorder) {
+        $cleanerSearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "Accent")
+        $cleanerSearchBorder.BorderThickness = [System.Windows.Thickness]::new(2)
     }
 }.GetNewClosure())
 
@@ -11979,9 +11988,9 @@ $txtSearch.Add_LostFocus({
         $txtSearch.Text = "Search rules..."
         $txtSearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextMuted")
     }
-    if ($script:CleanerSearchBorder) {
-        $script:CleanerSearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "BorderBrush")
-        $script:CleanerSearchBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+    if ($cleanerSearchBorder) {
+        $cleanerSearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "BorderBrush")
+        $cleanerSearchBorder.BorderThickness = [System.Windows.Thickness]::new(1)
     }
 }.GetNewClosure())
 
@@ -16800,6 +16809,12 @@ catch {
 }
 
 $lastLogIndex = 0
+$registryCleanupActiveState = Get-Variable -Name WmtRegistryCleanupActive -Scope Script
+$registryCleanupRunspaceState = Get-Variable -Name WmtRegistryCleanupRunspace -Scope Script
+$registryCleanupPowerShellState = Get-Variable -Name WmtRegistryCleanupPowerShell -Scope Script
+$registryCleanupTimerState = Get-Variable -Name WmtRegistryCleanupTimer -Scope Script
+$registryCleanupSyncState = Get-Variable -Name WmtRegistryCleanupSync -Scope Script
+$registryCleanupAsyncState = Get-Variable -Name WmtRegistryCleanupAsync -Scope Script
 $cleanupTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $cleanupTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $cleanupTimer.Add_Tick({
@@ -16837,12 +16852,12 @@ $cleanupTimer.Add_Tick({
             finally {
                 try { if ($ps) { $ps.Dispose() } } catch {}
                 try { if ($runspace) { $runspace.Dispose() } } catch {}
-                $script:WmtRegistryCleanupActive = $false
-                if ([object]::ReferenceEquals($script:WmtRegistryCleanupRunspace, $runspace)) { $script:WmtRegistryCleanupRunspace = $null }
-                if ([object]::ReferenceEquals($script:WmtRegistryCleanupPowerShell, $ps)) { $script:WmtRegistryCleanupPowerShell = $null }
-                if ([object]::ReferenceEquals($script:WmtRegistryCleanupTimer, $cleanupTimer)) { $script:WmtRegistryCleanupTimer = $null }
-                if ([object]::ReferenceEquals($script:WmtRegistryCleanupSync, $cleanupSync)) { $script:WmtRegistryCleanupSync = $null }
-                $script:WmtRegistryCleanupAsync = $null
+                $registryCleanupActiveState.Value = $false
+                if ([object]::ReferenceEquals($registryCleanupRunspaceState.Value, $runspace)) { $registryCleanupRunspaceState.Value = $null }
+                if ([object]::ReferenceEquals($registryCleanupPowerShellState.Value, $ps)) { $registryCleanupPowerShellState.Value = $null }
+                if ([object]::ReferenceEquals($registryCleanupTimerState.Value, $cleanupTimer)) { $registryCleanupTimerState.Value = $null }
+                if ([object]::ReferenceEquals($registryCleanupSyncState.Value, $cleanupSync)) { $registryCleanupSyncState.Value = $null }
+                $registryCleanupAsyncState.Value = $null
             }
 
             try { if ($progressWindow) { $progressWindow.Close() } } catch {}
@@ -16881,12 +16896,12 @@ $cleanupTimer.Add_Tick({
             try { $cleanupTimer.Stop() } catch {}
             try { if ($ps) { $ps.Dispose() } } catch {}
             try { if ($runspace) { $runspace.Dispose() } } catch {}
-            $script:WmtRegistryCleanupActive = $false
-            if ([object]::ReferenceEquals($script:WmtRegistryCleanupRunspace, $runspace)) { $script:WmtRegistryCleanupRunspace = $null }
-            if ([object]::ReferenceEquals($script:WmtRegistryCleanupPowerShell, $ps)) { $script:WmtRegistryCleanupPowerShell = $null }
-            if ([object]::ReferenceEquals($script:WmtRegistryCleanupTimer, $cleanupTimer)) { $script:WmtRegistryCleanupTimer = $null }
-            if ([object]::ReferenceEquals($script:WmtRegistryCleanupSync, $cleanupSync)) { $script:WmtRegistryCleanupSync = $null }
-            $script:WmtRegistryCleanupAsync = $null
+            $registryCleanupActiveState.Value = $false
+            if ([object]::ReferenceEquals($registryCleanupRunspaceState.Value, $runspace)) { $registryCleanupRunspaceState.Value = $null }
+            if ([object]::ReferenceEquals($registryCleanupPowerShellState.Value, $ps)) { $registryCleanupPowerShellState.Value = $null }
+            if ([object]::ReferenceEquals($registryCleanupTimerState.Value, $cleanupTimer)) { $registryCleanupTimerState.Value = $null }
+            if ([object]::ReferenceEquals($registryCleanupSyncState.Value, $cleanupSync)) { $registryCleanupSyncState.Value = $null }
+            $registryCleanupAsyncState.Value = $null
             Write-GuiLog "Registry cleanup completion handler failed: $($_.Exception.Message)"
         }
     }.GetNewClosure())
@@ -22455,6 +22470,7 @@ $closeBtn.Add_Click({
 
 $benchWindow.Content = $root
 $script:DriveBenchmarkWindow = $benchWindow
+$driveBenchmarkWindowState = Get-Variable -Name DriveBenchmarkWindow -Scope Script
 
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(200)
@@ -22463,12 +22479,12 @@ $releaseWindowState = {
     try {
         if ($isWindowCleanupDone) { return }
         $isWindowCleanupDone = $true
-        $script:DriveBenchmarkWindow = $null
+        $driveBenchmarkWindowState.Value = $null
         if ($launcherButton) { $launcherButton.IsEnabled = $true }
         Write-GuiLog "[Storage Benchmark] Window closed."
     }
     catch {
-        try { $script:DriveBenchmarkWindow = $null } catch {}
+        try { $driveBenchmarkWindowState.Value = $null } catch {}
         try { if ($launcherButton) { $launcherButton.IsEnabled = $true } } catch {}
     }
 }.GetNewClosure()
@@ -24209,15 +24225,17 @@ if (-not $selectedPath) {
     if ([string]::IsNullOrWhiteSpace($selectedPath)) { return }
 }
 
+$driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script
+$driverPackagesState = Get-Variable -Name DriverPackages -Scope Script
 $restoreDone = {
     param($results)
     $result = @($results | Where-Object { $_ -and $_.PSObject.Properties["Status"] } | Select-Object -Last 1)[0]
     if (-not $result) { return }
     if ($result.Output) { Write-GuiLog ([string]$result.Output) }
     if ($result.Status -eq "Success") {
-        $script:DriverCacheLoaded = $false
+        $driverCacheLoadedState.Value = $false
         Show-WmtMessageBox -Message "Drivers restored from:`n$($result.Path)" -Title "Restore Drivers" -Image Information | Out-Null
-        if ($script:DriverPackages.Count -gt 0) { Start-DriverListLoad -Force }
+        if ($driverPackagesState.Value -and $driverPackagesState.Value.Count -gt 0) { Start-DriverListLoad -Force }
     }
     elseif ($result.Status -eq "MissingInf") {
         Show-WmtMessageBox -Message "No INF files found in:`n$($result.Path)" -Title "Restore Drivers" -Image Warning | Out-Null
@@ -24881,6 +24899,10 @@ $restoreRefreshState = [hashtable]::Synchronized(@{
         Timer   = $null
     })
 
+$restorePointCreateActiveState = Get-Variable -Name WmtRestorePointCreateActive -Scope Script
+$restorePointCreateTimerState = Get-Variable -Name WmtRestorePointCreateTimer -Scope Script
+$restorePointCreateProcessState = Get-Variable -Name WmtRestorePointCreateProcess -Scope Script
+
 $startRestorePointCreate = {
     param([string]$Description)
 
@@ -24903,13 +24925,13 @@ $startRestorePointCreate = {
     }
     catch {}
 
-    if ($script:WmtRestorePointCreateActive) {
+    if ($restorePointCreateActiveState.Value) {
         Show-WmtMessageBox -Owner $restoreDialog -Message "A restore point is already being created. Please wait for it to finish." -Title "System Restore Manager" -Image Information | Out-Null
         return
     }
 
     if ($descriptionText.Length -gt 256) { $descriptionText = $descriptionText.Substring(0, 256) }
-    $script:WmtRestorePointCreateActive = $true
+    $restorePointCreateActiveState.Value = $true
     if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $false }
     if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Creating restore point..." }
 
@@ -24932,7 +24954,7 @@ $startRestorePointCreate = {
         $progressWindow = New-WmtWindowFromXaml -Title "Create Restore Point" -ContentXaml $progressContent -Width 560 -Height 205 -MinWidth 520 -MinHeight 190 -NoResize
     }
     catch {
-        $script:WmtRestorePointCreateActive = $false
+        $restorePointCreateActiveState.Value = $false
         if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
         if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Restore point creation failed to start." }
         Show-WmtMessageBox -Owner $restoreDialog -Message "Could not open the restore point progress window.`n$($_.Exception.Message)" -Title "System Restore Manager" -Image Error | Out-Null
@@ -25088,7 +25110,7 @@ exit 1
         try { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue } catch {}
         try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
         try { $progressWindow.Close() } catch {}
-        $script:WmtRestorePointCreateActive = $false
+        $restorePointCreateActiveState.Value = $false
         if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
         if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Restore point creation failed to start." }
         Show-WmtMessageBox -Owner $restoreDialog -Message "Failed to start restore point creation.`n$($_.Exception.Message)" -Title "System Restore Manager" -Image Error | Out-Null
@@ -25123,9 +25145,9 @@ exit 1
                 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
                 try { if ($progressWindow) { $progressWindow.Close() } } catch {}
 
-                $script:WmtRestorePointCreateActive = $false
-                if ([object]::ReferenceEquals($script:WmtRestorePointCreateTimer, $timer)) { $script:WmtRestorePointCreateTimer = $null }
-                if ([object]::ReferenceEquals($script:WmtRestorePointCreateProcess, $process)) { $script:WmtRestorePointCreateProcess = $null }
+                $restorePointCreateActiveState.Value = $false
+                if ([object]::ReferenceEquals($restorePointCreateTimerState.Value, $timer)) { $restorePointCreateTimerState.Value = $null }
+                if ([object]::ReferenceEquals($restorePointCreateProcessState.Value, $process)) { $restorePointCreateProcessState.Value = $null }
                 if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
 
                 $messageOwner = $null
@@ -25170,9 +25192,9 @@ exit 1
                 try { if ($process) { $process.Dispose() } } catch {}
                 try { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue } catch {}
                 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
-                $script:WmtRestorePointCreateActive = $false
-                if ([object]::ReferenceEquals($script:WmtRestorePointCreateTimer, $timer)) { $script:WmtRestorePointCreateTimer = $null }
-                if ([object]::ReferenceEquals($script:WmtRestorePointCreateProcess, $process)) { $script:WmtRestorePointCreateProcess = $null }
+                $restorePointCreateActiveState.Value = $false
+                if ([object]::ReferenceEquals($restorePointCreateTimerState.Value, $timer)) { $restorePointCreateTimerState.Value = $null }
+                if ([object]::ReferenceEquals($restorePointCreateProcessState.Value, $process)) { $restorePointCreateProcessState.Value = $null }
                 if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
                 try {
                     if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Restore point creation failed." }
@@ -25186,8 +25208,8 @@ exit 1
         }.GetNewClosure())
 
     [void]$progressWindow.Show()
-    $script:WmtRestorePointCreateTimer = $timer
-    $script:WmtRestorePointCreateProcess = $process
+    $restorePointCreateTimerState.Value = $timer
+    $restorePointCreateProcessState.Value = $process
     $timer.Start()
 }.GetNewClosure()
 
@@ -25392,8 +25414,9 @@ $btnOpenUi.Add_Click({ Start-Process "rstrui.exe" }.GetNewClosure())
 $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
 
 $dialog.Add_ContentRendered({ & $loadRestorePoints }.GetNewClosure())
+$restoreManagerWindowState = Get-Variable -Name WmtRestoreManagerWindow -Scope Script
 $dialog.Add_Closed({
-        if ($script:WmtRestoreManagerWindow -eq $dialog) { $script:WmtRestoreManagerWindow = $null }
+        if ($restoreManagerWindowState.Value -eq $dialog) { $restoreManagerWindowState.Value = $null }
         try { $restoreRefreshState.Handler = $null } catch {}
         try {
             if ($restoreRefreshState.Timer) {
@@ -51616,56 +51639,58 @@ function Update-WmtLibrarySearch {
 }
 
 if ($txtLibrarySearch) {
-    # Get reference to the search box border for focus glow effect
-    $script:LibrarySearchBorder = $txtLibrarySearch.Parent
-    if ($script:LibrarySearchBorder -and $script:LibrarySearchBorder.Parent -is [System.Windows.Controls.Border]) {
-        $script:LibrarySearchBorder = $script:LibrarySearchBorder.Parent
+    # Get reference to the search box border for focus glow effect.
+    $librarySearchBorder = $txtLibrarySearch.Parent
+    if ($librarySearchBorder -and $librarySearchBorder.Parent -is [System.Windows.Controls.Border]) {
+        $librarySearchBorder = $librarySearchBorder.Parent
     }
+    $librarySearchPlaceholder = $librarySearchPlaceholder
+    $librarySearchTimer = $librarySearchTimer
 
     # Placeholder behavior (focus/blur) with border glow.
     $txtLibrarySearch.Add_GotFocus({
-            if ($txtLibrarySearch.Text -eq $script:WmtLibrarySearchPlaceholder) {
+            if ($txtLibrarySearch.Text -eq $librarySearchPlaceholder) {
                 $txtLibrarySearch.Text = ""
                 $txtLibrarySearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextPrimary")
             }
-            if ($script:LibrarySearchBorder) {
-                $script:LibrarySearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "Accent")
-                $script:LibrarySearchBorder.BorderThickness = [System.Windows.Thickness]::new(2)
+            if ($librarySearchBorder) {
+                $librarySearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "Accent")
+                $librarySearchBorder.BorderThickness = [System.Windows.Thickness]::new(2)
             }
         }.GetNewClosure())
 
     $txtLibrarySearch.Add_LostFocus({
             if ([string]::IsNullOrWhiteSpace($txtLibrarySearch.Text)) {
-                $txtLibrarySearch.Text = $script:WmtLibrarySearchPlaceholder
+                $txtLibrarySearch.Text = $librarySearchPlaceholder
                 $txtLibrarySearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextMuted")
             }
-            if ($script:LibrarySearchBorder) {
-                $script:LibrarySearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "BorderBrush")
-                $script:LibrarySearchBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+            if ($librarySearchBorder) {
+                $librarySearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "BorderBrush")
+                $librarySearchBorder.BorderThickness = [System.Windows.Thickness]::new(1)
             }
         }.GetNewClosure())
 
     # Debounced filter on text change + toggle clear button.
     $txtLibrarySearch.Add_TextChanged({
-            try { $script:WmtLibrarySearchTimer.Stop() } catch {}
-            try { $script:WmtLibrarySearchTimer.Start() } catch {}
+            try { $librarySearchTimer.Stop() } catch {}
+            try { $librarySearchTimer.Start() } catch {}
             # Toggle clear button visibility
             $hasRealText = (-not [string]::IsNullOrWhiteSpace($txtLibrarySearch.Text)) -and
-                            ($txtLibrarySearch.Text -ne $script:WmtLibrarySearchPlaceholder)
+                            ($txtLibrarySearch.Text -ne $librarySearchPlaceholder)
             if ($btnLibraryClearSearch) {
                 $btnLibraryClearSearch.Visibility = if ($hasRealText) { "Visible" } else { "Collapsed" }
             }
         }.GetNewClosure())
 
-    $script:WmtLibrarySearchTimer.Add_Tick({
-            try { $script:WmtLibrarySearchTimer.Stop() } catch {}
+    $librarySearchTimer.Add_Tick({
+            try { $librarySearchTimer.Stop() } catch {}
             Update-WmtLibrarySearch
         }.GetNewClosure())
 }
 
 if ($btnLibraryClearSearch) {
     $btnLibraryClearSearch.Add_Click({
-            $txtLibrarySearch.Text = $script:WmtLibrarySearchPlaceholder
+            $txtLibrarySearch.Text = $librarySearchPlaceholder
             $txtLibrarySearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextMuted")
             $btnLibraryClearSearch.Visibility = "Collapsed"
             Update-WmtLibrarySearch
@@ -52749,7 +52774,7 @@ try {
 catch {
     try { Write-GuiLog "Launch Minimized startup handling failed: $($_.Exception.Message)" } catch {}
 }
-}.GetNewClosure()
+}
 [void]$window.Add_ContentRendered($onMainWindowContentRendered)
 
 $onMainWindowSizeChanged = {
@@ -53543,7 +53568,7 @@ try {
     Save-WmtSettings -Settings $settings
 }
 catch {}
-}.GetNewClosure()
+}
 [void]$window.Add_Closing($onMainWindowClosing)
 
 $onMainWindowClosed = {
@@ -53606,7 +53631,7 @@ try {
     if ($app) { $app.Shutdown() }
 }
 catch {}
-}.GetNewClosure()
+}
 [void]$window.Add_Closed($onMainWindowClosed)
 
 # Show the Window.
