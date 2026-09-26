@@ -40931,11 +40931,19 @@ if ($lblWingetStatus) {
 try { Unregister-WmtUiPollOperation -Name "WingetSourcePreflight" } catch {}
 $script:WingetSourcePreflightTimer = $null
 if ($script:WingetSourcePreflightRunspace) {
-    try { $script:WingetSourcePreflightRunspace.Stop() } catch {}
-    try { $script:WingetSourcePreflightRunspace.Dispose() } catch {}
+    $oldPreflightPs = $script:WingetSourcePreflightRunspace
+    $oldPreflightAsync = $script:WingetSourcePreflightAsyncResult
     $script:WingetSourcePreflightRunspace = $null
+    $script:WingetSourcePreflightAsyncResult = $null
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $oldPreflightPs -Invocation $oldPreflightAsync -Name "Winget source preflight replacement"
+    }
+    catch {
+        try { $oldPreflightPs.Dispose() } catch {}
+    }
 }
 
+try {
 $script:WingetSourcePreflightRunspace = (New-WmtPooledPowerShell).AddScript({
         param([string[]]$Sources)
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -40989,6 +40997,20 @@ $script:WingetSourcePreflightRunspace = (New-WmtPooledPowerShell).AddScript({
     }).AddArgument([string[]]$script:WingetSourcePreflightSources)
 
 $script:WingetSourcePreflightAsyncResult = $script:WingetSourcePreflightRunspace.BeginInvoke()
+}
+catch {
+    Write-GuiLog "Winget source preflight could not start: $($_.Exception.Message). Continuing with the package scan."
+    try { if ($script:WingetSourcePreflightRunspace) { $script:WingetSourcePreflightRunspace.Dispose() } } catch {}
+    $script:WingetSourcePreflightRunspace = $null
+    $script:WingetSourcePreflightAsyncResult = $null
+    $script:WingetScanSourcePreflightInProgress = $false
+    $script:WingetSourcePreflightReadyForScan = $true
+    if ($btnWingetScan) {
+        $btnWingetScan.IsEnabled = $true
+        $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+    }
+    return
+}
 $script:WingetSourcePreflightTimer = $null
 Register-WmtUiPollOperation -Name "WingetSourcePreflight" -IntervalMs 250 -TestComplete { $false } -OnTick {
         if (-not $script:WingetSourcePreflightAsyncResult) { return }
