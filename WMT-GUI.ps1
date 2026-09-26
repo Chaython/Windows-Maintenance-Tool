@@ -27042,19 +27042,28 @@ powercfg /S SCHEME_CURRENT | Out-Null
                 <Border Grid.Row="0" Style="{StaticResource CardStyle}" Margin="0,0,0,12">
                     <Grid>
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*" MinWidth="0"/>
                             <ColumnDefinition Width="380"/>
                         </Grid.ColumnDefinitions>
-                        <StackPanel>
-                            <StackPanel>
-                                <TextBlock Name="lblWingetTitle" Text="Package Updates" Style="{StaticResource SectionHeader}" Margin="0"/>
-                                <TextBlock Name="lblWingetStatus" Text="Ready to scan" Foreground="{DynamicResource TextSecondary}" FontSize="13" Visibility="Visible"/>
-                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0" VerticalAlignment="Center">
-                                    <ProgressBar Name="pbWingetProgress" Width="260" Height="8" Minimum="0" Maximum="100" Value="0" Visibility="Collapsed"/>
-                                    <TextBlock Name="lblWingetProgress" Text="" Margin="10,0,0,0" Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"/>
-                                </StackPanel>
-                                <TextBlock Name="lblWingetLastResult" Text="" Margin="0,6,0,0" Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"/>
-                            </StackPanel>
+                        <StackPanel Grid.Column="0" Margin="0,0,16,0">
+                            <TextBlock Name="lblWingetTitle" Text="Package Updates" Style="{StaticResource SectionHeader}" Margin="0"/>
+                            <TextBlock Name="lblWingetStatus" Text="Ready to scan"
+                                       Foreground="{DynamicResource TextSecondary}" FontSize="13" Visibility="Visible"
+                                       TextWrapping="Wrap"/>
+                            <Grid Margin="0,8,0,0" VerticalAlignment="Center">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <ProgressBar Name="pbWingetProgress" Grid.Column="0" Width="260" Height="8"
+                                             Minimum="0" Maximum="100" Value="0" Visibility="Collapsed"/>
+                                <TextBlock Name="lblWingetProgress" Grid.Column="1" Text="" Margin="10,0,0,0"
+                                           Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"
+                                           TextWrapping="Wrap"/>
+                            </Grid>
+                            <TextBlock Name="lblWingetLastResult" Text="" Margin="0,6,0,0"
+                                       Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"
+                                       TextWrapping="Wrap"/>
                         </StackPanel>
                         <Border Grid.Column="1" Style="{StaticResource ModernSearchBoxStyle}" VerticalAlignment="Top">
                             <Grid>
