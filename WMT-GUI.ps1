@@ -7039,6 +7039,7 @@ catch {}
 
 $script:WmtTrayMemoryTimer = $null
 $script:WmtTrayMemoryTimerHandler = $null
+$script:WmtTrayMemoryLastTrim = [DateTime]::MinValue
 
 function Test-WmtAggressiveTrayMemoryMode {
 try {
@@ -7088,6 +7089,7 @@ if (-not (Test-WmtAggressiveTrayMemoryMode)) { return }
 # A scheduled scan can recreate a runspace while WMT is hidden. Re-check every
 # ten seconds and trim again as soon as the work is idle, but do nothing when
 # the process is already near the low-memory target.
+$script:WmtTrayMemoryLastTrim = [DateTime]::MinValue
 $script:WmtTrayMemoryTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:WmtTrayMemoryTimer.Interval = [TimeSpan]::FromSeconds(10)
 $script:WmtTrayMemoryTimerHandler = [System.EventHandler] {
@@ -7101,8 +7103,12 @@ $script:WmtTrayMemoryTimerHandler = [System.EventHandler] {
     try {
         $proc = [System.Diagnostics.Process]::GetCurrentProcess()
         $proc.Refresh()
-        if ($proc.WorkingSet64 -gt 48MB) {
-            Invoke-WmtMemoryTrim -Reason "tray-idle"
+        if ($proc.WorkingSet64 -gt 32MB) {
+            $now = Get-Date
+            if (($now - $script:WmtTrayMemoryLastTrim).TotalSeconds -ge 60) {
+                $script:WmtTrayMemoryLastTrim = $now
+                Invoke-WmtMemoryTrim -Reason "tray-idle"
+            }
         }
     }
     catch {}
