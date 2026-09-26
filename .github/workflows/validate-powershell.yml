@@ -79,3 +79,95 @@ jobs:
           if ($failed) {
               throw "PowerShell syntax validation failed."
           }
+
+      - name: Smoke test shared runspace helpers
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $source = [System.IO.File]::ReadAllText((Resolve-Path ".\\WMT-GUI.ps1").Path)
+
+          # Regression guard: a closure-capture typo such as "$x = $x" silently
+          # turns the captured local into $null and previously broke Library search.
+          $selfAssignments = [regex]::Matches(
+              $source,
+              '(?m)^\s*\$([A-Za-z_][\w]*)\s*=\s*\$\1\s*$'
+          )
+          if ($selfAssignments.Count -gt 0) {
+              $found = @($selfAssignments | ForEach-Object { $_.Value.Trim() }) -join "; "
+              throw "Suspicious self-assignment regression detected: $found"
+          }
+
+          # A pooled worker must never silently fall back to bare PowerShell.Create().
+          if ([regex]::IsMatch($source, '(?m)return\s+\[PowerShell\]::Create\(\)')) {
+              throw "Helper-less pooled PowerShell fallback detected."
+          }
+
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+              $source,
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors -and $parseErrors.Count -gt 0) {
+              throw "WMT-GUI.ps1 unexpectedly failed AST parsing in runspace smoke test."
+          }
+
+          $initFn = $ast.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq "New-WmtRunspaceInitialState"
+              }, $true)
+          if (-not $initFn) {
+              throw "New-WmtRunspaceInitialState was not found."
+          }
+
+          # Pull the Steam helper here-string without executing the GUI application.
+          $marker = '$script:WmtSteamCommonHelpers = @' + [char]39
+          $markerIndex = $source.IndexOf($marker, [System.StringComparison]::Ordinal)
+          if ($markerIndex -lt 0) { throw "WmtSteamCommonHelpers block was not found." }
+
+          $bodyStart = $source.IndexOf("`n", $markerIndex)
+          if ($bodyStart -lt 0) { throw "WmtSteamCommonHelpers body start was not found." }
+          $bodyStart++
+
+          $endMarker = "`n" + [char]39 + "@"
+          $bodyEnd = $source.IndexOf($endMarker, $bodyStart, [System.StringComparison]::Ordinal)
+          if ($bodyEnd -lt 0) { throw "WmtSteamCommonHelpers body end was not found." }
+
+          $script:WmtSteamCommonHelpers = $source.Substring($bodyStart, $bodyEnd - $bodyStart).TrimEnd("`r", "`n")
+          $script:MyDeviceCommonHelpers = ""
+
+          # Load the real implementation from WMT rather than duplicating its logic.
+          Invoke-Expression $initFn.Extent.Text
+          $iss = New-WmtRunspaceInitialState
+
+          $pool = $null
+          $ps = $null
+          try {
+              $pool = [runspacefactory]::CreateRunspacePool(1, 1, $iss, $Host)
+              $pool.ApartmentState = "STA"
+              $pool.ThreadOptions = "ReuseThread"
+              $pool.Open()
+
+              $ps = [PowerShell]::Create()
+              $ps.RunspacePool = $pool
+              [void]$ps.AddScript('Get-WmtSteamManifestValue -Text ''"appid" "12345"'' -Key ''appid''')
+              $result = @($ps.Invoke())
+
+              if ($ps.HadErrors) {
+                  $errors = @($ps.Streams.Error | ForEach-Object { $_.ToString() }) -join "; "
+                  throw "Steam helper runspace smoke test emitted errors: $errors"
+              }
+              if ($result.Count -ne 1 -or [string]$result[0] -ne "12345") {
+                  throw "Steam helper runspace smoke test returned unexpected output: $($result -join ', ')"
+              }
+
+              Write-Host "OK: shared Steam helpers load and execute inside the pooled InitialSessionState."
+          }
+          finally {
+              try { if ($ps) { $ps.Dispose() } } catch {}
+              try { if ($pool) { $pool.Close() } } catch {}
+              try { if ($pool) { $pool.Dispose() } } catch {}
+          }
