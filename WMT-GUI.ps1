@@ -2152,6 +2152,50 @@ $result.Error = [string]$procResult.Error
 return $result
 }
 
+function Set-WmtJsonCacheFile {
+param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)]$InputObject,
+    [int]$Depth = 3
+)
+
+$directory = [System.IO.Path]::GetDirectoryName($Path)
+if ([string]::IsNullOrWhiteSpace($directory)) { $directory = (Get-Location).Path }
+if (-not [System.IO.Directory]::Exists($directory)) {
+    [void][System.IO.Directory]::CreateDirectory($directory)
+}
+
+$tempPath = Join-Path $directory (".{0}.{1}.tmp" -f [System.IO.Path]::GetFileName($Path), [Guid]::NewGuid().ToString("N"))
+try {
+    $json = $InputObject | ConvertTo-Json -Depth $Depth
+    if ($null -eq $json) { $json = "[]" }
+
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    [System.IO.File]::WriteAllText($tempPath, [string]$json, $utf8Bom)
+
+    if ([System.IO.File]::Exists($Path)) {
+        try {
+            [System.IO.File]::Replace($tempPath, $Path, $null, $true)
+        }
+        catch {
+            # Replace may be unsupported by a filesystem. Copying a fully-written
+            # temp file is still safer than streaming JSON directly into the live file.
+            [System.IO.File]::Copy($tempPath, $Path, $true)
+            [System.IO.File]::Delete($tempPath)
+        }
+    }
+    else {
+        [System.IO.File]::Move($tempPath, $Path)
+    }
+}
+finally {
+    try {
+        if ([System.IO.File]::Exists($tempPath)) { [System.IO.File]::Delete($tempPath) }
+    }
+    catch {}
+}
+}
+
 # Shared Steam parsing/discovery helpers. The same definitions are loaded into
 # main scope and injected into every pooled runspace to prevent parser drift.
 $script:WmtSteamCommonHelpers = @'
@@ -2367,7 +2411,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -38075,7 +38119,7 @@ $script:WmtLegendaryLibraryCache = $result.ToArray()
 try {
     $cacheFile = Join-Path (Get-DataPath) "legendary_library.json"
     if ($result.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
-        $script:WmtLegendaryLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+        Set-WmtJsonCacheFile -Path $cacheFile -InputObject $script:WmtLegendaryLibraryCache -Depth 3
     }
 }
 catch {
@@ -38163,7 +38207,7 @@ $script:WmtGogLibraryCache = $result.ToArray()
 try {
     $cacheFile = Join-Path (Get-DataPath) "gog_library.json"
     if ($result.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
-        $script:WmtGogLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+        Set-WmtJsonCacheFile -Path $cacheFile -InputObject $script:WmtGogLibraryCache -Depth 3
     }
 }
 catch {
@@ -38281,7 +38325,7 @@ $script:WmtSteamLibraryCache = $result.ToArray()
 try {
     $cacheFile = Join-Path (Get-DataPath) "steam_library.json"
     if ($result.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
-        $script:WmtSteamLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+        Set-WmtJsonCacheFile -Path $cacheFile -InputObject $script:WmtSteamLibraryCache -Depth 3
     }
     else {
         Write-GuiLog "Steam library refresh returned no games; keeping the existing cache."
@@ -38363,7 +38407,7 @@ try {
     # fetch, an empty cache is still allowed so callers have a valid JSON file.
     $allAppsArray = $allApps.ToArray()
     if ($allAppsArray.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
-        $allAppsArray | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+        Set-WmtJsonCacheFile -Path $cacheFile -InputObject $allAppsArray -Depth 1
         Write-GuiLog "Steam app list cached: $($appNames.Count) apps."
     }
     else {
@@ -44044,7 +44088,7 @@ $script:InvokeWingetSearch = {
                             # Extract just the package names to keep the cache small.
                             $names = @($resp.projects | ForEach-Object { [string]$_.name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                             if ($names.Count -gt 0 -or -not (Test-Path -LiteralPath $CacheFile -PathType Leaf)) {
-                                $names | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $CacheFile -Force -Encoding UTF8
+                                Set-WmtJsonCacheFile -Path $CacheFile -InputObject $names -Depth 1
                                 Write-Output "LOG:PyPI index cached: $($names.Count) packages."
                             }
                             else {
@@ -44235,7 +44279,7 @@ $script:InvokeWingetSearch = {
                         # good list, mirroring the other cache writers.
                         $arrLeg = $result.ToArray()
                         if ($arrLeg.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
-                            $arrLeg | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $LegCacheFile -Force -Encoding UTF8
+                            Set-WmtJsonCacheFile -Path $LegCacheFile -InputObject $arrLeg -Depth 3
                         }
                     }
                     catch {}
@@ -44276,7 +44320,7 @@ $script:InvokeWingetSearch = {
                         }
                         $arrGog = $result.ToArray()
                         if ($arrGog.Count -gt 0 -or -not (Test-Path -LiteralPath $GogCacheFile -PathType Leaf)) {
-                            $arrGog | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $GogCacheFile -Force -Encoding UTF8
+                            Set-WmtJsonCacheFile -Path $GogCacheFile -InputObject $arrGog -Depth 3
                         }
                     }
                     catch {}
@@ -53598,7 +53642,7 @@ try {
                     # Guard: never wipe an existing cache with an empty result (e.g. a
                     # network outage during the fetch) — keep the last good list.
                     if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
-                        $arr | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $LegCacheFile -Force -Encoding UTF8
+                        Set-WmtJsonCacheFile -Path $LegCacheFile -InputObject $arr -Depth 3
                     }
                     Write-Output "LOG:Legendary library cached: $($arr.Count) games."
                 }
@@ -53656,7 +53700,7 @@ try {
 
                     $arr = $result.ToArray()
                     if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $GogCacheFile -PathType Leaf)) {
-                        $arr | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $GogCacheFile -Force -Encoding UTF8
+                        Set-WmtJsonCacheFile -Path $GogCacheFile -InputObject $arr -Depth 3
                         Write-Output "LOG:GOG library cached: $($arr.Count) games."
                     }
                     else {
@@ -53681,7 +53725,7 @@ try {
                     if ($resp -and $resp.projects) {
                         $names = @($resp.projects | ForEach-Object { [string]$_.name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                         if ($names.Count -gt 0 -or -not (Test-Path -LiteralPath $PypiCacheFile -PathType Leaf)) {
-                            $names | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $PypiCacheFile -Force -Encoding UTF8
+                            Set-WmtJsonCacheFile -Path $PypiCacheFile -InputObject $names -Depth 1
                             Write-Output "LOG:PyPI index cached: $($names.Count) packages."
                         }
                         else {
@@ -53767,7 +53811,7 @@ try {
                                 # produces no usable rows.
                                 $allAppsArray = $allApps.ToArray()
                                 if ($allAppsArray.Count -gt 0 -or -not (Test-Path -LiteralPath $appListFile -PathType Leaf)) {
-                                    $allAppsArray | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $appListFile -Force -Encoding UTF8
+                                    Set-WmtJsonCacheFile -Path $appListFile -InputObject $allAppsArray -Depth 1
                                     Write-Output "LOG:Steam app list cached: $($appNames.Count) apps."
                                 }
                                 else {
@@ -53823,7 +53867,7 @@ try {
                         }
                         $steamArray = $sResult.ToArray()
                         if ($steamArray.Count -gt 0 -or -not (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
-                            $steamArray | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $SteamCacheFile -Force -Encoding UTF8
+                            Set-WmtJsonCacheFile -Path $SteamCacheFile -InputObject $steamArray -Depth 3
                             Write-Output "LOG:Steam library cached: $($sResult.Count) games."
                         }
                         else {
