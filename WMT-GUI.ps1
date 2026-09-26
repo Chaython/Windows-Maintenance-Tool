@@ -6,6 +6,13 @@
     Imported and integrated from Lil_Batti (author) with contributions from Chaython
 #>
 
+param(
+    [switch]$AutoCleanWorker,
+    [string]$AutoCleanResultPath = "",
+    [switch]$CleanerRefreshWorker,
+    [string]$CleanerRefreshResultPath = ""
+)
+
 # ==========================================
 # 1. SETUP
 # ==========================================
@@ -138,6 +145,7 @@ exit
 
 # Keep one elevated WMT process per interactive Windows session. A later launch
 # signals the existing window to restore/focus, then exits before doing any work.
+$script:WmtBackgroundWorkerMode = [bool]($AutoCleanWorker -or $CleanerRefreshWorker)
 $script:WmtSingleInstanceMutexName = "Local\WindowsMaintenanceTool.SingleInstance"
 $script:WmtSingleInstanceActivationEventName = "Local\WindowsMaintenanceTool.Activate"
 $script:WmtSingleInstanceMutex = $null
@@ -158,7 +166,7 @@ $script:WmtSingleInstanceMutex = [System.Threading.Mutex]::new(
 )
 $script:WmtSingleInstanceMutexOwned = [bool]$createdNew
 
-if (-not $createdNew) {
+if (-not $createdNew -and -not $script:WmtBackgroundWorkerMode) {
     try { [void]$script:WmtSingleInstanceActivationEvent.Set() } catch {}
     try { $script:WmtSingleInstanceActivationEvent.Dispose() } catch {}
     try { $script:WmtSingleInstanceMutex.Dispose() } catch {}
@@ -10961,6 +10969,124 @@ if ($memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $finalList }
 return $finalList
 }
 
+function Invoke-WmtCleanerDefinitionMaintenance {
+param([switch]$ForceRemote)
+
+$settings = Get-WmtSettings
+$skipDownloads = [bool]$settings.SkipRuleDownloads
+$cacheOnly = [bool]$settings.CacheOnly
+$remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $settings
+$processed = [System.Collections.Generic.List[string]]::new()
+$checked = [System.Collections.Generic.List[string]]::new()
+$updated = [System.Collections.Generic.List[string]]::new()
+
+$processSource = {
+    param([string]$Source, [scriptblock]$Loader, [string]$LocalPath, [bool]$Enabled)
+
+    if (-not $Enabled) { return }
+    $before = Get-WmtCleanerSourceState -Source $Source
+    $shouldDownload = $false
+    if (-not $skipDownloads -and -not $cacheOnly) {
+        $shouldDownload = $ForceRemote -or (-not [string]::IsNullOrWhiteSpace($LocalPath) -and -not (Test-Path -LiteralPath $LocalPath)) -or (Test-WmtCleanerRemoteRefreshDue -Source $Source -Minutes $remoteMinutes)
+    }
+
+    & $Loader $shouldDownload
+    [void]$processed.Add($Source)
+
+    $after = Get-WmtCleanerSourceState -Source $Source
+    if ([string]$after.LastCheckedUtc -ne [string]$before.LastCheckedUtc) { [void]$checked.Add($Source) }
+    if ([string]$after.LastUpdatedUtc -ne [string]$before.LastUpdatedUtc) { [void]$updated.Add($Source) }
+}.GetNewClosure()
+
+$dataPath = Get-DataPath
+& $processSource "Winapp2" {
+    param($download)
+    [void]@(Get-Winapp2Rules -Download:$download -SkipDownloads:$skipDownloads -CacheOnly:$cacheOnly)
+} (Join-Path $dataPath "winapp2.ini") ([bool]$settings.LoadWinapp2)
+
+& $processSource "Winapp3" {
+    param($download)
+    [void]@(Get-Winapp3Rules -Download:$download -SkipDownloads:$skipDownloads -CacheOnly:$cacheOnly)
+} (Join-Path $dataPath "winapp3.ini") ([bool]$settings.LoadWinapp3)
+
+$cleanerMlRoot = Join-Path $dataPath "bleachbit_cleanerml\cleanerml-master"
+& $processSource "CleanerML" {
+    param($download)
+    [void]@(Get-BleachBitCleanerMlRules -Download:$download -IncludePending:([bool]$settings.LoadCleanerMLPending) -SkipDownloads:$skipDownloads -CacheOnly:$cacheOnly)
+} $cleanerMlRoot ([bool]$settings.LoadCleanerML)
+
+return [PSCustomObject]@{
+    ProcessedSources = @($processed.ToArray())
+    CheckedSources   = @($checked.ToArray())
+    UpdatedSources   = @($updated.ToArray())
+    CompletedUtc     = [DateTime]::UtcNow.ToString("o")
+}
+}
+
+function Test-WmtSavedCleanerSelectionEnabled {
+param($State, [string]$Key)
+if (-not $State -or [string]::IsNullOrWhiteSpace($Key)) { return $false }
+try {
+    if ($State -is [System.Collections.IDictionary]) {
+        return ($State.Contains($Key) -and [bool]$State[$Key])
+    }
+    if ($State.PSObject.Properties[$Key]) { return [bool]$State.$Key }
+}
+catch {}
+return $false
+}
+
+function Get-WmtAutomaticCleanupSelections {
+$settings = Get-WmtSettings
+$saved = $settings.TempCleanup
+$selected = [System.Collections.Generic.List[object]]::new()
+
+# Automatic cleanup intentionally requires an explicit saved selection. It never
+# assumes the UI's first-run defaults, so enabling a schedule cannot silently
+# opt users into cleaners they have never selected.
+$internalKeys = @(
+    "TempFiles", "RecycleBin", "WER", "DNS", "Thumbnails", "ThumbsDb",
+    "Recent", "RunMRU", "Chrome", "Edge", "Firefox", "Brave", "Opera", "OperaGX"
+)
+foreach ($key in $internalKeys) {
+    if (Test-WmtSavedCleanerSelectionEnabled -State $saved -Key $key) { [void]$selected.Add($key) }
+}
+
+$skipDownloads = [bool]$settings.SkipRuleDownloads
+$cacheOnly = [bool]$settings.CacheOnly
+$remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $settings
+$dataPath = Get-DataPath
+
+if ([bool]$settings.LoadWinapp2) {
+    $iniPath = Join-Path $dataPath "winapp2.ini"
+    $download = (-not $skipDownloads) -and (-not $cacheOnly) -and ((-not (Test-Path -LiteralPath $iniPath)) -or (Test-WmtCleanerRemoteRefreshDue -Source "Winapp2" -Minutes $remoteMinutes))
+    foreach ($rule in @(Get-Winapp2Rules -Download:$download -SkipDownloads:$skipDownloads -CacheOnly:$cacheOnly)) {
+        $key = if ($rule.PSObject.Properties["Key"] -and $rule.Key) { [string]$rule.Key } else { [string]$rule.ID }
+        if (Test-WmtSavedCleanerSelectionEnabled -State $saved -Key $key) { [void]$selected.Add($rule) }
+    }
+}
+
+if ([bool]$settings.LoadWinapp3) {
+    $iniPath = Join-Path $dataPath "winapp3.ini"
+    $download = (-not $skipDownloads) -and (-not $cacheOnly) -and ((-not (Test-Path -LiteralPath $iniPath)) -or (Test-WmtCleanerRemoteRefreshDue -Source "Winapp3" -Minutes $remoteMinutes))
+    foreach ($rule in @(Get-Winapp3Rules -Download:$download -SkipDownloads:$skipDownloads -CacheOnly:$cacheOnly)) {
+        $key = if ($rule.PSObject.Properties["Key"] -and $rule.Key) { [string]$rule.Key } else { [string]$rule.ID }
+        if (Test-WmtSavedCleanerSelectionEnabled -State $saved -Key $key) { [void]$selected.Add($rule) }
+    }
+}
+
+if ([bool]$settings.LoadCleanerML) {
+    $hasLocal = ((Get-WmtBleachBitCleanerXmlDirectories).Count -gt 0)
+    $download = (-not $skipDownloads) -and (-not $cacheOnly) -and ((-not $hasLocal) -or (Test-WmtCleanerRemoteRefreshDue -Source "CleanerML" -Minutes $remoteMinutes))
+    foreach ($rule in @(Get-BleachBitCleanerMlRules -Download:$download -IncludePending:([bool]$settings.LoadCleanerMLPending) -SkipDownloads:$skipDownloads -CacheOnly:$cacheOnly)) {
+        $key = if ($rule.PSObject.Properties["Key"] -and $rule.Key) { [string]$rule.Key } else { [string]$rule.ID }
+        if (Test-WmtSavedCleanerSelectionEnabled -State $saved -Key $key) { [void]$selected.Add($rule) }
+    }
+}
+
+return $selected.ToArray()
+}
+
 function Show-WmtAdvancedCleanupSelectionWpf {
 $currentSettings = Get-WmtSettings
 $savedStates = $currentSettings.TempCleanup
@@ -12392,8 +12518,18 @@ $previewWindow.ShowDialog() | Out-Null
 }
 
 function Invoke-TempCleanup {
+param([switch]$Automatic)
+
 # 1. GET SELECTION
-$uiResult = Show-WmtAdvancedCleanupSelectionWpf
+if ($Automatic) {
+    $uiResult = [PSCustomObject]@{
+        Action = "Clean"
+        Items  = @(Get-WmtAutomaticCleanupSelections)
+    }
+}
+else {
+    $uiResult = Show-WmtAdvancedCleanupSelectionWpf
+}
 
 # FIX: Force the returned items into an array @() to prevent PowerShell
 # from unrolling single-item selections and losing the .Count property.
@@ -12401,6 +12537,16 @@ $selections = @($uiResult.Items)
 
 if (-not $uiResult -or $selections.Count -eq 0) {
     Write-GuiLog "Cleanup/Analysis canceled: No items selected."
+    if ($Automatic) {
+        return [PSCustomObject]@{
+            Status         = "NoSelection"
+            FilesRemoved   = 0
+            BytesRemoved   = 0
+            SpaceRecovered = "0 B"
+            SelectedCount  = 0
+            CompletedUtc   = [DateTime]::UtcNow.ToString("o")
+        }
+    }
     return
 }
 
@@ -12429,15 +12575,26 @@ $previewList = New-Object System.Collections.Generic.List[PSCustomObject]
 </Grid>
 </Window>
 '@
-$pForm = New-WmtWindowFromFullXaml -Xaml $cleanupProgressXaml
-$pForm.Title = if ($isAnalyze) { "Analyzing System..." } else { "Deep Cleaning System" }
-$pLabel = $pForm.FindName("pLabel")
-$pStatus = $pForm.FindName("pStatus")
-$pBar = $pForm.FindName("pBar")
 $progressState = @{ Closed = $false }
-$pForm.Add_Closed({ $progressState.Closed = $true }.GetNewClosure())
-$pForm.Show()
-Invoke-WmtDispatcherPump -Dispatcher $pForm.Dispatcher
+if ($Automatic) {
+    # The automatic worker runs in a separate process. Lightweight stand-ins
+    # preserve the existing cleanup engine's progress assignments without
+    # constructing or showing any WPF window.
+    $pForm = [PSCustomObject]@{ Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher }
+    $pLabel = [PSCustomObject]@{ Text = "" }
+    $pStatus = [PSCustomObject]@{ Text = "" }
+    $pBar = [PSCustomObject]@{ Value = 0 }
+}
+else {
+    $pForm = New-WmtWindowFromFullXaml -Xaml $cleanupProgressXaml
+    $pForm.Title = if ($isAnalyze) { "Analyzing System..." } else { "Deep Cleaning System" }
+    $pLabel = $pForm.FindName("pLabel")
+    $pStatus = $pForm.FindName("pStatus")
+    $pBar = $pForm.FindName("pBar")
+    $pForm.Add_Closed({ $progressState.Closed = $true }.GetNewClosure())
+    $pForm.Show()
+    Invoke-WmtDispatcherPump -Dispatcher $pForm.Dispatcher
+}
 
 # 3. STATS TRACKING
 $stats = @{
@@ -13883,7 +14040,7 @@ catch {
     Write-GuiLog "Error: $($_.Exception.Message)"
 }
 finally {
-    $pForm.Close()
+    if (-not $Automatic -and $pForm) { try { $pForm.Close() } catch {} }
 }
 
 # 5. FINAL REPORT & PREVIEW
@@ -13904,8 +14061,66 @@ if ($isAnalyze) {
 else {
     Write-GuiLog "Total Removed: $finalTotalFormatted"
     $msg = "Cleanup Complete.`n`nFiles Removed: $($stats.Deleted)`nSpace Recovered: $finalTotalFormatted"
-    Show-WmtMessageBox -Message $msg -Title "Cleanup Results" -Image Information | Out-Null
+    if (-not $Automatic) {
+        Show-WmtMessageBox -Message $msg -Title "Cleanup Results" -Image Information | Out-Null
+    }
 }
+
+if ($Automatic) {
+    return [PSCustomObject]@{
+        Status         = "Completed"
+        FilesRemoved   = [int64]$stats.Deleted
+        BytesRemoved   = [int64]$stats.Bytes
+        SpaceRecovered = $finalTotalFormatted
+        SelectedCount  = [int]$selections.Count
+        CompletedUtc   = [DateTime]::UtcNow.ToString("o")
+    }
+}
+}
+
+# Background worker entry points are evaluated here, before the main WMT window
+# is created. This keeps scheduled cleaner work independent of the UI process.
+if ($AutoCleanWorker) {
+    $resultPath = if ([string]::IsNullOrWhiteSpace($AutoCleanResultPath)) { Join-Path (Get-DataPath) "cleaner-auto-last.json" } else { $AutoCleanResultPath }
+    try {
+        $workerResult = Invoke-TempCleanup -Automatic
+        $json = $workerResult | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText($resultPath, $json, [System.Text.UTF8Encoding]::new($false))
+        exit 0
+    }
+    catch {
+        try {
+            $errorResult = [PSCustomObject]@{
+                Status       = "Error"
+                Error        = $_.Exception.Message
+                CompletedUtc = [DateTime]::UtcNow.ToString("o")
+            }
+            [System.IO.File]::WriteAllText($resultPath, ($errorResult | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+        }
+        catch {}
+        exit 1
+    }
+}
+
+if ($CleanerRefreshWorker) {
+    $resultPath = if ([string]::IsNullOrWhiteSpace($CleanerRefreshResultPath)) { Join-Path (Get-DataPath) "cleaner-refresh-last.json" } else { $CleanerRefreshResultPath }
+    try {
+        $workerResult = Invoke-WmtCleanerDefinitionMaintenance
+        [System.IO.File]::WriteAllText($resultPath, ($workerResult | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+        exit 0
+    }
+    catch {
+        try {
+            $errorResult = [PSCustomObject]@{
+                Status       = "Error"
+                Error        = $_.Exception.Message
+                CompletedUtc = [DateTime]::UtcNow.ToString("o")
+            }
+            [System.IO.File]::WriteAllText($resultPath, ($errorResult | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+        }
+        catch {}
+        exit 1
+    }
 }
 
 # --- Registry Scan Selection UI ---
@@ -39841,6 +40056,282 @@ foreach ($item in @($lstWinget.Items)) {
 return $items.ToArray()
 }
 
+function ConvertTo-WmtSelfWorkerArgument {
+param([string]$Value)
+if ($null -eq $Value) { return '""' }
+return '"' + (([string]$Value) -replace '"', '\"') + '"'
+}
+
+function Start-WmtHiddenSelfWorkerProcess {
+param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+$psi = [System.Diagnostics.ProcessStartInfo]::new()
+if ($script:WmtIsCompiledExe) {
+    $psi.FileName = $script:WmtLaunchPath
+    $psi.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WmtSelfWorkerArgument $_ }) -join " ")
+}
+else {
+    $psi.FileName = "powershell.exe"
+    $prefix = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", $script:WmtScriptPath)
+    $psi.Arguments = (@($prefix + $Arguments | ForEach-Object { ConvertTo-WmtSelfWorkerArgument $_ }) -join " ")
+}
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+return [System.Diagnostics.Process]::Start($psi)
+}
+
+function Test-WmtCleanerDefinitionMaintenanceDue {
+$settings = Get-WmtSettings
+if (-not ([bool]$settings.LoadWinapp2 -or [bool]$settings.LoadWinapp3 -or [bool]$settings.LoadCleanerML)) { return $false }
+
+$dataPath = Get-DataPath
+$localMinutes = Get-WmtCleanerLocalRefreshMinutes -Settings $settings
+$remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $settings
+
+$checks = @()
+if ([bool]$settings.LoadWinapp2) {
+    $checks += [PSCustomObject]@{
+        Source = "Winapp2"
+        SourcePath = Join-Path $dataPath "winapp2.ini"
+        CachePath = Join-Path $dataPath "winapp2_cache.json"
+        MetaPath = Join-Path $dataPath "winapp2_cache.meta.json"
+    }
+}
+if ([bool]$settings.LoadWinapp3) {
+    $checks += [PSCustomObject]@{
+        Source = "Winapp3"
+        SourcePath = Join-Path $dataPath "winapp3.ini"
+        CachePath = Join-Path $dataPath "winapp3_cache.json"
+        MetaPath = Join-Path $dataPath "winapp3_cache.meta.json"
+    }
+}
+if ([bool]$settings.LoadCleanerML) {
+    $checks += [PSCustomObject]@{
+        Source = "CleanerML"
+        SourcePath = Join-Path $dataPath "bleachbit_cleanerml\cleanerml-master"
+        CachePath = Join-Path $dataPath "cleanerml_cache.json"
+        MetaPath = Join-Path $dataPath "cleanerml_cache.meta.json"
+    }
+}
+
+foreach ($check in $checks) {
+    if (-not (Test-WmtCleanerLocalCacheFresh -CachePath $check.CachePath -MetaPath $check.MetaPath -Minutes $localMinutes)) { return $true }
+    if ($remoteMinutes -gt 0 -and (Test-WmtCleanerRemoteRefreshDue -Source $check.Source -Minutes $remoteMinutes)) { return $true }
+    if (-not (Test-Path -LiteralPath $check.SourcePath)) { return $true }
+}
+return $false
+}
+
+function Invoke-WmtCleanerDefinitionRefresh {
+param([switch]$Force)
+
+if ((Get-WmtDisableBackgroundJobs) -and -not $Force) { return }
+if (-not $Force -and -not (Test-WmtCleanerDefinitionMaintenanceDue)) { return }
+
+if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
+    Write-GuiLog "Cleaner definition refresh skipped because the previous refresh is still running."
+    return
+}
+
+$resultPath = Join-Path (Get-DataPath) "cleaner-refresh-last.json"
+try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
+
+try {
+    $proc = Start-WmtHiddenSelfWorkerProcess -Arguments @("-CleanerRefreshWorker", "-CleanerRefreshResultPath", $resultPath)
+    if (-not $proc) { throw "Worker process did not start." }
+    $script:WmtCleanerRefreshProcess = $proc
+    Write-GuiLog "Cleaner definition refresh started in the background."
+
+    Register-WmtUiPollOperation -Name "CleanerDefinitionRefresh" -IntervalMs 1000 -TestComplete {
+        return [bool]($script:WmtCleanerRefreshProcess -and $script:WmtCleanerRefreshProcess.HasExited)
+    } -OnComplete {
+        try {
+            $result = $null
+            if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
+                $result = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            }
+            if ($result -and $result.PSObject.Properties["Error"]) {
+                Write-GuiLog "Cleaner definition refresh failed: $($result.Error)"
+            }
+            elseif ($result) {
+                $processed = @($result.ProcessedSources)
+                $checked = @($result.CheckedSources)
+                $updated = @($result.UpdatedSources)
+                $message = "Cleaner definitions refreshed: $($processed.Count) source(s) processed"
+                if ($checked.Count -gt 0) { $message += ", $($checked.Count) upstream check(s)" }
+                if ($updated.Count -gt 0) { $message += ", $($updated.Count) updated" }
+                Write-GuiLog ($message + ".")
+            }
+        }
+        catch { Write-GuiLog "Cleaner definition refresh result warning: $($_.Exception.Message)" }
+        finally {
+            try { if ($script:WmtCleanerRefreshProcess) { $script:WmtCleanerRefreshProcess.Dispose() } } catch {}
+            $script:WmtCleanerRefreshProcess = $null
+        }
+    } | Out-Null
+}
+catch {
+    $script:WmtCleanerRefreshProcess = $null
+    Write-GuiLog "Cleaner definition refresh failed to start: $($_.Exception.Message)"
+}
+}
+
+function Start-WmtCleanerDefinitionRefreshTimer {
+param([switch]$ResetNextRun)
+
+Stop-WmtCleanerDefinitionRefreshTimer
+if (Get-WmtDisableBackgroundJobs) { return }
+
+$settings = Get-WmtSettings
+if (-not ([bool]$settings.LoadWinapp2 -or [bool]$settings.LoadWinapp3 -or [bool]$settings.LoadCleanerML)) { return }
+
+$intervals = [System.Collections.Generic.List[int]]::new()
+[void]$intervals.Add((Get-WmtCleanerLocalRefreshMinutes -Settings $settings))
+$remote = Get-WmtCleanerRemoteCheckMinutes -Settings $settings
+if ($remote -gt 0) { [void]$intervals.Add($remote) }
+$minutes = @($intervals.ToArray() | Measure-Object -Minimum).Minimum
+if (-not $minutes -or $minutes -lt 1) { $minutes = 1 }
+
+$script:WmtCleanerDefinitionRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:WmtCleanerDefinitionRefreshTimer.Interval = [TimeSpan]::FromMinutes([double]$minutes)
+$script:WmtCleanerDefinitionRefreshTimerTickHandler = [System.EventHandler] {
+    param($s, $eventArg)
+    Invoke-WmtCleanerDefinitionRefresh
+}
+$script:WmtCleanerDefinitionRefreshTimer.Add_Tick($script:WmtCleanerDefinitionRefreshTimerTickHandler)
+$script:WmtCleanerDefinitionRefreshTimer.Start()
+
+if ($ResetNextRun -and (Test-WmtCleanerDefinitionMaintenanceDue)) {
+    Invoke-WmtCleanerDefinitionRefresh
+}
+Write-GuiLog "Cleaner definition maintenance enabled: local refresh every $(Get-WmtCleanerLocalRefreshMinutes -Settings $settings) minute(s); upstream checks every $(if ($remote -gt 0) { $remote } else { 'Never' }) minute(s)."
+}
+
+function Stop-WmtCleanerDefinitionRefreshTimer {
+if ($script:WmtCleanerDefinitionRefreshTimer) {
+    try { $script:WmtCleanerDefinitionRefreshTimer.Stop() } catch {}
+    try {
+        if ($script:WmtCleanerDefinitionRefreshTimerTickHandler) {
+            $script:WmtCleanerDefinitionRefreshTimer.Remove_Tick($script:WmtCleanerDefinitionRefreshTimerTickHandler)
+        }
+    }
+    catch {}
+}
+$script:WmtCleanerDefinitionRefreshTimer = $null
+$script:WmtCleanerDefinitionRefreshTimerTickHandler = $null
+}
+
+function Test-WmtAnySavedCleanerSelected {
+$settings = Get-WmtSettings
+$state = $settings.TempCleanup
+if (-not $state) { return $false }
+try {
+    if ($state -is [System.Collections.IDictionary]) {
+        foreach ($key in $state.Keys) { if ([bool]$state[$key]) { return $true } }
+    }
+    else {
+        foreach ($property in @($state.PSObject.Properties)) { if ([bool]$property.Value) { return $true } }
+    }
+}
+catch {}
+return $false
+}
+
+function Invoke-WmtCleanerAutoClean {
+param([switch]$Force)
+
+$minutes = Get-WmtCleanerAutoCleanMinutes
+if ($minutes -le 0 -and -not $Force) { return }
+if ((Get-WmtDisableBackgroundJobs) -and -not $Force) { return }
+
+if (-not (Test-WmtAnySavedCleanerSelected)) {
+    Write-GuiLog "Automatic cleaner skipped: no saved cleaner selections are enabled."
+    return
+}
+
+if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProcess.HasExited) {
+    Write-GuiLog "Automatic cleaner skipped because the previous run is still active."
+    return
+}
+
+$resultPath = Join-Path (Get-DataPath) "cleaner-auto-last.json"
+try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
+
+try {
+    $proc = Start-WmtHiddenSelfWorkerProcess -Arguments @("-AutoCleanWorker", "-AutoCleanResultPath", $resultPath)
+    if (-not $proc) { throw "Worker process did not start." }
+    $script:WmtCleanerAutoCleanProcess = $proc
+    Write-GuiLog "Automatic cleaner started in a separate background worker."
+
+    Register-WmtUiPollOperation -Name "CleanerAutoClean" -IntervalMs 1000 -TestComplete {
+        return [bool]($script:WmtCleanerAutoCleanProcess -and $script:WmtCleanerAutoCleanProcess.HasExited)
+    } -OnComplete {
+        try {
+            $result = $null
+            if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
+                $result = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            }
+            if (-not $result) {
+                Write-GuiLog "Automatic cleaner finished without a result summary."
+            }
+            elseif ([string]$result.Status -eq "Error") {
+                Write-GuiLog "Automatic cleaner failed: $($result.Error)"
+            }
+            elseif ([string]$result.Status -eq "NoSelection") {
+                Write-GuiLog "Automatic cleaner finished: no saved cleaners were available to run."
+            }
+            else {
+                Write-GuiLog "Automatic cleaner complete: $($result.FilesRemoved) item(s), $($result.SpaceRecovered) recovered across $($result.SelectedCount) cleaner(s)."
+            }
+        }
+        catch { Write-GuiLog "Automatic cleaner result warning: $($_.Exception.Message)" }
+        finally {
+            try { if ($script:WmtCleanerAutoCleanProcess) { $script:WmtCleanerAutoCleanProcess.Dispose() } } catch {}
+            $script:WmtCleanerAutoCleanProcess = $null
+        }
+    } | Out-Null
+}
+catch {
+    $script:WmtCleanerAutoCleanProcess = $null
+    Write-GuiLog "Automatic cleaner failed to start: $($_.Exception.Message)"
+}
+}
+
+function Start-WmtCleanerAutoCleanTimer {
+param([switch]$ResetNextRun)
+
+Stop-WmtCleanerAutoCleanTimer
+if (Get-WmtDisableBackgroundJobs) { return }
+
+$minutes = Get-WmtCleanerAutoCleanMinutes
+if ($minutes -le 0) { return }
+
+$script:WmtCleanerAutoCleanTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:WmtCleanerAutoCleanTimer.Interval = [TimeSpan]::FromMinutes([double]$minutes)
+$script:WmtCleanerAutoCleanTimerTickHandler = [System.EventHandler] {
+    param($s, $eventArg)
+    Invoke-WmtCleanerAutoClean
+}
+$script:WmtCleanerAutoCleanTimer.Add_Tick($script:WmtCleanerAutoCleanTimerTickHandler)
+$script:WmtCleanerAutoCleanTimer.Start()
+Write-GuiLog "Automatic cleaner enabled: every $minutes minute(s) while WMT is open or in the tray."
+}
+
+function Stop-WmtCleanerAutoCleanTimer {
+if ($script:WmtCleanerAutoCleanTimer) {
+    try { $script:WmtCleanerAutoCleanTimer.Stop() } catch {}
+    try {
+        if ($script:WmtCleanerAutoCleanTimerTickHandler) {
+            $script:WmtCleanerAutoCleanTimer.Remove_Tick($script:WmtCleanerAutoCleanTimerTickHandler)
+        }
+    }
+    catch {}
+}
+$script:WmtCleanerAutoCleanTimer = $null
+$script:WmtCleanerAutoCleanTimerTickHandler = $null
+}
+
 function Invoke-WmtUpdateAutoScan {
 param([switch]$Force)
 
@@ -48761,6 +49252,11 @@ try {
     if (-not (Get-WmtUpdateScansDisabled)) {
         try { Start-WmtUpdateAutoScanTimer } catch {}
     }
+
+    # Cleaner definition refresh and optional automatic cleanup use isolated
+    # worker processes so they never block the WPF thread.
+    try { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } catch {}
+    try { Start-WmtCleanerAutoCleanTimer -ResetNextRun } catch {}
 }
 catch {
     try { Write-GuiLog "Background jobs failed to start: $($_.Exception.Message)" } catch {}
@@ -48796,6 +49292,8 @@ $btnDisableBgJobs.Add_Click({
             try { Start-WmtBackgroundJobsNow } catch {}
         }
         else {
+            try { Stop-WmtCleanerDefinitionRefreshTimer } catch {}
+            try { Stop-WmtCleanerAutoCleanTimer } catch {}
             Write-GuiLog "Background jobs disabled. In-flight jobs will finish; new ones will not start."
         }
     })
@@ -52097,8 +52595,12 @@ $preloadDeferTimer.Start()
         if (Get-WmtUpdateNotificationsEnabled -Settings $settings) {
             [void](Initialize-WmtNativeToastSupport)
         }
-        if (-not (Get-WmtDisableBackgroundJobs -Settings $settings) -and -not (Get-WmtUpdateScansDisabled -Settings $settings)) {
-            Start-WmtUpdateAutoScanTimer -ResetNextRun
+        if (-not (Get-WmtDisableBackgroundJobs -Settings $settings)) {
+            if (-not (Get-WmtUpdateScansDisabled -Settings $settings)) {
+                Start-WmtUpdateAutoScanTimer -ResetNextRun
+            }
+            Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun
+            Start-WmtCleanerAutoCleanTimer -ResetNextRun
         }
     }
 )
@@ -52842,6 +53344,8 @@ if ($script:ActiveScans) {
 if ($script:ScanTimer) { $script:ScanTimer.Stop() }
 if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() }
 Stop-WmtUpdateAutoScanTimer
+Stop-WmtCleanerDefinitionRefreshTimer
+Stop-WmtCleanerAutoCleanTimer
 Remove-WmtTrayIcon
 Stop-WmtNotificationFallbackTimers
 try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
