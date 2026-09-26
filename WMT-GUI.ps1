@@ -44284,25 +44284,177 @@ if (-not $Preload) {
 }
 
 $script:FirewallLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
+        function Get-FirewallFastKey {
+            param(
+                [string]$DisplayName,
+                [string]$Direction,
+                [string]$Action,
+                [string]$Enabled
+            )
+            return [string]::Join([char]0x1F, @($DisplayName.Trim(), $Direction, $Action, $Enabled))
+        }
+
+        function Convert-FirewallComDirection {
+            param($Value)
+            switch ([int]$Value) {
+                1 { return "Inbound" }
+                2 { return "Outbound" }
+                default { return [string]$Value }
+            }
+        }
+
+        function Convert-FirewallComAction {
+            param($Value)
+            switch ([int]$Value) {
+                0 { return "Block" }
+                1 { return "Allow" }
+                default { return [string]$Value }
+            }
+        }
+
+        function Convert-FirewallComProtocol {
+            param($Value)
+            switch ([int]$Value) {
+                1   { return "ICMPv4" }
+                6   { return "TCP" }
+                17  { return "UDP" }
+                58  { return "ICMPv6" }
+                256 { return "Any" }
+                default { return [string]$Value }
+            }
+        }
+
+        function Format-FirewallComPort {
+            param($Value)
+            $text = [string]$Value
+            if ([string]::IsNullOrWhiteSpace($text)) { return "Any" }
+            return $text
+        }
+
         try {
+            # Fast path: enumerate protocol/port metadata once through the Windows
+            # Firewall COM API. .NET activation keeps this off the WPF thread and
+            # avoids a Get-NetFirewallPortFilter call for every visible row.
+            $detailsByKey = @{}
+            $detailsByDisplayName = @{}
+            $ambiguousKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $ambiguousDisplayNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $fastPathError = ""
+            $fastPathCount = 0
+            $policy = $null
+            $comRules = $null
+
+            try {
+                $policyType = [Type]::GetTypeFromProgID("HNetCfg.FwPolicy2", $false)
+                if ($policyType) {
+                    $policy = [Activator]::CreateInstance($policyType)
+                    $comRules = $policy.Rules
+                    foreach ($fwRule in $comRules) {
+                        try {
+                            $displayName = [string]$fwRule.Name
+                            if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
+
+                            $direction = Convert-FirewallComDirection $fwRule.Direction
+                            $action = Convert-FirewallComAction $fwRule.Action
+                            $enabled = ([bool]$fwRule.Enabled).ToString()
+                            $detail = [PSCustomObject]@{
+                                Protocol  = Convert-FirewallComProtocol $fwRule.Protocol
+                                LocalPort = Format-FirewallComPort $fwRule.LocalPorts
+                            }
+
+                            $key = Get-FirewallFastKey -DisplayName $displayName -Direction $direction -Action $action -Enabled $enabled
+                            if ($ambiguousKeys.Contains($key)) {
+                                # Already known to be ambiguous.
+                            }
+                            elseif ($detailsByKey.ContainsKey($key)) {
+                                [void]$detailsByKey.Remove($key)
+                                [void]$ambiguousKeys.Add($key)
+                            }
+                            else {
+                                $detailsByKey[$key] = $detail
+                            }
+
+                            if ($ambiguousDisplayNames.Contains($displayName)) {
+                                # Already known to be ambiguous.
+                            }
+                            elseif ($detailsByDisplayName.ContainsKey($displayName)) {
+                                [void]$detailsByDisplayName.Remove($displayName)
+                                [void]$ambiguousDisplayNames.Add($displayName)
+                            }
+                            else {
+                                $detailsByDisplayName[$displayName] = $detail
+                            }
+                        }
+                        finally {
+                            if ($fwRule -and [Runtime.InteropServices.Marshal]::IsComObject($fwRule)) {
+                                try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($fwRule) } catch {}
+                            }
+                        }
+                    }
+                }
+                else {
+                    $fastPathError = "HNetCfg.FwPolicy2 is unavailable."
+                }
+            }
+            catch {
+                $fastPathError = $_.Exception.Message
+            }
+            finally {
+                if ($comRules -and [Runtime.InteropServices.Marshal]::IsComObject($comRules)) {
+                    try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($comRules) } catch {}
+                }
+                if ($policy -and [Runtime.InteropServices.Marshal]::IsComObject($policy)) {
+                    try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($policy) } catch {}
+                }
+            }
+
             $rules = @(Get-NetFirewallRule -ErrorAction Stop | ForEach-Object {
-                    $displayName = if ([string]::IsNullOrWhiteSpace([string]$_.DisplayName)) { $_.Name } else { $_.DisplayName }
+                    $displayName = if ([string]::IsNullOrWhiteSpace([string]$_.DisplayName)) { [string]$_.Name } else { [string]$_.DisplayName }
+                    $enabled = $_.Enabled.ToString()
+                    $direction = $_.Direction.ToString()
+                    $action = $_.Action.ToString()
+                    $detail = $null
+
+                    $key = Get-FirewallFastKey -DisplayName $displayName -Direction $direction -Action $action -Enabled $enabled
+                    if ($detailsByKey.ContainsKey($key)) {
+                        $detail = $detailsByKey[$key]
+                    }
+                    elseif ($detailsByDisplayName.ContainsKey($displayName)) {
+                        # Secondary match is used only when the COM display name is unique.
+                        $detail = $detailsByDisplayName[$displayName]
+                    }
+
+                    if ($detail) { $fastPathCount++ }
+
                     [PSCustomObject]@{
                         Name           = [string]$_.Name
-                        DisplayName    = [string]$displayName
-                        Enabled        = $_.Enabled.ToString()
-                        Direction      = $_.Direction.ToString()
-                        Action         = $_.Action.ToString()
-                        Protocol       = ""
-                        LocalPort      = ""
-                        DetailsLoaded  = $false
+                        DisplayName    = $displayName
+                        Enabled        = $enabled
+                        Direction      = $direction
+                        Action         = $action
+                        Protocol       = if ($detail) { [string]$detail.Protocol } else { "" }
+                        LocalPort      = if ($detail) { [string]$detail.LocalPort } else { "" }
+                        DetailsLoaded  = [bool]($null -ne $detail)
                         DetailsLoading = $false
                     }
                 })
-            return [PSCustomObject]@{ Success = $true; Rules = $rules; Error = "" }
+
+            return [PSCustomObject]@{
+                Success       = $true
+                Rules         = $rules
+                FastPathCount = $fastPathCount
+                FastPathError = $fastPathError
+                Error         = ""
+            }
         }
         catch {
-            return [PSCustomObject]@{ Success = $false; Rules = @(); Error = $_.Exception.Message }
+            return [PSCustomObject]@{
+                Success       = $false
+                Rules         = @()
+                FastPathCount = 0
+                FastPathError = ""
+                Error         = $_.Exception.Message
+            }
         }
     })
 $script:FirewallLoadAsyncResult = $script:FirewallLoadRunspace.BeginInvoke()
@@ -44324,7 +44476,16 @@ Register-WmtUiPollOperation -Name "FirewallRuleLoad" -IntervalMs 150 -TestComple
                 }
                 else {
                     Update-FirewallListView
-                    Write-GuiLog "[Firewall] Loaded $($script:AllFw.Count) base rules."
+                    $fastCount = if ($result.PSObject.Properties["FastPathCount"]) { [int]$result.FastPathCount } else { 0 }
+                    if ($fastCount -gt 0) {
+                        Write-GuiLog "[Firewall] Loaded $($script:AllFw.Count) rules; preloaded protocol/port details for $fastCount via HNetCfg.FwPolicy2."
+                    }
+                    else {
+                        Write-GuiLog "[Firewall] Loaded $($script:AllFw.Count) base rules; port details will use the lazy NetSecurity fallback."
+                    }
+                    if ($result.PSObject.Properties["FastPathError"] -and -not [string]::IsNullOrWhiteSpace([string]$result.FastPathError)) {
+                        Write-GuiLog "[Firewall] .NET/COM port preload unavailable: $($result.FastPathError)"
+                    }
                     Set-FirewallStatus "" -Visible $false
                 }
             }
