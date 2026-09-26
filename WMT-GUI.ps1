@@ -9967,7 +9967,16 @@ try {
     }
     catch {
         Write-GuiLog "CleanerML ZIP extraction failed: $($_.Exception.Message)"
-        return
+        try {
+            $failedState = Get-WmtCleanerSourceState -Source "CleanerML"
+            $failedState.ETag = ""
+            $failedState.LastModified = ""
+            $failedState.ContentSha256 = ""
+            $failedState.LastUpdatedUtc = ""
+            Save-WmtCleanerSourceState -State $failedState
+        }
+        catch {}
+        return $false
     }
 
     # Find the extracted repo root (cleanerml-master/)
@@ -10004,6 +10013,15 @@ try {
             try { Rename-Item -LiteralPath $backupRoot -NewName "cleanerml-master" -Force } catch {}
         }
         Write-GuiLog "CleanerML update failed during swap: $($_.Exception.Message)"
+        try {
+            $failedState = Get-WmtCleanerSourceState -Source "CleanerML"
+            $failedState.ETag = ""
+            $failedState.LastModified = ""
+            $failedState.ContentSha256 = ""
+            $failedState.LastUpdatedUtc = ""
+            Save-WmtCleanerSourceState -State $failedState
+        }
+        catch {}
         return $false
     }
     return $true
@@ -11847,13 +11865,26 @@ if ($btnApplyCleanerIntervals) { $btnApplyCleanerIntervals.Add_Click({
             return
         }
 
-        Set-WmtCleanerIntervals -LocalRefreshMinutes $localMinutes -RemoteCheckMinutes $remoteMinutes -AutoCleanMinutes $autoMinutes
+        # Persist the currently visible cleaner selection together with the
+        # schedule. Auto-clean therefore uses exactly the checked rules shown in
+        # this dialog even if the user has not pressed Analyze/Clean yet.
+        foreach ($key in $cleanupCheckboxes.Keys) {
+            $currentSettings.TempCleanup[$key] = [bool]$cleanupCheckboxes[$key].IsChecked
+        }
         $currentSettings.CleanerLocalRefreshMinutes = $localMinutes
         $currentSettings.CleanerRemoteCheckMinutes = $remoteMinutes
         $currentSettings.CleanerAutoCleanMinutes = $autoMinutes
+        $currentSettings.LoadWinapp2 = $toggleState.Winapp2
+        $currentSettings.LoadWinapp3 = $toggleState.Winapp3
+        $currentSettings.LoadCleanerML = $toggleState.CleanerML
+        $currentSettings.LoadCleanerMLPending = $toggleState.CleanerMLPending
+        $currentSettings.SkipRuleDownloads = $toggleState.SkipDownloads
+        $currentSettings.CacheOnly = $toggleState.CacheOnly
+        Save-WmtSettings -Settings $currentSettings
+
         try { if (Get-Command Start-WmtCleanerDefinitionRefreshTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } } catch {}
         try { if (Get-Command Start-WmtCleanerAutoCleanTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerAutoCleanTimer -ResetNextRun } } catch {}
-        $lblStatus.Text = "Cleaner intervals saved."
+        $lblStatus.Text = "Cleaner intervals and selected rules saved."
     }.GetNewClosure()) }
 
 if ($btnRefreshCleanerSources) { $btnRefreshCleanerSources.Add_Click({
