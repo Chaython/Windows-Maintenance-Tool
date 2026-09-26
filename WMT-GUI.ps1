@@ -7650,12 +7650,15 @@ try {
             if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) {
                 $window.WindowState = [System.Windows.WindowState]::Normal
             }
+            $wasAggressiveTray = Test-WmtAggressiveTrayMemoryMode
             $script:WmtHiddenToTray = $false
             Stop-WmtTrayMemoryTimer
             $window.Activate() | Out-Null
             $window.Topmost = $true
             $window.Topmost = $false
-            Restore-WmtAggressiveTrayPage
+            if ($wasAggressiveTray) {
+                Restore-WmtAggressiveTrayPage
+            }
             Write-GuiLog "WMT restored from the system tray."
         }
         catch {
