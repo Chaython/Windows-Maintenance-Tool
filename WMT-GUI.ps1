@@ -345,10 +345,14 @@ try {
         param($Operation)
         $current = $jobTable[$Name]
         if (-not $current) { return }
-        try { $current.PowerShell.Stop() } catch {}
         Write-GuiLog "ERROR: Background operation '$Name' timed out."
         if ($current.OnError) { try { & $current.OnError ([System.TimeoutException]::new("Background operation '$Name' timed out.")) } catch {} }
-        try { $current.PowerShell.Dispose() } catch {}
+        try {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $current.PowerShell -Invocation $current.Async -Name "Background operation '$Name'"
+        }
+        catch {
+            try { $current.PowerShell.Dispose() } catch {}
+        }
         [void]$jobTable.Remove($Name)
     }.GetNewClosure()
 
@@ -356,8 +360,12 @@ try {
         param($Operation, $ErrorRecord)
         $current = $jobTable[$Name]
         if ($current) {
-            try { $current.PowerShell.Stop() } catch {}
-            try { $current.PowerShell.Dispose() } catch {}
+            try {
+                Stop-WmtPowerShellInvocationAsync -PowerShell $current.PowerShell -Invocation $current.Async -Name "Background operation '$Name'"
+            }
+            catch {
+                try { $current.PowerShell.Dispose() } catch {}
+            }
             if ($current.OnError) { try { & $current.OnError $ErrorRecord } catch {} }
             [void]$jobTable.Remove($Name)
         }
@@ -2489,14 +2497,17 @@ $onComplete = {
 $onError = {
     param($Operation, $ErrorRecord)
     try {
-        if ($psRef -and $asyncRef -and -not $asyncRef.IsCompleted) { $psRef.Stop() }
+        if ($psRef -and $asyncRef -and -not $asyncRef.IsCompleted) {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $psRef -Invocation $asyncRef -Name $nameRef
+        }
+        else {
+            try { if ($psRef -and $asyncRef) { [void]$psRef.EndInvoke($asyncRef) } } catch {}
+            try { if ($psRef) { $psRef.Dispose() } } catch {}
+        }
     }
-    catch {}
-    try {
-        if ($psRef -and $asyncRef -and $asyncRef.IsCompleted) { [void]$psRef.EndInvoke($asyncRef) }
+    catch {
+        try { if ($psRef) { $psRef.Dispose() } } catch {}
     }
-    catch {}
-    try { if ($psRef) { $psRef.Dispose() } } catch {}
     try { Write-GuiLog "$nameRef monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
 }.GetNewClosure()
 
@@ -2539,14 +2550,14 @@ $stopRef = $stopAsync
 $operationName = "StopPowerShell:$Name:$([Guid]::NewGuid().ToString('N'))"
 
 $testComplete = {
-    $stopRef -and $stopRef.IsCompleted
+    $stopDone = [bool]($stopRef -and $stopRef.IsCompleted)
+    $invokeDone = [bool](-not $invokeRef -or $invokeRef.IsCompleted)
+    return ($stopDone -and $invokeDone)
 }.GetNewClosure()
 
 $onComplete = {
     try {
-        if ($invokeRef -and $invokeRef.IsCompleted) {
-            [void]$psRef.EndInvoke($invokeRef)
-        }
+        if ($invokeRef) { [void]$psRef.EndInvoke($invokeRef) }
     }
     catch [System.Management.Automation.PipelineStoppedException] {}
     catch {
@@ -2557,13 +2568,29 @@ $onComplete = {
     }
 }.GetNewClosure()
 
+$onTimeout = {
+    param($Operation)
+    try {
+        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
+    }
+    catch [System.Management.Automation.PipelineStoppedException] {}
+    catch {}
+    try { $psRef.Dispose() } catch {}
+    try { Write-GuiLog "$nameRef did not fully stop within 10 seconds; worker resources were released." } catch {}
+}.GetNewClosure()
+
 $onError = {
     param($Operation, $ErrorRecord)
+    try {
+        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
+    }
+    catch [System.Management.Automation.PipelineStoppedException] {}
+    catch {}
     try { $psRef.Dispose() } catch {}
     try { Write-GuiLog "$nameRef stop monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
 }.GetNewClosure()
 
-Register-WmtUiPollOperation -Name $operationName -IntervalMs 250 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+Register-WmtUiPollOperation -Name $operationName -IntervalMs 250 -TimeoutMs 10000 -TestComplete $testComplete -OnComplete $onComplete -OnTimeout $onTimeout -OnError $onError | Out-Null
 }
 
 # ============================================================================
