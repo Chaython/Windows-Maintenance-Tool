@@ -92,7 +92,11 @@ jobs:
               ".\dist\WindowsMaintenanceTool.exe.sha256"
           )
 
-          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          # A missing release is an expected condition. In Windows PowerShell 5.1,
+          # gh writes "release not found" to stderr, and with ErrorActionPreference=Stop
+          # that stderr can become a terminating NativeCommandError before LASTEXITCODE
+          # can be inspected. Suppress stderr for this existence probe only.
+          & gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null | Out-Null
           $releaseExists = ($LASTEXITCODE -eq 0)
 
           if ($releaseExists) {
