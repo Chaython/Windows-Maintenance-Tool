@@ -7037,6 +7037,183 @@ try {
 catch {}
 }
 
+$script:WmtTrayMemoryTimer = $null
+$script:WmtTrayMemoryTimerHandler = $null
+
+function Test-WmtAggressiveTrayMemoryMode {
+try {
+    return [bool]($script:WmtHiddenToTray -and (Get-WmtReduceRamInTray))
+}
+catch {
+    return $false
+}
+}
+
+function Test-WmtTrayMemoryBusy {
+try {
+    if (Get-Command Test-WmtUpdateScanEngineBusy -ErrorAction SilentlyContinue) {
+        if (Test-WmtUpdateScanEngineBusy) { return $true }
+    }
+}
+catch {}
+try { if ($script:WmtUiBackgroundCommands -and $script:WmtUiBackgroundCommands.Count -gt 0) { return $true } } catch {}
+try { if ($script:WmtRegistryCleanupActive) { return $true } } catch {}
+try { if ($script:WmtLibraryCacheRunspace -or $script:WmtLibraryScanRunspace) { return $true } } catch {}
+try { if ($script:WmtAppxLoadRunspace) { return $true } } catch {}
+try { if ($script:FirewallLoadInProgress -or $script:FirewallDetailJob) { return $true } } catch {}
+try { if ($script:DriverLoadInProgress) { return $true } } catch {}
+try { if ($script:TweakStatesBgPS -or $script:FeaturesCheckPS) { return $true } } catch {}
+try { if ($script:MyDeviceSectionJobs -and $script:MyDeviceSectionJobs.Count -gt 0) { return $true } } catch {}
+return $false
+}
+
+function Stop-WmtTrayMemoryTimer {
+if ($script:WmtTrayMemoryTimer) {
+    try { $script:WmtTrayMemoryTimer.Stop() } catch {}
+    try {
+        if ($script:WmtTrayMemoryTimerHandler) {
+            $script:WmtTrayMemoryTimer.Remove_Tick($script:WmtTrayMemoryTimerHandler)
+        }
+    }
+    catch {}
+}
+$script:WmtTrayMemoryTimer = $null
+$script:WmtTrayMemoryTimerHandler = $null
+}
+
+function Start-WmtTrayMemoryTimer {
+Stop-WmtTrayMemoryTimer
+if (-not (Test-WmtAggressiveTrayMemoryMode)) { return }
+
+# A scheduled scan can recreate a runspace while WMT is hidden. Re-check every
+# ten seconds and trim again as soon as the work is idle, but do nothing when
+# the process is already near the low-memory target.
+$script:WmtTrayMemoryTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WmtTrayMemoryTimer.Interval = [TimeSpan]::FromSeconds(10)
+$script:WmtTrayMemoryTimerHandler = [System.EventHandler] {
+    param($s, $e)
+    if (-not (Test-WmtAggressiveTrayMemoryMode)) {
+        Stop-WmtTrayMemoryTimer
+        return
+    }
+    if (Test-WmtTrayMemoryBusy) { return }
+
+    try {
+        $proc = [System.Diagnostics.Process]::GetCurrentProcess()
+        $proc.Refresh()
+        if ($proc.WorkingSet64 -gt 48MB) {
+            Invoke-WmtMemoryTrim -Reason "tray-idle"
+        }
+    }
+    catch {}
+}
+$script:WmtTrayMemoryTimer.Add_Tick($script:WmtTrayMemoryTimerHandler)
+$script:WmtTrayMemoryTimer.Start()
+}
+
+function Stop-WmtTrayTransientWorkers {
+# Reduce-RAM mode is intentionally an idle shell while hidden. Keep scheduled
+# update/cleaner timers, but cancel jobs whose only purpose is warming GUI pages.
+if (-not (Test-WmtAggressiveTrayMemoryMode)) { return }
+
+try {
+    if ($script:preloadDeferTimer) {
+        $script:preloadDeferTimer.Stop()
+        $script:preloadDeferTimer = $null
+    }
+}
+catch {}
+try {
+    if ($script:bootCacheTimer) {
+        $script:bootCacheTimer.Stop()
+        $script:bootCacheTimer = $null
+    }
+}
+catch {}
+
+try { Stop-WmtStartupBackgroundPreload } catch {}
+try {
+    Stop-MyDeviceSectionJobs
+    $script:MyDeviceStatsStarted = $false
+    $script:MyDeviceStatsPreloadMode = $false
+}
+catch {}
+
+try { Stop-FirewallDetailLoad } catch {}
+try { Stop-FirewallRuleLoad } catch {}
+try { Stop-DriverLoad } catch {}
+
+try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
+if ($script:WmtAppxLoadRunspace) {
+    try { $script:WmtAppxLoadRunspace.Stop() } catch {}
+    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+}
+$script:WmtAppxLoadRunspace = $null
+$script:WmtAppxLoadAsyncResult = $null
+$script:AppxListLoaded = $false
+
+try { Unregister-WmtUiPollOperation -Name "LibraryCacheBuilder" } catch {}
+if ($script:WmtLibraryCacheRunspace) {
+    try { $script:WmtLibraryCacheRunspace.Stop() } catch {}
+    try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
+}
+$script:WmtLibraryCacheRunspace = $null
+$script:WmtLibraryCacheAsyncResult = $null
+
+try { Unregister-WmtUiPollOperation -Name "LibraryScan" } catch {}
+if ($script:WmtLibraryScanRunspace) {
+    try { $script:WmtLibraryScanRunspace.Stop() } catch {}
+    try { $script:WmtLibraryScanRunspace.Dispose() } catch {}
+}
+$script:WmtLibraryScanRunspace = $null
+$script:WmtLibraryScanAsyncResult = $null
+$script:WmtLibraryScanTimer = $null
+
+try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
+if ($script:TweakStatesBgPS) {
+    try { $script:TweakStatesBgPS.Stop() } catch {}
+    try { $script:TweakStatesBgPS.Dispose() } catch {}
+}
+$script:TweakStatesBgPS = $null
+$script:TweakStatesBgAsync = $null
+$script:TweakStatesBgStarted = $false
+$script:TweakStatesReady = $false
+
+try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+if ($script:FeaturesCheckPS) {
+    try { $script:FeaturesCheckPS.Stop() } catch {}
+    try { $script:FeaturesCheckPS.Dispose() } catch {}
+}
+$script:FeaturesCheckPS = $null
+$script:FeaturesCheckAsync = $null
+$script:OptionalFeaturesReady = $false
+$script:OptionalFeaturesCheckStarted = $false
+}
+
+function Enter-WmtAggressiveTrayMode {
+if (-not (Test-WmtAggressiveTrayMemoryMode)) { return }
+Stop-WmtTrayTransientWorkers
+Invoke-WmtMemoryTrim -Reason "aggressive-tray"
+Start-WmtTrayMemoryTimer
+}
+
+function Restore-WmtAggressiveTrayPage {
+# Reload only whichever top-level page was active before hiding.
+try {
+    foreach ($buttonName in @($script:WmtTabTargetByButton.Keys)) {
+        $panel = $script:WmtTabTargetByButton[$buttonName]
+        if ($panel -and $panel.Visibility -eq [System.Windows.Visibility]::Visible) {
+            $button = Get-Ctrl $buttonName
+            if ($button) {
+                $button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+            }
+            break
+        }
+    }
+}
+catch {}
+}
+
 function Stop-WmtIdleRunspacePools {
 # PowerShell runspaces retain loaded modules/session state even when no command is
 # running. Close only completely idle pools; New-WmtPooledPowerShell recreates
@@ -7103,6 +7280,9 @@ if ($script:WmtMemoryTrimBusy) { return }
 $script:WmtMemoryTrimBusy = $true
 try {
     Stop-WmtStartupBackgroundPreload
+    if (Test-WmtAggressiveTrayMemoryMode) {
+        Stop-WmtTrayTransientWorkers
+    }
 
     if ($script:MyDeviceCache) {
         try { $script:MyDeviceCache.Clear() } catch { $script:MyDeviceCache = @{} }
@@ -7471,9 +7651,11 @@ try {
                 $window.WindowState = [System.Windows.WindowState]::Normal
             }
             $script:WmtHiddenToTray = $false
+            Stop-WmtTrayMemoryTimer
             $window.Activate() | Out-Null
             $window.Topmost = $true
             $window.Topmost = $false
+            Restore-WmtAggressiveTrayPage
             Write-GuiLog "WMT restored from the system tray."
         }
         catch {
@@ -38903,7 +39085,7 @@ foreach ($p in $providerDefinitions) {
                 <CheckBox Name="chkRunInTrayOnClose" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3" Content="Run in system tray when closed" Margin="0,8,0,0"
                           ToolTip="When enabled, closing the main window hides WMT to the system tray so background scans and notifications can continue."/>
                 <CheckBox Name="chkReduceRamInTray" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Content="Reduce RAM while hidden in tray" Margin="0,8,0,0"
-                          ToolTip="When WMT is hidden to the tray, unload reloadable page data, dispose idle PowerShell runspace pools, compact managed memory, trim the log, and ask Windows to release unused working-set pages. Data reloads on demand when WMT is reopened."/>
+                          ToolTip="Aggressive low-memory tray mode. While hidden, WMT cancels UI-only preload work, unloads reloadable page data, releases idle PowerShell runspaces, compacts managed memory, and re-trims after background jobs finish. Scheduled updates/cleaning remain available; UI data reloads on demand when reopened."/>
                 <CheckBox Name="chkUpdateSilentInstall" Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Content="Run update/install commands headless. ⚠ Experimental!" Margin="0,8,0,0"
                           ToolTip="Hide CLI, PowerShell, and cmd update windows. Providers that require their own GUI, including Steam validation and Microsoft Store GUI updates, can still appear."/>
                 <CheckBox Name="chkUpdateAutoInstall" Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Content="Automatically install available updates after scans" Margin="0,8,0,0"
@@ -49749,6 +49931,15 @@ if ($btnLaunchMinimized) {
 # the update auto-scan timer running.
 function Start-WmtBackgroundJobsNow {
 try {
+    if (Test-WmtAggressiveTrayMemoryMode) {
+        if (-not (Get-WmtUpdateScansDisabled)) {
+            try { Start-WmtUpdateAutoScanTimer } catch {}
+        }
+        try { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } catch {}
+        try { Start-WmtCleanerAutoCleanTimer -ResetNextRun } catch {}
+        return
+    }
+
     # My Device stats (sections run in pooled runspaces; safe to kick from UI thread)
     if (-not $script:MyDeviceStatsStarted) {
         $script:MyDeviceStatsStarted = $true
@@ -52345,6 +52536,7 @@ if ($script:WmtStartupPreloadTimer) {
 
 function Start-WmtStartupBackgroundPreload {
 if ($script:WmtStartupPreloadTimer) { return }
+if (Test-WmtAggressiveTrayMemoryMode) { return }
 
 # "Bg Jobs: Off" suppresses automatic hidden-page warming. Manual page opens
 # and Refresh actions still use UiSupport runspaces so they remain responsive.
@@ -53153,14 +53345,16 @@ if (-not ((Get-WmtLaunchMinimized) -and (Get-WmtReduceRamInTray))) {
 }
 
 # 2. Warm hidden pages in the background (deferred 1s so UI paints first).
-$preloadDeferTimer = New-Object System.Windows.Threading.DispatcherTimer
-$preloadDeferTimer.Interval = [TimeSpan]::FromSeconds(1)
-$preloadDeferTimer.Add_Tick({
-        try { $preloadDeferTimer.Stop() } catch {}
-        Start-WmtStartupBackgroundPreload
-        $preloadDeferTimer = $null
+$script:preloadDeferTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:preloadDeferTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:preloadDeferTimer.Add_Tick({
+        try { $script:preloadDeferTimer.Stop() } catch {}
+        if (-not (Test-WmtAggressiveTrayMemoryMode)) {
+            Start-WmtStartupBackgroundPreload
+        }
+        $script:preloadDeferTimer = $null
     })
-$preloadDeferTimer.Start()
+$script:preloadDeferTimer.Start()
 
 # 3. Trigger the background update check (deferred).
 [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
@@ -53200,7 +53394,7 @@ try {
             $window.ShowInTaskbar = $false
             $window.Hide()
             if (Get-WmtReduceRamInTray) {
-                Invoke-WmtMemoryTrim -Reason "launch-minimized"
+                Enter-WmtAggressiveTrayMode
             }
             Write-GuiLog "Launch Minimized is enabled. WMT started hidden in the system tray."
         }
@@ -53962,14 +54156,17 @@ catch {
 }
 
 # Kick off the background library cache builder shortly after the window opens.
-$bootCacheTimer = New-Object System.Windows.Threading.DispatcherTimer
-$bootCacheTimer.Interval = [TimeSpan]::FromSeconds(2)
-$bootCacheTimer.Add_Tick({
-    try { $bootCacheTimer.Stop() } catch {}
-    Sync-WmtCompactRecompressWorker
-    Start-WmtLibraryCacheBuilder
-}.GetNewClosure())
-$bootCacheTimer.Start()
+$script:bootCacheTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:bootCacheTimer.Interval = [TimeSpan]::FromSeconds(2)
+$script:bootCacheTimer.Add_Tick({
+    try { $script:bootCacheTimer.Stop() } catch {}
+    if (-not (Test-WmtAggressiveTrayMemoryMode)) {
+        Sync-WmtCompactRecompressWorker
+        Start-WmtLibraryCacheBuilder
+    }
+    $script:bootCacheTimer = $null
+})
+$script:bootCacheTimer.Start()
 
 $onMainWindowClosing = {
 param($windowSender, $closeArgs)
@@ -53982,7 +54179,7 @@ if (-not $script:WmtAllowFinalClose -and (Get-WmtRunInTrayOnClose)) {
             $window.ShowInTaskbar = $false
             $window.Hide()
             if (Get-WmtReduceRamInTray) {
-                Invoke-WmtMemoryTrim -Reason "hidden-to-tray"
+                Enter-WmtAggressiveTrayMode
             }
             Show-WmtTrayHiddenBalloon
             Write-GuiLog "WMT hidden to the system tray. Background update scans will continue. Left-click the tray icon to reopen, or right-click it to exit."
@@ -54005,6 +54202,7 @@ if ($script:ActiveScans) {
 if ($script:ScanTimer) { $script:ScanTimer.Stop() }
 if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() }
 Stop-WmtUpdateAutoScanTimer
+Stop-WmtTrayMemoryTimer
 Stop-WmtCleanerDefinitionRefreshTimer
 Stop-WmtCleanerAutoCleanTimer
 Remove-WmtTrayIcon
