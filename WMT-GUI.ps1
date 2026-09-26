@@ -40959,6 +40959,29 @@ $script:ScanTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:ScanTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 # We now use a LIST of active scanners instead of just one
 $script:ActiveScans = [System.Collections.ArrayList]::new()
+
+function Start-WmtActiveScanWorker {
+param(
+    [Parameter(Mandatory = $true)][System.Management.Automation.PowerShell]$PowerShell,
+    [string]$Name = "Provider scan"
+)
+
+try {
+    $async = $PowerShell.BeginInvoke()
+    if (-not $async) { throw "$Name returned no async invocation handle." }
+    [void]$script:ActiveScans.Add([PSCustomObject]@{
+            PowerShell = $PowerShell
+            AsyncResult = $async
+            Name = $Name
+        })
+    return $async
+}
+catch {
+    try { $PowerShell.Dispose() } catch {}
+    throw
+}
+}
+
 $script:WmtAutoInstallSuppressNextScan = $false
 $script:WmtAutoInstallActive = $false
 $script:WmtCompletedWindowsUpdateIds = @{}
@@ -41356,6 +41379,9 @@ $btnWingetScan.Add_Click({
     $script:GlobalScanTimer.Start()
 
     # --- Provider Workers ---
+    # Provider startup is atomic: if any worker cannot be created/started, cancel
+    # and finalize every worker already started for this scan and restore the UI.
+    try {
 
     # A. WINGET
     foreach ($wingetSource in @("winget")) {
@@ -41485,7 +41511,7 @@ $btnWingetScan.Add_Click({
                 }
             }).AddArgument($wingetSource).AddArgument($ignoreList).AddArgument([bool]$includeUnknown)
 
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     if ("msstore" -in $enabled) {
@@ -41670,7 +41696,7 @@ $btnWingetScan.Add_Click({
                 }
             }).AddArgument($ignoreList)
 
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # Resolve WU category toggles in main scope (can't call functions inside runspace).
@@ -41873,7 +41899,7 @@ $btnWingetScan.Add_Click({
                 }
             }).AddArgument($ignoreList).AddArgument($completedWindowsUpdateIds).AddArgument($wuCategoryTogglesForScan)
 
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # B. PIP WORKER
@@ -41934,7 +41960,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Pip check failed: $($_.Exception.Message)" }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # C. NPM WORKER
@@ -41990,7 +42016,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Npm check failed." }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # D. CHOCOLATEY WORKER (unchanged)
@@ -42020,7 +42046,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Choco check failed." }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # E. SCOOP WORKER (unchanged)
@@ -42050,7 +42076,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Scoop check failed." }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # F. RUBY GEMS WORKER (unchanged)
@@ -42078,7 +42104,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Gem check failed." }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # G. CARGO WORKER (unchanged)
@@ -42106,7 +42132,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Cargo check failed." }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # H. .NET GLOBAL TOOLS WORKER
@@ -42197,7 +42223,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:.NET tools check failed: $($_.Exception.Message)" }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # I. POWERSHELL MODULES WORKER
@@ -42299,7 +42325,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:PowerShell module check failed: $($_.Exception.Message)" }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # J. COMPOSER WORKER
@@ -42342,7 +42368,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Composer check failed: $($_.Exception.Message)" }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # H. PNPM WORKER (unchanged)
@@ -42395,7 +42421,7 @@ $btnWingetScan.Add_Click({
                 }
                 catch { Write-Output "LOG:Pnpm check failed or pnpm not installed." }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # I. LEGENDARY / EPIC GAMES WORKER
@@ -42642,7 +42668,7 @@ $btnWingetScan.Add_Click({
                     Write-Output "LOG:Legendary scan failed: $($_.Exception.Message)"
                 }
             }).AddArgument($ignoreList).AddArgument((Get-WmtLegendaryExePath))
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # J. GOGDL / GOG GAMES WORKER
@@ -42895,7 +42921,7 @@ $btnWingetScan.Add_Click({
                     Write-Output "LOG:GOGDL scan failed: $($_.Exception.Message)"
                 }
             }).AddArgument($ignoreList).AddArgument((Get-WmtGogdlExePath))
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # K. PORTABLE PROVIDER SELF-UPDATE WORKER
@@ -43021,7 +43047,7 @@ $btnWingetScan.Add_Click({
                     }
                 }
             }).AddArgument($portableProviderChecks).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # L. STEAM WORKER
@@ -43110,11 +43136,39 @@ $btnWingetScan.Add_Click({
                     Write-Output "LOG:Steam scan failed: $($_.Exception.Message)"
                 }
             }).AddArgument($ignoreList)
-        [void]$script:ActiveScans.Add([PSCustomObject]@{ PowerShell = $ps; AsyncResult = $ps.BeginInvoke() })
+        [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
     # --- Start the result collection timer (already defined earlier in script) ---
     $script:ScanTimer.Start()
+    }
+    catch {
+        $scanSetupError = $_.Exception.Message
+        Write-GuiLog "Scan setup failed: $scanSetupError"
+
+        try { if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() } } catch {}
+        try { if ($script:ScanTimer -and $script:ScanTimer.IsEnabled) { $script:ScanTimer.Stop() } } catch {}
+
+        foreach ($task in @($script:ActiveScans)) {
+            try {
+                $taskName = if ($task.PSObject.Properties["Name"] -and $task.Name) { [string]$task.Name } else { "Provider scan" }
+                Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$taskName setup rollback"
+            }
+            catch {
+                try { $task.PowerShell.Dispose() } catch {}
+            }
+        }
+        $script:ActiveScans.Clear()
+
+        $lblWingetStatus.Text = "Scan failed to start"
+        $lblWingetStatus.Visibility = "Visible"
+        $btnWingetScan.IsEnabled = $true
+        $txtWingetSearch.IsEnabled = $true
+        $txtWingetSearch.ToolTip = ""
+        if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
+        $btnWingetUpdateSel.IsEnabled = $true
+        return
+    }
 })
 
 # --- IGNORE SELECTED ---
