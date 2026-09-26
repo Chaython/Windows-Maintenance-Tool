@@ -46542,7 +46542,7 @@ function Get-EntrySkipExtensionSet {
             }
         }
     }
-    return $set
+    return ,$set
 }
 
 function Invoke-CompactSelective {
@@ -46981,7 +46981,7 @@ function Start-WmtCompactConsole {
     $trackerPath = Get-WmtCompactTrackerPath
     $trackerPathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($trackerPath))
     $normalizedCustomSkip = [string[]]@(ConvertTo-WmtCompactExtensionList -Values $CustomSkipExtensions)
-    $customSkipJson = $normalizedCustomSkip | ConvertTo-Json -Compress
+    $customSkipJson = ConvertTo-Json -InputObject @($normalizedCustomSkip) -Compress
     $customSkipBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($customSkipJson))
 
     $consoleScript = @'
@@ -47029,7 +47029,7 @@ function Get-ManualSkipExtensionSet {
             [void]$set.Add($ext.ToLowerInvariant())
         }
     }
-    return $set
+    return ,$set
 }
 
 function Invoke-ManualSelectiveCompact {
