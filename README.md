@@ -53,7 +53,8 @@ VirusTotal maintains a broader vendor contact directory here: https://docs.virus
 
 ![Windows Maintenance Tool v6.7](docs/wmt-v6.7.png)
 
-## What's new in v6.7
+<details>
+<summary><strong>What's new in v6.7</strong></summary>
 
 Recent v6.7 work includes substantial performance, automation, and maintenance improvements:
 
@@ -71,9 +72,12 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Added tweak configuration **Export JSON / Import JSON** support.
 - Expanded registry-cleaner handling for BAM/DAM and `PendingFileRenameOperations`, including safer pair-preserving rewrites and review-only handling where automatic changes are unsafe.
 
+</details>
+
 ## Core Features
 
-### Updates and Software
+<details>
+<summary><strong>Updates and Software</strong></summary>
 
 - Scan for updates from Winget, Microsoft Store / Store CLI, Chocolatey, pip, npm, pnpm, Scoop, Ruby Gems, Cargo, .NET global tools, PowerShell modules, Composer, Steam manifests, Legendary, GOGDL, and other supported providers.
 - Update packages one at a time with visible status/progress, or use supported batch/update-all flows.
@@ -89,7 +93,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Background update scanning can run from tray mode; **BG Jobs** and **Update Scans** are independently toggleable.
 - Shared provider process/runspace infrastructure includes timeout/error handling so a slow provider is less likely to block the entire Updates page.
 
-### Game & Software Library
+</details>
+
+<details>
+<summary><strong>Game & Software Library</strong></summary>
 
 - View installed Steam, Epic/Legendary, and GOG games in one combined library.
 - Search/filter the library by title/provider and sort list columns.
@@ -99,7 +106,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Optionally hide Unreal Engine / Fab marketplace assets from the visible library without disabling their update checks.
 - Uses cached provider/library metadata and background refreshes to improve repeat-load performance.
 
-### System Health
+</details>
+
+<details>
+<summary><strong>System Health</strong></summary>
 
 - Run `sfc /scannow`.
 - Run DISM CheckHealth and RestoreHealth operations.
@@ -109,7 +119,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Repair Windows Update components and reset update services.
 - Long-running repair operations use background workers where practical to reduce WPF-thread stalls.
 
-### My Device
+</details>
+
+<details>
+<summary><strong>My Device</strong></summary>
 
 - View Windows, CPU, RAM, GPU, motherboard, storage, network, battery, and power details.
 - View drive health details and run drive benchmarks.
@@ -119,7 +132,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Run SSD TRIM/disk optimization logic while avoiding TRIM actions on HDDs.
 - Open Disk Management, Windows Update, and related Windows tools.
 
-### Tweaks
+</details>
+
+<details>
+<summary><strong>Tweaks</strong></summary>
 
 - State-aware toggle buttons for supported settings, with consistent active/inactive visual states.
 - Export the current tweak configuration to JSON and import a previous export, applying only settings that differ.
@@ -134,7 +150,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Privacy, search, gaming, visual-effect, notification, lock-screen, AppX/bloatware, and advanced/power-user controls.
 - Tweak state loading runs in the background and is scoped to the Tweaks page so loading overlays do not leak onto other tabs.
 
-### Cleanup
+</details>
+
+<details>
+<summary><strong>Cleanup</strong></summary>
 
 - Delete temporary files, recycle-bin contents, Windows Error Reporting data, thumbnail caches, browser traces, Explorer traces, and other selected targets.
 - Analyze/preview cleanup targets before deleting files, including status for protected or in-use items.
@@ -151,7 +170,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Clear Xbox credentials for login-loop fixes.
 - Free local OneDrive disk space while keeping cloud copies.
 
-### Compact Compression
+</details>
+
+<details>
+<summary><strong>Compact Compression</strong></summary>
 
 - Compress a folder or a whole local NTFS drive from a dedicated GUI.
 - Use standard NTFS compression and supported Compact/WOF executable compression modes.
@@ -163,7 +185,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Optionally skip extensions that are commonly already-compressed/poor compression candidates, with support for custom extension skip lists.
 - Keep last-run/result/status information for tracked targets and surface it in the compression UI.
 
-### Drivers
+</details>
+
+<details>
+<summary><strong>Drivers</strong></summary>
 
 - Inventory third-party packages staged in the Windows Driver Store.
 - Show package status including **In Use**, **Old**, **Unattached**, and **Inactive** with device-usage context.
@@ -178,7 +203,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Open external research/update checks for selected drivers, including Microsoft Update Catalog and VirusTotal where supported by the UI.
 - Driver backup/cleanup and `pnputil` operations are moved off the WPF thread where possible.
 
-### Network and DNS
+</details>
+
+<details>
+<summary><strong>Network and DNS</strong></summary>
 
 - Flush DNS and reset network settings.
 - Set DNS to Cloudflare, Google, Quad9, DHCP, or custom IPv4/IPv6 servers.
@@ -187,7 +215,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - View routing tables.
 - Edit the hosts file and apply supported ad-block hosts lists with backup handling.
 
-### Firewall Manager
+</details>
+
+<details>
+<summary><strong>Firewall Manager</strong></summary>
 
 - View, search, add, edit, enable, disable, and delete firewall rules.
 - Background-load the base firewall rule list to keep navigation responsive.
@@ -198,13 +229,19 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Restore firewall defaults or purge rules with confirmation.
 - Background firewall preload respects the global Background Jobs setting.
 
-### Startup & Restore Management
+</details>
+
+<details>
+<summary><strong>Startup & Restore Management</strong></summary>
 
 - Startup Manager for startup apps, scheduled tasks, context-menu entries, and services.
 - Open relevant file locations, Registry paths, and Task Scheduler locations/actions where possible.
 - Restore Manager for creating, deleting, restoring, enabling, and disabling restore points/system protection workflows.
 
-### System Tray, Background Jobs, and Automation
+</details>
+
+<details>
+<summary><strong>System Tray, Background Jobs, and Automation</strong></summary>
 
 - Optional system-tray mode keeps selected background scans/notifications active while the main window is hidden.
 - Start WMT with Windows and optionally launch minimized.
@@ -215,7 +252,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Compact auto-recompression uses a scheduled worker/task and does not require the main WMT window to stay open.
 - Shared polling/runspace infrastructure centralizes background completion handling and reduces duplicated UI timers.
 
-### Utilities
+</details>
+
+<details>
+<summary><strong>Utilities</strong></summary>
 
 - Startup Manager.
 - Restore Manager.
@@ -228,7 +268,10 @@ Recent v6.7 work includes substantial performance, automation, and maintenance i
 - Optional MAS activation helper with explicit user confirmation.
 - Quick access to common Windows administrative tools.
 
-## Getting Started
+</details>
+
+<details>
+<summary><strong>Getting Started</strong></summary>
 
 ### Recommended Launch
 
@@ -262,14 +305,20 @@ The EXE build uses the version from `$AppVersion` in `WMT-GUI.ps1` and requires 
 powershell -NoProfile -ExecutionPolicy Bypass -File "WMT-GUI.ps1"
 ```
 
-## Requirements
+</details>
+
+<details>
+<summary><strong>Requirements</strong></summary>
 
 - Windows 10 or Windows 11
 - PowerShell 5.1 or later
 - Administrator privileges for most maintenance actions
 - Internet connection for online update checks, provider scans, downloads, metadata, and community cleaner definitions
 
-## Output and Data Folder
+</details>
+
+<details>
+<summary><strong>Output and Data Folder</strong></summary>
 
 WMT stores generated data next to the script in its local `data` folder.
 
@@ -290,7 +339,10 @@ WMT stores generated data next to the script in its local `data` folder.
 | Cleaner refresh/auto-clean result files | Last background cleaner maintenance/automatic-clean summaries |
 | `last-crash.txt` | Last captured WMT crash/monitor diagnostic |
 
-## Safety Notes
+</details>
+
+<details>
+<summary><strong>Safety Notes</strong></summary>
 
 - Destructive actions use confirmation prompts where practical.
 - Registry and hosts changes create backups where applicable.
@@ -303,7 +355,10 @@ WMT stores generated data next to the script in its local `data` folder.
 - WMT itself does not send telemetry.
 - Some functions call Windows components, package managers, GitHub/community rule sources, or third-party provider CLIs and therefore depend on those components/services being available.
 
-## Troubleshooting
+</details>
+
+<details>
+<summary><strong>Troubleshooting</strong></summary>
 
 | Problem | What to try |
 | --- | --- |
@@ -322,14 +377,20 @@ WMT stores generated data next to the script in its local `data` folder.
 | A tweak causes issues | Use the matching revert/toggle action or import a known-good tweaks JSON export. |
 | Registry cleanup finds protected/review-only entries | Inspect them; those rows are intentionally not changed automatically. |
 
-## Development and Releases
+</details>
+
+<details>
+<summary><strong>Development and Releases</strong></summary>
 
 - `.github/workflows/validate-powershell.yml` validates PowerShell syntax and can also be run manually.
 - `.github/workflows/release-ps2exe.yml` builds PS2EXE releases and supports manual release controls.
 - Release tooling includes optional WinGet submission and Chocolatey package publication paths when the required secrets/package entries are available.
 - Long-running GUI operations are increasingly routed through shared runspace/process/polling infrastructure to keep the main WPF dispatcher responsive.
 
-## Project Links
+</details>
+
+<details>
+<summary><strong>Project Links</strong></summary>
 
 - [Releases](https://github.com/Chaython/Windows-Maintenance-Tool/releases)
 - [Issues](https://github.com/Chaython/Windows-Maintenance-Tool/issues)
@@ -337,17 +398,26 @@ WMT stores generated data next to the script in its local `data` folder.
 - [Actions](https://github.com/Chaython/Windows-Maintenance-Tool/actions)
 - [Commit history](https://github.com/Chaython/Windows-Maintenance-Tool/commits/Main)
 
-## Credits
+</details>
+
+<details>
+<summary><strong>Credits</strong></summary>
 
 - Original author: [Lil_Batti / ios12checker](https://github.com/ios12checker)
 - GUI, features, and current fork maintenance: [Chaython](https://github.com/Chaython)
 - Upstream project: [ios12checker/Windows-Maintenance-Tool](https://github.com/ios12checker/Windows-Maintenance-Tool)
 
-## Community
+</details>
+
+<details>
+<summary><strong>Community</strong></summary>
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord)](https://discord.gg/bCQqKHGxja)
 
-## Contributing
+</details>
+
+<details>
+<summary><strong>Contributing</strong></summary>
 
 Issues and pull requests are welcome. When reporting a problem, include when possible:
 
@@ -358,3 +428,5 @@ Issues and pull requests are welcome. When reporting a problem, include when pos
 - Screenshot, copied row data, activity-log output, or error text
 
 If WMT helps you, consider starring the repository.
+
+</details>
