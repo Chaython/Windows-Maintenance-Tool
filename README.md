@@ -54,7 +54,9 @@ VirusTotal maintains a broader vendor contact directory here: https://docs.virus
 
 ## Screenshot
 
-![Windows Maintenance Tool v6.7](docs/wmt-v6.7.png)
+<img width="1902" height="1024" alt="image" src="https://github.com/user-attachments/assets/4fbd8b16-b03f-45c5-a53e-48b9caf45376" />
+
+
 
 <details>
 <summary><strong>What's new in v6.7</strong></summary>
