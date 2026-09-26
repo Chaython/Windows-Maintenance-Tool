@@ -2313,12 +2313,49 @@ Invoke-Expression $script:WmtSteamCommonHelpers
 function New-WmtRunspaceInitialState {
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
+# Register shared helper functions structurally. The previous regex stopped at
+# the first line-level closing brace inside nested try/catch/foreach blocks,
+# truncating helpers such as Get-WmtSteamInstallRoots. The registration errors
+# were then swallowed, so pooled workers started without the Steam helpers.
 foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommonHelpers)) {
     if ([string]::IsNullOrWhiteSpace([string]$helperBlock)) { continue }
-    $helperFuncs = [regex]::Matches([string]$helperBlock, '(?ms)^function\s+(\w[\w-]*)\s*\{.*?^\}')
-    foreach ($m in $helperFuncs) {
-        try { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($m.Groups[1].Value, $m.Value)) }
-        catch {}
+    try {
+        $tokens = $null
+        $parseErrors = $null
+        $helperAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            [string]$helperBlock,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+
+        if ($parseErrors -and $parseErrors.Count -gt 0) {
+            throw ("Shared helper parse failed: " + (($parseErrors | ForEach-Object { $_.Message }) -join "; "))
+        }
+
+        $helperFuncs = @($helperAst.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true))
+
+        foreach ($funcAst in $helperFuncs) {
+            # SessionStateFunctionEntry expects the function body, not a complete
+            # "function Name { ... }" declaration.
+            $bodyText = [string]$funcAst.Body.Extent.Text
+            if ($bodyText.Length -ge 2 -and $bodyText[0] -eq '{' -and $bodyText[$bodyText.Length - 1] -eq '}') {
+                $bodyText = $bodyText.Substring(1, $bodyText.Length - 2)
+            }
+
+            [void]$iss.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                    [string]$funcAst.Name,
+                    $bodyText
+                )
+            )
+        }
+    }
+    catch {
+        try { Write-GuiLog "Shared runspace helper registration failed: $($_.Exception.Message)" } catch {}
+        throw
     }
 }
 
