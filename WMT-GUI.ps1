@@ -46263,11 +46263,43 @@ function Get-WmtCompactTrackerPath {
     return $path
 }
 
+function Get-WmtCompactDefaultPoorlyCompressedExtensions {
+    # Common formats that are already compressed internally and typically gain
+    # little or nothing from NTFS/WOF compression. Kept conservative and opt-in.
+    return [string[]]@(
+        ".dl_", ".gif", ".jpg", ".jpeg", ".png", ".wmf",
+        ".mkv", ".mp4", ".wmv", ".avi", ".bik", ".bk2", ".flv", ".ogg",
+        ".mpg", ".m2v", ".m4v", ".vob", ".mp3", ".aac", ".wma", ".flac",
+        ".zip", ".xap", ".rar", ".7z", ".cab", ".lzx",
+        ".docx", ".xlsx", ".pptx", ".vssx", ".vstx", ".onepkg",
+        ".tar", ".gz", ".dmg", ".bz2", ".tgz", ".lz", ".xz", ".txz"
+    )
+}
+
+function ConvertTo-WmtCompactExtensionList {
+    param([object[]]$Values)
+
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in @($Values)) {
+        if ($null -eq $value) { continue }
+        foreach ($token in ([string]$value -split '[,;\s]+')) {
+            $ext = $token.Trim()
+            if ([string]::IsNullOrWhiteSpace($ext)) { continue }
+            if (-not $ext.StartsWith(".")) { $ext = "." + $ext }
+            if ($ext -match '^\.[^\\/:*?"<>|\s]+$') {
+                [void]$set.Add($ext.ToLowerInvariant())
+            }
+        }
+    }
+    return [string[]]@($set | Sort-Object)
+}
+
 function Get-WmtCompactTrackerData {
     $result = [PSCustomObject]@{
-        Version  = 2
-        Schedule = "Off"
-        Entries  = @()
+        Version                 = 3
+        Schedule                = "Off"
+        ScheduleIntervalMinutes = 60
+        Entries                 = @()
     }
 
     $path = Get-WmtCompactTrackerPath
@@ -46285,6 +46317,12 @@ function Get-WmtCompactTrackerData {
             $sourceEntries = @($json.Entries)
             if ($json.PSObject.Properties["Schedule"] -and -not [string]::IsNullOrWhiteSpace([string]$json.Schedule)) {
                 $result.Schedule = [string]$json.Schedule
+            }
+            if ($json.PSObject.Properties["ScheduleIntervalMinutes"]) {
+                $minutes = 0
+                if ([int]::TryParse([string]$json.ScheduleIntervalMinutes, [ref]$minutes)) {
+                    $result.ScheduleIntervalMinutes = [Math]::Max(1, [Math]::Min(1439, $minutes))
+                }
             }
         }
         else {
@@ -46313,6 +46351,9 @@ function Get-WmtCompactTrackerData {
                 NeedsRecompress       = if ($entry.PSObject.Properties["NeedsRecompress"] -and $null -ne $entry.NeedsRecompress) { [bool]$entry.NeedsRecompress } else { $null }
                 LastChangePath        = if ($entry.PSObject.Properties["LastChangePath"]) { [string]$entry.LastChangePath } else { "" }
                 FilesScanned          = if ($entry.PSObject.Properties["FilesScanned"]) { [int64]$entry.FilesScanned } else { 0 }
+                SkipPoorlyCompressed  = if ($entry.PSObject.Properties["SkipPoorlyCompressed"]) { [bool]$entry.SkipPoorlyCompressed } else { $false }
+                CustomSkipExtensions  = if ($entry.PSObject.Properties["CustomSkipExtensions"]) { [string[]]@(ConvertTo-WmtCompactExtensionList -Values @($entry.CustomSkipExtensions)) } else { [string[]]@() }
+                LastSkippedFiles      = if ($entry.PSObject.Properties["LastSkippedFiles"]) { [int64]$entry.LastSkippedFiles } else { 0 }
             })
         }
         $result.Entries = $entries.ToArray()
@@ -46348,7 +46389,9 @@ function Set-WmtCompactTrackedTarget {
         [string]$State = "",
         [string]$LastResult = "",
         [switch]$TouchCompressed,
-        [Nullable[bool]]$AutoRecompress = $null
+        [Nullable[bool]]$AutoRecompress = $null,
+        [Nullable[bool]]$SkipPoorlyCompressed = $null,
+        [string[]]$CustomSkipExtensions = $null
     )
 
     try { $target = Resolve-WmtCompactTarget -Path $Path }
@@ -46373,6 +46416,9 @@ function Set-WmtCompactTrackedTarget {
             NeedsRecompress   = $null
             LastChangePath    = ""
             FilesScanned      = 0
+            SkipPoorlyCompressed = $false
+            CustomSkipExtensions = [string[]]@()
+            LastSkippedFiles     = 0
         }
         $data.Entries = @($data.Entries) + $item
     }
@@ -46382,6 +46428,10 @@ function Set-WmtCompactTrackedTarget {
     if (-not [string]::IsNullOrWhiteSpace($LastResult)) { $item.LastResult = $LastResult }
     if ($TouchCompressed) { $item.LastCompressedUtc = [DateTime]::UtcNow.ToString("o") }
     if ($null -ne $AutoRecompress) { $item.AutoRecompress = [bool]$AutoRecompress }
+    if ($null -ne $SkipPoorlyCompressed) { $item.SkipPoorlyCompressed = [bool]$SkipPoorlyCompressed }
+    if ($null -ne $CustomSkipExtensions) {
+        $item.CustomSkipExtensions = [string[]]@(ConvertTo-WmtCompactExtensionList -Values $CustomSkipExtensions)
+    }
 
     Save-WmtCompactTrackerData -Data $data
     return $item
@@ -46464,8 +46514,125 @@ function Write-WorkerLog {
     try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
 }
 
+function Get-DefaultPoorlyCompressedExtensions {
+    return [string[]]@(
+        ".dl_", ".gif", ".jpg", ".jpeg", ".png", ".wmf",
+        ".mkv", ".mp4", ".wmv", ".avi", ".bik", ".bk2", ".flv", ".ogg",
+        ".mpg", ".m2v", ".m4v", ".vob", ".mp3", ".aac", ".wma", ".flac",
+        ".zip", ".xap", ".rar", ".7z", ".cab", ".lzx",
+        ".docx", ".xlsx", ".pptx", ".vssx", ".vstx", ".onepkg",
+        ".tar", ".gz", ".dmg", ".bz2", ".tgz", ".lz", ".xz", ".txz"
+    )
+}
+
+function Get-EntrySkipExtensionSet {
+    param($Entry)
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    if ($Entry.PSObject.Properties["SkipPoorlyCompressed"] -and [bool]$Entry.SkipPoorlyCompressed) {
+        foreach ($ext in @(Get-DefaultPoorlyCompressedExtensions)) { [void]$set.Add($ext) }
+    }
+    if ($Entry.PSObject.Properties["CustomSkipExtensions"]) {
+        foreach ($value in @($Entry.CustomSkipExtensions)) {
+            foreach ($token in ([string]$value -split '[,;\s]+')) {
+                $ext = $token.Trim()
+                if ([string]::IsNullOrWhiteSpace($ext)) { continue }
+                if (-not $ext.StartsWith(".")) { $ext = "." + $ext }
+                [void]$set.Add($ext.ToLowerInvariant())
+            }
+        }
+    }
+    return $set
+}
+
+function Invoke-CompactSelective {
+    param(
+        [string]$Target,
+        [string]$Algorithm,
+        [System.Collections.Generic.HashSet[string]]$SkipExtensions
+    )
+
+    $baseArgs = [System.Collections.Generic.List[string]]::new()
+    foreach ($arg in @("/C", "/I", "/A", "/F")) { [void]$baseArgs.Add($arg) }
+    if ($Algorithm -ne "NTFS") { [void]$baseArgs.Add("/EXE:$Algorithm") }
+
+    $batch = [System.Collections.Generic.List[string]]::new()
+    $skipped = [int64]0
+    $candidates = [int64]0
+    $script:selectiveExitCode = 0
+    $script:selectiveBatchChars = 0
+
+    function Flush-CompactBatch {
+        if ($batch.Count -eq 0) { return }
+        $args = @($baseArgs.ToArray()) + @($batch.ToArray())
+        & $compactExe @args 2>&1 | Add-Content -LiteralPath $LogPath -Encoding UTF8
+        if ($LASTEXITCODE -ne 0 -and $script:selectiveExitCode -eq 0) { $script:selectiveExitCode = [int]$LASTEXITCODE }
+        $batch.Clear()
+        $script:selectiveBatchChars = 0
+    }
+
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push([System.IO.DirectoryInfo]::new($Target).FullName)
+
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        try {
+            $di = [System.IO.DirectoryInfo]::new($dir)
+            if (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        }
+        catch { continue }
+
+        try {
+            foreach ($file in [System.IO.Directory]::EnumerateFiles($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
+                try {
+                    $fi = [System.IO.FileInfo]::new($file)
+                    if (($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $ext = [System.IO.Path]::GetExtension($fi.Name)
+                    if (-not [string]::IsNullOrWhiteSpace($ext) -and $SkipExtensions.Contains($ext)) {
+                        $skipped++
+                        continue
+                    }
+
+                    $candidates++
+                    $argChars = $fi.FullName.Length + 3
+                    if ($batch.Count -ge 96 -or ($script:selectiveBatchChars + $argChars) -gt 24000) {
+                        Flush-CompactBatch
+                    }
+                    [void]$batch.Add($fi.FullName)
+                    $script:selectiveBatchChars += $argChars
+                }
+                catch {}
+            }
+        }
+        catch {}
+
+        try {
+            foreach ($child in [System.IO.Directory]::EnumerateDirectories($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
+                try {
+                    $attrs = [System.IO.Directory]::GetAttributes($child)
+                    if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $pending.Push($child)
+                }
+                catch {}
+            }
+        }
+        catch {}
+    }
+
+    Flush-CompactBatch
+    $exitCode = [int]$script:selectiveExitCode
+    Remove-Variable -Name selectiveExitCode -Scope Script -ErrorAction SilentlyContinue
+    Remove-Variable -Name selectiveBatchChars -Scope Script -ErrorAction SilentlyContinue
+
+    return [PSCustomObject]@{
+        ExitCode   = $exitCode
+        Skipped    = $skipped
+        Candidates = $candidates
+    }
+}
+
 function Test-TargetChanged {
-    param([string]$Path, [string]$LastCompressedUtc)
+    param([string]$Path, [string]$LastCompressedUtc, [System.Collections.Generic.HashSet[string]]$SkipExtensions)
 
     $result = [PSCustomObject]@{
         Exists          = $false
@@ -46512,6 +46679,8 @@ function Test-TargetChanged {
             try {
                 foreach ($file in [System.IO.Directory]::EnumerateFiles($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
                     $result.FilesScanned++
+                    $ext = [System.IO.Path]::GetExtension($file)
+                    if ($SkipExtensions -and -not [string]::IsNullOrWhiteSpace($ext) -and $SkipExtensions.Contains($ext)) { continue }
                     try {
                         $fi = [System.IO.FileInfo]::new($file)
                         $stamp = if ($fi.CreationTimeUtc -gt $fi.LastWriteTimeUtc) { $fi.CreationTimeUtc } else { $fi.LastWriteTimeUtc }
@@ -46578,7 +46747,8 @@ try {
             continue
         }
 
-        $analysis = Test-TargetChanged -Path $target -LastCompressedUtc ([string]$entry.LastCompressedUtc)
+        $skipExtensions = Get-EntrySkipExtensionSet -Entry $entry
+        $analysis = Test-TargetChanged -Path $target -LastCompressedUtc ([string]$entry.LastCompressedUtc) -SkipExtensions $skipExtensions
         Set-EntryValue $entry "LastAnalysisUtc" $nowUtc
         Set-EntryValue $entry "NeedsRecompress" ([bool]$analysis.NeedsRecompress)
         Set-EntryValue $entry "FilesScanned" ([int64]$analysis.FilesScanned)
@@ -46620,23 +46790,38 @@ try {
 
         $pushed = $false
         try {
-            Push-Location -LiteralPath $target -ErrorAction Stop
-            $pushed = $true
-            $compactArgs = @("/C", "/S", "/I", "/A")
-            if ($algorithm -ne "NTFS") { $compactArgs += "/EXE:$algorithm" }
+            $skippedFiles = [int64]0
+            if ($skipExtensions.Count -gt 0) {
+                Write-WorkerLog "Recompressing changed target $target with $algorithm; selective skip list enabled ($($skipExtensions.Count) extension(s))."
+                $selective = Invoke-CompactSelective -Target $target -Algorithm $algorithm -SkipExtensions $skipExtensions
+                $code = [int]$selective.ExitCode
+                $skippedFiles = [int64]$selective.Skipped
+            }
+            else {
+                Push-Location -LiteralPath $target -ErrorAction Stop
+                $pushed = $true
+                $compactArgs = @("/C", "/S", "/I", "/A")
+                if ($algorithm -ne "NTFS") { $compactArgs += "/EXE:$algorithm" }
 
-            Write-WorkerLog "Recompressing changed target $target with $algorithm"
-            & $compactExe @compactArgs 2>&1 | Add-Content -LiteralPath $LogPath -Encoding UTF8
-            $code = $LASTEXITCODE
+                Write-WorkerLog "Recompressing changed target $target with $algorithm"
+                & $compactExe @compactArgs 2>&1 | Add-Content -LiteralPath $LogPath -Encoding UTF8
+                $code = $LASTEXITCODE
+            }
 
+            Set-EntryValue $entry "LastSkippedFiles" $skippedFiles
             Set-EntryValue $entry "LastExitCode" ([int]$code)
             if ($code -eq 0) {
                 Set-EntryValue $entry "State" "Current"
                 Set-EntryValue $entry "LastCompressedUtc" ([DateTime]::UtcNow.ToString("o"))
                 Set-EntryValue $entry "NeedsRecompress" $false
                 Set-EntryValue $entry "LastChangePath" ""
-                Set-EntryValue $entry "LastResult" "Automatic recompression completed after changes were detected."
-                Write-WorkerLog "Completed $target"
+                if ($skippedFiles -gt 0) {
+                    Set-EntryValue $entry "LastResult" "Automatic recompression completed; skipped $skippedFiles poorly-compressible file(s)."
+                }
+                else {
+                    Set-EntryValue $entry "LastResult" "Automatic recompression completed after changes were detected."
+                }
+                Write-WorkerLog "Completed $target (skipped $skippedFiles file(s))"
             }
             else {
                 Set-EntryValue $entry "State" "Error"
@@ -46661,7 +46846,7 @@ try {
     # This prevents a background run from overwriting UI edits made while it ran.
     $latest = Get-Content -LiteralPath $TrackerPath -Raw | ConvertFrom-Json -ErrorAction Stop
     if (-not $latest.PSObject.Properties["Entries"]) { exit 0 }
-    $resultFields = @("State", "LastCompressedUtc", "LastAutoRunUtc", "LastResult", "LastExitCode", "LastAnalysisUtc", "NeedsRecompress", "LastChangePath", "FilesScanned")
+        $resultFields = @("State", "LastCompressedUtc", "LastAutoRunUtc", "LastResult", "LastExitCode", "LastAnalysisUtc", "NeedsRecompress", "LastChangePath", "FilesScanned", "LastSkippedFiles")
 
     foreach ($latestEntry in @($latest.Entries)) {
         if (-not $latestEntry) { continue }
@@ -46736,7 +46921,10 @@ function Start-WmtCompactRecompressWorker {
 }
 
 function Set-WmtCompactRecompressSchedule {
-    param([ValidateSet("Off", "OnIdle", "AtLogon", "Daily", "Weekly")][string]$Mode)
+    param(
+        [ValidateSet("Off", "OnIdle", "AtLogon", "Daily", "Weekly", "Custom")][string]$Mode,
+        [ValidateRange(1, 1439)][int]$IntervalMinutes = 60
+    )
 
     $taskName = "Windows Maintenance Tool - Compact Recompress"
     $data = Get-WmtCompactTrackerData
@@ -46758,6 +46946,7 @@ function Set-WmtCompactRecompressSchedule {
         "AtLogon" { $taskArgs += @("/SC", "ONLOGON") }
         "Daily"   { $taskArgs += @("/SC", "DAILY", "/ST", "03:00") }
         "Weekly"  { $taskArgs += @("/SC", "WEEKLY", "/D", "SUN", "/ST", "03:00") }
+        "Custom"  { $taskArgs += @("/SC", "MINUTE", "/MO", [string]$IntervalMinutes) }
     }
 
     $output = & schtasks.exe @taskArgs 2>&1
@@ -46766,6 +46955,7 @@ function Set-WmtCompactRecompressSchedule {
     }
 
     $data.Schedule = $Mode
+    $data.ScheduleIntervalMinutes = $IntervalMinutes
     Save-WmtCompactTrackerData -Data $data
     Write-GuiLog "[Compact] Automatic recompression schedule set to $Mode."
 }
@@ -46775,7 +46965,9 @@ function Start-WmtCompactConsole {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [ValidateSet("Compress", "Decompress")][string]$Mode = "Compress",
-        [ValidateSet("NTFS", "XPRESS4K", "XPRESS8K", "XPRESS16K", "LZX")][string]$Algorithm = "XPRESS8K"
+        [ValidateSet("NTFS", "XPRESS4K", "XPRESS8K", "XPRESS16K", "LZX")][string]$Algorithm = "XPRESS8K",
+        [bool]$SkipPoorlyCompressed = $false,
+        [string[]]$CustomSkipExtensions = @()
     )
 
     try { $target = Resolve-WmtCompactTarget -Path $Path }
@@ -46788,6 +46980,9 @@ function Start-WmtCompactConsole {
     $targetBase64 = [Convert]::ToBase64String($targetBytes)
     $trackerPath = Get-WmtCompactTrackerPath
     $trackerPathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($trackerPath))
+    $normalizedCustomSkip = [string[]]@(ConvertTo-WmtCompactExtensionList -Values $CustomSkipExtensions)
+    $customSkipJson = $normalizedCustomSkip | ConvertTo-Json -Compress
+    $customSkipBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($customSkipJson))
 
     $consoleScript = @'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -46798,8 +46993,128 @@ $Target = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(
 $TrackerPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__TRACKER_BASE64__"))
 $Mode = "__MODE__"
 $Algorithm = "__ALGORITHM__"
+$SkipPoorlyCompressed = [System.Convert]::ToBoolean("__SKIP_POOR__")
+$CustomSkipJson = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("__CUSTOM_SKIP_BASE64__"))
+$CustomSkipExtensions = @()
+try {
+    $decodedSkip = $CustomSkipJson | ConvertFrom-Json -ErrorAction Stop
+    if ($null -ne $decodedSkip) { $CustomSkipExtensions = @($decodedSkip) }
+}
+catch {}
 $compactExe = Join-Path $env:SystemRoot "System32\compact.exe"
 if (-not (Test-Path -LiteralPath $compactExe -PathType Leaf)) { $compactExe = "compact.exe" }
+
+
+function Get-DefaultPoorlyCompressedExtensions {
+    return [string[]]@(
+        ".dl_", ".gif", ".jpg", ".jpeg", ".png", ".wmf",
+        ".mkv", ".mp4", ".wmv", ".avi", ".bik", ".bk2", ".flv", ".ogg",
+        ".mpg", ".m2v", ".m4v", ".vob", ".mp3", ".aac", ".wma", ".flac",
+        ".zip", ".xap", ".rar", ".7z", ".cab", ".lzx",
+        ".docx", ".xlsx", ".pptx", ".vssx", ".vstx", ".onepkg",
+        ".tar", ".gz", ".dmg", ".bz2", ".tgz", ".lz", ".xz", ".txz"
+    )
+}
+
+function Get-ManualSkipExtensionSet {
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($SkipPoorlyCompressed) {
+        foreach ($ext in @(Get-DefaultPoorlyCompressedExtensions)) { [void]$set.Add($ext) }
+    }
+    foreach ($value in @($CustomSkipExtensions)) {
+        foreach ($token in ([string]$value -split '[,;\s]+')) {
+            $ext = $token.Trim()
+            if ([string]::IsNullOrWhiteSpace($ext)) { continue }
+            if (-not $ext.StartsWith(".")) { $ext = "." + $ext }
+            [void]$set.Add($ext.ToLowerInvariant())
+        }
+    }
+    return $set
+}
+
+function Invoke-ManualSelectiveCompact {
+    param([System.Collections.Generic.HashSet[string]]$SkipExtensions)
+
+    $baseArgs = [System.Collections.Generic.List[string]]::new()
+    foreach ($arg in @("/C", "/I", "/A", "/F")) { [void]$baseArgs.Add($arg) }
+    if ($Algorithm -ne "NTFS") { [void]$baseArgs.Add("/EXE:$Algorithm") }
+
+    $batch = [System.Collections.Generic.List[string]]::new()
+    $skipped = [int64]0
+    $candidates = [int64]0
+    $script:manualCompactExitCode = 0
+    $script:manualCompactBatchChars = 0
+
+    function Flush-ManualCompactBatch {
+        if ($batch.Count -eq 0) { return }
+        $args = @($baseArgs.ToArray()) + @($batch.ToArray())
+        & $compactExe @args
+        if ($LASTEXITCODE -ne 0 -and $script:manualCompactExitCode -eq 0) {
+            $script:manualCompactExitCode = [int]$LASTEXITCODE
+        }
+        $batch.Clear()
+        $script:manualCompactBatchChars = 0
+    }
+
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push([System.IO.DirectoryInfo]::new($Target).FullName)
+
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        try {
+            $di = [System.IO.DirectoryInfo]::new($dir)
+            if (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        }
+        catch { continue }
+
+        try {
+            foreach ($file in [System.IO.Directory]::EnumerateFiles($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
+                try {
+                    $fi = [System.IO.FileInfo]::new($file)
+                    if (($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $ext = [System.IO.Path]::GetExtension($fi.Name)
+                    if (-not [string]::IsNullOrWhiteSpace($ext) -and $SkipExtensions.Contains($ext)) {
+                        $skipped++
+                        continue
+                    }
+
+                    $candidates++
+                    $argChars = $fi.FullName.Length + 3
+                    if ($batch.Count -ge 96 -or ($script:manualCompactBatchChars + $argChars) -gt 24000) {
+                        Flush-ManualCompactBatch
+                    }
+                    [void]$batch.Add($fi.FullName)
+                    $script:manualCompactBatchChars += $argChars
+                }
+                catch {}
+            }
+        }
+        catch {}
+
+        try {
+            foreach ($child in [System.IO.Directory]::EnumerateDirectories($dir, "*", [System.IO.SearchOption]::TopDirectoryOnly)) {
+                try {
+                    $attrs = [System.IO.Directory]::GetAttributes($child)
+                    if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $pending.Push($child)
+                }
+                catch {}
+            }
+        }
+        catch {}
+    }
+
+    Flush-ManualCompactBatch
+    $firstExitCode = [int]$script:manualCompactExitCode
+    Remove-Variable -Name manualCompactExitCode -Scope Script -ErrorAction SilentlyContinue
+    Remove-Variable -Name manualCompactBatchChars -Scope Script -ErrorAction SilentlyContinue
+
+    return [PSCustomObject]@{
+        ExitCode   = $firstExitCode
+        Skipped    = $skipped
+        Candidates = $candidates
+    }
+}
 
 Write-Host "WMT Compact Compression" -ForegroundColor Cyan
 Write-Host "Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -46809,18 +47124,30 @@ if ($Mode -eq "Compress") { Write-Host "Method:  $Algorithm" }
 Write-Host ""
 
 $locationPushed = $false
+$skippedFiles = [int64]0
 try {
     Push-Location -LiteralPath $Target -ErrorAction Stop
     $locationPushed = $true
 
     if ($Mode -eq "Compress") {
-        $args = @("/C", "/S", "/I", "/A", "/F")
-        if ($Algorithm -ne "NTFS") { $args += "/EXE:$Algorithm" }
+        $skipExtensions = Get-ManualSkipExtensionSet
+        if ($skipExtensions.Count -gt 0) {
+            Write-Host "Skip list: $($skipExtensions.Count) extension(s); enumerating files selectively." -ForegroundColor DarkCyan
+            $selective = Invoke-ManualSelectiveCompact -SkipExtensions $skipExtensions
+            $exitCode = [int]$selective.ExitCode
+            $skippedFiles = [int64]$selective.Skipped
+            Write-Host ""
+            Write-Host "Skipped poorly-compressible files: $skippedFiles" -ForegroundColor DarkCyan
+        }
+        else {
+            $args = @("/C", "/S", "/I", "/A", "/F")
+            if ($Algorithm -ne "NTFS") { $args += "/EXE:$Algorithm" }
 
-        Write-Host ("Running: compact.exe " + ($args -join " ")) -ForegroundColor Yellow
-        Write-Host ""
-        & $compactExe @args
-        $exitCode = $LASTEXITCODE
+            Write-Host ("Running: compact.exe " + ($args -join " ")) -ForegroundColor Yellow
+            Write-Host ""
+            & $compactExe @args
+            $exitCode = $LASTEXITCODE
+        }
     }
     else {
         Write-Host "Removing Compact /EXE compression..." -ForegroundColor Yellow
@@ -46867,7 +47194,8 @@ function Update-TrackerResult {
                 Set-TrackerValue $item "LastAnalysisUtc" ([DateTime]::UtcNow.ToString("o"))
                 Set-TrackerValue $item "NeedsRecompress" $false
                 Set-TrackerValue $item "LastChangePath" ""
-                Set-TrackerValue $item "LastResult" "Manual compression completed."
+                Set-TrackerValue $item "LastSkippedFiles" $skippedFiles
+                Set-TrackerValue $item "LastResult" $(if ($skippedFiles -gt 0) { "Manual compression completed; skipped $skippedFiles poorly-compressible file(s)." } else { "Manual compression completed." })
             }
             else {
                 Set-TrackerValue $item "State" "Decompressed"
@@ -46905,7 +47233,7 @@ Write-Host ""
 try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyContinue } catch {}
 '@
 
-    $consoleScript = $consoleScript.Replace("__TARGET_BASE64__", $targetBase64).Replace("__TRACKER_BASE64__", $trackerPathBase64).Replace("__MODE__", $Mode).Replace("__ALGORITHM__", $Algorithm)
+    $consoleScript = $consoleScript.Replace("__TARGET_BASE64__", $targetBase64).Replace("__TRACKER_BASE64__", $trackerPathBase64).Replace("__MODE__", $Mode).Replace("__ALGORITHM__", $Algorithm).Replace("__SKIP_POOR__", ([string]$SkipPoorlyCompressed)).Replace("__CUSTOM_SKIP_BASE64__", $customSkipBase64)
     $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ("WMT_Compact_{0}.ps1" -f (Get-Random))
 
     try {
@@ -46919,7 +47247,7 @@ try { Remove-Item -LiteralPath $ScriptToDelete -Force -ErrorAction SilentlyConti
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
 
         if ($Mode -eq "Compress") {
-            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressing" -LastResult "Manual compression starting.")
+            [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Compressing" -LastResult "Manual compression starting." -SkipPoorlyCompressed:$SkipPoorlyCompressed -CustomSkipExtensions $normalizedCustomSkip)
         }
         else {
             [void](Set-WmtCompactTrackedTarget -Path $target -Algorithm $Algorithm -State "Decompressing" -AutoRecompress:$false -LastResult "Manual decompression starting.")
@@ -47233,6 +47561,10 @@ function Show-WmtCompactManager {
                     </ComboBox>
                     <TextBlock Text="XPRESS8K is a good default. LZX favors maximum savings on mostly read-only data."
                                Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap"/>
+                    <CheckBox Name="chkCompactSkipPoor" Content="Skip poorly-compressed formats" Margin="0,9,0,3"
+                              ToolTip="Skip common already-compressed media, archive, and Office-container formats. Off by default."/>
+                    <TextBox Name="txtCompactSkipExtensions" MinHeight="28" VerticalContentAlignment="Center"
+                             ToolTip="Optional extra extensions to skip, separated by spaces, commas, or semicolons (example: .pak; .wem)."/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -47249,6 +47581,7 @@ function Show-WmtCompactManager {
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="170"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" Text="AUTO RECOMPRESS" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,10,0"/>
@@ -47258,9 +47591,15 @@ function Show-WmtCompactManager {
                     <ComboBoxItem Content="At logon" Tag="AtLogon"/>
                     <ComboBoxItem Content="Daily at 3:00 AM" Tag="Daily"/>
                     <ComboBoxItem Content="Weekly Sunday 3:00 AM" Tag="Weekly"/>
+                    <ComboBoxItem Content="Custom interval" Tag="Custom"/>
                 </ComboBox>
-                <Button Grid.Column="2" Name="btnCompactApplySchedule" Content="Apply" MinWidth="78" Margin="8,0,0,0"/>
-                <TextBlock Grid.Column="3" Name="txtCompactScheduleStatus" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap"/>
+                <StackPanel Grid.Column="2" Name="pnlCompactCustomInterval" Orientation="Horizontal" Margin="8,0,0,0" Visibility="Collapsed" VerticalAlignment="Center">
+                    <TextBox Name="txtCompactCustomMinutes" Text="60" Width="52" MinHeight="28" VerticalContentAlignment="Center" TextAlignment="Center"
+                             ToolTip="Custom interval in minutes (1-1439)."/>
+                    <TextBlock Text="min" Margin="5,0,0,0" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+                </StackPanel>
+                <Button Grid.Column="3" Name="btnCompactApplySchedule" Content="Apply" MinWidth="78" Margin="8,0,0,0"/>
+                <TextBlock Grid.Column="4" Name="txtCompactScheduleStatus" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap"/>
             </Grid>
         </Border>
 
@@ -47289,6 +47628,7 @@ function Show-WmtCompactManager {
                     <DataGrid.Columns>
                         <DataGridTextColumn Header="Target" Binding="{Binding Path}" Width="2.4*"/>
                         <DataGridTextColumn Header="Method" Binding="{Binding Algorithm}" Width="95"/>
+                        <DataGridTextColumn Header="Skip" Binding="{Binding SkipText}" Width="65"/>
                         <DataGridTextColumn Header="Auto" Binding="{Binding AutoText}" Width="55"/>
                         <DataGridTextColumn Header="Needs" Binding="{Binding NeedsText}" Width="72"/>
                         <DataGridTextColumn Header="State" Binding="{Binding State}" Width="85"/>
@@ -47309,7 +47649,7 @@ function Show-WmtCompactManager {
             </Grid>
         </Border>
 
-        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, then invoke compact.exe only when recompression is needed. Reparse points are skipped during analysis. The schedule is a standalone Windows Scheduled Task running as SYSTEM, so it continues to work after WMT is closed. Tracker state, worker script, and log are secured under ProgramData\WindowsMaintenanceTool."
+        <TextBlock Grid.Row="5" Text="Automatic runs first check for files created or modified since the last successful compression, ignores configured poorly-compressed extensions, then invokes compact.exe only when recompression is needed. Reparse points are skipped during analysis. The schedule is a standalone Windows Scheduled Task running as SYSTEM, so it continues to work after WMT is closed. Tracker state, worker script, and log are secured under ProgramData\WindowsMaintenanceTool."
                    Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap" Margin="0,10,0,0"/>
 
         <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
@@ -47329,7 +47669,11 @@ function Show-WmtCompactManager {
     $btnBrowse = $dialog.FindName("btnCompactBrowse")
     $cmbDrive = $dialog.FindName("cmbCompactDrive")
     $cmbAlgorithm = $dialog.FindName("cmbCompactAlgorithm")
+    $chkSkipPoor = $dialog.FindName("chkCompactSkipPoor")
+    $txtSkipExtensions = $dialog.FindName("txtCompactSkipExtensions")
     $cmbSchedule = $dialog.FindName("cmbCompactSchedule")
+    $pnlCustomInterval = $dialog.FindName("pnlCompactCustomInterval")
+    $txtCustomMinutes = $dialog.FindName("txtCompactCustomMinutes")
     $btnApplySchedule = $dialog.FindName("btnCompactApplySchedule")
     $txtScheduleStatus = $dialog.FindName("txtCompactScheduleStatus")
     $dgTracked = $dialog.FindName("dgCompactTracked")
@@ -47344,6 +47688,8 @@ function Show-WmtCompactManager {
     $btnCompress = $dialog.FindName("btnCompactCompress")
     $btnDecompress = $dialog.FindName("btnCompactDecompress")
     $btnClose = $dialog.FindName("btnCompactClose")
+
+    try { [void](Write-WmtCompactRecompressWorker) } catch { Write-GuiLog "[Compact] Could not refresh recompression worker: $($_.Exception.Message)" }
 
     foreach ($drive in @(Get-WmtCompactDriveChoices)) {
         $item = [System.Windows.Controls.ComboBoxItem]::new()
@@ -47365,6 +47711,15 @@ function Show-WmtCompactManager {
         }
         return "XPRESS8K"
     }.GetNewClosure()
+
+    $getCurrentSkipSettings = {
+        $custom = [string[]]@(ConvertTo-WmtCompactExtensionList -Values @([string]$txtSkipExtensions.Text))
+        return [PSCustomObject]@{
+            SkipPoor = [bool]$chkSkipPoor.IsChecked
+            Custom   = $custom
+        }
+    }.GetNewClosure()
+
 
     $selectAlgorithm = {
         param([string]$Algorithm)
@@ -47402,6 +47757,10 @@ function Show-WmtCompactManager {
                 LastCompressedText = Format-WmtCompactTrackerDate ([string]$entry.LastCompressedUtc)
                 LastAnalysisText   = Format-WmtCompactTrackerDate ([string]$entry.LastAnalysisUtc)
                 LastResult         = [string]$entry.LastResult
+                SkipText           = if ([bool]$entry.SkipPoorlyCompressed) { "Smart" } elseif (@($entry.CustomSkipExtensions).Count -gt 0) { "Custom" } else { "Off" }
+                SkipPoorlyCompressed = [bool]$entry.SkipPoorlyCompressed
+                CustomSkipExtensions = [string[]]@($entry.CustomSkipExtensions)
+                LastSkippedFiles    = [int64]$entry.LastSkippedFiles
             })
         }
         $dgTracked.ItemsSource = $rows.ToArray()
@@ -47409,13 +47768,24 @@ function Show-WmtCompactManager {
         $needsCount = @($data.Entries | Where-Object { $_.PSObject.Properties["NeedsRecompress"] -and $null -ne $_.NeedsRecompress -and [bool]$_.NeedsRecompress }).Count
         $txtTrackerSummary.Text = "$($rows.Count) tracked target(s), $autoCount automatic, $needsCount currently flagged for recompression."
         & $selectSchedule ([string]$data.Schedule)
+        $txtCustomMinutes.Text = [string][int]$data.ScheduleIntervalMinutes
         $txtScheduleStatus.Text = if ([string]$data.Schedule -eq "Off") {
             "No scheduled task. Enable one to run independently of WMT."
+        }
+        elseif ([string]$data.Schedule -eq "Custom") {
+            "Windows Scheduled Task: every $([int]$data.ScheduleIntervalMinutes) minute(s). Runs as SYSTEM even when WMT is closed."
         }
         else {
             "Windows Scheduled Task: $([string]$data.Schedule). Runs as SYSTEM even when WMT is closed."
         }
     }.GetNewClosure()
+
+    $updateScheduleMode = {
+        $isCustom = ($cmbSchedule.SelectedItem -and [string]$cmbSchedule.SelectedItem.Tag -eq "Custom")
+        $pnlCustomInterval.Visibility = if ($isCustom) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    }.GetNewClosure()
+    $cmbSchedule.Add_SelectionChanged({ & $updateScheduleMode }.GetNewClosure())
+
 
     $setTargetMode = {
         $folderMode = [bool]$rbFolder.IsChecked
@@ -47456,7 +47826,8 @@ function Show-WmtCompactManager {
         $confirm = Show-WmtMessageBox -Message $detail -Title "Compact Compression" -Button YesNo -Image Warning
         if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-        Start-WmtCompactConsole -Path $target -Mode $Mode -Algorithm $algorithm
+        $skipSettings = & $getCurrentSkipSettings
+        Start-WmtCompactConsole -Path $target -Mode $Mode -Algorithm $algorithm -SkipPoorlyCompressed:$skipSettings.SkipPoor -CustomSkipExtensions $skipSettings.Custom
         & $refreshTracker
     }.GetNewClosure()
 
@@ -47471,7 +47842,8 @@ function Show-WmtCompactManager {
         }
         try {
             $resolved = Resolve-WmtCompactTarget -Path $target
-            [void](Set-WmtCompactTrackedTarget -Path $resolved -Algorithm (& $getCurrentAlgorithm) -State "Tracked" -LastResult "Added to tracker.")
+            $skipSettings = & $getCurrentSkipSettings
+            [void](Set-WmtCompactTrackedTarget -Path $resolved -Algorithm (& $getCurrentAlgorithm) -State "Tracked" -LastResult "Added to tracker." -SkipPoorlyCompressed:$skipSettings.SkipPoor -CustomSkipExtensions $skipSettings.Custom)
             & $refreshTracker
         }
         catch {
@@ -47494,6 +47866,8 @@ function Show-WmtCompactManager {
             $txtFolder.Text = $path
         }
         & $selectAlgorithm ([string]$row.Algorithm)
+        $chkSkipPoor.IsChecked = [bool]$row.SkipPoorlyCompressed
+        $txtSkipExtensions.Text = [string]::Join("; ", @($row.CustomSkipExtensions))
     }.GetNewClosure())
 
     $btnRefreshTracked.Add_Click({ & $refreshTracker }.GetNewClosure())
@@ -47534,7 +47908,7 @@ function Show-WmtCompactManager {
             return
         }
         $row = $dgTracked.SelectedItem
-        Start-WmtCompactConsole -Path ([string]$row.Path) -Mode Compress -Algorithm ([string]$row.Algorithm)
+        Start-WmtCompactConsole -Path ([string]$row.Path) -Mode Compress -Algorithm ([string]$row.Algorithm) -SkipPoorlyCompressed:[bool]$row.SkipPoorlyCompressed -CustomSkipExtensions @($row.CustomSkipExtensions)
         & $refreshTracker
     }.GetNewClosure())
 
@@ -47561,7 +47935,14 @@ function Show-WmtCompactManager {
         if (-not $cmbSchedule.SelectedItem) { return }
         $mode = [string]$cmbSchedule.SelectedItem.Tag
         try {
-            Set-WmtCompactRecompressSchedule -Mode $mode
+            $intervalMinutes = 60
+            if ($mode -eq "Custom") {
+                if (-not [int]::TryParse(([string]$txtCustomMinutes.Text).Trim(), [ref]$intervalMinutes) -or $intervalMinutes -lt 1 -or $intervalMinutes -gt 1439) {
+                    Show-WmtMessageBox -Message "Enter a custom interval from 1 to 1439 minutes." -Title "Compact Compression" -Image Warning | Out-Null
+                    return
+                }
+            }
+            Set-WmtCompactRecompressSchedule -Mode $mode -IntervalMinutes $intervalMinutes
             & $refreshTracker
         }
         catch {
@@ -47572,6 +47953,7 @@ function Show-WmtCompactManager {
     $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
 
     & $setTargetMode
+    & $updateScheduleMode
     & $refreshTracker
     $dialog.ShowDialog() | Out-Null
 }
