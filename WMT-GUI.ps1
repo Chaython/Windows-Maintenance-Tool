@@ -7428,6 +7428,7 @@ try {
     $driversItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open Drivers"
     $utilsItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Open Utilities"
     $themeItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Toggle WMT theme"
+    $themeItem.Name = "WmtThemeToggle"
     $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem -ArgumentList "Exit WMT"
 
     [void]$menu.Items.Add($openItem)
@@ -7446,12 +7447,25 @@ try {
     $menu.Renderer = New-WmtTrayMenuRenderer -Menu $menu
     Set-WmtTrayMenuTheme -Menu $menu
     $menu.Add_Opening({
+            param($sender, $e)
             try {
-                $themeItem.Text = if ($script:CurrentTheme -eq "dark") { "Switch to light theme" } else { "Switch to dark theme" }
-                Set-WmtTrayMenuTheme -Menu $menu
+                # Do not use GetNewClosure here: a closure creates a dynamic module,
+                # which gives $script:CurrentTheme a different script scope and can
+                # make the tray label report the opposite theme.
+                $themeToggle = $null
+                foreach ($item in @($sender.Items)) {
+                    if ($item -and $item.Name -eq "WmtThemeToggle") {
+                        $themeToggle = $item
+                        break
+                    }
+                }
+                if ($themeToggle) {
+                    $themeToggle.Text = if ($script:CurrentTheme -eq "dark") { "Switch to light theme" } else { "Switch to dark theme" }
+                }
+                Set-WmtTrayMenuTheme -Menu $sender
             }
             catch {}
-        }.GetNewClosure())
+        })
 
     $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
     $trayIconImage = Get-WmtTrayIconImage
@@ -47963,6 +47977,12 @@ try {
         Start-AppxBackgroundLoad
     }
 
+    # Firewall manager preload. This is only the automatic warm-up path;
+    # manually opening/refreshing Firewall remains available when Bg Jobs are off.
+    if (-not $script:FirewallRulesLoaded -and -not $script:FirewallLoadInProgress) {
+        try { Start-FirewallRuleLoad -Preload } catch {}
+    }
+
     # Legendary/GOG library cache for the Updates search box (self-guarding,
     # refreshes only when a cache file is missing or older than 24 hours)
     try { Start-WmtLibraryCacheBuilder } catch {}
@@ -50520,6 +50540,13 @@ if ($script:WmtStartupPreloadTimer) {
 
 function Start-WmtStartupBackgroundPreload {
 if ($script:WmtStartupPreloadTimer) { return }
+
+# "Bg Jobs: Off" suppresses automatic hidden-page warming. Manual page opens
+# and Refresh actions still use UiSupport runspaces so they remain responsive.
+if (Get-WmtDisableBackgroundJobs) {
+    Write-GuiLog "Startup background preload skipped because background jobs are disabled."
+    return
+}
 
 if (-not $script:MyDeviceStatsStarted) {
     Update-MyDeviceStats -Preload
