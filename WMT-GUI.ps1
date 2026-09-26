@@ -2469,7 +2469,7 @@ $psRef = $PowerShell
 $asyncRef = $async
 $nameRef = $Name
 $logOutputRef = [bool]$LogOutput
-$operationName = "DetachedPowerShell:$Name:$([Guid]::NewGuid().ToString('N'))"
+$operationName = "DetachedPowerShell:${Name}:$([Guid]::NewGuid().ToString('N'))"
 
 $testComplete = {
     $asyncRef -and $asyncRef.IsCompleted
@@ -2547,7 +2547,7 @@ if (-not $stopAsync) {
 }
 
 $stopRef = $stopAsync
-$operationName = "StopPowerShell:$Name:$([Guid]::NewGuid().ToString('N'))"
+$operationName = "StopPowerShell:${Name}:$([Guid]::NewGuid().ToString('N'))"
 
 $testComplete = {
     $stopDone = [bool]($stopRef -and $stopRef.IsCompleted)
