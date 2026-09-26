@@ -7037,6 +7037,65 @@ try {
 catch {}
 }
 
+function Stop-WmtIdleRunspacePools {
+# PowerShell runspaces retain loaded modules/session state even when no command is
+# running. Close only completely idle pools; New-WmtPooledPowerShell recreates
+# them lazily the next time a scheduled/background action actually needs one.
+foreach ($poolKind in @("Background", "UiSupport")) {
+    $pool = if ($poolKind -eq "UiSupport") { $script:WmtUiSupportPool } else { $script:WmtBackgroundPool }
+    if (-not $pool) { continue }
+
+    $idle = $false
+    try {
+        $max = [int]$pool.GetMaxRunspaces()
+        $available = [int]$pool.GetAvailableRunspaces()
+        $idle = ($max -gt 0 -and $available -ge $max)
+    }
+    catch {}
+
+    if ($idle) {
+        try { Reset-WmtRunspacePool -PoolKind $poolKind } catch {}
+    }
+}
+}
+
+function Clear-WmtTrayReloadableData {
+# These collections are UI caches, not durable state. Dropping them while the
+# window is hidden substantially reduces retained WPF/PowerShell objects. Their
+# tabs already reload on demand when the user opens WMT again.
+if (-not $script:WmtHiddenToTray) { return }
+
+if (-not $script:FirewallLoadInProgress) {
+    $script:AllFw = @()
+    $script:FirewallRulesLoaded = $false
+    $script:FirewallDetailCache = @{}
+    try { if ($lstFw) { $lstFw.Items.Clear() } } catch {}
+}
+
+if (-not $script:DriverLoadInProgress) {
+    $script:DriverPackages = @()
+    $script:DriverDeviceMap = @{}
+    $script:DriverServiceMap = $null
+    $script:DriverUsageLoaded = $false
+    $script:DriverCacheLoaded = $false
+    try { if ($lstDrivers) { $lstDrivers.Items.Clear() } } catch {}
+}
+
+if (-not $script:WmtLibraryScanRunspace) {
+    $script:WmtLibraryScanResults = $null
+    try { if ($lstLibrary) { $lstLibrary.Items.Clear() } } catch {}
+}
+
+if (-not $script:WmtAppxLoadRunspace) {
+    $script:AppxListLoaded = $false
+    try { if ($lstAppxPackages) { $lstAppxPackages.Items.Clear() } } catch {}
+}
+
+# Quick Find results are disposable and can retain references into several
+# page models even after the search flyout is no longer visible.
+try { if ($lstSearchResults) { $lstSearchResults.Items.Clear() } } catch {}
+}
+
 function Invoke-WmtMemoryTrim {
 param([string]$Reason = "manual")
 
@@ -7084,9 +7143,30 @@ try {
     $script:WmtCompletedWindowsUpdateIds = $null
     $script:WmtCompletedWindowsUpdateIds = @{}
 
-    Optimize-WmtLogMemory -MaxLines $script:WmtMaxLogLines
+    if ($script:WmtHiddenToTray) {
+        Clear-WmtTrayReloadableData
+        # Completed work can leave large module/session-state graphs in the two
+        # shared pools. Reclaim them only when every runspace in a pool is idle.
+        Stop-WmtIdleRunspacePools
+        Optimize-WmtLogMemory -MaxLines 150
+    }
+    else {
+        Optimize-WmtLogMemory -MaxLines $script:WmtMaxLogLines
+    }
 
-    [System.GC]::Collect()
+    # Compact the LOH before the full blocking collection. Cleaner definitions,
+    # package metadata and library JSON can allocate large temporary arrays that
+    # otherwise keep committed heap segments around after their objects die.
+    try {
+        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
+    }
+    catch {}
+    try {
+        [System.GC]::Collect([System.GC]::MaxGeneration, [System.GCCollectionMode]::Forced, $true, $true)
+    }
+    catch {
+        [System.GC]::Collect()
+    }
     [System.GC]::WaitForPendingFinalizers()
     [System.GC]::Collect()
 
@@ -38823,7 +38903,7 @@ foreach ($p in $providerDefinitions) {
                 <CheckBox Name="chkRunInTrayOnClose" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3" Content="Run in system tray when closed" Margin="0,8,0,0"
                           ToolTip="When enabled, closing the main window hides WMT to the system tray so background scans and notifications can continue."/>
                 <CheckBox Name="chkReduceRamInTray" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Content="Reduce RAM while hidden in tray" Margin="0,8,0,0"
-                          ToolTip="When WMT is hidden to the tray, clear short-lived caches, trim the log, run garbage collection, and ask Windows to release unused working-set pages."/>
+                          ToolTip="When WMT is hidden to the tray, unload reloadable page data, dispose idle PowerShell runspace pools, compact managed memory, trim the log, and ask Windows to release unused working-set pages. Data reloads on demand when WMT is reopened."/>
                 <CheckBox Name="chkUpdateSilentInstall" Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Content="Run update/install commands headless. ⚠ Experimental!" Margin="0,8,0,0"
                           ToolTip="Hide CLI, PowerShell, and cmd update windows. Providers that require their own GUI, including Steam validation and Microsoft Store GUI updates, can still appear."/>
                 <CheckBox Name="chkUpdateAutoInstall" Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Content="Automatically install available updates after scans" Margin="0,8,0,0"
@@ -40863,38 +40943,40 @@ $script:WmtUpdateAutoScanTimerTickHandler = $null
 }
 
 # Periodic memory trim — runs every 5 minutes to release idle caches and reduce working set.
-# Only trims caches that are safe to release (re-loaded on next use) and forces GC.
+# Hidden tray mode uses the more aggressive tray-safe path so memory used by a
+# startup/background job is reclaimed after that job finishes.
 $script:WmtPeriodicMemoryTrimTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:WmtPeriodicMemoryTrimTimer.Interval = [TimeSpan]::FromMinutes(5)
 $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
     try { $script:WmtPeriodicMemoryTrimTimer.Stop() } catch {}
     try {
-        # Only release caches if no scan is actively running
+        # Only release caches if no scan is actively running.
         $scanBusy = $false
         if ($script:ScanTimer -and $script:ScanTimer.IsEnabled) { $scanBusy = $true }
         if (Test-WmtUiPollOperation -Name "LibraryScan") { $scanBusy = $true }
         if ($script:WmtLibraryCacheRunspace) { $scanBusy = $true }
         if ($script:WmtRegistryCleanupActive -or ($script:WmtRegistryCleanupTimer -and $script:WmtRegistryCleanupTimer.IsEnabled)) { $scanBusy = $true }
-        if (-not $scanBusy) {
-            # Release parsed cleaner rules (re-parsed on next cleaner use)
+
+        if (-not $scanBusy -and $script:WmtHiddenToTray -and (Get-WmtReduceRamInTray)) {
+            Invoke-WmtMemoryTrim -Reason "tray-periodic"
+        }
+        elseif (-not $scanBusy) {
+            # Release parsed cleaner rules (re-parsed on next cleaner use).
             if ($script:CleanerMlRulesMemoryCache) { $script:CleanerMlRulesMemoryCache = $null }
             if ($script:Winapp2RulesMemoryCache) { $script:Winapp2RulesMemoryCache = $null }
-            # Release game library caches (re-loaded on next library tab visit)
+            # Release game library caches (re-loaded on next library tab visit).
             $script:LegendaryLibraryCache = $null
             $script:WmtGogLibraryCache = $null
             $script:SteamLibraryCache = $null
-            # Release firewall detail cache (re-loaded on demand)
+            # Release firewall detail cache (re-loaded on demand).
             $script:FirewallDetailCache = $null
-            # Compact the log
             Optimize-WmtLogMemory -MaxLines $script:WmtMaxLogLines
-            # Force GC to reclaim freed memory
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
             [System.GC]::Collect()
         }
     }
     catch {}
-    # Restart timer for next cycle
     try { $script:WmtPeriodicMemoryTrimTimer.Start() } catch {}
 })
 $script:WmtPeriodicMemoryTrimTimer.Start()
@@ -53064,8 +53146,11 @@ if ($settings.WindowState -eq "Maximized") {
 # 1. Click the Updates tab by default.
 (Get-Ctrl "btnTabUpdates").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
 
-# 1b. Initialize the shared RunspacePool early (before any background jobs need it)
-Initialize-WmtBackgroundRunspacePool
+# 1b. Initialize the shared RunspacePool early for an interactive launch.
+# Launch-minimized + Reduce RAM leaves it unallocated until real work requests it.
+if (-not ((Get-WmtLaunchMinimized) -and (Get-WmtReduceRamInTray))) {
+    Initialize-WmtBackgroundRunspacePool
+}
 
 # 2. Warm hidden pages in the background (deferred 1s so UI paints first).
 $preloadDeferTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -53114,6 +53199,9 @@ try {
             $script:WmtHiddenToTray = $true
             $window.ShowInTaskbar = $false
             $window.Hide()
+            if (Get-WmtReduceRamInTray) {
+                Invoke-WmtMemoryTrim -Reason "launch-minimized"
+            }
             Write-GuiLog "Launch Minimized is enabled. WMT started hidden in the system tray."
         }
     }
