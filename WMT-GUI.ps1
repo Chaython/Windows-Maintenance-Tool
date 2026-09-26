@@ -2393,7 +2393,7 @@ catch { return [PowerShell]::Create() }
 $script:WmtUiPollOperations = [ordered]@{}
 $script:WmtUiPollTimer = $null
 
-function Ensure-WmtUiPollTimer {
+function Initialize-WmtUiPollTimer {
 if (-not $script:WmtUiPollTimer) {
     $script:WmtUiPollTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $script:WmtUiPollTimer.Interval = [TimeSpan]::FromMilliseconds(200)
@@ -2458,7 +2458,7 @@ $op = [PSCustomObject]@{
     OnError = $OnError
 }
 $script:WmtUiPollOperations[$Name] = $op
-Ensure-WmtUiPollTimer
+Initialize-WmtUiPollTimer
 return $op
 }
 
@@ -7356,7 +7356,7 @@ $renderer = New-Object System.Windows.Forms.ToolStripProfessionalRenderer
 $renderer.RoundedEdges = $false
 
 $renderer.Add_RenderToolStripBackground({
-        param($sender, $e)
+        param($s, $e)
         try {
             $state = $e.ToolStrip.Tag
             if (-not $state) { return }
@@ -7367,7 +7367,7 @@ $renderer.Add_RenderToolStripBackground({
     }.GetNewClosure())
 
 $renderer.Add_RenderMenuItemBackground({
-        param($sender, $e)
+        param($s, $e)
         try {
             $state = $e.Item.Owner.Tag
             if (-not $state) { return }
@@ -7379,7 +7379,7 @@ $renderer.Add_RenderMenuItemBackground({
     }.GetNewClosure())
 
 $renderer.Add_RenderItemText({
-        param($sender, $e)
+        param($s, $e)
         try {
             $state = $e.Item.Owner.Tag
             if ($state) {
@@ -7390,7 +7390,7 @@ $renderer.Add_RenderItemText({
     }.GetNewClosure())
 
 $renderer.Add_RenderSeparator({
-        param($sender, $e)
+        param($s, $e)
         try {
             $state = $e.Item.Owner.Tag
             if (-not $state) { return }
@@ -7405,7 +7405,7 @@ $renderer.Add_RenderSeparator({
     }.GetNewClosure())
 
 $renderer.Add_RenderToolStripBorder({
-        param($sender, $e)
+        param($s, $e)
         try {
             $state = $e.ToolStrip.Tag
             if (-not $state) { return }
@@ -7470,13 +7470,13 @@ try {
     $menu.Renderer = New-WmtTrayMenuRenderer -Menu $menu
     Set-WmtTrayMenuTheme -Menu $menu
     $menu.Add_Opening({
-            param($sender, $e)
+            param($s, $e)
             try {
                 # Do not use GetNewClosure here: a closure creates a dynamic module,
                 # which gives $script:CurrentTheme a different script scope and can
                 # make the tray label report the opposite theme.
                 $themeToggle = $null
-                foreach ($item in @($sender.Items)) {
+                foreach ($item in @($s.Items)) {
                     if ($item -and $item.Name -eq "WmtThemeToggle") {
                         $themeToggle = $item
                         break
@@ -7485,7 +7485,7 @@ try {
                 if ($themeToggle) {
                     $themeToggle.Text = if ($script:CurrentTheme -eq "dark") { "Switch to light theme" } else { "Switch to dark theme" }
                 }
-                Set-WmtTrayMenuTheme -Menu $sender
+                Set-WmtTrayMenuTheme -Menu $s
             }
             catch {}
         })
@@ -7753,7 +7753,6 @@ if ($lbStart) {
 
 $localVersionStr = $script:AppVersion
 $runningAsExe = [bool]$script:WmtIsCompiledExe
-$scriptPathForUpdate = if ($runningAsExe) { $null } else { $script:WmtScriptPath }
 
 # 2. Start Background Thread (Runspace)
 $script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
@@ -8069,7 +8068,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                         }
 
                                         # The shared UI poll callback runs after Start-UpdateCheckBackground
-                                        # returns, so do not depend on its local $scriptPathForUpdate variable.
+                                        # returns, so resolve the script path from the startup-captured script scope.
                                         # $script:WmtScriptPath is captured at startup and remains valid when
                                         # WMT-GUI.ps1 is launched directly with powershell.exe -File (issue #161).
                                         $scriptPath = $script:WmtScriptPath
