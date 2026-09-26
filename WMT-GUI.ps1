@@ -2409,26 +2409,54 @@ Reset-WmtRunspacePool -PoolKind Background
 Reset-WmtRunspacePool -PoolKind UiSupport
 }
 
+function New-WmtStandalonePowerShell {
+param(
+    [ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background",
+    [string]$Reason = ""
+)
+# A standalone fallback must use the same InitialSessionState as the pool.
+# Returning bare [PowerShell]::Create() drops injected helpers and turns a
+# recoverable pool problem into command-not-found failures inside workers.
+$iss = New-WmtRunspaceInitialState
+$iss.ApartmentState = [System.Threading.ApartmentState]::STA
+$iss.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+    try { Write-GuiLog "[RunspacePool:$PoolKind] Using helper-aware standalone runspace: $Reason" } catch {}
+}
+return [PowerShell]::Create($iss)
+}
+
 function New-WmtPooledPowerShell {
 param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
 try {
     $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
-    if (-not $pool) { return [PowerShell]::Create() }
+    if (-not $pool) {
+        return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool initialization returned null"
+    }
     if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
         Reset-WmtRunspacePool -PoolKind $PoolKind
         $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
-        if (-not $pool) { return [PowerShell]::Create() }
+        if (-not $pool -or $pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
+            return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool rebuild did not return a valid RunspacePool"
+        }
     }
+
     $ps = [PowerShell]::Create()
-    try { $ps.RunspacePool = $pool; return $ps }
+    try {
+        $ps.RunspacePool = $pool
+        return $ps
+    }
     catch {
-        try { Write-GuiLog "[RunspacePool:$PoolKind] Pool rejected a worker ($($_.Exception.Message)); rebuilding it for the next job." } catch {}
-        Reset-WmtRunspacePool -PoolKind $PoolKind
+        $poolError = $_.Exception.Message
         try { $ps.Dispose() } catch {}
-        return [PowerShell]::Create()
+        Reset-WmtRunspacePool -PoolKind $PoolKind
+        return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool rejected worker: $poolError"
     }
 }
-catch { return [PowerShell]::Create() }
+catch {
+    $poolError = $_.Exception.Message
+    return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool setup failed: $poolError"
+}
 }
 
 # ============================================================================
@@ -16579,14 +16607,25 @@ $functionNames = @(
 )
 
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$missingCleanupHelpers = [System.Collections.Generic.List[string]]::new()
 foreach ($fnName in $functionNames) {
     try {
         $cmd = Get-Command -Name $fnName -CommandType Function -ErrorAction Stop
-        $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($fnName, $cmd.Definition))
+        [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($fnName, $cmd.Definition))
     }
     catch {
+        [void]$missingCleanupHelpers.Add($fnName)
         Write-GuiLog "Registry cleanup background worker missing helper $fnName`: $($_.Exception.Message)"
     }
+}
+
+if ($missingCleanupHelpers.Count -gt 0) {
+    $missingText = ($missingCleanupHelpers.ToArray() -join ", ")
+    $message = "Registry cleanup could not start because required worker helpers are unavailable: $missingText"
+    Write-GuiLog $message
+    try { if ($progressWindow) { $progressWindow.Close() } } catch {}
+    Show-WmtMessageBox -Message $message -Title "Registry Cleaner" -Image Error | Out-Null
+    return
 }
 
 $runspace = $null
@@ -51681,8 +51720,8 @@ if ($txtLibrarySearch) {
     if ($librarySearchBorder -and $librarySearchBorder.Parent -is [System.Windows.Controls.Border]) {
         $librarySearchBorder = $librarySearchBorder.Parent
     }
-    $librarySearchPlaceholder = $librarySearchPlaceholder
-    $librarySearchTimer = $librarySearchTimer
+    $librarySearchPlaceholder = [string]$script:WmtLibrarySearchPlaceholder
+    $librarySearchTimer = $script:WmtLibrarySearchTimer
 
     # Placeholder behavior (focus/blur) with border glow.
     $txtLibrarySearch.Add_GotFocus({
