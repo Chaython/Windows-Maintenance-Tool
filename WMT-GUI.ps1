@@ -2504,6 +2504,68 @@ Register-WmtUiPollOperation -Name $operationName -IntervalMs 500 -TestComplete $
 return $async
 }
 
+function Stop-WmtPowerShellInvocationAsync {
+param(
+    [System.Management.Automation.PowerShell]$PowerShell,
+    [System.IAsyncResult]$Invocation,
+    [string]$Name = "PowerShell invocation"
+)
+
+if (-not $PowerShell) { return }
+
+$psRef = $PowerShell
+$invokeRef = $Invocation
+$nameRef = $Name
+$stopAsync = $null
+
+try {
+    $stopAsync = $psRef.BeginStop($null, $null)
+}
+catch {
+    try {
+        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
+    }
+    catch {}
+    try { $psRef.Dispose() } catch {}
+    return
+}
+
+if (-not $stopAsync) {
+    try { $psRef.Dispose() } catch {}
+    return
+}
+
+$stopRef = $stopAsync
+$operationName = "StopPowerShell:$Name:$([Guid]::NewGuid().ToString('N'))"
+
+$testComplete = {
+    $stopRef -and $stopRef.IsCompleted
+}.GetNewClosure()
+
+$onComplete = {
+    try {
+        if ($invokeRef -and $invokeRef.IsCompleted) {
+            [void]$psRef.EndInvoke($invokeRef)
+        }
+    }
+    catch [System.Management.Automation.PipelineStoppedException] {}
+    catch {
+        try { Write-GuiLog "$nameRef stop finalization reported: $($_.Exception.Message)" } catch {}
+    }
+    finally {
+        try { $psRef.Dispose() } catch {}
+    }
+}.GetNewClosure()
+
+$onError = {
+    param($Operation, $ErrorRecord)
+    try { $psRef.Dispose() } catch {}
+    try { Write-GuiLog "$nameRef stop monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
+}.GetNewClosure()
+
+Register-WmtUiPollOperation -Name $operationName -IntervalMs 250 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+}
+
 # ============================================================================
 # Shared UI async-operation poller
 # Replaces one DispatcherTimer per background operation with one 200ms timer.
@@ -40938,6 +41000,7 @@ $script:ScanTimer.Add_Tick({
                 }
                 catch {
                     Write-GuiLog "Scan Error: $($_.Exception.Message)"
+                    try { $task.PowerShell.Dispose() } catch {}
                 }
 
                 # Remove finished task
@@ -41225,9 +41288,14 @@ $btnWingetScan.Add_Click({
             if ($script:ActiveScans.Count -gt 0 -and -not $script:ScanCancelled) {
                 $script:ScanCancelled = $true
                 Write-GuiLog "Global scan timeout reached (120s). Cancelling remaining provider scans."
-                # Stop all still-running runspaces
-                foreach ($task in $script:ActiveScans) {
-                    try { $null = $task.PowerShell.BeginStop($null, $null) } catch { }
+                # Stop all still-running workers without dropping their async handles.
+                foreach ($task in @($script:ActiveScans)) {
+                    try {
+                        Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan timeout"
+                    }
+                    catch {
+                        try { $task.PowerShell.Dispose() } catch {}
+                    }
                 }
                 $script:ActiveScans.Clear()
                 # Stop result collection timer
@@ -43626,7 +43694,12 @@ $script:SearchTimer.Add_Tick({
         ((Get-Date) - $script:WmtPackageSearchStartedAt).TotalSeconds -ge $script:WmtPackageSearchTimeoutSeconds) {
         $script:SearchTimer.Stop()
         Write-GuiLog "Package search timed out after $($script:WmtPackageSearchTimeoutSeconds) seconds."
-        try { $null = $script:AsyncPowerShell.BeginStop($null, $null) } catch {}
+        try {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $script:AsyncPowerShell -Invocation $script:AsyncSearch -Name "Package search timeout"
+        }
+        catch {
+            try { if ($script:AsyncPowerShell) { $script:AsyncPowerShell.Dispose() } } catch {}
+        }
         $lblWingetStatus.Text = "Search timed out"
         $lblWingetStatus.Visibility = "Visible"
         $txtWingetSearch.IsEnabled = $true
@@ -43715,6 +43788,13 @@ $script:SearchTimer.Add_Tick({
                 }
             }
         }
+        # Complete the asynchronous invocation even though output was streamed into
+        # SearchOutput. EndInvoke returns no additional buffer for this overload,
+        # but it finalizes the invocation and releases its async resources.
+        try { [void]$script:AsyncPowerShell.EndInvoke($script:AsyncSearch) }
+        catch [System.Management.Automation.PipelineStoppedException] {}
+        catch { Write-GuiLog "Search completion error: $($_.Exception.Message)" }
+
         # Check for background errors
         try {
             $streamErrors = $script:AsyncPowerShell.Streams.Error.ReadAll()
@@ -43756,8 +43836,12 @@ $script:InvokeWingetSearch = {
 
     # --- Cleanup any leftover/abandoned search state ---
     if ($script:AsyncSearch) {
-        try { $null = $script:AsyncPowerShell.BeginStop($null, $null) } catch {}
-        try { $script:AsyncPowerShell.Dispose() } catch {}
+        try {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $script:AsyncPowerShell -Invocation $script:AsyncSearch -Name "Abandoned package search"
+        }
+        catch {
+            try { if ($script:AsyncPowerShell) { $script:AsyncPowerShell.Dispose() } } catch {}
+        }
         $script:AsyncSearch = $null
         $script:AsyncPowerShell = $null
     }
@@ -44646,16 +44730,10 @@ $script:InvokeWingetSearch = {
         [void]$script:AsyncPowerShell.AddArgument($gogCacheFile)
         [void]$script:AsyncPowerShell.AddArgument($pypiIndexFile)
 
-        # BeginInvoke overload differs between pool-bound and standalone PowerShell:
-        #   standalone:  BeginInvoke(AsyncCallback, PSDataCollection output)
-        #   pool-bound:  BeginInvoke(PSDataCollection input,  PSDataCollection output)
-        if ($script:AsyncPowerShell.RunspacePool) {
-            $emptyInput = New-Object System.Management.Automation.PSDataCollection[PSObject]
-            $script:AsyncSearch = $script:AsyncPowerShell.BeginInvoke($emptyInput, $script:SearchOutput)
-        }
-        else {
-            $script:AsyncSearch = $script:AsyncPowerShell.BeginInvoke($null, $script:SearchOutput)
-        }
+        # Stream results into SearchOutput. New-WmtPooledPowerShell either returns a
+        # valid pool-bound worker or throws, so there is no helper-less standalone path.
+        $emptyInput = New-Object System.Management.Automation.PSDataCollection[PSObject]
+        $script:AsyncSearch = $script:AsyncPowerShell.BeginInvoke($emptyInput, $script:SearchOutput)
         $script:WmtPackageSearchStartedAt = Get-Date
         $script:SearchTimer.Start()
         Write-GuiLog "Search thread started with $($enabled.Count) provider(s): $($enabled -join ', ')"
