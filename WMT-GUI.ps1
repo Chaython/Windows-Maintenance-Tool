@@ -9987,7 +9987,16 @@ try {
     $releaseDir = Join-Path $stagingRoot "release"
     if (-not (Test-Path -LiteralPath $releaseDir)) {
         Write-GuiLog "CleanerML download: no 'release' folder found in archive"
-        return
+        try {
+            $failedState = Get-WmtCleanerSourceState -Source "CleanerML"
+            $failedState.ETag = ""
+            $failedState.LastModified = ""
+            $failedState.ContentSha256 = ""
+            $failedState.LastUpdatedUtc = ""
+            Save-WmtCleanerSourceState -State $failedState
+        }
+        catch {}
+        return $false
     }
 
     # Atomic swap: rename current root out of the way, move new one in
@@ -40164,6 +40173,10 @@ if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.
     Write-GuiLog "Cleaner definition refresh skipped because the previous refresh is still running."
     return
 }
+if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProcess.HasExited) {
+    Write-GuiLog "Cleaner definition refresh deferred because automatic cleaning is running."
+    return
+}
 
 $resultPath = Join-Path (Get-DataPath) "cleaner-refresh-last.json"
 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
@@ -40283,6 +40296,10 @@ if (-not (Test-WmtAnySavedCleanerSelected)) {
 
 if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProcess.HasExited) {
     Write-GuiLog "Automatic cleaner skipped because the previous run is still active."
+    return
+}
+if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
+    Write-GuiLog "Automatic cleaner deferred because cleaner definitions are being refreshed."
     return
 }
 
