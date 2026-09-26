@@ -2409,54 +2409,99 @@ Reset-WmtRunspacePool -PoolKind Background
 Reset-WmtRunspacePool -PoolKind UiSupport
 }
 
-function New-WmtStandalonePowerShell {
-param(
-    [ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background",
-    [string]$Reason = ""
-)
-# A standalone fallback must use the same InitialSessionState as the pool.
-# Returning bare [PowerShell]::Create() drops injected helpers and turns a
-# recoverable pool problem into command-not-found failures inside workers.
-$iss = New-WmtRunspaceInitialState
-$iss.ApartmentState = [System.Threading.ApartmentState]::STA
-$iss.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
-if (-not [string]::IsNullOrWhiteSpace($Reason)) {
-    try { Write-GuiLog "[RunspacePool:$PoolKind] Using helper-aware standalone runspace: $Reason" } catch {}
-}
-return [PowerShell]::Create($iss)
-}
-
 function New-WmtPooledPowerShell {
 param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
-try {
-    $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
-    if (-not $pool) {
-        return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool initialization returned null"
-    }
-    if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
-        Reset-WmtRunspacePool -PoolKind $PoolKind
+
+$lastError = $null
+for ($attempt = 1; $attempt -le 2; $attempt++) {
+    try {
         $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
-        if (-not $pool -or $pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
-            return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool rebuild did not return a valid RunspacePool"
+        if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
+            throw "Runspace pool initialization did not return a valid RunspacePool."
+        }
+
+        $ps = [PowerShell]::Create()
+        try {
+            $ps.RunspacePool = $pool
+            return $ps
+        }
+        catch {
+            $lastError = $_.Exception
+            try { $ps.Dispose() } catch {}
+            throw
         }
     }
-
-    $ps = [PowerShell]::Create()
-    try {
-        $ps.RunspacePool = $pool
-        return $ps
-    }
     catch {
-        $poolError = $_.Exception.Message
-        try { $ps.Dispose() } catch {}
+        $lastError = $_.Exception
+        try { Write-GuiLog "[RunspacePool:$PoolKind] Worker creation attempt $attempt failed: $($lastError.Message)" } catch {}
         Reset-WmtRunspacePool -PoolKind $PoolKind
-        return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool rejected worker: $poolError"
     }
+}
+
+throw "Unable to create a $PoolKind PowerShell worker after rebuilding the runspace pool. $($lastError.Message)"
+}
+
+function Start-WmtDetachedPowerShell {
+param(
+    [Parameter(Mandatory = $true)][System.Management.Automation.PowerShell]$PowerShell,
+    [string]$Name = "BackgroundPowerShell",
+    [switch]$LogOutput
+)
+
+$async = $null
+try {
+    $async = $PowerShell.BeginInvoke()
 }
 catch {
-    $poolError = $_.Exception.Message
-    return New-WmtStandalonePowerShell -PoolKind $PoolKind -Reason "pool setup failed: $poolError"
+    try { $PowerShell.Dispose() } catch {}
+    throw
 }
+
+$psRef = $PowerShell
+$asyncRef = $async
+$nameRef = $Name
+$logOutputRef = [bool]$LogOutput
+$operationName = "DetachedPowerShell:$Name:$([Guid]::NewGuid().ToString('N'))"
+
+$testComplete = {
+    $asyncRef -and $asyncRef.IsCompleted
+}.GetNewClosure()
+
+$onComplete = {
+    try {
+        $results = @($psRef.EndInvoke($asyncRef))
+        if ($logOutputRef) {
+            foreach ($line in $results) {
+                if ($line -is [string] -and $line.StartsWith("LOG:")) {
+                    Write-GuiLog ($line.Substring(4))
+                }
+            }
+        }
+    }
+    catch {
+        try { Write-GuiLog "$nameRef failed: $($_.Exception.Message)" } catch {}
+    }
+    finally {
+        try { $psRef.Dispose() } catch {}
+    }
+}.GetNewClosure()
+
+$onError = {
+    param($Operation, $ErrorRecord)
+    try {
+        if ($psRef -and $asyncRef -and -not $asyncRef.IsCompleted) { $psRef.Stop() }
+    }
+    catch {}
+    try {
+        if ($psRef -and $asyncRef -and $asyncRef.IsCompleted) { [void]$psRef.EndInvoke($asyncRef) }
+    }
+    catch {}
+    try { if ($psRef) { $psRef.Dispose() } } catch {}
+    try { Write-GuiLog "$nameRef monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
+}.GetNewClosure()
+
+Register-WmtUiPollOperation -Name $operationName -IntervalMs 500 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+return $async
 }
 
 # ============================================================================
@@ -21972,7 +22017,7 @@ if ($Action -eq "DeepClean") {
             }
         })
 
-    [void]$ps.BeginInvoke()
+    $registryScanAsync = $ps.BeginInvoke()
 
     # --- UI TIMER (Main Thread) ---
     $timer = New-Object System.Windows.Threading.DispatcherTimer
@@ -21988,6 +22033,7 @@ if ($Action -eq "DeepClean") {
             if ($syncHash.IsCompleted) {
                 $timer.Stop()
                 $pForm.Close()
+                try { if ($registryScanAsync) { [void]$ps.EndInvoke($registryScanAsync) } } catch {}
                 $ps.Dispose()
                 $rs.Dispose()
 
@@ -38027,7 +38073,9 @@ $script:WmtGogLibraryCache = $result.ToArray()
 # Write to cache file for use by the search runspace.
 try {
     $cacheFile = Join-Path (Get-DataPath) "gog_library.json"
-    $script:WmtGogLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+    if ($result.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
+        $script:WmtGogLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+    }
 }
 catch {
     Write-GuiLog "Failed to write GOG library cache: $($_.Exception.Message)"
@@ -43826,7 +43874,7 @@ $script:InvokeWingetSearch = {
                         Write-Output "LOG:PyPI index fetch failed: $($_.Exception.Message)"
                     }
                 }).AddArgument($pypiIndexFile)
-            try { [void]$pypiPs.BeginInvoke() } catch { try { $pypiPs.Dispose() } catch {} }
+            try { [void](Start-WmtDetachedPowerShell -PowerShell $pypiPs -Name "PyPI index refresh" -LogOutput) } catch { Write-GuiLog "PyPI index refresh failed to start: $($_.Exception.Message)" }
         }
     }
 
@@ -43835,8 +43883,8 @@ $script:InvokeWingetSearch = {
     # the UI does not hang. The search runspace below will read from
     # the cache files; if they are not ready yet on the first search,
     # it logs a message and the user can search again shortly after.
-    # The runspace scriptBlock is self-contained (inline logic) because
-    # main-scope functions are NOT available in [PowerShell]::Create().
+    # Keep this script block self-contained so it remains independent of
+    # provider-specific main-scope state; shared pooled helpers are still available.
     $needLegCache = ("legendary" -in $enabled -and -not (Test-Path -LiteralPath $legendaryCacheFile -PathType Leaf))
     $needGogCache = ("gogdl" -in $enabled -and -not (Test-Path -LiteralPath $gogCacheFile -PathType Leaf))
     if ($needLegCache -or $needGogCache) {
@@ -44044,12 +44092,15 @@ $script:InvokeWingetSearch = {
                                 }
                             }
                         }
-                        $result.ToArray() | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $GogCacheFile -Force -Encoding UTF8
+                        $arrGog = $result.ToArray()
+                        if ($arrGog.Count -gt 0 -or -not (Test-Path -LiteralPath $GogCacheFile -PathType Leaf)) {
+                            $arrGog | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $GogCacheFile -Force -Encoding UTF8
+                        }
                     }
                     catch {}
                 }
             }).AddArgument($needLegCache).AddArgument($needGogCache).AddArgument($legExe).AddArgument($legendaryCacheFile).AddArgument($gogAuth).AddArgument($gogCacheFile)
-        try { [void]$cachePs.BeginInvoke() } catch { try { $cachePs.Dispose() } catch {} }
+        try { [void](Start-WmtDetachedPowerShell -PowerShell $cachePs -Name "Game library refresh" -LogOutput) } catch { Write-GuiLog "Game library refresh failed to start: $($_.Exception.Message)" }
     }
 
     # 3. DEFINE THE WORKER THREAD SCRIPT
@@ -52957,9 +53008,31 @@ $script:WmtLibraryCacheAsyncResult = $null
 
 function Start-WmtLibraryCacheBuilder {
 try {
-    if ($script:WmtLibraryCacheAsyncResult -and -not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
-        Write-GuiLog "Library cache build already in progress."
-        return
+    if ($script:WmtLibraryCacheAsyncResult) {
+        if (-not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
+            Write-GuiLog "Library cache build already in progress."
+            return
+        }
+
+        # A completed invocation can still be waiting for the shared poller.
+        # Finalize it here before replacing the script-level worker references.
+        try {
+            if ($script:WmtLibraryCacheRunspace) {
+                $priorResults = @($script:WmtLibraryCacheRunspace.EndInvoke($script:WmtLibraryCacheAsyncResult))
+                foreach ($line in $priorResults) {
+                    if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog ($line.Substring(4)) }
+                }
+            }
+        }
+        catch {
+            Write-GuiLog "Previous library cache build finalization failed: $($_.Exception.Message)"
+        }
+        finally {
+            try { Unregister-WmtUiPollOperation -Name "LibraryCacheBuilder" } catch {}
+            try { if ($script:WmtLibraryCacheRunspace) { $script:WmtLibraryCacheRunspace.Dispose() } } catch {}
+            $script:WmtLibraryCacheRunspace = $null
+            $script:WmtLibraryCacheAsyncResult = $null
+        }
     }
     $settings = Get-WmtSettings
     $enabled = @($settings.EnabledProviders)
@@ -53107,8 +53180,8 @@ try {
     Write-GuiLog "Building Legendary/GOGDL library caches in background..."
     $ps = New-WmtPooledPowerShell
 
-    # Self-contained scriptBlock: all logic is inline, paths are passed as args.
-    # This runspace does NOT share the main script's functions or variables.
+    # Self-contained scriptBlock: provider state is passed as arguments.
+    # Shared pooled helpers are available, but main-scope variables are not.
     [void]$ps.AddScript({
             param($DoLeg, $DoGog, $LegendaryExe, $LegCacheFile, $GogAuthPath, $GogCacheFile, $DoPypi, $PypiCacheFile, $DoSteam, $SteamCacheFile, $SteamAppListFile)
 
@@ -53333,8 +53406,13 @@ try {
                     }
 
                     $arr = $result.ToArray()
-                    $arr | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $GogCacheFile -Force -Encoding UTF8
-                    Write-Output "LOG:GOG library cached: $($arr.Count) games."
+                    if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $GogCacheFile -PathType Leaf)) {
+                        $arr | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $GogCacheFile -Force -Encoding UTF8
+                        Write-Output "LOG:GOG library cached: $($arr.Count) games."
+                    }
+                    else {
+                        Write-Output "LOG:GOG library refresh returned no games; keeping the existing cache."
+                    }
                 }
                 catch {
                     Write-Output "LOG:GOG library cache failed: $($_.Exception.Message)"
