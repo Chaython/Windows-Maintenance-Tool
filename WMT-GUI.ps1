@@ -28609,7 +28609,8 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <TextBlock Text="Appx Bloatware" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
                             <TextBlock Text="Remove pre-installed UWP/Modern apps" FontSize="11" Foreground="{DynamicResource TextMuted}" Margin="0,2,0,8"/>
                             <TextBlock Text="Select apps to remove (use Ctrl+Click for multiple)" Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,8" FontSize="12"/>
-                            <ListView Name="lstAppxPackages" Height="200" Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" SelectionMode="Multiple"
+                            <ListView Name="lstAppxPackages" Height="200" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" SelectionMode="Multiple"
+                                      AlternationCount="2" ItemContainerStyle="{StaticResource FwItem}"
                                       VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                                 <ListView.View>
                                     <GridView>
