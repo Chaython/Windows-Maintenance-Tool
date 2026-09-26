@@ -46471,6 +46471,10 @@ function Format-WmtCompactTrackerDate {
 }
 
 function Write-WmtCompactRecompressWorker {
+    # Bump this whenever the generated worker's behavior changes. The worker
+    # also compares its complete generated content, so accidental version-bump
+    # omissions still self-heal the next time WMT starts.
+    $workerVersion = 2
     $trackerPath = Get-WmtCompactTrackerPath
 
     # Scheduled tasks run this worker as SYSTEM. Keep executable script content
@@ -46487,6 +46491,9 @@ function Write-WmtCompactRecompressWorker {
     $logBase64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($logPath))
 
     $worker = @'
+# Windows Maintenance Tool - Compact recompression worker
+# Generated file. Changes are replaced automatically by WMT.
+# Worker version: __WORKER_VERSION__
 param(
     [switch]$AllTracked,
     [switch]$AnalyzeOnly,
@@ -46872,8 +46879,31 @@ catch {
 }
 '@
 
-    $worker = $worker.Replace("__TRACKER__", $trackerBase64).Replace("__LOG__", $logBase64)
-    [System.IO.File]::WriteAllText($workerPath, $worker, [System.Text.UTF8Encoding]::new($true))
+    $worker = $worker.Replace("__TRACKER__", $trackerBase64).Replace("__LOG__", $logBase64).Replace("__WORKER_VERSION__", [string]$workerVersion)
+
+    # Keep the scheduled worker synchronized with the currently running WMT
+    # implementation. Reading removes the UTF-8 BOM, so a direct ordinal
+    # comparison is stable across runs. Rewrite only when the generated content
+    # has actually changed.
+    $workerNeedsRefresh = $true
+    if (Test-Path -LiteralPath $workerPath -PathType Leaf) {
+        try {
+            $existingWorker = [System.IO.File]::ReadAllText($workerPath)
+            $workerNeedsRefresh = -not [string]::Equals(
+                $existingWorker,
+                $worker,
+                [System.StringComparison]::Ordinal
+            )
+        }
+        catch {
+            $workerNeedsRefresh = $true
+        }
+    }
+
+    if ($workerNeedsRefresh) {
+        [System.IO.File]::WriteAllText($workerPath, $worker, [System.Text.UTF8Encoding]::new($true))
+        Write-GuiLog "[Compact] Refreshed standalone recompression worker to version $workerVersion."
+    }
 
     # Restrict the worker directory to SYSTEM and Administrators. Use SIDs so
     # this works on non-English Windows installations.
@@ -46888,6 +46918,22 @@ catch {
     }
 
     return $workerPath
+}
+
+function Sync-WmtCompactRecompressWorker {
+    # Scheduled recompression is deliberately independent of the WMT process,
+    # but the generated worker can become stale after WMT itself is updated.
+    # Refresh it on WMT startup whenever a schedule is configured. The writer
+    # performs a full content comparison, so this is effectively free when the
+    # worker is already current.
+    try {
+        $data = Get-WmtCompactTrackerData
+        if ([string]$data.Schedule -eq "Off") { return }
+        [void](Write-WmtCompactRecompressWorker)
+    }
+    catch {
+        Write-GuiLog "[Compact] Could not refresh the scheduled recompression worker: $($_.Exception.Message)"
+    }
 }
 
 function Start-WmtCompactRecompressWorker {
@@ -52415,6 +52461,7 @@ $bootCacheTimer = New-Object System.Windows.Threading.DispatcherTimer
 $bootCacheTimer.Interval = [TimeSpan]::FromSeconds(2)
 $bootCacheTimer.Add_Tick({
     try { $bootCacheTimer.Stop() } catch {}
+    Sync-WmtCompactRecompressWorker
     Start-WmtLibraryCacheBuilder
 }.GetNewClosure())
 $bootCacheTimer.Start()
