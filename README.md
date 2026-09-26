@@ -397,11 +397,11 @@ WMT stores generated data next to the script in its local `data` folder.
 <details>
 <summary><strong>Project Links</strong></summary>
 
-- [Releases](https://github.com/Chaython/Windows-Maintenance-Tool/releases)
-- [Issues](https://github.com/Chaython/Windows-Maintenance-Tool/issues)
-- [Pull Requests](https://github.com/Chaython/Windows-Maintenance-Tool/pulls)
-- [Actions](https://github.com/Chaython/Windows-Maintenance-Tool/actions)
-- [Commit history](https://github.com/Chaython/Windows-Maintenance-Tool/commits/Main)
+- [Releases](https://github.com/ios12checker/Windows-Maintenance-Tool/releases)
+- [Issues](https://github.com/ios12checker/Windows-Maintenance-Tool/issues)
+- [Pull Requests](https://github.com/ios12checker/Windows-Maintenance-Tool/pulls)
+- [Actions](https://github.com/ios12checker/Windows-Maintenance-Tool/actions)
+- [Commit history](https://github.com/ios12checker/Windows-Maintenance-Tool/commits/main)
 
 </details>
 
