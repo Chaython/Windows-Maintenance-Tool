@@ -272,7 +272,13 @@ param(
 
 if (-not $script:WmtUiBackgroundCommands) { $script:WmtUiBackgroundCommands = @{} }
 if ([string]::IsNullOrWhiteSpace($Name)) { $Name = "UiCommand_" + [guid]::NewGuid().ToString("N") }
-if ($script:WmtUiBackgroundCommands.ContainsKey($Name)) {
+
+# GetNewClosure() creates a dynamic module. A $script: reference inside those
+# closures therefore points at the closure module rather than this script, which
+# made the monitor see a null job table ("Cannot index into a null array").
+# Capture the actual shared hashtable by reference and use that in every closure.
+$jobTable = $script:WmtUiBackgroundCommands
+if ($jobTable.ContainsKey($Name)) {
     Write-GuiLog "Background operation '$Name' is already running."
     return $null
 }
@@ -291,17 +297,17 @@ try {
         OnError           = $OnError
         SuppressResultLog = [bool]$SuppressResultLog
     }
-    $script:WmtUiBackgroundCommands[$Name] = $job
+    $jobTable[$Name] = $job
 
     $testComplete = {
         param($Operation)
-        $current = $script:WmtUiBackgroundCommands[$Name]
+        $current = $jobTable[$Name]
         return [bool]($current -and $current.Async -and $current.Async.IsCompleted)
     }.GetNewClosure()
 
     $finish = {
         param($Operation)
-        $current = $script:WmtUiBackgroundCommands[$Name]
+        $current = $jobTable[$Name]
         if (-not $current) { return }
         try {
             $results = @($current.PowerShell.EndInvoke($current.Async))
@@ -328,29 +334,29 @@ try {
         }
         finally {
             try { $current.PowerShell.Dispose() } catch {}
-            [void]$script:WmtUiBackgroundCommands.Remove($Name)
+            [void]$jobTable.Remove($Name)
         }
     }.GetNewClosure()
 
     $timeout = {
         param($Operation)
-        $current = $script:WmtUiBackgroundCommands[$Name]
+        $current = $jobTable[$Name]
         if (-not $current) { return }
         try { $current.PowerShell.Stop() } catch {}
         Write-GuiLog "ERROR: Background operation '$Name' timed out."
         if ($current.OnError) { try { & $current.OnError ([System.TimeoutException]::new("Background operation '$Name' timed out.")) } catch {} }
         try { $current.PowerShell.Dispose() } catch {}
-        [void]$script:WmtUiBackgroundCommands.Remove($Name)
+        [void]$jobTable.Remove($Name)
     }.GetNewClosure()
 
     $pollError = {
         param($Operation, $ErrorRecord)
-        $current = $script:WmtUiBackgroundCommands[$Name]
+        $current = $jobTable[$Name]
         if ($current) {
             try { $current.PowerShell.Stop() } catch {}
             try { $current.PowerShell.Dispose() } catch {}
             if ($current.OnError) { try { & $current.OnError $ErrorRecord } catch {} }
-            [void]$script:WmtUiBackgroundCommands.Remove($Name)
+            [void]$jobTable.Remove($Name)
         }
     }.GetNewClosure()
 
