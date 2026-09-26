@@ -5847,6 +5847,9 @@ try {
         LoadCleanerMLPending       = [bool]$Settings.LoadCleanerMLPending
         SkipRuleDownloads          = [bool]$Settings.SkipRuleDownloads
         CacheOnly                  = [bool]$Settings.CacheOnly
+        CleanerLocalRefreshMinutes = if ($Settings.PSObject.Properties["CleanerLocalRefreshMinutes"]) { [int]$Settings.CleanerLocalRefreshMinutes } else { 60 }
+        CleanerRemoteCheckMinutes  = if ($Settings.PSObject.Properties["CleanerRemoteCheckMinutes"]) { [int]$Settings.CleanerRemoteCheckMinutes } else { 1440 }
+        CleanerAutoCleanMinutes    = if ($Settings.PSObject.Properties["CleanerAutoCleanMinutes"]) { [int]$Settings.CleanerAutoCleanMinutes } else { 0 }
         EnabledProviders           = $Settings.EnabledProviders
         ProviderToggles            = if ($Settings.ProviderToggles) { $Settings.ProviderToggles } else { @{} }
         WuCategoryToggles          = if ($Settings.WuCategoryToggles) { $Settings.WuCategoryToggles } else { @{} }
@@ -5897,6 +5900,9 @@ $defaults = @{
     LoadCleanerMLPending       = $false
     SkipRuleDownloads          = $false
     CacheOnly                  = $false
+    CleanerLocalRefreshMinutes = 60
+    CleanerRemoteCheckMinutes  = 1440
+    CleanerAutoCleanMinutes    = 0
     EnabledProviders           = @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     WuCategoryToggles          = @{}
     ProviderToggles            = @{}
@@ -5969,6 +5975,15 @@ if (Test-Path $path) {
         if ($json.PSObject.Properties["LoadCleanerMLPending"]) { $defaults.LoadCleanerMLPending = [bool]$json.LoadCleanerMLPending }
         if ($json.PSObject.Properties["SkipRuleDownloads"]) { $defaults.SkipRuleDownloads = [bool]$json.SkipRuleDownloads }
         if ($json.PSObject.Properties["CacheOnly"]) { $defaults.CacheOnly = [bool]$json.CacheOnly }
+        if ($json.PSObject.Properties["CleanerLocalRefreshMinutes"]) {
+            try { $defaults.CleanerLocalRefreshMinutes = [Math]::Max(1, [Math]::Min(525600, [int]$json.CleanerLocalRefreshMinutes)) } catch {}
+        }
+        if ($json.PSObject.Properties["CleanerRemoteCheckMinutes"]) {
+            try { $defaults.CleanerRemoteCheckMinutes = [Math]::Max(0, [Math]::Min(525600, [int]$json.CleanerRemoteCheckMinutes)) } catch {}
+        }
+        if ($json.PSObject.Properties["CleanerAutoCleanMinutes"]) {
+            try { $defaults.CleanerAutoCleanMinutes = [Math]::Max(0, [Math]::Min(525600, [int]$json.CleanerAutoCleanMinutes)) } catch {}
+        }
         if ($json.PSObject.Properties["EnabledProviders"]) { $defaults.EnabledProviders = $json.EnabledProviders }
         if ($json.PSObject.Properties["ProviderToggles"]) { $defaults.ProviderToggles = $json.ProviderToggles }
         if ($json.PSObject.Properties["WuCategoryToggles"]) { $defaults.WuCategoryToggles = $json.WuCategoryToggles }
@@ -9659,6 +9674,256 @@ try {
 catch { if ($script:WmtDebug) { Write-GuiLog "CacheMetaMatch error: $($_.Exception.Message)" }; return $false }
 }
 
+function Get-WmtCleanerLocalRefreshMinutes {
+param($Settings)
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$value = 60
+try {
+    if ($Settings -is [System.Collections.IDictionary] -and $Settings.Contains("CleanerLocalRefreshMinutes")) { $value = [int]$Settings["CleanerLocalRefreshMinutes"] }
+    elseif ($Settings.PSObject.Properties["CleanerLocalRefreshMinutes"]) { $value = [int]$Settings.CleanerLocalRefreshMinutes }
+}
+catch { $value = 60 }
+return [Math]::Max(1, [Math]::Min(525600, $value))
+}
+
+function Get-WmtCleanerRemoteCheckMinutes {
+param($Settings)
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$value = 1440
+try {
+    if ($Settings -is [System.Collections.IDictionary] -and $Settings.Contains("CleanerRemoteCheckMinutes")) { $value = [int]$Settings["CleanerRemoteCheckMinutes"] }
+    elseif ($Settings.PSObject.Properties["CleanerRemoteCheckMinutes"]) { $value = [int]$Settings.CleanerRemoteCheckMinutes }
+}
+catch { $value = 1440 }
+return [Math]::Max(0, [Math]::Min(525600, $value))
+}
+
+function Get-WmtCleanerAutoCleanMinutes {
+param($Settings)
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$value = 0
+try {
+    if ($Settings -is [System.Collections.IDictionary] -and $Settings.Contains("CleanerAutoCleanMinutes")) { $value = [int]$Settings["CleanerAutoCleanMinutes"] }
+    elseif ($Settings.PSObject.Properties["CleanerAutoCleanMinutes"]) { $value = [int]$Settings.CleanerAutoCleanMinutes }
+}
+catch { $value = 0 }
+return [Math]::Max(0, [Math]::Min(525600, $value))
+}
+
+function Set-WmtCleanerIntervals {
+param(
+    [ValidateRange(1, 525600)][int]$LocalRefreshMinutes,
+    [ValidateRange(0, 525600)][int]$RemoteCheckMinutes,
+    [ValidateRange(0, 525600)][int]$AutoCleanMinutes
+)
+
+$settings = Get-WmtSettings
+foreach ($pair in @(
+        @{ Name = "CleanerLocalRefreshMinutes"; Value = $LocalRefreshMinutes },
+        @{ Name = "CleanerRemoteCheckMinutes"; Value = $RemoteCheckMinutes },
+        @{ Name = "CleanerAutoCleanMinutes"; Value = $AutoCleanMinutes }
+    )) {
+    if ($settings -is [System.Collections.IDictionary]) {
+        $settings[$pair.Name] = $pair.Value
+    }
+    elseif ($settings.PSObject.Properties[$pair.Name]) {
+        $settings.($pair.Name) = $pair.Value
+    }
+    else {
+        $settings | Add-Member -MemberType NoteProperty -Name $pair.Name -Value $pair.Value -Force
+    }
+}
+Save-WmtSettings -Settings $settings
+}
+
+function Get-WmtCleanerSourceStatePath {
+param([Parameter(Mandatory = $true)][string]$Source)
+$key = ($Source -replace '[^A-Za-z0-9_-]', '').ToLowerInvariant()
+return (Join-Path (Get-DataPath) ("cleaner_source_" + $key + ".meta.json"))
+}
+
+function Get-WmtCleanerSourceState {
+param([Parameter(Mandatory = $true)][string]$Source)
+
+$state = [PSCustomObject]@{
+    Source          = $Source
+    LastCheckedUtc  = ""
+    LastUpdatedUtc  = ""
+    ETag            = ""
+    LastModified    = ""
+    ContentSha256   = ""
+    Url             = ""
+}
+$path = Get-WmtCleanerSourceStatePath -Source $Source
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $state }
+
+try {
+    $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    foreach ($name in @("Source", "LastCheckedUtc", "LastUpdatedUtc", "ETag", "LastModified", "ContentSha256", "Url")) {
+        if ($json.PSObject.Properties[$name]) { $state.$name = [string]$json.$name }
+    }
+}
+catch {}
+return $state
+}
+
+function Save-WmtCleanerSourceState {
+param([Parameter(Mandatory = $true)]$State)
+$path = Get-WmtCleanerSourceStatePath -Source ([string]$State.Source)
+try {
+    $json = $State | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+}
+catch { if ($script:WmtDebug) { Write-GuiLog "Cleaner source state write failed: $($_.Exception.Message)" } }
+}
+
+function Test-WmtCleanerRemoteRefreshDue {
+param(
+    [Parameter(Mandatory = $true)][string]$Source,
+    [int]$Minutes = (Get-WmtCleanerRemoteCheckMinutes)
+)
+if ($Minutes -le 0) { return $false }
+$state = Get-WmtCleanerSourceState -Source $Source
+if ([string]::IsNullOrWhiteSpace([string]$state.LastCheckedUtc)) { return $true }
+try {
+    $last = [DateTimeOffset]::Parse([string]$state.LastCheckedUtc).UtcDateTime
+    return (([DateTime]::UtcNow - $last).TotalMinutes -ge $Minutes)
+}
+catch { return $true }
+}
+
+function Test-WmtCleanerLocalCacheFresh {
+param(
+    [Parameter(Mandatory = $true)][string]$CachePath,
+    [Parameter(Mandatory = $true)][string]$MetaPath,
+    [int]$Minutes = (Get-WmtCleanerLocalRefreshMinutes)
+)
+if (-not (Test-Path -LiteralPath $CachePath -PathType Leaf) -or -not (Test-Path -LiteralPath $MetaPath -PathType Leaf)) { return $false }
+try {
+    $meta = Get-Content -LiteralPath $MetaPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if (-not $meta.PSObject.Properties["LastLocalRefreshUtc"] -or [string]::IsNullOrWhiteSpace([string]$meta.LastLocalRefreshUtc)) { return $false }
+    $last = [DateTimeOffset]::Parse([string]$meta.LastLocalRefreshUtc).UtcDateTime
+    return (([DateTime]::UtcNow - $last).TotalMinutes -lt [Math]::Max(1, $Minutes))
+}
+catch { return $false }
+}
+
+function Set-WmtCleanerLocalRefreshStamp {
+param([Parameter(Mandatory = $true)][string]$MetaPath)
+if (-not (Test-Path -LiteralPath $MetaPath -PathType Leaf)) { return }
+try {
+    $meta = Get-Content -LiteralPath $MetaPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $stamp = [DateTime]::UtcNow.ToString("o")
+    if ($meta.PSObject.Properties["LastLocalRefreshUtc"]) { $meta.LastLocalRefreshUtc = $stamp }
+    else { $meta | Add-Member -MemberType NoteProperty -Name "LastLocalRefreshUtc" -Value $stamp -Force }
+    $json = $meta | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($MetaPath, $json, [System.Text.UTF8Encoding]::new($false))
+}
+catch { if ($script:WmtDebug) { Write-GuiLog "Cleaner local refresh stamp failed: $($_.Exception.Message)" } }
+}
+
+function Invoke-WmtCleanerConditionalDownload {
+param(
+    [Parameter(Mandatory = $true)][string]$Source,
+    [Parameter(Mandatory = $true)][string]$Url,
+    [Parameter(Mandatory = $true)][string]$Destination
+)
+
+$result = [PSCustomObject]@{ Checked = $false; Changed = $false; StatusCode = 0; Error = "" }
+$state = Get-WmtCleanerSourceState -Source $Source
+$client = $null
+$request = $null
+$response = $null
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Add-Type -AssemblyName System.Net.Http
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$state.ETag)) {
+        [void]$request.Headers.TryAddWithoutValidation("If-None-Match", [string]$state.ETag)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$state.LastModified)) {
+        [void]$request.Headers.TryAddWithoutValidation("If-Modified-Since", [string]$state.LastModified)
+    }
+
+    $response = $client.SendAsync($request).Result
+    $result.StatusCode = [int]$response.StatusCode
+    $result.Checked = $true
+    $state.LastCheckedUtc = [DateTime]::UtcNow.ToString("o")
+    $state.Url = $Url
+
+    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::NotModified) {
+        Save-WmtCleanerSourceState -State $state
+        return $result
+    }
+
+    if (-not $response.IsSuccessStatusCode) {
+        throw "HTTP $([int]$response.StatusCode) $($response.ReasonPhrase)"
+    }
+
+    $bytes = $response.Content.ReadAsByteArrayAsync().Result
+    if (-not $bytes -or $bytes.Length -le 0) { throw "Downloaded content was empty." }
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [Convert]::ToBase64String($sha.ComputeHash($bytes))
+    }
+    finally { $sha.Dispose() }
+
+    $changed = [string]::IsNullOrWhiteSpace([string]$state.ContentSha256) -or ([string]$state.ContentSha256 -ne $hash) -or -not (Test-Path -LiteralPath $Destination -PathType Leaf)
+    if ($changed) {
+        [System.IO.File]::WriteAllBytes($Destination, $bytes)
+        $state.LastUpdatedUtc = [DateTime]::UtcNow.ToString("o")
+        $result.Changed = $true
+    }
+
+    $state.ContentSha256 = $hash
+    if ($response.Headers.ETag) { $state.ETag = [string]$response.Headers.ETag.ToString() }
+    if ($response.Content.Headers.LastModified) { $state.LastModified = [string]$response.Content.Headers.LastModified.ToString() }
+    Save-WmtCleanerSourceState -State $state
+    return $result
+}
+catch {
+    $result.Error = $_.Exception.Message
+    if ($result.Checked) {
+        try {
+            $state.LastCheckedUtc = [DateTime]::UtcNow.ToString("o")
+            $state.Url = $Url
+            Save-WmtCleanerSourceState -State $state
+        }
+        catch {}
+    }
+    return $result
+}
+finally {
+    if ($response) { try { $response.Dispose() } catch {} }
+    if ($request) { try { $request.Dispose() } catch {} }
+    if ($client) { try { $client.Dispose() } catch {} }
+}
+}
+
+function Get-WmtCleanerSourceStatusSummary {
+param([string[]]$Sources = @("Winapp2", "Winapp3", "CleanerML"))
+$parts = [System.Collections.Generic.List[string]]::new()
+foreach ($source in @($Sources)) {
+    $state = Get-WmtCleanerSourceState -Source $source
+    $checked = "never checked"
+    if (-not [string]::IsNullOrWhiteSpace([string]$state.LastCheckedUtc)) {
+        try { $checked = "checked " + ([DateTimeOffset]::Parse([string]$state.LastCheckedUtc).ToLocalTime().ToString("yyyy-MM-dd HH:mm")) }
+        catch {}
+    }
+    $updated = ""
+    if (-not [string]::IsNullOrWhiteSpace([string]$state.LastUpdatedUtc)) {
+        try { $updated = ", updated " + ([DateTimeOffset]::Parse([string]$state.LastUpdatedUtc).ToLocalTime().ToString("yyyy-MM-dd HH:mm")) }
+        catch {}
+    }
+    [void]$parts.Add("$source: $checked$updated")
+}
+return ($parts -join "  |  ")
+}
+
 function Update-WmtBleachBitCleanerMlFiles {
 $dataPath = Get-DataPath
 $targetRoot = Join-Path $dataPath "bleachbit_cleanerml"
@@ -9668,23 +9933,22 @@ $tempZip = ""
 
 try {
     [System.IO.Directory]::CreateDirectory($targetRoot) | Out-Null
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $url = "https://github.com/bleachbit/cleanerml/archive/refs/heads/master.zip"
 
-    # Download to a temporary location first
+    # Conditional request: a 304 or identical content only updates freshness
+    # metadata and leaves the existing validated CleanerML tree untouched.
     $tempZip = [System.IO.Path]::GetTempFileName()
-    $wc = New-Object System.Net.WebClient
-    try {
-        $wc.DownloadFile($url, $tempZip)
+    $download = Invoke-WmtCleanerConditionalDownload -Source "CleanerML" -Url $url -Destination $tempZip
+    if (-not $download.Checked) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$download.Error)) { Write-GuiLog "CleanerML update check failed: $($download.Error)" }
+        return $false
     }
-    finally {
-        $wc.Dispose()
-    }
+    if (-not $download.Changed) { return $false }
 
     # Validate ZIP before extraction
     if (-not (Test-Path -LiteralPath $tempZip) -or (New-Object System.IO.FileInfo($tempZip)).Length -eq 0) {
         Write-GuiLog "CleanerML download failed: empty or missing ZIP"
-        return
+        return $false
     }
 
     # Extract to a temporary directory
@@ -9732,10 +9996,13 @@ try {
             try { Rename-Item -LiteralPath $backupRoot -NewName "cleanerml-master" -Force } catch {}
         }
         Write-GuiLog "CleanerML update failed during swap: $($_.Exception.Message)"
+        return $false
     }
+    return $true
 }
 catch {
     Write-GuiLog "CleanerML download warning: $($_.Exception.Message)"
+    return $false
 }
 finally {
     # Always clean up temp files
@@ -9979,6 +10246,14 @@ $cachePath = Join-Path $dataPath "cleanerml_cache.json"
 $cacheMetaPath = Join-Path $dataPath "cleanerml_cache.meta.json"
 $cacheVersion = if ($IncludePending) { 6 } else { 5 }
 
+if (-not $Download -and -not $CacheOnly -and (Test-WmtCleanerLocalCacheFresh -CachePath $cachePath -MetaPath $cacheMetaPath)) {
+    try {
+        $fastRules = @(Get-Content -LiteralPath $cachePath -Raw -ErrorAction Stop | ConvertFrom-Json)
+        if ($fastRules.Count -gt 0) { return $fastRules }
+    }
+    catch {}
+}
+
 # Migrate: remove old bleachbit repo download (now using cleanerml repo)
 $oldBleachbitRoot = Join-Path $dataPath "bleachbit_cleanerml\bleachbit-master"
 if (Test-Path -LiteralPath $oldBleachbitRoot) {
@@ -10061,11 +10336,13 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                         FileCount           = [int]$sourceSignature.FileCount
                         TotalLength         = [int64]$sourceSignature.TotalLength
                         LatestWriteUtcTicks = [int64]$sourceSignature.LatestWriteUtcTicks
+                        LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
                         Files               = @($sourceSignature.Files)
                     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheMetaPath -Force
                 }
                 catch {}
             }
+            Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
             if ($memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
@@ -10091,6 +10368,7 @@ try {
         FileCount           = [int]$sourceSignature.FileCount
         TotalLength         = [int64]$sourceSignature.TotalLength
         LatestWriteUtcTicks = [int64]$sourceSignature.LatestWriteUtcTicks
+        LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
         Files               = @($sourceSignature.Files)
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheMetaPath -Force
     $memoryKey = "{0}|{1}|{2}|{3}" -f $cacheVersion, [int]$sourceSignature.FileCount, [int64]$sourceSignature.TotalLength, [int64]$sourceSignature.LatestWriteUtcTicks
@@ -10109,6 +10387,13 @@ $iniPath = Join-Path $dataPath "winapp2.ini"
 $cachePath = Join-Path $dataPath "winapp2_cache.json" 
 $cacheMetaPath = Join-Path $dataPath "winapp2_cache.meta.json"
 $cacheVersion = 2
+if (-not $Download -and -not $CacheOnly -and (Test-WmtCleanerLocalCacheFresh -CachePath $cachePath -MetaPath $cacheMetaPath)) {
+    try {
+        $fastRules = @(Get-Content -LiteralPath $cachePath -Raw -ErrorAction Stop | ConvertFrom-Json)
+        if ($fastRules.Count -gt 0) { return $fastRules }
+    }
+    catch {}
+}
 if (-not $script:Winapp2RulesMemoryCache) { $script:Winapp2RulesMemoryCache = @{} }
 $iniInfoForCache = $null
 if (Test-Path $iniPath) {
@@ -10172,25 +10457,14 @@ if (Test-Path $cachePath) {
     }
 }
 
-# --- 2. DOWNLOAD ---
+# --- 2. REMOTE UPDATE CHECK ---
 if ($Download -and -not $SkipDownloads) {
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Add-Type -AssemblyName System.Net.Http
-        $client = New-Object System.Net.Http.HttpClient
-        $client.Timeout = [TimeSpan]::FromSeconds(15)
-
-        $url = "https://cdn.jsdelivr.net/gh/MoscaDotTo/Winapp2@master/Winapp2.ini"
-        $response = $client.GetAsync($url).Result
-        if ($response.IsSuccessStatusCode) {
-            $contentBytes = $response.Content.ReadAsByteArrayAsync().Result
-            $iniContent = [System.Text.Encoding]::UTF8.GetString($contentBytes)
-            [System.IO.File]::WriteAllText($iniPath, $iniContent)
-            $forceRebuild = $true
-        }
-        $client.Dispose()
+    $url = "https://cdn.jsdelivr.net/gh/MoscaDotTo/Winapp2@master/Winapp2.ini"
+    $download = Invoke-WmtCleanerConditionalDownload -Source "Winapp2" -Url $url -Destination $iniPath
+    if ($download.Changed) { $forceRebuild = $true }
+    elseif (-not $download.Checked -and -not [string]::IsNullOrWhiteSpace([string]$download.Error)) {
+        Write-GuiLog "Winapp2 update check warning: $($download.Error)"
     }
-    catch { Write-GuiLog "Download Warning: $($_.Exception.Message)"; if ($script:WmtDebug) { Write-GuiLog "Winapp2 download stack: $($_.ScriptStackTrace)" } }
 }
 
 # --- 3. CACHE LOAD ---
@@ -10205,10 +10479,12 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                         CacheVersion    = $cacheVersion
                         IniLength       = [int64]$iniInfo.Length
                         IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
+                        LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
                     } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
                 }
                 catch {}
             }
+            Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
             if ($memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
@@ -10402,6 +10678,7 @@ try {
             CacheVersion    = $cacheVersion
             IniLength       = [int64]$iniInfo.Length
             IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
+            LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
         } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
         $memoryKey = "{0}|{1}|{2}" -f $cacheVersion, [int64]$iniInfo.Length, $iniInfo.LastWriteTimeUtc.Ticks
     }
@@ -10421,6 +10698,13 @@ $iniPath = Join-Path $dataPath "winapp3.ini"
 $cachePath = Join-Path $dataPath "winapp3_cache.json"
 $cacheMetaPath = Join-Path $dataPath "winapp3_cache.meta.json"
 $cacheVersion = 1
+if (-not $Download -and -not $CacheOnly -and (Test-WmtCleanerLocalCacheFresh -CachePath $cachePath -MetaPath $cacheMetaPath)) {
+    try {
+        $fastRules = @(Get-Content -LiteralPath $cachePath -Raw -ErrorAction Stop | ConvertFrom-Json)
+        if ($fastRules.Count -gt 0) { return $fastRules }
+    }
+    catch {}
+}
 if (-not $script:Winapp3RulesMemoryCache) { $script:Winapp3RulesMemoryCache = @{} }
 $iniInfoForCache = $null
 if (Test-Path $iniPath) {
@@ -10479,24 +10763,14 @@ if (Test-Path $cachePath) {
     }
 }
 
-# --- 2. DOWNLOAD ---
+# --- 2. REMOTE UPDATE CHECK ---
 if ($Download -and -not $SkipDownloads) {
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Add-Type -AssemblyName System.Net.Http
-        $client = New-Object System.Net.Http.HttpClient
-        $client.Timeout = [TimeSpan]::FromSeconds(15)
-        $url = "https://github.com/MoscaDotTo/Winapp2/raw/refs/heads/master/Winapp3/Winapp3.ini"
-        $response = $client.GetAsync($url).Result
-        if ($response.IsSuccessStatusCode) {
-            $contentBytes = $response.Content.ReadAsByteArrayAsync().Result
-            $iniContent = [System.Text.Encoding]::UTF8.GetString($contentBytes)
-            [System.IO.File]::WriteAllText($iniPath, $iniContent)
-            $forceRebuild = $true
-        }
-        $client.Dispose()
+    $url = "https://github.com/MoscaDotTo/Winapp2/raw/refs/heads/master/Winapp3/Winapp3.ini"
+    $download = Invoke-WmtCleanerConditionalDownload -Source "Winapp3" -Url $url -Destination $iniPath
+    if ($download.Changed) { $forceRebuild = $true }
+    elseif (-not $download.Checked -and -not [string]::IsNullOrWhiteSpace([string]$download.Error)) {
+        Write-GuiLog "Winapp3 update check warning: $($download.Error)"
     }
-    catch { Write-GuiLog "Winapp3 download warning: $($_.Exception.Message)"; if ($script:WmtDebug) { Write-GuiLog "Winapp3 download stack: $($_.ScriptStackTrace)" } }
 }
 
 # --- 3. CACHE LOAD ---
@@ -10511,10 +10785,12 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                         CacheVersion    = $cacheVersion
                         IniLength       = [int64]$iniInfo.Length
                         IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
+                        LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
                     } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
                 }
                 catch {}
             }
+            Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
             if ($memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
@@ -10675,6 +10951,7 @@ try {
             CacheVersion    = $cacheVersion
             IniLength       = [int64]$iniInfo.Length
             IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
+            LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
         } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
         $memoryKey = "{0}|{1}|{2}" -f $cacheVersion, [int64]$iniInfo.Length, $iniInfo.LastWriteTimeUtc.Ticks
     }
@@ -10697,7 +10974,7 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
 [xml]$cleanupSelectionXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Advanced Cleanup Selection" Width="720" Height="820" MinWidth="620" MinHeight="540"
+    Title="Advanced Cleanup Selection" Width="920" Height="840" MinWidth="760" MinHeight="560"
     WindowStartupLocation="CenterOwner" Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
     FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13">
 <Window.Resources>
@@ -10761,6 +11038,20 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
                     <Button Name="chkCacheOnly" Content="Cache Only" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Skip cache validation and parsing. Instantly load from existing cache file."/>
                 </WrapPanel>
             </DockPanel>
+            <WrapPanel Margin="4,6,0,0" VerticalAlignment="Center">
+                <TextBlock Text="Local cache refresh:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <TextBox Name="txtCleanerLocalRefresh" Width="58" Height="28" VerticalContentAlignment="Center" ToolTip="Minutes between validation/rebuilds of parsed local cleaner caches. Minimum 1 minute."/>
+                <TextBlock Text="min" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="4,0,14,0"/>
+                <TextBlock Text="List update check:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <TextBox Name="txtCleanerRemoteRefresh" Width="64" Height="28" VerticalContentAlignment="Center" ToolTip="Minutes between conditional upstream checks. Use 0 to disable automatic list update checks."/>
+                <TextBlock Text="min" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="4,0,14,0"/>
+                <TextBlock Text="Auto clean:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <TextBox Name="txtCleanerAutoClean" Width="64" Height="28" VerticalContentAlignment="Center" ToolTip="Minutes between automatic background clean runs. Use 0 for Off."/>
+                <TextBlock Text="min" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="4,0,10,0"/>
+                <Button Name="btnApplyCleanerIntervals" Content="Apply" Height="30" MinWidth="70" Margin="4,0"/>
+                <Button Name="btnRefreshCleanerSources" Content="Refresh Lists" Height="30" MinWidth="100" Margin="4,0"/>
+            </WrapPanel>
+            <TextBlock Name="lblCleanerFreshness" Foreground="{DynamicResource TextMuted}" FontSize="11" Margin="4,5,0,0" TextTrimming="CharacterEllipsis"/>
             <TextBlock Name="lblStatus" Foreground="{DynamicResource Warning}" FontSize="12" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
         </StackPanel>
     </Border>
@@ -10806,6 +11097,12 @@ $chkToggleCleanerMLPending = $dialog.FindName("chkToggleCleanerMLPending")
 $chkToggleWinapp3 = $dialog.FindName("chkToggleWinapp3")
 $chkSkipDownloads = $dialog.FindName("chkSkipDownloads")
 $chkCacheOnly = $dialog.FindName("chkCacheOnly")
+$txtCleanerLocalRefresh = $dialog.FindName("txtCleanerLocalRefresh")
+$txtCleanerRemoteRefresh = $dialog.FindName("txtCleanerRemoteRefresh")
+$txtCleanerAutoClean = $dialog.FindName("txtCleanerAutoClean")
+$btnApplyCleanerIntervals = $dialog.FindName("btnApplyCleanerIntervals")
+$btnRefreshCleanerSources = $dialog.FindName("btnRefreshCleanerSources")
+$lblCleanerFreshness = $dialog.FindName("lblCleanerFreshness")
 $txtSearch = $dialog.FindName("txtSearch")
 $btnClearSearch = $dialog.FindName("btnClearSearch")
 $lblStatus = $dialog.FindName("lblStatus")
@@ -10834,6 +11131,11 @@ try {
 } catch {}
 
 $secondaryBtnNames = @("chkToggleWinapp3", "chkToggleCleanerMLPending", "chkSkipDownloads", "chkCacheOnly")
+
+if ($txtCleanerLocalRefresh) { $txtCleanerLocalRefresh.Text = [string](Get-WmtCleanerLocalRefreshMinutes -Settings $currentSettings) }
+if ($txtCleanerRemoteRefresh) { $txtCleanerRemoteRefresh.Text = [string](Get-WmtCleanerRemoteCheckMinutes -Settings $currentSettings) }
+if ($txtCleanerAutoClean) { $txtCleanerAutoClean.Text = [string](Get-WmtCleanerAutoCleanMinutes -Settings $currentSettings) }
+if ($lblCleanerFreshness) { $lblCleanerFreshness.Text = Get-WmtCleanerSourceStatusSummary }
 
 $toggleState = @{
     Winapp2          = [bool]$isWinapp2Enabled
@@ -11260,6 +11562,7 @@ $renderCurrentCleanerRules = {
 $loadExternalCleanerRules = {
     param(
         [switch]$ForceWinapp2Download,
+        [switch]$ForceWinapp3Download,
         [switch]$ForceCleanerMlDownload
     )
 
@@ -11275,7 +11578,8 @@ $loadExternalCleanerRules = {
             $lblStatus.Text = "Loading Winapp2 rules..."
             Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
             $iniPath = Join-Path (Get-DataPath) "winapp2.ini"
-            $shouldDownload = (-not $skipDl) -and ($ForceWinapp2Download -or (-not (Test-Path $iniPath)))
+            $remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $currentSettings
+            $shouldDownload = (-not $skipDl) -and (-not $cacheOnly) -and ($ForceWinapp2Download -or (-not (Test-Path $iniPath)) -or (Test-WmtCleanerRemoteRefreshDue -Source "Winapp2" -Minutes $remoteMinutes))
             $externalRuleState.Winapp2 = @(Get-Winapp2Rules -Download:$shouldDownload -SkipDownloads:$skipDl -CacheOnly:$cacheOnly)
         }
         else {
@@ -11286,7 +11590,8 @@ $loadExternalCleanerRules = {
            $lblStatus.Text = "Loading Winapp3 rules..."
            Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
            $w3IniPath = Join-Path (Get-DataPath) "winapp3.ini"
-           $w3ShouldDownload = (-not $skipDl) -and (-not (Test-Path $w3IniPath))
+           $remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $currentSettings
+           $w3ShouldDownload = (-not $skipDl) -and (-not $cacheOnly) -and ($ForceWinapp3Download -or (-not (Test-Path $w3IniPath)) -or (Test-WmtCleanerRemoteRefreshDue -Source "Winapp3" -Minutes $remoteMinutes))
            $externalRuleState.Winapp3 = @(Get-Winapp3Rules -Download:$w3ShouldDownload -SkipDownloads:$skipDl -CacheOnly:$cacheOnly)
        }
        else {
@@ -11298,13 +11603,15 @@ $loadExternalCleanerRules = {
             Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
             $hasLocalCleanerMl = ((Get-WmtBleachBitCleanerXmlDirectories).Count -gt 0)
             $cachePath = Join-Path (Get-DataPath) "cleanerml_cache.json"
-            $shouldDownloadCleanerMl = (-not $skipDl) -and ($ForceCleanerMlDownload -or ((-not $hasLocalCleanerMl) -and (-not (Test-Path $cachePath))))
+            $remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $currentSettings
+            $shouldDownloadCleanerMl = (-not $skipDl) -and (-not $cacheOnly) -and ($ForceCleanerMlDownload -or ((-not $hasLocalCleanerMl) -and (-not (Test-Path $cachePath))) -or (Test-WmtCleanerRemoteRefreshDue -Source "CleanerML" -Minutes $remoteMinutes))
             $externalRuleState.CleanerML = @(Get-BleachBitCleanerMlRules -Download:$shouldDownloadCleanerMl -IncludePending:$toggleState.CleanerMLPending -SkipDownloads:$skipDl -CacheOnly:$cacheOnly)
         }
         else {
             $externalRuleState.CleanerML = @()
         }
         & $renderCurrentCleanerRules
+        if ($lblCleanerFreshness) { $lblCleanerFreshness.Text = Get-WmtCleanerSourceStatusSummary }
     }
     catch {
         Write-GuiLog "Cleaner rules warning: $($_.Exception.Message)"
@@ -11365,7 +11672,8 @@ if ($chkToggleWinapp3) { $chkToggleWinapp3.Add_Click({
                 $dialog.Cursor = [System.Windows.Input.Cursors]::Wait
                 Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
                 $w3IniPath = Join-Path (Get-DataPath) "winapp3.ini"
-                $w3ShouldDownload = (-not $toggleState.SkipDownloads) -and (-not (Test-Path $w3IniPath))
+                $remoteMinutes = Get-WmtCleanerRemoteCheckMinutes -Settings $currentSettings
+                $w3ShouldDownload = (-not $toggleState.SkipDownloads) -and (-not $toggleState.CacheOnly) -and ((-not (Test-Path $w3IniPath)) -or (Test-WmtCleanerRemoteRefreshDue -Source "Winapp3" -Minutes $remoteMinutes))
                 $externalRuleState.Winapp3 = @(Get-Winapp3Rules -Download:$w3ShouldDownload -SkipDownloads:$toggleState.SkipDownloads -CacheOnly:$toggleState.CacheOnly)
             } else {
                 $externalRuleState.Winapp3 = @()
@@ -11394,6 +11702,40 @@ if ($chkCacheOnly) { $chkCacheOnly.Add_Click({
         Save-WmtSettings -Settings $currentSettings
         & $setCleanerToggle $chkCacheOnly $toggleState.CacheOnly
         & $loadExternalCleanerRules
+    }.GetNewClosure()) }
+
+if ($btnApplyCleanerIntervals) { $btnApplyCleanerIntervals.Add_Click({
+        $localMinutes = 0
+        $remoteMinutes = 0
+        $autoMinutes = 0
+        if (-not [int]::TryParse(([string]$txtCleanerLocalRefresh.Text).Trim(), [ref]$localMinutes) -or $localMinutes -lt 1 -or $localMinutes -gt 525600) {
+            Show-WmtMessageBox -Owner $dialog -Message "Local cache refresh must be between 1 and 525600 minutes." -Title "Cleaner Intervals" -Image Warning | Out-Null
+            return
+        }
+        if (-not [int]::TryParse(([string]$txtCleanerRemoteRefresh.Text).Trim(), [ref]$remoteMinutes) -or $remoteMinutes -lt 0 -or $remoteMinutes -gt 525600) {
+            Show-WmtMessageBox -Owner $dialog -Message "List update check must be between 0 and 525600 minutes. Use 0 for Never." -Title "Cleaner Intervals" -Image Warning | Out-Null
+            return
+        }
+        if (-not [int]::TryParse(([string]$txtCleanerAutoClean.Text).Trim(), [ref]$autoMinutes) -or $autoMinutes -lt 0 -or $autoMinutes -gt 525600) {
+            Show-WmtMessageBox -Owner $dialog -Message "Auto clean must be between 0 and 525600 minutes. Use 0 for Off." -Title "Cleaner Intervals" -Image Warning | Out-Null
+            return
+        }
+
+        Set-WmtCleanerIntervals -LocalRefreshMinutes $localMinutes -RemoteCheckMinutes $remoteMinutes -AutoCleanMinutes $autoMinutes
+        $currentSettings.CleanerLocalRefreshMinutes = $localMinutes
+        $currentSettings.CleanerRemoteCheckMinutes = $remoteMinutes
+        $currentSettings.CleanerAutoCleanMinutes = $autoMinutes
+        try { if (Get-Command Start-WmtCleanerDefinitionRefreshTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } } catch {}
+        try { if (Get-Command Start-WmtCleanerAutoCleanTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerAutoCleanTimer -ResetNextRun } } catch {}
+        $lblStatus.Text = "Cleaner intervals saved."
+    }.GetNewClosure()) }
+
+if ($btnRefreshCleanerSources) { $btnRefreshCleanerSources.Add_Click({
+        if ($toggleState.SkipDownloads -or $toggleState.CacheOnly) {
+            Show-WmtMessageBox -Owner $dialog -Message "Disable Skip Downloads and Cache Only before refreshing upstream cleaner lists." -Title "Refresh Cleaner Lists" -Image Information | Out-Null
+            return
+        }
+        & $loadExternalCleanerRules -ForceWinapp2Download -ForceWinapp3Download -ForceCleanerMlDownload
     }.GetNewClosure()) }
 
 $searchDelayTimer = [System.Windows.Threading.DispatcherTimer]::new()
