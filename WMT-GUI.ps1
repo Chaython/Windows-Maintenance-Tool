@@ -38253,7 +38253,12 @@ $script:WmtSteamLibraryCache = $result.ToArray()
 # Write to cache file.
 try {
     $cacheFile = Join-Path (Get-DataPath) "steam_library.json"
-    $script:WmtSteamLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+    if ($result.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
+        $script:WmtSteamLibraryCache | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+    }
+    else {
+        Write-GuiLog "Steam library refresh returned no games; keeping the existing cache."
+    }
 }
 catch {
     Write-GuiLog "Failed to write Steam library cache: $($_.Exception.Message)"
@@ -38327,9 +38332,16 @@ try {
         }
     }
 
-    # Save to cache.
-    $allApps.ToArray() | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
-    Write-GuiLog "Steam app list cached: $($appNames.Count) apps."
+    # Save only a useful refresh over an existing cache. If this is the first
+    # fetch, an empty cache is still allowed so callers have a valid JSON file.
+    $allAppsArray = $allApps.ToArray()
+    if ($allAppsArray.Count -gt 0 -or -not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
+        $allAppsArray | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $cacheFile -Force -Encoding UTF8
+        Write-GuiLog "Steam app list cached: $($appNames.Count) apps."
+    }
+    else {
+        Write-GuiLog "Steam app list refresh returned no apps; keeping the existing cache."
+    }
 }
 catch {
     Write-GuiLog "Steam app list download failed: $($_.Exception.Message)"
@@ -43949,9 +43961,14 @@ $script:InvokeWingetSearch = {
                         $resp = Invoke-RestMethod -Uri "https://pypi.org/simple/" -Headers $headers -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
                         if ($resp -and $resp.projects) {
                             # Extract just the package names to keep the cache small.
-                            $names = @($resp.projects | ForEach-Object { [string]$_.name })
-                            $names | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $CacheFile -Force -Encoding UTF8
-                            Write-Output "LOG:PyPI index cached: $($names.Count) packages."
+                            $names = @($resp.projects | ForEach-Object { [string]$_.name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                            if ($names.Count -gt 0 -or -not (Test-Path -LiteralPath $CacheFile -PathType Leaf)) {
+                                $names | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $CacheFile -Force -Encoding UTF8
+                                Write-Output "LOG:PyPI index cached: $($names.Count) packages."
+                            }
+                            else {
+                                Write-Output "LOG:PyPI index refresh returned no packages; keeping the existing cache."
+                            }
                         }
                     }
                     catch {
@@ -53508,9 +53525,14 @@ try {
                     }
                     $resp = Invoke-RestMethod -Uri "https://pypi.org/simple/" -Headers $headers -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
                     if ($resp -and $resp.projects) {
-                        $names = @($resp.projects | ForEach-Object { [string]$_.name })
-                        $names | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $PypiCacheFile -Force -Encoding UTF8
-                        Write-Output "LOG:PyPI index cached: $($names.Count) packages."
+                        $names = @($resp.projects | ForEach-Object { [string]$_.name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                        if ($names.Count -gt 0 -or -not (Test-Path -LiteralPath $PypiCacheFile -PathType Leaf)) {
+                            $names | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $PypiCacheFile -Force -Encoding UTF8
+                            Write-Output "LOG:PyPI index cached: $($names.Count) packages."
+                        }
+                        else {
+                            Write-Output "LOG:PyPI index refresh returned no packages; keeping the existing cache."
+                        }
                     }
                 }
                 catch {
@@ -53587,9 +53609,16 @@ try {
                                     }
                                 }
 
-                                # Save to cache file.
-                                $allApps.ToArray() | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $appListFile -Force -Encoding UTF8
-                                Write-Output "LOG:Steam app list cached: $($appNames.Count) apps."
+                                # Preserve a previously good app list if a transient refresh
+                                # produces no usable rows.
+                                $allAppsArray = $allApps.ToArray()
+                                if ($allAppsArray.Count -gt 0 -or -not (Test-Path -LiteralPath $appListFile -PathType Leaf)) {
+                                    $allAppsArray | ConvertTo-Json -Depth 1 | Set-Content -LiteralPath $appListFile -Force -Encoding UTF8
+                                    Write-Output "LOG:Steam app list cached: $($appNames.Count) apps."
+                                }
+                                else {
+                                    Write-Output "LOG:Steam app list refresh returned no apps; keeping the existing cache."
+                                }
                             }
                             catch {
                                 Write-Output "LOG:Steam app list download failed: $($_.Exception.Message)"
@@ -53638,8 +53667,14 @@ try {
                                 $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = [string]$info.Name; Id = $aid; Version = [string]$info.BuildId; Source = "steam"; Kind = "Library"; IsInstalled = $true; InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" } })
                             }
                         }
-                        $sResult.ToArray() | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $SteamCacheFile -Force -Encoding UTF8
-                        Write-Output "LOG:Steam library cached: $($sResult.Count) games."
+                        $steamArray = $sResult.ToArray()
+                        if ($steamArray.Count -gt 0 -or -not (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
+                            $steamArray | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $SteamCacheFile -Force -Encoding UTF8
+                            Write-Output "LOG:Steam library cached: $($sResult.Count) games."
+                        }
+                        else {
+                            Write-Output "LOG:Steam library refresh returned no games; keeping the existing cache."
+                        }
                     }
                     else {
                         Write-Output "LOG:Steam install not found."
