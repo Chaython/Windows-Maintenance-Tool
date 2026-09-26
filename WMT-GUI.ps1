@@ -12694,6 +12694,7 @@ else {
     $pBar = $pForm.FindName("pBar")
     $pForm.Add_Closed({ $progressState.Closed = $true }.GetNewClosure())
     $pForm.Show()
+    $script:WmtCleanerOperationActive = $true
     Invoke-WmtDispatcherPump -Dispatcher $pForm.Dispatcher
 }
 
@@ -13960,7 +13961,6 @@ function Invoke-WmtOutOfProcessAnalyze {
 }
 
 # 4. MAIN EXECUTION LOOP
-if (-not $Automatic) { $script:WmtCleanerOperationActive = $true }
 $actionText = if ($isAnalyze) { "Analyzing" } else { "Cleaning" }
 Write-GuiLog "--- Starting $actionText ---"
 $internalRuleDisplayNames = @{
@@ -40230,11 +40230,11 @@ function Invoke-WmtCleanerDefinitionRefresh {
 param([switch]$Force)
 
 if ((Get-WmtDisableBackgroundJobs) -and -not $Force) { return }
-if (-not $Force -and -not (Test-WmtCleanerDefinitionMaintenanceDue)) { return }
 if ($script:WmtCleanerDialogActive -or $script:WmtCleanerOperationActive) {
     Write-GuiLog "Cleaner definition refresh deferred because the interactive Cleaner is active."
     return
 }
+if (-not $Force -and -not (Test-WmtCleanerDefinitionMaintenanceDue)) { return }
 
 if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
     Write-GuiLog "Cleaner definition refresh skipped because the previous refresh is still running."
