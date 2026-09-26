@@ -52368,7 +52368,20 @@ function Start-TweakButtonStatesBackgroundUpdate {
 if ($script:TweakStatesBgStarted) { return }
 $script:TweakStatesBgStarted = $true
 
-$ps = New-WmtPooledPowerShell -PoolKind UiSupport
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell -PoolKind UiSupport
+}
+catch {
+    try { Write-GuiLog "[Tweak States] Could not create background worker: $($_.Exception.Message). Falling back to synchronous load." } catch {}
+    $script:TweakStatesReady = $true
+    try { Update-TweakButtonStates } catch {
+        try { Write-GuiLog "[Tweak States] Fallback synchronous load also failed: $($_.Exception.Message)" } catch {}
+        Show-TweakStatesLoadError -Message "Background worker could not be created and fallback also failed. Toggle states may be inaccurate. Error: $($_.Exception.Message)"
+    }
+    Sync-WmtTweakOverlayHide
+    return
+}
 [void]$ps.AddScript({
         # Collect all unique registry paths that Update-TweakButtonStates queries.
         # Pre-loading them in background means the UI thread never blocks on registry I/O.
@@ -52619,11 +52632,16 @@ $ps = New-WmtPooledPowerShell -PoolKind UiSupport
         return @{ RegCache = $regCache; PathChecks = $pathChecks; NonRegData = $nonRegData; SupportChecks = $supportChecks }
     })
 
-$async = $ps.BeginInvoke()
+$async = $null
+try {
+    $async = $ps.BeginInvoke()
+}
+catch {
+    try { Write-GuiLog "[Tweak States] BeginInvoke failed: $($_.Exception.Message). Falling back to synchronous load." } catch {}
+}
 
-# Guard: if BeginInvoke itself fails (e.g. pool disposed / closed), fall back immediately
-if ($null -eq $async -or $async.IsFaulted) {
-    try { Write-GuiLog "[Tweak States] BeginInvoke failed (runspace pool may be closed). Falling back to synchronous load." } catch {}
+# BeginInvoke throws on start failure; a null result is also treated as failure.
+if ($null -eq $async) {
     try { $ps.Dispose() } catch {}
     $script:TweakStatesReady = $true
     try {
@@ -52774,7 +52792,17 @@ $script:OptionalFeaturesCheckStarted = $true
 $featureMap = $script:OptionalFeaturesMap
 
 # Run in a background runspace (shared pool)
-$ps = New-WmtPooledPowerShell -PoolKind UiSupport
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell -PoolKind UiSupport
+}
+catch {
+    Write-GuiLog "[Optional Features] Could not create background worker: $($_.Exception.Message). Using synchronous fallback."
+    try { Update-OptionalFeaturesSynchronously } catch { Write-GuiLog "[Optional Features] Synchronous fallback failed: $($_.Exception.Message)" }
+    $script:OptionalFeaturesReady = $true
+    Sync-WmtTweakOverlayHide
+    return
+}
 [void]$ps.AddScript({
         param($map)
         $results = @{}
@@ -52819,7 +52847,20 @@ $ps = New-WmtPooledPowerShell -PoolKind UiSupport
         return $results
     })
 [void]$ps.AddArgument($featureMap)
-$async = $ps.BeginInvoke()
+$async = $null
+try {
+    $async = $ps.BeginInvoke()
+}
+catch {
+    Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message). Using synchronous fallback."
+}
+if ($null -eq $async) {
+    try { $ps.Dispose() } catch {}
+    try { Update-OptionalFeaturesSynchronously } catch { Write-GuiLog "[Optional Features] Synchronous fallback failed: $($_.Exception.Message)" }
+    $script:OptionalFeaturesReady = $true
+    Sync-WmtTweakOverlayHide
+    return
+}
 
 # Store in script scope so the timer tick can access them
 $script:FeaturesCheckAsync = $async
@@ -53037,16 +53078,33 @@ $script:WmtAppxLoadRunspace = $null
 $script:WmtAppxLoadAsyncResult = $null
 
 function Start-AppxBackgroundLoad {
-if ($script:WmtAppxLoadAsyncResult -and -not $script:WmtAppxLoadAsyncResult.IsCompleted) { return }
+if ($script:WmtAppxLoadAsyncResult) {
+    if (-not $script:WmtAppxLoadAsyncResult.IsCompleted) { return }
 
-try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
-if ($script:WmtAppxLoadRunspace) {
-    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
-    $script:WmtAppxLoadRunspace = $null
-    $script:WmtAppxLoadAsyncResult = $null
+    # The shared poller may not have consumed a just-completed invocation yet.
+    # Finalize it before replacing the script-level worker references.
+    try {
+        if ($script:WmtAppxLoadRunspace) {
+            [void]$script:WmtAppxLoadRunspace.EndInvoke($script:WmtAppxLoadAsyncResult)
+        }
+    }
+    catch {}
+    finally {
+        try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
+        try { if ($script:WmtAppxLoadRunspace) { $script:WmtAppxLoadRunspace.Dispose() } } catch {}
+        $script:WmtAppxLoadRunspace = $null
+        $script:WmtAppxLoadAsyncResult = $null
+    }
 }
 
-$ps = New-WmtPooledPowerShell -PoolKind UiSupport
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell -PoolKind UiSupport
+}
+catch {
+    Write-GuiLog "AppX background load could not create a worker: $($_.Exception.Message)"
+    return
+}
 [void]$ps.AddScript({
     $results = [System.Collections.Generic.List[object]]::new()
     $usedCmdlet = $false
@@ -53086,7 +53144,16 @@ $ps = New-WmtPooledPowerShell -PoolKind UiSupport
 })
 
 $script:WmtAppxLoadRunspace = $ps
-$script:WmtAppxLoadAsyncResult = $ps.BeginInvoke()
+try {
+    $script:WmtAppxLoadAsyncResult = $ps.BeginInvoke()
+}
+catch {
+    Write-GuiLog "AppX background load failed to start: $($_.Exception.Message)"
+    try { $ps.Dispose() } catch {}
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
+    return
+}
 
 Register-WmtUiPollOperation -Name "AppxBackgroundLoad" -IntervalMs 250 -TestComplete {
     $script:WmtAppxLoadAsyncResult -and $script:WmtAppxLoadAsyncResult.IsCompleted
@@ -53116,10 +53183,16 @@ Register-WmtUiPollOperation -Name "AppxBackgroundLoad" -IntervalMs 250 -TestComp
 } -OnError {
     param($Operation, $ErrorRecord)
     Write-GuiLog "AppX background monitor failed: $($ErrorRecord.Exception.Message)"
-    try { $script:WmtAppxLoadRunspace.Stop() } catch {}
-    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+    $failedPs = $script:WmtAppxLoadRunspace
+    $failedAsync = $script:WmtAppxLoadAsyncResult
     $script:WmtAppxLoadRunspace = $null
     $script:WmtAppxLoadAsyncResult = $null
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $failedPs -Invocation $failedAsync -Name "AppX background load"
+    }
+    catch {
+        try { if ($failedPs) { $failedPs.Dispose() } } catch {}
+    }
 } | Out-Null
 }
 
