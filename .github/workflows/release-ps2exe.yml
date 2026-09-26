@@ -92,12 +92,27 @@ jobs:
               ".\dist\WindowsMaintenanceTool.exe.sha256"
           )
 
-          # A missing release is an expected condition. In Windows PowerShell 5.1,
-          # gh writes "release not found" to stderr, and with ErrorActionPreference=Stop
-          # that stderr can become a terminating NativeCommandError before LASTEXITCODE
-          # can be inspected. Suppress stderr for this existence probe only.
-          & gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null | Out-Null
-          $releaseExists = ($LASTEXITCODE -eq 0)
+          # Probe the Releases API instead of using "gh release view". On Windows
+          # PowerShell 5.1, native stderr from a missing release can become a terminating
+          # NativeCommandError when ErrorActionPreference is Stop, even when redirected.
+          $releaseApi = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG"
+          $headers = @{
+              Authorization = "Bearer $env:GITHUB_TOKEN"
+              Accept = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+              "User-Agent" = "Windows-Maintenance-Tool-release"
+          }
+
+          $releaseExists = $false
+          try {
+              Invoke-RestMethod -Uri $releaseApi -Headers $headers -UseBasicParsing -TimeoutSec 15 | Out-Null
+              $releaseExists = $true
+          }
+          catch {
+              $statusCode = $null
+              try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+              if ($statusCode -ne 404) { throw }
+          }
 
           if ($releaseExists) {
               Write-Host "Release $env:RELEASE_TAG already exists; replacing its generated assets."
