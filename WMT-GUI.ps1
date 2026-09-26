@@ -40849,13 +40849,15 @@ try {
     $script:WmtCleanerRefreshProcess = $proc
     Write-GuiLog "Cleaner definition refresh started in the background."
 
-    Register-WmtUiPollOperation -Name "CleanerDefinitionRefresh" -IntervalMs 1000 -TestComplete {
-        return [bool]($script:WmtCleanerRefreshProcess -and $script:WmtCleanerRefreshProcess.HasExited)
-    } -OnComplete {
+    # The completion callback runs later from the shared UI poller, after this
+    # function scope has returned. Capture the result path explicitly so it
+    # cannot resolve to $null when the callback reads the worker result.
+    $refreshResultPath = $resultPath
+    $refreshOnComplete = {
         try {
             $result = $null
-            if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
-                $result = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($refreshResultPath) -and (Test-Path -LiteralPath $refreshResultPath -PathType Leaf)) {
+                $result = Get-Content -LiteralPath $refreshResultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             }
             if ($result -and $result.PSObject.Properties["Error"]) {
                 Write-GuiLog "Cleaner definition refresh failed: $($result.Error)"
@@ -40875,7 +40877,11 @@ try {
             try { if ($script:WmtCleanerRefreshProcess) { $script:WmtCleanerRefreshProcess.Dispose() } } catch {}
             $script:WmtCleanerRefreshProcess = $null
         }
-    } | Out-Null
+    }.GetNewClosure()
+
+    Register-WmtUiPollOperation -Name "CleanerDefinitionRefresh" -IntervalMs 1000 -TestComplete {
+        return [bool]($script:WmtCleanerRefreshProcess -and $script:WmtCleanerRefreshProcess.HasExited)
+    } -OnComplete $refreshOnComplete | Out-Null
 }
 catch {
     $script:WmtCleanerRefreshProcess = $null
@@ -40978,13 +40984,14 @@ try {
     $script:WmtCleanerAutoCleanProcess = $proc
     Write-GuiLog "Automatic cleaner started in a separate background worker."
 
-    Register-WmtUiPollOperation -Name "CleanerAutoClean" -IntervalMs 1000 -TestComplete {
-        return [bool]($script:WmtCleanerAutoCleanProcess -and $script:WmtCleanerAutoCleanProcess.HasExited)
-    } -OnComplete {
+    # Like the definition refresh callback above, this runs after the function
+    # returns. Keep the result path alive in a real closure.
+    $autoCleanResultPath = $resultPath
+    $autoCleanOnComplete = {
         try {
             $result = $null
-            if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
-                $result = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($autoCleanResultPath) -and (Test-Path -LiteralPath $autoCleanResultPath -PathType Leaf)) {
+                $result = Get-Content -LiteralPath $autoCleanResultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             }
             if (-not $result) {
                 Write-GuiLog "Automatic cleaner finished without a result summary."
@@ -41004,7 +41011,11 @@ try {
             try { if ($script:WmtCleanerAutoCleanProcess) { $script:WmtCleanerAutoCleanProcess.Dispose() } } catch {}
             $script:WmtCleanerAutoCleanProcess = $null
         }
-    } | Out-Null
+    }.GetNewClosure()
+
+    Register-WmtUiPollOperation -Name "CleanerAutoClean" -IntervalMs 1000 -TestComplete {
+        return [bool]($script:WmtCleanerAutoCleanProcess -and $script:WmtCleanerAutoCleanProcess.HasExited)
+    } -OnComplete $autoCleanOnComplete | Out-Null
 }
 catch {
     $script:WmtCleanerAutoCleanProcess = $null
