@@ -11189,6 +11189,7 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
                     <Button Name="chkToggleCleanerMLPending" Content="Pending (Beta)" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Unverified CleanerML rules from the pending folder"/>
                     <Button Name="chkSkipDownloads" Content="Skip Downloads" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Don't download or update rule files. Use only what's cached locally."/>
                     <Button Name="chkCacheOnly" Content="Cache Only" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Skip cache validation and parsing. Instantly load from existing cache file."/>
+                    <Button Name="btnShowEnabled" Content="Show Enabled" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Show only checked/enabled cleaner rules. This is a view filter and does not change selections."/>
                 </WrapPanel>
             </DockPanel>
             <WrapPanel Margin="4,6,0,0" VerticalAlignment="Center">
@@ -11250,6 +11251,7 @@ $chkToggleCleanerMLPending = $dialog.FindName("chkToggleCleanerMLPending")
 $chkToggleWinapp3 = $dialog.FindName("chkToggleWinapp3")
 $chkSkipDownloads = $dialog.FindName("chkSkipDownloads")
 $chkCacheOnly = $dialog.FindName("chkCacheOnly")
+$btnShowEnabled = $dialog.FindName("btnShowEnabled")
 $txtCleanerLocalRefresh = $dialog.FindName("txtCleanerLocalRefresh")
 $txtCleanerRemoteRefresh = $dialog.FindName("txtCleanerRemoteRefresh")
 $txtCleanerAutoClean = $dialog.FindName("txtCleanerAutoClean")
@@ -11278,7 +11280,7 @@ try {
     </Border>
 </ControlTemplate>
 '@)
-    foreach ($btn in @($chkToggleWinapp2, $chkToggleWinapp3, $chkToggleCleanerML, $chkToggleCleanerMLPending, $chkSkipDownloads, $chkCacheOnly)) {
+    foreach ($btn in @($chkToggleWinapp2, $chkToggleWinapp3, $chkToggleCleanerML, $chkToggleCleanerMLPending, $chkSkipDownloads, $chkCacheOnly, $btnShowEnabled)) {
         if ($btn) { $btn.Template = $toggleTemplate }
     }
 } catch {}
@@ -11502,10 +11504,36 @@ $setVisibility = {
     }
 }.GetNewClosure()
 
+$showEnabledState = @{ Enabled = $false }
+
+$setShowEnabledButtonState = {
+    if (-not $btnShowEnabled) { return }
+    try {
+        if ($showEnabledState.Enabled) {
+            $btnShowEnabled.Content = "Showing Enabled"
+            $btnShowEnabled.Background = $dialog.TryFindResource("Accent")
+            $btnShowEnabled.Foreground = $dialog.TryFindResource("AccentText")
+            $btnShowEnabled.FontWeight = [System.Windows.FontWeights]::Bold
+        }
+        else {
+            $btnShowEnabled.Content = "Show Enabled"
+            $btnShowEnabled.Background = $dialog.TryFindResource("BgElevated")
+            $btnShowEnabled.Foreground = $dialog.TryFindResource("TextSecondary")
+            $btnShowEnabled.FontWeight = [System.Windows.FontWeights]::Normal
+        }
+    }
+    catch {}
+}.GetNewClosure()
+
+& $setShowEnabledButtonState
+
 $applyCleanerSearch = {
     $rawText = [string]$txtSearch.Text
     if ($rawText -eq "Search rules...") { $rawText = "" }
     $q = $rawText.ToLowerInvariant()
+    $showEnabledOnly = [bool]$showEnabledState.Enabled
+    $filterActive = ($q.Length -gt 0 -or $showEnabledOnly)
+
     foreach ($entry in @($sectionEntries.ToArray())) {
         $hasVisibleChildren = $false
         $currentGroupHeader = $null
@@ -11514,17 +11542,19 @@ $applyCleanerSearch = {
         foreach ($child in @($entry.Flow.Children)) {
             if ([string]$child.Tag -eq "GROUPHEADER") {
                 if ($currentGroupHeader) {
-                    & $setVisibility $currentGroupHeader ($q.Length -eq 0 -or $currentGroupHasVisibleChildren)
+                    & $setVisibility $currentGroupHeader ((-not $filterActive) -or $currentGroupHasVisibleChildren)
                 }
                 $currentGroupHeader = $child
                 $currentGroupHasVisibleChildren = $false
-                & $setVisibility $child ($q.Length -eq 0)
+                & $setVisibility $child (-not $filterActive)
                 continue
             }
 
             if ($child -is [System.Windows.Controls.CheckBox]) {
                 $searchKey = [string]$child.Uid
-                $match = ($q.Length -eq 0 -or ($checkboxSearchText.ContainsKey($searchKey) -and $checkboxSearchText[$searchKey].Contains($q)))
+                $searchMatch = ($q.Length -eq 0 -or ($checkboxSearchText.ContainsKey($searchKey) -and $checkboxSearchText[$searchKey].Contains($q)))
+                $enabledMatch = (-not $showEnabledOnly -or [bool]$child.IsChecked)
+                $match = ($searchMatch -and $enabledMatch)
                 & $setVisibility $child $match
                 if ($match) {
                     $hasVisibleChildren = $true
@@ -11534,7 +11564,7 @@ $applyCleanerSearch = {
         }
 
         if ($currentGroupHeader) {
-            & $setVisibility $currentGroupHeader ($q.Length -eq 0 -or $currentGroupHasVisibleChildren)
+            & $setVisibility $currentGroupHeader ((-not $filterActive) -or $currentGroupHasVisibleChildren)
         }
         & $setVisibility $entry.Header $hasVisibleChildren
         & $setVisibility $entry.Flow $hasVisibleChildren
@@ -11661,6 +11691,13 @@ $RenderAllRules = {
             if (-not [bool]$chk.IsChecked) { $isSecChecked = $false }
             if ($item.Desc) { $chk.ToolTip = [string]$item.Desc }
 
+            $chk.Add_Checked({
+                    if ($showEnabledState.Enabled) { & $applyCleanerSearch }
+                }.GetNewClosure())
+            $chk.Add_Unchecked({
+                    if ($showEnabledState.Enabled) { & $applyCleanerSearch }
+                }.GetNewClosure())
+
             [void]$flow.Children.Add($chk)
             $cleanupCheckboxes[$itemKey] = $chk
             [void]$childChecks.Add($chk)
@@ -11671,7 +11708,7 @@ $RenderAllRules = {
                 param($s, $e)
                 $searchText = [string]$txtSearch.Text
                 if ($searchText -eq "Search rules...") { $searchText = "" }
-                $filterActive = -not [string]::IsNullOrWhiteSpace($searchText)
+                $filterActive = (-not [string]::IsNullOrWhiteSpace($searchText)) -or [bool]$showEnabledState.Enabled
                 foreach ($c in $childChecks) {
                     if (-not $filterActive -or $c.Visibility -eq [System.Windows.Visibility]::Visible) { $c.IsChecked = $true }
                 }
@@ -11680,7 +11717,7 @@ $RenderAllRules = {
                 param($s, $e)
                 $searchText = [string]$txtSearch.Text
                 if ($searchText -eq "Search rules...") { $searchText = "" }
-                $filterActive = -not [string]::IsNullOrWhiteSpace($searchText)
+                $filterActive = (-not [string]::IsNullOrWhiteSpace($searchText)) -or [bool]$showEnabledState.Enabled
                 foreach ($c in $childChecks) {
                     if (-not $filterActive -or $c.Visibility -eq [System.Windows.Visibility]::Visible) { $c.IsChecked = $false }
                 }
@@ -11953,6 +11990,14 @@ if ($btnClearSearch) {
         $txtSearch.Text = ""
         $txtSearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextPrimary")
         $btnClearSearch.Visibility = "Collapsed"
+        & $applyCleanerSearch
+    }.GetNewClosure())
+}
+
+if ($btnShowEnabled) {
+    $btnShowEnabled.Add_Click({
+        $showEnabledState.Enabled = -not [bool]$showEnabledState.Enabled
+        & $setShowEnabledButtonState
         & $applyCleanerSearch
     }.GetNewClosure())
 }
