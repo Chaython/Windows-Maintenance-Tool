@@ -11237,13 +11237,18 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
 try {
     $dialog = New-WmtWindowFromFullXaml -Xaml $cleanupSelectionXaml
     $workArea = [System.Windows.SystemParameters]::WorkArea
-    $dialog.Width = [Math]::Min(720, [Math]::Max(620, $workArea.Width - 80))
-    $dialog.Height = [Math]::Min(820, [Math]::Max(540, $workArea.Height - 80))
+    $dialog.Width = [Math]::Min(920, [Math]::Max(760, $workArea.Width - 80))
+    $dialog.Height = [Math]::Min(840, [Math]::Max(560, $workArea.Height - 80))
 }
 catch {
     Write-GuiLog "Failed to open WPF cleanup selection: $($_.Exception.Message)"
     return $null
 }
+
+$script:WmtCleanerDialogActive = $true
+$dialog.Add_Closed({
+        $script:WmtCleanerDialogActive = $false
+    }.GetNewClosure())
 
 $chkToggleWinapp2 = $dialog.FindName("chkToggleWinapp2")
 $chkToggleCleanerML = $dialog.FindName("chkToggleCleanerML")
@@ -12605,6 +12610,17 @@ $previewWindow.ShowDialog() | Out-Null
 function Invoke-TempCleanup {
 param([switch]$Automatic)
 
+if (-not $Automatic) {
+    if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProcess.HasExited) {
+        Show-WmtMessageBox -Message "Automatic cleaning is already running in the background. The manual Cleaner will be available when it finishes." -Title "Cleaner Busy" -Image Information | Out-Null
+        return
+    }
+    if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
+        Show-WmtMessageBox -Message "Cleaner definitions are being refreshed in the background. The manual Cleaner will be available when that refresh finishes." -Title "Cleaner Busy" -Image Information | Out-Null
+        return
+    }
+}
+
 # 1. GET SELECTION
 if ($Automatic) {
     $uiResult = [PSCustomObject]@{
@@ -13944,6 +13960,7 @@ function Invoke-WmtOutOfProcessAnalyze {
 }
 
 # 4. MAIN EXECUTION LOOP
+if (-not $Automatic) { $script:WmtCleanerOperationActive = $true }
 $actionText = if ($isAnalyze) { "Analyzing" } else { "Cleaning" }
 Write-GuiLog "--- Starting $actionText ---"
 $internalRuleDisplayNames = @{
@@ -14125,6 +14142,7 @@ catch {
     Write-GuiLog "Error: $($_.Exception.Message)"
 }
 finally {
+    if (-not $Automatic) { $script:WmtCleanerOperationActive = $false }
     if (-not $Automatic -and $pForm) { try { $pForm.Close() } catch {} }
 }
 
@@ -40213,6 +40231,10 @@ param([switch]$Force)
 
 if ((Get-WmtDisableBackgroundJobs) -and -not $Force) { return }
 if (-not $Force -and -not (Test-WmtCleanerDefinitionMaintenanceDue)) { return }
+if ($script:WmtCleanerDialogActive -or $script:WmtCleanerOperationActive) {
+    Write-GuiLog "Cleaner definition refresh deferred because the interactive Cleaner is active."
+    return
+}
 
 if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
     Write-GuiLog "Cleaner definition refresh skipped because the previous refresh is still running."
@@ -40333,6 +40355,10 @@ param([switch]$Force)
 $minutes = Get-WmtCleanerAutoCleanMinutes
 if ($minutes -le 0 -and -not $Force) { return }
 if ((Get-WmtDisableBackgroundJobs) -and -not $Force) { return }
+if ($script:WmtCleanerDialogActive -or $script:WmtCleanerOperationActive) {
+    Write-GuiLog "Automatic cleaner deferred because the interactive Cleaner is active."
+    return
+}
 
 if (-not (Test-WmtAnySavedCleanerSelected)) {
     Write-GuiLog "Automatic cleaner skipped: no saved cleaner selections are enabled."
