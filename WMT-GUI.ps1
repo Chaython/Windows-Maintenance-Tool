@@ -9927,7 +9927,7 @@ foreach ($source in @($Sources)) {
         try { $updated = ", updated " + ([DateTimeOffset]::Parse([string]$state.LastUpdatedUtc).ToLocalTime().ToString("yyyy-MM-dd HH:mm")) }
         catch {}
     }
-    [void]$parts.Add("$source: $checked$updated")
+    [void]$parts.Add("${source}: $checked$updated")
 }
 return ($parts -join "  |  ")
 }
