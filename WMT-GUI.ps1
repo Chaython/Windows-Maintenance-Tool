@@ -2852,10 +2852,19 @@ if (-not $osText) { return }
 
 try { Unregister-WmtUiPollOperation -Name "BitLockerStatus" } catch {}
 if ($script:BitLockerStatusRunspace) {
-    try { $script:BitLockerStatusRunspace.Stop() } catch {}
-    try { $script:BitLockerStatusRunspace.Dispose() } catch {}
+    $oldBitLockerPs = $script:BitLockerStatusRunspace
+    $oldBitLockerAsync = $script:BitLockerStatusAsyncResult
+    $script:BitLockerStatusRunspace = $null
+    $script:BitLockerStatusAsyncResult = $null
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $oldBitLockerPs -Invocation $oldBitLockerAsync -Name "BitLocker status refresh"
+    }
+    catch {
+        try { $oldBitLockerPs.Dispose() } catch {}
+    }
 }
 
+try {
 $script:BitLockerStatusRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
         function Get-BitLockerStatusTextFast {
             $systemDrive = $env:SystemDrive
@@ -2900,21 +2909,38 @@ $script:BitLockerStatusRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).
 
         Get-BitLockerStatusTextFast
     })
-
 $script:BitLockerStatusAsyncResult = $script:BitLockerStatusRunspace.BeginInvoke()
+}
+catch {
+    Write-GuiLog "[My Device] BitLocker status background query failed to start: $($_.Exception.Message)"
+    try { if ($script:BitLockerStatusRunspace) { $script:BitLockerStatusRunspace.Dispose() } } catch {}
+    $script:BitLockerStatusRunspace = $null
+    $script:BitLockerStatusAsyncResult = $null
+    $script:BitLockerStatusStartedAt = $null
+    return
+}
 $script:BitLockerStatusStartedAt = Get-Date
 $script:BitLockerStatusTimer = $null
 Register-WmtUiPollOperation -Name "BitLockerStatus" -IntervalMs 500 -TestComplete { $false } -OnTick {
         $timedOut = $script:BitLockerStatusStartedAt -and (((Get-Date) - $script:BitLockerStatusStartedAt).TotalSeconds -gt 20)
         if (($script:BitLockerStatusAsyncResult -and $script:BitLockerStatusAsyncResult.IsCompleted) -or $timedOut) {
             Unregister-WmtUiPollOperation -Name "BitLockerStatus"
+            $disposeBitLockerNow = $true
+            $bitLockerPs = $script:BitLockerStatusRunspace
+            $bitLockerAsync = $script:BitLockerStatusAsyncResult
             try {
                 if ($timedOut) {
-                    try { $script:BitLockerStatusRunspace.Stop() } catch {}
                     $status = "Timed out"
+                    $disposeBitLockerNow = $false
+                    try {
+                        Stop-WmtPowerShellInvocationAsync -PowerShell $bitLockerPs -Invocation $bitLockerAsync -Name "BitLocker status timeout"
+                    }
+                    catch {
+                        try { if ($bitLockerPs) { $bitLockerPs.Dispose() } } catch {}
+                    }
                 }
                 else {
-                    $status = $script:BitLockerStatusRunspace.EndInvoke($script:BitLockerStatusAsyncResult)
+                    $status = $bitLockerPs.EndInvoke($bitLockerAsync)
                     if ($status -is [System.Collections.ObjectModel.Collection[PSObject]] -and $status.Count -gt 0) { $status = [string]$status[-1] }
                 }
                 if ([string]::IsNullOrWhiteSpace([string]$status)) { $status = "Unavailable" }
@@ -2931,7 +2957,7 @@ Register-WmtUiPollOperation -Name "BitLockerStatus" -IntervalMs 500 -TestComplet
                 }
             }
             catch {}
-            try { $script:BitLockerStatusRunspace.Dispose() } catch {}
+            if ($disposeBitLockerNow) { try { if ($bitLockerPs) { $bitLockerPs.Dispose() } } catch {} }
             $script:BitLockerStatusRunspace = $null
             $script:BitLockerStatusAsyncResult = $null
             $script:BitLockerStatusStartedAt = $null
