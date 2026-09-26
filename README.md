@@ -4,6 +4,9 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+[![Community](https://img.shields.io/badge/Community-Join%20Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/bCQqKHGxja)
+[![Sponsor Chaython](https://img.shields.io/badge/Sponsor-Chaython-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Chaython)
+[![Sponsor ios12checker](https://img.shields.io/badge/Sponsor-ios12checker-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/ios12checker)
 
 Windows Maintenance Tool (WMT) is an all-in-one Windows 10/11 maintenance GUI for updates, repairs, cleanup, drivers, networking, firewall management, system tuning, compression, software/game libraries, and diagnostics. It brings tasks that normally live across Settings, Control Panel, PowerShell, Task Scheduler, Registry Editor, Device Manager, and separate utilities into one interface.
 
@@ -400,21 +403,11 @@ WMT stores generated data next to the script in its local `data` folder.
 
 </details>
 
-<details>
-<summary><strong>Credits</strong></summary>
+## Credits
 
 - Original author: [Lil_Batti / ios12checker](https://github.com/ios12checker)
 - GUI, features, and current fork maintenance: [Chaython](https://github.com/Chaython)
 - Upstream project: [ios12checker/Windows-Maintenance-Tool](https://github.com/ios12checker/Windows-Maintenance-Tool)
-
-</details>
-
-<details>
-<summary><strong>Community</strong></summary>
-
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord)](https://discord.gg/bCQqKHGxja)
-
-</details>
 
 <details>
 <summary><strong>Contributing</strong></summary>
