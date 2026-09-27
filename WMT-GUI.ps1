@@ -16678,6 +16678,103 @@ if ($errors.Count -gt 0) {
 return (-not (Test-WmtRegExeKeyExists -RegPath $RegPath -View $View))
 }
 
+function Remove-WmtDefenderExclusion {
+param(
+    [string]$RegPath,
+    [string]$ValueName,
+    [string]$ExclusionType,
+    [string]$ExclusionValue
+)
+
+$script:WmtLastRegistryDeleteFailure = $null
+
+try {
+    $pathText = [string]$RegPath
+    $typeName = [string]$ExclusionType
+    if ([string]::IsNullOrWhiteSpace($typeName) -and
+        $pathText -match '^(?i)(?:HKLM:\\|HKEY_LOCAL_MACHINE\\|Registry::HKEY_LOCAL_MACHINE\\)SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\(?<Type>[^\\]+)') {
+        $typeName = [string]$Matches.Type
+    }
+
+    $value = [string]$ExclusionValue
+    if ([string]::IsNullOrWhiteSpace($value)) { $value = [string]$ValueName }
+
+    if ([string]::IsNullOrWhiteSpace($typeName)) {
+        $script:WmtLastRegistryDeleteFailure = "Defender exclusion removal was skipped because WMT could not determine the exclusion type. No direct registry delete was attempted."
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $script:WmtLastRegistryDeleteFailure = "Defender exclusion removal was skipped because the exclusion value was blank. No direct registry delete was attempted."
+        return $false
+    }
+
+    $parameterName = switch -Regex ($typeName.Trim()) {
+        '^(?i)Paths?$'       { 'ExclusionPath'; break }
+        '^(?i)Processes?$'   { 'ExclusionProcess'; break }
+        '^(?i)Extensions?$'  { 'ExclusionExtension'; break }
+        '^(?i)IpAddresses?$' { 'ExclusionIpAddress'; break }
+        default              { $null }
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$parameterName)) {
+        $script:WmtLastRegistryDeleteFailure = "Defender exclusion type '$typeName' is not supported by WMT's Defender API cleanup path. No direct registry delete was attempted."
+        return $false
+    }
+
+    $removeCmd = Get-Command -Name "Remove-MpPreference" -ErrorAction SilentlyContinue
+    if (-not $removeCmd) {
+        try { Import-Module Defender -ErrorAction Stop } catch {}
+        $removeCmd = Get-Command -Name "Remove-MpPreference" -ErrorAction SilentlyContinue
+    }
+    if (-not $removeCmd) {
+        $script:WmtLastRegistryDeleteFailure = "Remove-MpPreference is unavailable on this system. WMT did not fall back to deleting the protected Defender registry value directly."
+        return $false
+    }
+    if (-not $removeCmd.Parameters.ContainsKey($parameterName)) {
+        $script:WmtLastRegistryDeleteFailure = "This version of Remove-MpPreference does not support -$parameterName. WMT did not fall back to deleting the protected Defender registry value directly."
+        return $false
+    }
+
+    $removeParams = @{
+        ErrorAction = "Stop"
+        Force       = $true
+    }
+    $removeParams[$parameterName] = [string[]]@($value)
+    & $removeCmd @removeParams | Out-Null
+
+    # Verify through Defender's supported API instead of attempting another
+    # write against the protected HKLM Defender registry path.
+    $getCmd = Get-Command -Name "Get-MpPreference" -ErrorAction SilentlyContinue
+    if ($getCmd) {
+        try {
+            $preferences = & $getCmd -ErrorAction Stop
+            $property = if ($preferences) { $preferences.PSObject.Properties[$parameterName] } else { $null }
+            if ($property) {
+                $expandedValue = [Environment]::ExpandEnvironmentVariables($value)
+                foreach ($remaining in @($property.Value)) {
+                    $remainingText = [string]$remaining
+                    if ([string]::Equals($remainingText, $value, [System.StringComparison]::OrdinalIgnoreCase) -or
+                        (-not [string]::IsNullOrWhiteSpace($expandedValue) -and [string]::Equals($remainingText, $expandedValue, [System.StringComparison]::OrdinalIgnoreCase))) {
+                        $script:WmtLastRegistryDeleteFailure = "Remove-MpPreference returned without an error, but Defender still reports '$value' in $parameterName. Tamper Protection, policy, or another Defender control may be enforcing the exclusion."
+                        return $false
+                    }
+                }
+            }
+        }
+        catch {
+            $script:WmtLastRegistryDeleteFailure = "Remove-MpPreference ran, but WMT could not verify the result with Get-MpPreference: $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    return $true
+}
+catch {
+    $script:WmtLastRegistryDeleteFailure = "Remove-MpPreference failed for Defender exclusion '$value' ($typeName): $($_.Exception.Message)"
+    return $false
+}
+}
+
 function Remove-RegKeyForced {
 param($Path, $IsKey, $ValName)
 
@@ -17075,6 +17172,7 @@ $functionNames = @(
     "ConvertTo-WmtRegExeKeyDeleteTargets",
     "Test-WmtRegExeKeyExists",
     "Remove-WmtRegistryKeyRegExe",
+    "Remove-WmtDefenderExclusion",
     "Remove-RegKeyForced",
     "Backup-RegKey",
     "ConvertTo-Int",
@@ -17247,7 +17345,17 @@ try {
                 }
 
                 $pendingRenameFailure = $null
-                if ($item.Type -eq "SetValue") {
+                $isDefenderApiRemoval = (
+                    [string]$item.Problem -eq "Invalid Defender Exclusion" -and
+                    [string]$item.RegPath -match '^(?i)(?:HKLM:\\|HKEY_LOCAL_MACHINE\\|Registry::HKEY_LOCAL_MACHINE\\)SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\'
+                )
+
+                if ($isDefenderApiRemoval) {
+                    $defenderType = if ($item.PSObject.Properties["DefenderExclusionType"]) { [string]$item.DefenderExclusionType } else { "" }
+                    $defenderValue = if ($item.PSObject.Properties["DefenderExclusionValue"]) { [string]$item.DefenderExclusionValue } else { [string]$item.ValueName }
+                    $success = Remove-WmtDefenderExclusion -RegPath ([string]$item.RegPath) -ValueName ([string]$item.ValueName) -ExclusionType $defenderType -ExclusionValue $defenderValue
+                }
+                elseif ($item.Type -eq "SetValue") {
                     $success = Set-WmtRegistryValueNative -Path $item.RegPath -ValueName $item.ValueName -ValueData $item.NewData
                 }
                 elseif ($item.Type -eq "SetPendingRename") {
@@ -17274,7 +17382,10 @@ try {
                 if ($success) {
                     $fixed++
                     if ($shouldAppendItemBackup) { & $appendVerifiedBackup $itemBackupFile }
-                    if ($isUpdateAction) {
+                    if ($isDefenderApiRemoval) {
+                        Add-WmtCleanupWorkerLog "Removed Defender exclusion via Remove-MpPreference: $($item.DisplayKey)"
+                    }
+                    elseif ($isUpdateAction) {
                         Add-WmtCleanupWorkerLog "Updated: $($item.RegPath)\$($item.ValueName)"
                     }
                     else {
@@ -17283,7 +17394,12 @@ try {
                 }
                 else {
                     $skipped++
-                    if ($item.Type -eq "SetPendingRename") {
+                    if ($isDefenderApiRemoval) {
+                        $deleteFailureDetail = if (-not [string]::IsNullOrWhiteSpace([string]$script:WmtLastRegistryDeleteFailure)) { $script:WmtLastRegistryDeleteFailure } else { "Defender API cleanup returned failure without additional details." }
+                        Add-WmtCleanupWorkerLog "Failed to remove Defender exclusion via Remove-MpPreference: $($item.DisplayKey) - $deleteFailureDetail"
+                        & $writeSkippedRegistryLog $item "Defender exclusion API removal failed" $deleteFailureDetail
+                    }
+                    elseif ($item.Type -eq "SetPendingRename") {
                         if ([string]::IsNullOrWhiteSpace([string]$pendingRenameFailure)) {
                             $pendingRenameFailure = "The pending rename value could not be rewritten and verified."
                         }
@@ -21695,6 +21811,8 @@ if ($Action -eq "DeepClean") {
                                                     DisplayKey = $expanded
                                                     RegPath    = "$hivePrefix\$defRoot\$exType"
                                                     ValueName  = $valName
+                                                    DefenderExclusionType  = $exType
+                                                    DefenderExclusionValue = $valName
                                                     Type       = "Value"
                                                     SafeToFix  = $true
                                                     Risk       = "Medium"
@@ -21734,6 +21852,8 @@ if ($Action -eq "DeepClean") {
                                                         DisplayKey = $procName
                                                         RegPath    = "$hivePrefix\$defRoot\$exType"
                                                         ValueName  = $valName
+                                                        DefenderExclusionType  = $exType
+                                                        DefenderExclusionValue = $valName
                                                         Type       = "Value"
                                                         SafeToFix  = $true
                                                         Risk       = "Low"
@@ -21760,6 +21880,8 @@ if ($Action -eq "DeepClean") {
                                                         DisplayKey = $exName
                                                         RegPath    = "$hivePrefix\$defRoot\$exType\$exName"
                                                         ValueName  = ""
+                                                        DefenderExclusionType  = $exType
+                                                        DefenderExclusionValue = $val
                                                         Type       = "Value"
                                                         SafeToFix  = $true
                                                         Risk       = "Medium"
