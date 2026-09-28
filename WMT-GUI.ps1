@@ -11048,10 +11048,10 @@ if (Test-Path $cachePath) {
 # --- 2. REMOTE UPDATE CHECK ---
 if ($Download -and -not $SkipDownloads) {
     $url = "https://cdn.jsdelivr.net/gh/MoscaDotTo/Winapp2@master/Winapp2.ini"
-    $download = Invoke-WmtCleanerConditionalDownload -Source "Winapp2" -Url $url -Destination $iniPath
-    if ($download.Changed) { $forceRebuild = $true }
-    elseif (-not $download.Checked -and -not [string]::IsNullOrWhiteSpace([string]$download.Error)) {
-        Write-GuiLog "Winapp2 update check warning: $($download.Error)"
+    $downloadResult = Invoke-WmtCleanerConditionalDownload -Source "Winapp2" -Url $url -Destination $iniPath
+    if ($downloadResult.Changed) { $forceRebuild = $true }
+    elseif (-not $downloadResult.Checked -and -not [string]::IsNullOrWhiteSpace([string]$downloadResult.Error)) {
+        Write-GuiLog "Winapp2 update check warning: $($downloadResult.Error)"
     }
 }
 
@@ -11354,10 +11354,10 @@ if (Test-Path $cachePath) {
 # --- 2. REMOTE UPDATE CHECK ---
 if ($Download -and -not $SkipDownloads) {
     $url = "https://github.com/MoscaDotTo/Winapp2/raw/refs/heads/master/Winapp3/Winapp3.ini"
-    $download = Invoke-WmtCleanerConditionalDownload -Source "Winapp3" -Url $url -Destination $iniPath
-    if ($download.Changed) { $forceRebuild = $true }
-    elseif (-not $download.Checked -and -not [string]::IsNullOrWhiteSpace([string]$download.Error)) {
-        Write-GuiLog "Winapp3 update check warning: $($download.Error)"
+    $downloadResult = Invoke-WmtCleanerConditionalDownload -Source "Winapp3" -Url $url -Destination $iniPath
+    if ($downloadResult.Changed) { $forceRebuild = $true }
+    elseif (-not $downloadResult.Checked -and -not [string]::IsNullOrWhiteSpace([string]$downloadResult.Error)) {
+        Write-GuiLog "Winapp3 update check warning: $($downloadResult.Error)"
     }
 }
 
@@ -17475,7 +17475,9 @@ catch {
     return
 }
 
-$lastLogIndex = 0
+# Event-handler invocations get their own local scope. Keep the drain cursor in a
+# mutable object so its updated value persists across DispatcherTimer ticks.
+$logCursor = [PSCustomObject]@{ Index = 0 }
 $registryCleanupActiveState = Get-Variable -Name WmtRegistryCleanupActive -Scope Script
 $registryCleanupRunspaceState = Get-Variable -Name WmtRegistryCleanupRunspace -Scope Script
 $registryCleanupPowerShellState = Get-Variable -Name WmtRegistryCleanupPowerShell -Scope Script
@@ -17486,9 +17488,9 @@ $cleanupTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $cleanupTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $cleanupTimer.Add_Tick({
         try {
-            while ($lastLogIndex -lt $cleanupSync.Logs.Count) {
-                Write-GuiLog ([string]$cleanupSync.Logs[$lastLogIndex])
-                $lastLogIndex++
+            while ($logCursor.Index -lt $cleanupSync.Logs.Count) {
+                Write-GuiLog ([string]$cleanupSync.Logs[$logCursor.Index])
+                $logCursor.Index++
             }
 
             try {
@@ -17505,9 +17507,9 @@ $cleanupTimer.Add_Tick({
             if (-not $cleanupSync.IsCompleted -and $async -and -not $async.IsCompleted) { return }
 
             $cleanupTimer.Stop()
-            while ($lastLogIndex -lt $cleanupSync.Logs.Count) {
-                Write-GuiLog ([string]$cleanupSync.Logs[$lastLogIndex])
-                $lastLogIndex++
+            while ($logCursor.Index -lt $cleanupSync.Logs.Count) {
+                Write-GuiLog ([string]$cleanupSync.Logs[$logCursor.Index])
+                $logCursor.Index++
             }
 
             try {
