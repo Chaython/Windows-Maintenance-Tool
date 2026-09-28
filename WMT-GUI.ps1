@@ -6060,8 +6060,137 @@ finally {
 }
 
 # --- SETTINGS MANAGER ---
-# Initialize cache variable
+# Initialize cache variables
 $script:WmtSettingsCache = $null
+$script:WmtSettingsCacheStamp = $null
+$script:WmtSettingsWriteMutexName = "Local\Chaython_WindowsMaintenanceTool_Settings_v2"
+
+function Get-WmtSettingsFileStamp {
+param([string]$Path)
+try {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.File]::Exists($Path)) { return "<missing>" }
+    $fi = [System.IO.FileInfo]::new($Path)
+    return "$($fi.Length):$($fi.LastWriteTimeUtc.Ticks)"
+}
+catch { return "<unknown>" }
+}
+
+function Test-WmtSettingsMember {
+param($Settings, [Parameter(Mandatory = $true)][string]$Name)
+if ($null -eq $Settings) { return $false }
+if ($Settings -is [System.Collections.IDictionary]) { return [bool]$Settings.Contains($Name) }
+try { return [bool]$Settings.PSObject.Properties[$Name] } catch { return $false }
+}
+
+function Get-WmtSettingsMember {
+param($Settings, [Parameter(Mandatory = $true)][string]$Name, $Default = $null)
+if (-not (Test-WmtSettingsMember -Settings $Settings -Name $Name)) { return $Default }
+try {
+    if ($Settings -is [System.Collections.IDictionary]) { return $Settings[$Name] }
+    return $Settings.$Name
+}
+catch { return $Default }
+}
+
+function ConvertTo-WmtSettingsBoolean {
+param($Value, [bool]$Default = $false)
+if ($null -eq $Value) { return $Default }
+if ($Value -is [bool]) { return [bool]$Value }
+if ($Value -is [string]) {
+    switch ($Value.Trim().ToLowerInvariant()) {
+        "true" { return $true }
+        "false" { return $false }
+        "1" { return $true }
+        "0" { return $false }
+        "yes" { return $true }
+        "no" { return $false }
+        "on" { return $true }
+        "off" { return $false }
+        default { return $Default }
+    }
+}
+try { return [System.Convert]::ToBoolean($Value) } catch { return $Default }
+}
+
+function Test-WmtFiniteDouble {
+param($Value)
+try {
+    $d = [double]$Value
+    return (-not [double]::IsNaN($d) -and -not [double]::IsInfinity($d))
+}
+catch { return $false }
+}
+
+function Move-WmtCorruptSettingsFile {
+param([Parameter(Mandatory = $true)][string]$Path)
+if (-not [System.IO.File]::Exists($Path)) { return $null }
+try {
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmssfff")
+    $archive = Join-Path $dir "settings.corrupt-$stamp.json"
+    [System.IO.File]::Move($Path, $archive)
+    return $archive
+}
+catch { return $null }
+}
+
+function Write-WmtSettingsFileAtomic {
+param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Json
+)
+
+$mutex = $null
+$lockTaken = $false
+$tempPath = $null
+try {
+    $mutex = [System.Threading.Mutex]::new($false, $script:WmtSettingsWriteMutexName)
+    try { $lockTaken = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+    catch [System.Threading.AbandonedMutexException] { $lockTaken = $true }
+    if (-not $lockTaken) { throw "Timed out waiting for the settings file lock." }
+
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [System.IO.Directory]::Exists($dir)) {
+        [void][System.IO.Directory]::CreateDirectory($dir)
+    }
+
+    $tempPath = Join-Path $dir ("settings.{0}.{1}.tmp" -f $PID, [Guid]::NewGuid().ToString("N"))
+    [System.IO.File]::WriteAllText($tempPath, $Json, [System.Text.UTF8Encoding]::new($false))
+
+    # Never replace the user's settings with JSON we cannot parse back.
+    $check = Get-Content -LiteralPath $tempPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $check) { throw "Serialized settings unexpectedly parsed as null." }
+
+    if ([System.IO.File]::Exists($Path)) {
+        $backupPath = "$Path.bak"
+        try {
+            if ([System.IO.File]::Exists($backupPath)) { [System.IO.File]::Delete($backupPath) }
+            [System.IO.File]::Replace($tempPath, $Path, $backupPath, $true)
+            $tempPath = $null
+        }
+        catch {
+            # File.Replace may be unavailable on some removable/non-NTFS media.
+            # Keep a known-good previous copy, then use same-directory Move-Item.
+            try { [System.IO.File]::Copy($Path, $backupPath, $true) } catch {}
+            Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+            $tempPath = $null
+        }
+    }
+    else {
+        [System.IO.File]::Move($tempPath, $Path)
+        $tempPath = $null
+    }
+}
+finally {
+    if ($tempPath -and [System.IO.File]::Exists($tempPath)) {
+        try { [System.IO.File]::Delete($tempPath) } catch {}
+    }
+    if ($lockTaken -and $mutex) {
+        try { $mutex.ReleaseMutex() } catch {}
+    }
+    if ($mutex) { try { $mutex.Dispose() } catch {} }
+}
+}
 
 function Copy-WmtSettingsValue {
 param([AllowNull()]$Value)
@@ -6106,61 +6235,101 @@ function Save-WmtSettings {
 param($Settings)
 $path = Join-Path (Get-DataPath) "settings.json"
 try {
-    # Update the memory cache immediately
-    $script:WmtSettingsCache = Copy-WmtSettings -Settings $Settings
+    if ($null -eq $Settings) { throw "Settings object is null." }
 
-    # Convert Hashtable/OrderedDictionary to generic Object for cleaner JSON
+    $theme = [string](Get-WmtSettingsMember -Settings $Settings -Name "Theme" -Default "dark")
+    if ($theme -notin @("dark", "light")) { $theme = "dark" }
+
+    $windowState = [string](Get-WmtSettingsMember -Settings $Settings -Name "WindowState" -Default "Normal")
+    if ($windowState -notin @("Normal", "Maximized")) { $windowState = "Normal" }
+
+    $windowBounds = Get-WmtSettingsMember -Settings $Settings -Name "WindowBounds" -Default $null
+    if ($windowBounds) {
+        $top = Get-WmtSettingsMember -Settings $windowBounds -Name "Top" -Default 0
+        $left = Get-WmtSettingsMember -Settings $windowBounds -Name "Left" -Default 0
+        $width = Get-WmtSettingsMember -Settings $windowBounds -Name "Width" -Default 1280
+        $height = Get-WmtSettingsMember -Settings $windowBounds -Name "Height" -Default 820
+        if ((Test-WmtFiniteDouble $top) -and (Test-WmtFiniteDouble $left) -and
+            (Test-WmtFiniteDouble $width) -and (Test-WmtFiniteDouble $height) -and
+            [double]$width -ge 320 -and [double]$height -ge 240) {
+            $windowBounds = @{
+                Top = [double]$top
+                Left = [double]$left
+                Width = [double]$width
+                Height = [double]$height
+            }
+        }
+        else { $windowBounds = $null }
+    }
+
+    # Convert Hashtable/OrderedDictionary to a stable explicit schema.
     $saveObj = [PSCustomObject]@{
-        TempCleanup                = $Settings.TempCleanup
-        RegistryScan               = $Settings.RegistryScan
-        WingetIgnore               = $Settings.WingetIgnore
+        TempCleanup                = (Get-WmtSettingsMember -Settings $Settings -Name "TempCleanup" -Default @{})
+        RegistryScan               = (Get-WmtSettingsMember -Settings $Settings -Name "RegistryScan" -Default @{})
+        WingetIgnore               = @(Get-WmtSettingsMember -Settings $Settings -Name "WingetIgnore" -Default @("228980"))
         WingetIncludeUnknown       = [bool](Get-WmtWingetIncludeUnknown -Settings $Settings)
         CustomUpdateCommands       = @(Get-WmtCustomUpdateCommands -Settings $Settings)
-        UpdateAutoScanMinutes      = (ConvertTo-Int (Get-WmtUpdateAutoScanMinutes -Settings $Settings) 0)
+        UpdateAutoScanMinutes      = [Math]::Max(0, (ConvertTo-Int (Get-WmtUpdateAutoScanMinutes -Settings $Settings) 0))
         UpdateNotificationsEnabled = [bool](Get-WmtUpdateNotificationsEnabled -Settings $Settings)
         UpdateSilentInstallEnabled = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $Settings)
         UpdateAutoInstallEnabled   = [bool](Get-WmtUpdateAutoInstallEnabled -Settings $Settings)
         RunInTrayOnClose           = [bool](Get-WmtRunInTrayOnClose -Settings $Settings)
         ReduceRamInTray            = [bool](Get-WmtReduceRamInTray -Settings $Settings)
         DisableBackgroundJobs      = [bool](Get-WmtDisableBackgroundJobs -Settings $Settings)
-        UpdateScansDisabled         = [bool](Get-WmtUpdateScansDisabled -Settings $Settings)
-        LaunchMinimized             = [bool]$Settings.LaunchMinimized
-        HideLegendaryUeAssets       = [bool](Get-WmtHideLegendaryUeAssets -Settings $Settings)
-        SavedUpdateAutoScanMinutes  = (ConvertTo-Int (Get-WmtSavedUpdateAutoScanMinutes -Settings $Settings) 0)
-        LoadWinapp2                = [bool]$Settings.LoadWinapp2
-        LoadWinapp3                = [bool]$Settings.LoadWinapp3
-        LoadCleanerML              = [bool]$Settings.LoadCleanerML
-        LoadCleanerMLPending       = [bool]$Settings.LoadCleanerMLPending
-        SkipRuleDownloads          = [bool]$Settings.SkipRuleDownloads
-        CacheOnly                  = [bool]$Settings.CacheOnly
-        CleanerLocalRefreshMinutes = if ($Settings.PSObject.Properties["CleanerLocalRefreshMinutes"]) { [int]$Settings.CleanerLocalRefreshMinutes } else { 60 }
-        CleanerRemoteCheckMinutes  = if ($Settings.PSObject.Properties["CleanerRemoteCheckMinutes"]) { [int]$Settings.CleanerRemoteCheckMinutes } else { 1440 }
-        CleanerAutoCleanMinutes    = if ($Settings.PSObject.Properties["CleanerAutoCleanMinutes"]) { [int]$Settings.CleanerAutoCleanMinutes } else { 0 }
-        EnabledProviders           = $Settings.EnabledProviders
-        ProviderToggles            = if ($Settings.ProviderToggles) { $Settings.ProviderToggles } else { @{} }
-        WuCategoryToggles          = if ($Settings.WuCategoryToggles) { $Settings.WuCategoryToggles } else { @{} }
-        CustomDnsServers           = if ($Settings.CustomDnsServers) { @($Settings.CustomDnsServers) } else { @() }
-        CustomDohTemplate          = if ($Settings.CustomDohTemplate) { [string]$Settings.CustomDohTemplate } else { "" }
-        CustomDohEnabled           = [bool]$Settings.CustomDohEnabled
-        Theme                      = if ($Settings.Theme) { [string]$Settings.Theme } else { "dark" }
-        WindowState                = if ($Settings.WindowState) { [string]$Settings.WindowState } else { "Normal" }
-        WindowBounds               = if ($Settings.WindowBounds) { $Settings.WindowBounds } else { $null }
+        UpdateScansDisabled        = [bool](Get-WmtUpdateScansDisabled -Settings $Settings)
+        LaunchMinimized            = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "LaunchMinimized" -Default $false) $false
+        HideLegendaryUeAssets      = [bool](Get-WmtHideLegendaryUeAssets -Settings $Settings)
+        SavedUpdateAutoScanMinutes = [Math]::Max(0, (ConvertTo-Int (Get-WmtSavedUpdateAutoScanMinutes -Settings $Settings) 0))
+        LoadWinapp2                = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "LoadWinapp2" -Default $false) $false
+        LoadWinapp3                = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "LoadWinapp3" -Default $false) $false
+        LoadCleanerML              = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "LoadCleanerML" -Default $false) $false
+        LoadCleanerMLPending       = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "LoadCleanerMLPending" -Default $false) $false
+        SkipRuleDownloads          = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "SkipRuleDownloads" -Default $false) $false
+        CacheOnly                  = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "CacheOnly" -Default $false) $false
+        # Use the type-safe getters. The old PSObject.Properties checks failed
+        # for the hashtable returned by Get-WmtSettings and reset these values.
+        CleanerLocalRefreshMinutes = [int](Get-WmtCleanerLocalRefreshMinutes -Settings $Settings)
+        CleanerRemoteCheckMinutes  = [int](Get-WmtCleanerRemoteCheckMinutes -Settings $Settings)
+        CleanerAutoCleanMinutes    = [int](Get-WmtCleanerAutoCleanMinutes -Settings $Settings)
+        EnabledProviders           = @(Get-WmtSettingsMember -Settings $Settings -Name "EnabledProviders" -Default @("winget"))
+        ProviderToggles            = (Get-WmtSettingsMember -Settings $Settings -Name "ProviderToggles" -Default @{})
+        WuCategoryToggles          = (Get-WmtSettingsMember -Settings $Settings -Name "WuCategoryToggles" -Default @{})
+        CustomDnsServers           = @(Get-WmtSettingsMember -Settings $Settings -Name "CustomDnsServers" -Default @())
+        CustomDohTemplate          = [string](Get-WmtSettingsMember -Settings $Settings -Name "CustomDohTemplate" -Default "")
+        CustomDohEnabled           = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "CustomDohEnabled" -Default $false) $false
+        Theme                      = $theme
+        WindowState                = $windowState
+        WindowBounds               = $windowBounds
     }
-    $saveObj | ConvertTo-Json -Depth 5 | Set-Content $path -Force
+
+    $json = $saveObj | ConvertTo-Json -Depth 8
+    Write-WmtSettingsFileAtomic -Path $path -Json $json
+
+    # Cache only after disk persistence succeeds, and cache the normalized form
+    # that was actually written rather than the caller's possibly malformed input.
+    $script:WmtSettingsCache = Copy-WmtSettings -Settings $saveObj
+    $script:WmtSettingsCacheStamp = Get-WmtSettingsFileStamp -Path $path
 }
 catch {
-    Write-Warning "Failed to save settings: $_"
+    # A failed write must not make memory claim a setting was persisted.
+    try { Write-GuiLog "Settings save failed: $($_.Exception.Message)" } catch {}
+    Write-Warning "Failed to save settings: $($_.Exception.Message)"
 }
 }
 
 function Get-WmtSettings {
-# OPTIMIZATION: Return cached settings if available to avoid disk I/O.
-# Return a deep clone so callers cannot mutate nested cache structures by reference.
-if ($script:WmtSettingsCache) {
+$path = Join-Path (Get-DataPath) "settings.json"
+
+# Keep the fast in-process cache, but invalidate it if settings.json changed
+# outside this process (manual edit, another WMT process, recovery, etc.).
+$currentStamp = Get-WmtSettingsFileStamp -Path $path
+if ($script:WmtSettingsCache -and $script:WmtSettingsCacheStamp -eq $currentStamp) {
     return (Copy-WmtSettings -Settings $script:WmtSettingsCache)
 }
-
-$path = Join-Path (Get-DataPath) "settings.json"
+if ($script:WmtSettingsCache) {
+    $script:WmtSettingsCache = $null
+    $script:WmtSettingsCacheStamp = $null
+}
 
 # Default Structure
 $defaults = @{
@@ -6205,10 +6374,54 @@ $defaults = @{
     }
 }
 
-if (Test-Path $path) {
+$json = $null
+if (Test-Path -LiteralPath $path -PathType Leaf) {
     try {
-        $json = Get-Content $path -Raw | ConvertFrom-Json
+        $rawSettings = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($rawSettings)) { throw "settings.json is empty." }
+        $json = $rawSettings | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $json) { throw "settings.json contains no settings object." }
+    }
+    catch {
+        $primaryError = $_.Exception.Message
+        $backupPath = "$path.bak"
+        $backupJson = $null
 
+        if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+            try {
+                $backupRaw = Get-Content -LiteralPath $backupPath -Raw -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace($backupRaw)) { throw "settings backup is empty." }
+                $backupJson = $backupRaw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -eq $backupJson) { throw "settings backup contains no settings object." }
+            }
+            catch {
+                try { Write-GuiLog "Settings backup is also invalid: $($_.Exception.Message)" } catch {}
+                $backupJson = $null
+            }
+        }
+
+        $archived = Move-WmtCorruptSettingsFile -Path $path
+        if ($backupJson) {
+            $json = $backupJson
+            try { [System.IO.File]::Copy($backupPath, $path, $true) } catch {}
+            try {
+                $where = if ($archived) { " Corrupt copy: $archived" } else { "" }
+                Write-GuiLog "Recovered settings.json from backup after load failure: $primaryError$where"
+            }
+            catch {}
+        }
+        else {
+            try {
+                $where = if ($archived) { " Corrupt copy: $archived" } else { "" }
+                Write-GuiLog "Settings file was invalid; defaults will be used. $primaryError$where"
+            }
+            catch {}
+        }
+    }
+}
+
+if ($json) {
+    try {
         if ($json.TempCleanup) { 
             foreach ($p in $json.TempCleanup.PSObject.Properties) { $defaults.TempCleanup[$p.Name] = $p.Value } 
         }
@@ -6221,7 +6434,7 @@ if (Test-Path $path) {
             if ($raw) { foreach ($item in $raw) { [void]$clean.Add("$item".Trim()) } }
             $defaults.WingetIgnore = $clean.ToArray()
         }
-        if ($json.PSObject.Properties["WingetIncludeUnknown"]) { $defaults.WingetIncludeUnknown = [bool]$json.WingetIncludeUnknown }
+        if ($json.PSObject.Properties["WingetIncludeUnknown"]) { $defaults.WingetIncludeUnknown = ConvertTo-WmtSettingsBoolean $json.WingetIncludeUnknown $true }
         if ($json.PSObject.Properties["CustomUpdateCommands"]) {
             $customUpdateCommands = New-Object System.Collections.Generic.List[object]
             foreach ($entry in @($json.CustomUpdateCommands)) {
@@ -6242,25 +6455,25 @@ if (Test-Path $path) {
             try { $defaults.UpdateAutoScanMinutes = [int]$json.UpdateAutoScanMinutes } catch { $defaults.UpdateAutoScanMinutes = 0 }
             if ($defaults.UpdateAutoScanMinutes -lt 0) { $defaults.UpdateAutoScanMinutes = 0 }
         }
-        if ($json.PSObject.Properties["UpdateNotificationsEnabled"]) { $defaults.UpdateNotificationsEnabled = [bool]$json.UpdateNotificationsEnabled }
-        if ($json.PSObject.Properties["UpdateSilentInstallEnabled"]) { $defaults.UpdateSilentInstallEnabled = [bool]$json.UpdateSilentInstallEnabled }
-        if ($json.PSObject.Properties["UpdateAutoInstallEnabled"]) { $defaults.UpdateAutoInstallEnabled = [bool]$json.UpdateAutoInstallEnabled }
-        if ($json.PSObject.Properties["RunInTrayOnClose"]) { $defaults.RunInTrayOnClose = [bool]$json.RunInTrayOnClose }
-        if ($json.PSObject.Properties["ReduceRamInTray"]) { $defaults.ReduceRamInTray = [bool]$json.ReduceRamInTray }
-        if ($json.PSObject.Properties["DisableBackgroundJobs"]) { $defaults.DisableBackgroundJobs = [bool]$json.DisableBackgroundJobs }
-        if ($json.PSObject.Properties["UpdateScansDisabled"]) { $defaults.UpdateScansDisabled = [bool]$json.UpdateScansDisabled }
-        if ($json.PSObject.Properties["LaunchMinimized"]) { $defaults.LaunchMinimized = [bool]$json.LaunchMinimized }
-        if ($json.PSObject.Properties["HideLegendaryUeAssets"]) { $defaults.HideLegendaryUeAssets = [bool]$json.HideLegendaryUeAssets }
+        if ($json.PSObject.Properties["UpdateNotificationsEnabled"]) { $defaults.UpdateNotificationsEnabled = ConvertTo-WmtSettingsBoolean $json.UpdateNotificationsEnabled $true }
+        if ($json.PSObject.Properties["UpdateSilentInstallEnabled"]) { $defaults.UpdateSilentInstallEnabled = ConvertTo-WmtSettingsBoolean $json.UpdateSilentInstallEnabled $false }
+        if ($json.PSObject.Properties["UpdateAutoInstallEnabled"]) { $defaults.UpdateAutoInstallEnabled = ConvertTo-WmtSettingsBoolean $json.UpdateAutoInstallEnabled $false }
+        if ($json.PSObject.Properties["RunInTrayOnClose"]) { $defaults.RunInTrayOnClose = ConvertTo-WmtSettingsBoolean $json.RunInTrayOnClose $false }
+        if ($json.PSObject.Properties["ReduceRamInTray"]) { $defaults.ReduceRamInTray = ConvertTo-WmtSettingsBoolean $json.ReduceRamInTray $true }
+        if ($json.PSObject.Properties["DisableBackgroundJobs"]) { $defaults.DisableBackgroundJobs = ConvertTo-WmtSettingsBoolean $json.DisableBackgroundJobs $false }
+        if ($json.PSObject.Properties["UpdateScansDisabled"]) { $defaults.UpdateScansDisabled = ConvertTo-WmtSettingsBoolean $json.UpdateScansDisabled $false }
+        if ($json.PSObject.Properties["LaunchMinimized"]) { $defaults.LaunchMinimized = ConvertTo-WmtSettingsBoolean $json.LaunchMinimized $false }
+        if ($json.PSObject.Properties["HideLegendaryUeAssets"]) { $defaults.HideLegendaryUeAssets = ConvertTo-WmtSettingsBoolean $json.HideLegendaryUeAssets $true }
         if ($json.PSObject.Properties["SavedUpdateAutoScanMinutes"]) {
             try { $defaults.SavedUpdateAutoScanMinutes = [int]$json.SavedUpdateAutoScanMinutes } catch { $defaults.SavedUpdateAutoScanMinutes = 0 }
             if ($defaults.SavedUpdateAutoScanMinutes -lt 0) { $defaults.SavedUpdateAutoScanMinutes = 0 }
         }
-        if ($json.PSObject.Properties["LoadWinapp2"]) { $defaults.LoadWinapp2 = [bool]$json.LoadWinapp2 }
-        if ($json.PSObject.Properties["LoadWinapp3"]) { $defaults.LoadWinapp3 = [bool]$json.LoadWinapp3 }
-        if ($json.PSObject.Properties["LoadCleanerML"]) { $defaults.LoadCleanerML = [bool]$json.LoadCleanerML }
-        if ($json.PSObject.Properties["LoadCleanerMLPending"]) { $defaults.LoadCleanerMLPending = [bool]$json.LoadCleanerMLPending }
-        if ($json.PSObject.Properties["SkipRuleDownloads"]) { $defaults.SkipRuleDownloads = [bool]$json.SkipRuleDownloads }
-        if ($json.PSObject.Properties["CacheOnly"]) { $defaults.CacheOnly = [bool]$json.CacheOnly }
+        if ($json.PSObject.Properties["LoadWinapp2"]) { $defaults.LoadWinapp2 = ConvertTo-WmtSettingsBoolean $json.LoadWinapp2 $false }
+        if ($json.PSObject.Properties["LoadWinapp3"]) { $defaults.LoadWinapp3 = ConvertTo-WmtSettingsBoolean $json.LoadWinapp3 $false }
+        if ($json.PSObject.Properties["LoadCleanerML"]) { $defaults.LoadCleanerML = ConvertTo-WmtSettingsBoolean $json.LoadCleanerML $false }
+        if ($json.PSObject.Properties["LoadCleanerMLPending"]) { $defaults.LoadCleanerMLPending = ConvertTo-WmtSettingsBoolean $json.LoadCleanerMLPending $false }
+        if ($json.PSObject.Properties["SkipRuleDownloads"]) { $defaults.SkipRuleDownloads = ConvertTo-WmtSettingsBoolean $json.SkipRuleDownloads $false }
+        if ($json.PSObject.Properties["CacheOnly"]) { $defaults.CacheOnly = ConvertTo-WmtSettingsBoolean $json.CacheOnly $false }
         if ($json.PSObject.Properties["CleanerLocalRefreshMinutes"]) {
             try { $defaults.CleanerLocalRefreshMinutes = [Math]::Max(1, [Math]::Min(525600, [int]$json.CleanerLocalRefreshMinutes)) } catch {}
         }
@@ -6282,20 +6495,31 @@ if (Test-Path $path) {
             $defaults.CustomDnsServers = $customDnsServers
         }
         if ($json.PSObject.Properties["CustomDohTemplate"]) { $defaults.CustomDohTemplate = [string]$json.CustomDohTemplate }
-        if ($json.PSObject.Properties["CustomDohEnabled"]) { $defaults.CustomDohEnabled = [bool]$json.CustomDohEnabled }
+        if ($json.PSObject.Properties["CustomDohEnabled"]) { $defaults.CustomDohEnabled = ConvertTo-WmtSettingsBoolean $json.CustomDohEnabled $false }
         if ($json.PSObject.Properties["Theme"] -and $json.Theme) { $defaults.Theme = [string]$json.Theme }
-        if ($json.PSObject.Properties["WindowState"] -and $json.WindowState) { $defaults.WindowState = [string]$json.WindowState }
+        if ($json.PSObject.Properties["WindowState"] -and $json.WindowState) {
+            $loadedWindowState = [string]$json.WindowState
+            if ($loadedWindowState -in @("Normal", "Maximized")) { $defaults.WindowState = $loadedWindowState }
+        }
         if ($json.PSObject.Properties["WindowBounds"] -and $json.WindowBounds) {
-            $defaults.WindowBounds = @{
-                Top    = [double]$json.WindowBounds.Top
-                Left   = [double]$json.WindowBounds.Left
-                Width  = [double]$json.WindowBounds.Width
-                Height = [double]$json.WindowBounds.Height
+            $bt = $json.WindowBounds.Top
+            $bl = $json.WindowBounds.Left
+            $bw = $json.WindowBounds.Width
+            $bh = $json.WindowBounds.Height
+            if ((Test-WmtFiniteDouble $bt) -and (Test-WmtFiniteDouble $bl) -and
+                (Test-WmtFiniteDouble $bw) -and (Test-WmtFiniteDouble $bh) -and
+                [double]$bw -ge 320 -and [double]$bh -ge 240) {
+                $defaults.WindowBounds = @{
+                    Top    = [double]$bt
+                    Left   = [double]$bl
+                    Width  = [double]$bw
+                    Height = [double]$bh
+                }
             }
         }
     }
-    catch { 
-        Write-GuiLog "Error loading settings: $($_.Exception.Message)" 
+    catch {
+        try { Write-GuiLog "Error normalizing settings: $($_.Exception.Message)" } catch {}
     }
 }
 $normalizedProviders = New-Object System.Collections.Generic.List[string]
@@ -6312,8 +6536,9 @@ if ($normalizedProviders.Count -eq 0) {
 }
 $defaults.EnabledProviders = $normalizedProviders.ToArray()
 
-# Cache an isolated copy and return a second copy to preserve clone semantics.
+# Cache an isolated copy and remember the file generation it came from.
 $script:WmtSettingsCache = Copy-WmtSettings -Settings $defaults
+$script:WmtSettingsCacheStamp = Get-WmtSettingsFileStamp -Path $path
 return (Copy-WmtSettings -Settings $script:WmtSettingsCache)
 }
 
