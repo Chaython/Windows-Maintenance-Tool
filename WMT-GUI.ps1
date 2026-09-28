@@ -7050,6 +7050,25 @@ catch {
 }
 }
 
+function Test-WmtCleanerRuleMemoryCacheEnabled {
+# Parsed cleaner definitions are one of WMT's largest managed-memory caches.
+# Do not retain or recreate them while Reduce RAM in Tray is actively hiding WMT.
+try {
+    return -not (Test-WmtAggressiveTrayMemoryMode)
+}
+catch {
+    return $true
+}
+}
+
+function Clear-WmtCleanerRuleMemoryCaches {
+# Keep all cleaner providers symmetrical. Disk JSON/INI caches remain intact;
+# only the large parsed in-process object graphs are discarded.
+$script:CleanerMlRulesMemoryCache = $null
+$script:Winapp2RulesMemoryCache = $null
+$script:Winapp3RulesMemoryCache = $null
+}
+
 function Test-WmtTrayMemoryBusy {
 try {
     if (Get-Command Test-WmtUpdateScanEngineBusy -ErrorAction SilentlyContinue) {
@@ -7294,9 +7313,9 @@ try {
         try { $script:MyDeviceCache.Clear() } catch { $script:MyDeviceCache = @{} }
     }
 
-    # Release parsed CleanerML / Winapp2 rule caches (can be 50-100MB)
-    if ($script:CleanerMlRulesMemoryCache) { $script:CleanerMlRulesMemoryCache = $null }
-    if ($script:Winapp2RulesMemoryCache) { $script:Winapp2RulesMemoryCache = $null }
+    # Release parsed cleaner rule caches. Winapp3 must be dropped too;
+    # these remain reloadable from the on-disk caches on the next Cleaner visit.
+    Clear-WmtCleanerRuleMemoryCaches
 
     # Release game library caches (can be 30-80MB)
     $script:LegendaryLibraryCache = $null
@@ -10849,7 +10868,7 @@ if (Test-Path -LiteralPath $oldBleachbitRoot) {
 }
 
 if ($Download -and -not $SkipDownloads) { Update-WmtBleachBitCleanerMlFiles }
-if (-not $script:CleanerMlRulesMemoryCache) { $script:CleanerMlRulesMemoryCache = @{} }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and -not $script:CleanerMlRulesMemoryCache) { $script:CleanerMlRulesMemoryCache = @{} }
 
 $xmlFiles = @(Get-WmtBleachBitCleanerXmlFiles -IncludePending:$IncludePending)
 $sourceSignature = Get-WmtCleanerMlSourceSignature -XmlFiles $xmlFiles
@@ -10862,7 +10881,7 @@ elseif (Test-Path $cachePath) {
 }
 else { "" }
 
-if (-not $Download -and $memoryKey -and $script:CleanerMlRulesMemoryCache.ContainsKey($memoryKey)) {
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and -not $Download -and $memoryKey -and $script:CleanerMlRulesMemoryCache -and $script:CleanerMlRulesMemoryCache.ContainsKey($memoryKey)) {
     return $script:CleanerMlRulesMemoryCache[$memoryKey]
 }
 
@@ -10871,7 +10890,7 @@ if ($CacheOnly -and (Test-Path $cachePath)) {
     try {
         $cachedRules = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         if ($cachedRules.Count -gt 0) {
-            if ($memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
     }
@@ -10931,7 +10950,7 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                 catch {}
             }
             Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
-            if ($memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
     }
@@ -10963,7 +10982,7 @@ try {
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "CleanerML cache write error: $($_.Exception.Message)" } }
 
-if ($memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $final }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $final }
 return $final
 }
 
@@ -10982,7 +11001,7 @@ if (-not $Download -and -not $CacheOnly -and (Test-WmtCleanerLocalCacheFresh -Ca
     }
     catch {}
 }
-if (-not $script:Winapp2RulesMemoryCache) { $script:Winapp2RulesMemoryCache = @{} }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and -not $script:Winapp2RulesMemoryCache) { $script:Winapp2RulesMemoryCache = @{} }
 $iniInfoForCache = $null
 if (Test-Path $iniPath) {
     try { $iniInfoForCache = Get-Item -LiteralPath $iniPath -ErrorAction Stop } catch {}
@@ -10996,7 +11015,7 @@ elseif (Test-Path $cachePath) {
 }
 else { "" }
 
-if (-not $Download -and $memoryKey -and $script:Winapp2RulesMemoryCache.ContainsKey($memoryKey)) {
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and -not $Download -and $memoryKey -and $script:Winapp2RulesMemoryCache -and $script:Winapp2RulesMemoryCache.ContainsKey($memoryKey)) {
     return $script:Winapp2RulesMemoryCache[$memoryKey]
 }
 
@@ -11005,7 +11024,7 @@ if ($CacheOnly -and (Test-Path $cachePath)) {
     try {
         $cachedRules = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         if ($cachedRules.Count -gt 0) {
-            if ($memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
     }
@@ -11073,7 +11092,7 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                 catch {}
             }
             Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
-            if ($memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
     }
@@ -11273,7 +11292,7 @@ try {
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "Winapp2 cache write error: $($_.Exception.Message)" } }
 
-if ($memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $finalList }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $finalList }
 
 return $finalList
 }
@@ -11293,7 +11312,7 @@ if (-not $Download -and -not $CacheOnly -and (Test-WmtCleanerLocalCacheFresh -Ca
     }
     catch {}
 }
-if (-not $script:Winapp3RulesMemoryCache) { $script:Winapp3RulesMemoryCache = @{} }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and -not $script:Winapp3RulesMemoryCache) { $script:Winapp3RulesMemoryCache = @{} }
 $iniInfoForCache = $null
 if (Test-Path $iniPath) {
     try { $iniInfoForCache = Get-Item -LiteralPath $iniPath -ErrorAction Stop } catch {}
@@ -11307,7 +11326,7 @@ elseif (Test-Path $cachePath) {
 }
 else { "" }
 
-if (-not $Download -and $memoryKey -and $script:Winapp3RulesMemoryCache.ContainsKey($memoryKey)) {
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and -not $Download -and $memoryKey -and $script:Winapp3RulesMemoryCache -and $script:Winapp3RulesMemoryCache.ContainsKey($memoryKey)) {
     return $script:Winapp3RulesMemoryCache[$memoryKey]
 }
 
@@ -11316,7 +11335,7 @@ if ($CacheOnly -and (Test-Path $cachePath)) {
     try {
         $cachedRules = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         if ($cachedRules.Count -gt 0) {
-            if ($memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
     }
@@ -11379,7 +11398,7 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                 catch {}
             }
             Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
-            if ($memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
             return $cachedRules
         }
     }
@@ -11545,7 +11564,7 @@ try {
     }
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "Winapp3 cache write error: $($_.Exception.Message)" } }
-if ($memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $finalList }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $finalList }
 return $finalList
 }
 
@@ -41289,8 +41308,7 @@ $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
         }
         elseif (-not $scanBusy) {
             # Release parsed cleaner rules (re-parsed on next cleaner use).
-            if ($script:CleanerMlRulesMemoryCache) { $script:CleanerMlRulesMemoryCache = $null }
-            if ($script:Winapp2RulesMemoryCache) { $script:Winapp2RulesMemoryCache = $null }
+            Clear-WmtCleanerRuleMemoryCaches
             # Release game library caches (re-loaded on next library tab visit).
             $script:LegendaryLibraryCache = $null
             $script:WmtGogLibraryCache = $null
