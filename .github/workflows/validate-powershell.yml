@@ -118,6 +118,7 @@ jobs:
               "Get-WmtRunInTrayOnClose",
               "Get-WmtReduceRamInTray",
               "Get-WmtDisableBackgroundJobs",
+              "Get-WmtDebugMode",
               "Get-WmtUpdateScansDisabled",
               "Get-WmtHideLegendaryUeAssets",
               "Get-WmtSavedUpdateAutoScanMinutes",
@@ -158,6 +159,7 @@ jobs:
               $s.CleanerLocalRefreshMinutes = 17
               $s.CleanerRemoteCheckMinutes = 31
               $s.CleanerAutoCleanMinutes = 47
+              $s.DebugMode = $true
               Save-WmtSettings -Settings $s
 
               $script:WmtSettingsCache = $null
@@ -167,6 +169,9 @@ jobs:
                   $loaded.CleanerRemoteCheckMinutes -ne 31 -or
                   $loaded.CleanerAutoCleanMinutes -ne 47) {
                   throw "Cleaner interval settings did not survive the first save/reload."
+              }
+              if (-not (Get-WmtDebugMode -Settings $loaded)) {
+                  throw "DebugMode did not survive the first save/reload."
               }
 
               # Regression guard for the original bug: an unrelated setting save
@@ -189,6 +194,7 @@ jobs:
                   throw "Unrelated settings save reset cleaner intervals."
               }
               if ($again.Theme -ne "light") { throw "Unrelated Theme setting was not persisted." }
+              if (-not (Get-WmtDebugMode -Settings $again)) { throw "Unrelated settings save reset DebugMode." }
 
               # Corrupt the primary file. Get-WmtSettings should archive it and
               # recover the previous known-good generation from .bak.
@@ -205,18 +211,19 @@ jobs:
 
               # The cache must notice a valid external/manual edit.
               $disk = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-              $disk.Theme = "light"
+              $disk.Theme = "dark"
+              $disk.DebugMode = $false
               [System.IO.File]::WriteAllText(
                   $settingsPath,
                   ($disk | ConvertTo-Json -Depth 8),
                   [System.Text.UTF8Encoding]::new($false)
               )
               $external = Get-WmtSettings
-              if ($external.Theme -ne "light") {
+              if ($external.Theme -ne "dark" -or (Get-WmtDebugMode -Settings $external)) {
                   throw "Settings cache did not invalidate after an external file change."
               }
 
-              Write-Host "OK: settings persistence, interval retention, backup recovery, and cache invalidation."
+              Write-Host "OK: settings persistence, interval retention, DebugMode persistence, backup recovery, and cache invalidation."
           }
           finally {
               try { Remove-Item -LiteralPath $script:SettingsTestDataPath -Recurse -Force -ErrorAction SilentlyContinue } catch {}

@@ -18,7 +18,8 @@ param(
 # ==========================================
 $AppVersion = "6.7"
 $ErrorActionPreference = "SilentlyContinue"
-$script:WmtDebug = [bool](Get-WmtSetting -Name "DebugMode" -Default $false -ErrorAction SilentlyContinue)
+# Safe until the settings manager is initialized below; the persisted value is loaded there.
+$script:WmtDebug = $false
 # Preserve UTF-8 for web content, alt codes, and Unicode symbols.
 # OEM encoding is only used per-process where needed (e.g. ipconfig).
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -6276,6 +6277,7 @@ try {
         RunInTrayOnClose           = [bool](Get-WmtRunInTrayOnClose -Settings $Settings)
         ReduceRamInTray            = [bool](Get-WmtReduceRamInTray -Settings $Settings)
         DisableBackgroundJobs      = [bool](Get-WmtDisableBackgroundJobs -Settings $Settings)
+        DebugMode                  = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "DebugMode" -Default $false) $false
         UpdateScansDisabled        = [bool](Get-WmtUpdateScansDisabled -Settings $Settings)
         LaunchMinimized            = ConvertTo-WmtSettingsBoolean (Get-WmtSettingsMember -Settings $Settings -Name "LaunchMinimized" -Default $false) $false
         HideLegendaryUeAssets      = [bool](Get-WmtHideLegendaryUeAssets -Settings $Settings)
@@ -6345,6 +6347,7 @@ $defaults = @{
     RunInTrayOnClose           = $false
     ReduceRamInTray            = $true
     DisableBackgroundJobs      = $false
+    DebugMode                  = $false
     UpdateScansDisabled         = $false
     LaunchMinimized             = $false
     HideLegendaryUeAssets      = $true
@@ -6461,6 +6464,7 @@ if ($json) {
         if ($json.PSObject.Properties["RunInTrayOnClose"]) { $defaults.RunInTrayOnClose = ConvertTo-WmtSettingsBoolean $json.RunInTrayOnClose $false }
         if ($json.PSObject.Properties["ReduceRamInTray"]) { $defaults.ReduceRamInTray = ConvertTo-WmtSettingsBoolean $json.ReduceRamInTray $true }
         if ($json.PSObject.Properties["DisableBackgroundJobs"]) { $defaults.DisableBackgroundJobs = ConvertTo-WmtSettingsBoolean $json.DisableBackgroundJobs $false }
+        if ($json.PSObject.Properties["DebugMode"]) { $defaults.DebugMode = ConvertTo-WmtSettingsBoolean $json.DebugMode $false }
         if ($json.PSObject.Properties["UpdateScansDisabled"]) { $defaults.UpdateScansDisabled = ConvertTo-WmtSettingsBoolean $json.UpdateScansDisabled $false }
         if ($json.PSObject.Properties["LaunchMinimized"]) { $defaults.LaunchMinimized = ConvertTo-WmtSettingsBoolean $json.LaunchMinimized $false }
         if ($json.PSObject.Properties["HideLegendaryUeAssets"]) { $defaults.HideLegendaryUeAssets = ConvertTo-WmtSettingsBoolean $json.HideLegendaryUeAssets $true }
@@ -7022,6 +7026,50 @@ else {
 }
 Save-WmtSettings -Settings $settings
 }
+
+function Get-WmtDebugMode {
+param($Settings)
+
+if (-not $Settings) { $Settings = Get-WmtSettings }
+
+try {
+    if ($Settings -is [System.Collections.IDictionary] -and $Settings.Contains("DebugMode")) {
+        return (ConvertTo-WmtSettingsBoolean $Settings["DebugMode"] $false)
+    }
+    if ($Settings.PSObject.Properties["DebugMode"]) {
+        return (ConvertTo-WmtSettingsBoolean $Settings.DebugMode $false)
+    }
+}
+catch {}
+
+return $false
+}
+
+function Set-WmtDebugMode {
+param([bool]$Enabled)
+
+$settings = Get-WmtSettings
+if ($settings -is [System.Collections.IDictionary]) {
+    $settings["DebugMode"] = $Enabled
+}
+elseif ($settings.PSObject.Properties["DebugMode"]) {
+    $settings.DebugMode = $Enabled
+}
+else {
+    $settings | Add-Member -MemberType NoteProperty -Name "DebugMode" -Value $Enabled -Force
+}
+
+Save-WmtSettings -Settings $settings
+
+# Read back the persisted/cached value so a failed save cannot make the
+# in-memory debug state claim a preference that was not actually stored.
+$script:WmtDebug = [bool](Get-WmtDebugMode)
+return $script:WmtDebug
+}
+
+# The startup default above is intentionally conservative. Once the settings
+# manager exists, honor the persisted debug preference for the rest of the run.
+$script:WmtDebug = [bool](Get-WmtDebugMode)
 
 function Get-WmtDisableBackgroundJobs {
 param($Settings)
@@ -30317,6 +30365,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <Button Name="btnLaunchMinimized" Content="Launch Minimized: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="160" Margin="0,0,8,0" ToolTip="WMT starts with a visible window. Click to start hidden in the system tray instead."/>
                             <Button Name="btnDisableBgJobs" Content="Bg Jobs: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="130" Margin="0,0,8,0" ToolTip="Background auto-refresh ENABLED. My Device info and Tweaks states load automatically. Click to disable."/>
                             <Button Name="btnDisableUpdateScans" Content="Update Scans: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="150" Margin="0,0,8,0" ToolTip="Disable all automatic and tray-triggered update scans. Manual scans will still work. Click to toggle."/>
+                            <Button Name="btnDebugMode" Content="Debug Logs: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="135" Margin="0,0,8,0" ToolTip="Extra internal diagnostic error logging is disabled. Click to enable additional WMT troubleshooting logs."/>
                             <Button Name="btnToggleTheme" Content="Toggle Theme" Style="{StaticResource ActionBtn}" Height="32" MinWidth="112" ToolTip="Switch between dark and light theme"/>
                         </StackPanel>
                     </Grid>
@@ -32677,6 +32726,7 @@ $btnCatSecurity = Get-Ctrl "btnCatSecurity"
 $btnSupportDiscord = Get-Ctrl "btnSupportDiscord"
 $btnSupportIssue = Get-Ctrl "btnSupportIssue"
 $btnToggleTheme = Get-Ctrl "btnToggleTheme"
+$btnDebugMode = Get-Ctrl "btnDebugMode"
 $btnStartWithWindows = Get-Ctrl "btnStartWithWindows"
 $btnLaunchMinimized = Get-Ctrl "btnLaunchMinimized"
 $btnNavDownloads = Get-Ctrl "btnNavDownloads"
@@ -34242,6 +34292,9 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnDisableBgJobs"      "Background Jobs"                 "btnTabSupport"
     Add-SearchIndexAction "Disable Background Jobs" { Set-WmtDisableBackgroundJobs -Enabled $true; Update-WmtDisableBgJobsButton; Write-GuiLog "Background jobs disabled." } "btnTabSupport"
     Add-SearchIndexAction "Enable Background Jobs"  { Set-WmtDisableBackgroundJobs -Enabled $false; Update-WmtDisableBgJobsButton; Write-GuiLog "Background jobs enabled."; try { Start-WmtBackgroundJobsNow } catch {} } "btnTabSupport"
+    Add-SearchIndexEntry "btnDebugMode"          "Debug Logs"                      "btnTabSupport"
+    Add-SearchIndexAction "Enable Debug Logs"  { Set-WmtDebugMode -Enabled $true | Out-Null;  Update-WmtDebugModeButton; Write-GuiLog "Debug diagnostic logging enabled." } "btnTabSupport"
+    Add-SearchIndexAction "Disable Debug Logs" { Set-WmtDebugMode -Enabled $false | Out-Null; Update-WmtDebugModeButton; Write-GuiLog "Debug diagnostic logging disabled." } "btnTabSupport"
     Add-SearchIndexEntry "btnDisableUpdateScans"  "Update Scans"                    "btnTabSupport"
     Add-SearchIndexAction "Disable Update Scans" { Set-WmtUpdateScansDisabled -Enabled $true; Update-WmtUpdateScansButton; Write-GuiLog "Update scans disabled." } "btnTabSupport"
     Add-SearchIndexAction "Enable Update Scans"  { Set-WmtUpdateScansDisabled -Enabled $false; Update-WmtUpdateScansButton; Write-GuiLog "Update scans enabled."; try { if (-not (Get-WmtDisableBackgroundJobs)) { Start-WmtUpdateAutoScanTimer } } catch {} } "btnTabSupport"
@@ -50375,6 +50428,37 @@ try {
 catch {
     try { Write-GuiLog "Background jobs failed to start: $($_.Exception.Message)" } catch {}
 }
+}
+
+# ── Debug Diagnostic Logging Toggle ──
+$btnDebugMode = Get-Ctrl "btnDebugMode"
+if ($btnDebugMode) {
+function Update-WmtDebugModeButton {
+    $btn = Get-Ctrl "btnDebugMode"
+    if (-not $btn) { return }
+
+    $enabled = Get-WmtDebugMode
+    Update-WmtTweakToggle `
+        -Button $btn `
+        -IsOn $enabled `
+        -OnLabel "Debug Logs: On" `
+        -OffLabel "Debug Logs: Off" `
+        -Description "Extra internal diagnostic error logging for WMT troubleshooting. This does not enable full PowerShell Write-Verbose tracing."
+}
+
+Update-WmtDebugModeButton
+
+$btnDebugMode.Add_Click({
+        $currentlyEnabled = [bool](Get-WmtDebugMode)
+        $newEnabled = [bool](Set-WmtDebugMode -Enabled (-not $currentlyEnabled))
+        Update-WmtDebugModeButton
+        if ($newEnabled) {
+            Write-GuiLog "Debug diagnostic logging enabled."
+        }
+        else {
+            Write-GuiLog "Debug diagnostic logging disabled."
+        }
+    })
 }
 
 # ── Background Jobs Toggle ──
