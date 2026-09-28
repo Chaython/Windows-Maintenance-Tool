@@ -80,6 +80,148 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Smoke test settings persistence
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $source = [System.IO.File]::ReadAllText((Resolve-Path ".\WMT-GUI.ps1").Path)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+              $source,
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors -and $parseErrors.Count -gt 0) {
+              throw "WMT-GUI.ps1 unexpectedly failed AST parsing in settings smoke test."
+          }
+
+          $needed = @(
+              "Get-WmtSettingsFileStamp",
+              "Test-WmtSettingsMember",
+              "Get-WmtSettingsMember",
+              "ConvertTo-WmtSettingsBoolean",
+              "Test-WmtFiniteDouble",
+              "Move-WmtCorruptSettingsFile",
+              "Write-WmtSettingsFileAtomic",
+              "Copy-WmtSettingsValue",
+              "Copy-WmtSettings",
+              "Save-WmtSettings",
+              "Get-WmtSettings",
+              "Get-WmtWingetIncludeUnknown",
+              "Get-WmtCustomUpdateCommands",
+              "Get-WmtUpdateAutoScanMinutes",
+              "Get-WmtUpdateNotificationsEnabled",
+              "Get-WmtUpdateSilentInstallEnabled",
+              "Get-WmtUpdateAutoInstallEnabled",
+              "Get-WmtRunInTrayOnClose",
+              "Get-WmtReduceRamInTray",
+              "Get-WmtDisableBackgroundJobs",
+              "Get-WmtUpdateScansDisabled",
+              "Get-WmtHideLegendaryUeAssets",
+              "Get-WmtSavedUpdateAutoScanMinutes",
+              "Get-WmtCleanerLocalRefreshMinutes",
+              "Get-WmtCleanerRemoteCheckMinutes",
+              "Get-WmtCleanerAutoCleanMinutes"
+          )
+
+          foreach ($name in $needed) {
+              $fn = $ast.Find({
+                      param($node)
+                      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $node.Name -eq $name
+                  }, $true)
+              if (-not $fn) { throw "Required settings function '$name' was not found." }
+              Invoke-Expression $fn.Extent.Text
+          }
+
+          function Get-DataPath { return $script:SettingsTestDataPath }
+          function Write-GuiLog { param([string]$Message) }
+          function ConvertTo-Int {
+              param($Value, [int]$Default = 0)
+              try {
+                  if ($null -eq $Value -or "" -eq $Value) { return $Default }
+                  return [int]$Value
+              }
+              catch { return $Default }
+          }
+
+          $script:SettingsTestDataPath = Join-Path $env:RUNNER_TEMP ("wmt-settings-" + [guid]::NewGuid().ToString("N"))
+          [void][System.IO.Directory]::CreateDirectory($script:SettingsTestDataPath)
+          $script:WmtSettingsCache = $null
+          $script:WmtSettingsCacheStamp = $null
+          $script:WmtSettingsWriteMutexName = "Local\Wmt_Settings_CI_" + [guid]::NewGuid().ToString("N")
+
+          try {
+              $s = Get-WmtSettings
+              $s.CleanerLocalRefreshMinutes = 17
+              $s.CleanerRemoteCheckMinutes = 31
+              $s.CleanerAutoCleanMinutes = 47
+              Save-WmtSettings -Settings $s
+
+              $script:WmtSettingsCache = $null
+              $script:WmtSettingsCacheStamp = $null
+              $loaded = Get-WmtSettings
+              if ($loaded.CleanerLocalRefreshMinutes -ne 17 -or
+                  $loaded.CleanerRemoteCheckMinutes -ne 31 -or
+                  $loaded.CleanerAutoCleanMinutes -ne 47) {
+                  throw "Cleaner interval settings did not survive the first save/reload."
+              }
+
+              # Regression guard for the original bug: an unrelated setting save
+              # must not reset the cleaner interval values to 60/1440/0.
+              $loaded.Theme = "light"
+              Save-WmtSettings -Settings $loaded
+
+              $settingsPath = Join-Path $script:SettingsTestDataPath "settings.json"
+              $backupPath = "$settingsPath.bak"
+              if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+                  throw "Atomic settings save did not create settings.json.bak."
+              }
+
+              $script:WmtSettingsCache = $null
+              $script:WmtSettingsCacheStamp = $null
+              $again = Get-WmtSettings
+              if ($again.CleanerLocalRefreshMinutes -ne 17 -or
+                  $again.CleanerRemoteCheckMinutes -ne 31 -or
+                  $again.CleanerAutoCleanMinutes -ne 47) {
+                  throw "Unrelated settings save reset cleaner intervals."
+              }
+              if ($again.Theme -ne "light") { throw "Unrelated Theme setting was not persisted." }
+
+              # Corrupt the primary file. Get-WmtSettings should archive it and
+              # recover the previous known-good generation from .bak.
+              [System.IO.File]::WriteAllText($settingsPath, "{ broken", [System.Text.UTF8Encoding]::new($false))
+              $script:WmtSettingsCache = $null
+              $script:WmtSettingsCacheStamp = $null
+              $recovered = Get-WmtSettings
+              if ($recovered.CleanerAutoCleanMinutes -ne 47) {
+                  throw "Settings backup recovery did not restore saved cleaner values."
+              }
+              if (@(Get-ChildItem -LiteralPath $script:SettingsTestDataPath -Filter "settings.corrupt-*.json").Count -lt 1) {
+                  throw "Corrupt settings file was not preserved for diagnosis."
+              }
+
+              # The cache must notice a valid external/manual edit.
+              $disk = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+              $disk.Theme = "light"
+              [System.IO.File]::WriteAllText(
+                  $settingsPath,
+                  ($disk | ConvertTo-Json -Depth 8),
+                  [System.Text.UTF8Encoding]::new($false)
+              )
+              $external = Get-WmtSettings
+              if ($external.Theme -ne "light") {
+                  throw "Settings cache did not invalidate after an external file change."
+              }
+
+              Write-Host "OK: settings persistence, interval retention, backup recovery, and cache invalidation."
+          }
+          finally {
+              try { Remove-Item -LiteralPath $script:SettingsTestDataPath -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
       - name: Smoke test shared runspace helpers
         shell: powershell
         run: |
