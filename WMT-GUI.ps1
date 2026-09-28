@@ -41274,6 +41274,11 @@ try {
     # function scope has returned. Capture the result path explicitly so it
     # cannot resolve to $null when the callback reads the worker result.
     $refreshResultPath = $resultPath
+    # GetNewClosure() runs in a dynamic module, so $script: inside the callback
+    # would target that module instead of WMT's real script scope. Capture both
+    # the specific Process and the real script-scope variable explicitly.
+    $refreshProcess = $proc
+    $refreshProcessState = Get-Variable -Name WmtCleanerRefreshProcess -Scope Script
     $refreshOnComplete = {
         try {
             $result = $null
@@ -41295,8 +41300,15 @@ try {
         }
         catch { Write-GuiLog "Cleaner definition refresh result warning: $($_.Exception.Message)" }
         finally {
-            try { if ($script:WmtCleanerRefreshProcess) { $script:WmtCleanerRefreshProcess.Dispose() } } catch {}
-            $script:WmtCleanerRefreshProcess = $null
+            try { if ($refreshProcess) { $refreshProcess.Dispose() } } catch {}
+            try {
+                # Avoid clearing a newer worker if this delayed callback belongs
+                # to an older process instance.
+                if ([object]::ReferenceEquals($refreshProcessState.Value, $refreshProcess)) {
+                    $refreshProcessState.Value = $null
+                }
+            }
+            catch {}
         }
     }.GetNewClosure()
 
@@ -41408,6 +41420,10 @@ try {
     # Like the definition refresh callback above, this runs after the function
     # returns. Keep the result path alive in a real closure.
     $autoCleanResultPath = $resultPath
+    # Preserve the actual main-script state instead of resolving $script:
+    # against GetNewClosure()'s dynamic module.
+    $autoCleanProcess = $proc
+    $autoCleanProcessState = Get-Variable -Name WmtCleanerAutoCleanProcess -Scope Script
     $autoCleanOnComplete = {
         try {
             $result = $null
@@ -41429,8 +41445,13 @@ try {
         }
         catch { Write-GuiLog "Automatic cleaner result warning: $($_.Exception.Message)" }
         finally {
-            try { if ($script:WmtCleanerAutoCleanProcess) { $script:WmtCleanerAutoCleanProcess.Dispose() } } catch {}
-            $script:WmtCleanerAutoCleanProcess = $null
+            try { if ($autoCleanProcess) { $autoCleanProcess.Dispose() } } catch {}
+            try {
+                if ([object]::ReferenceEquals($autoCleanProcessState.Value, $autoCleanProcess)) {
+                    $autoCleanProcessState.Value = $null
+                }
+            }
+            catch {}
         }
     }.GetNewClosure()
 

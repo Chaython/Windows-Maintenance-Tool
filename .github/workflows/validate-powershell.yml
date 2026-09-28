@@ -247,6 +247,25 @@ jobs:
               throw "Suspicious self-assignment regression detected: $found"
           }
 
+          # GetNewClosure() changes $script: resolution to its dynamic module.
+          # Cleaner process completion handlers must capture the real script
+          # variable and only clear it when it still points at their process.
+          $closureStateGuards = @(
+              @{
+                  ProcessState = '$refreshProcessState = Get-Variable -Name WmtCleanerRefreshProcess -Scope Script'
+                  IdentityGuard = '[object]::ReferenceEquals($refreshProcessState.Value, $refreshProcess)'
+              },
+              @{
+                  ProcessState = '$autoCleanProcessState = Get-Variable -Name WmtCleanerAutoCleanProcess -Scope Script'
+                  IdentityGuard = '[object]::ReferenceEquals($autoCleanProcessState.Value, $autoCleanProcess)'
+              }
+          )
+          foreach ($guard in $closureStateGuards) {
+              if (-not $source.Contains($guard.ProcessState) -or -not $source.Contains($guard.IdentityGuard)) {
+                  throw "Cleaner GetNewClosure process-state regression detected."
+              }
+          }
+
           # A pooled worker must never silently fall back to bare PowerShell.Create().
           if ([regex]::IsMatch($source, '(?m)return\s+\[PowerShell\]::Create\(\)')) {
               throw "Helper-less pooled PowerShell fallback detected."
