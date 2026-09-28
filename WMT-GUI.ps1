@@ -10563,32 +10563,6 @@ catch { $value = 0 }
 return [Math]::Max(0, [Math]::Min(525600, $value))
 }
 
-function Set-WmtCleanerIntervals {
-param(
-    [ValidateRange(1, 525600)][int]$LocalRefreshMinutes,
-    [ValidateRange(0, 525600)][int]$RemoteCheckMinutes,
-    [ValidateRange(0, 525600)][int]$AutoCleanMinutes
-)
-
-$settings = Get-WmtSettings
-foreach ($pair in @(
-        @{ Name = "CleanerLocalRefreshMinutes"; Value = $LocalRefreshMinutes },
-        @{ Name = "CleanerRemoteCheckMinutes"; Value = $RemoteCheckMinutes },
-        @{ Name = "CleanerAutoCleanMinutes"; Value = $AutoCleanMinutes }
-    )) {
-    if ($settings -is [System.Collections.IDictionary]) {
-        $settings[$pair.Name] = $pair.Value
-    }
-    elseif ($settings.PSObject.Properties[$pair.Name]) {
-        $settings.($pair.Name) = $pair.Value
-    }
-    else {
-        $settings | Add-Member -MemberType NoteProperty -Name $pair.Name -Value $pair.Value -Force
-    }
-}
-Save-WmtSettings -Settings $settings
-}
-
 function Get-WmtCleanerSourceStatePath {
 param([Parameter(Mandatory = $true)][string]$Source)
 $key = ($Source -replace '[^A-Za-z0-9_-]', '').ToLowerInvariant()
@@ -12780,7 +12754,7 @@ if ($btnApplyCleanerIntervals) { $btnApplyCleanerIntervals.Add_Click({
         Save-WmtSettings -Settings $currentSettings
 
         try { if (Get-Command Start-WmtCleanerDefinitionRefreshTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } } catch {}
-        try { if (Get-Command Start-WmtCleanerAutoCleanTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerAutoCleanTimer -ResetNextRun } } catch {}
+        try { if (Get-Command Start-WmtCleanerAutoCleanTimer -ErrorAction SilentlyContinue) { Start-WmtCleanerAutoCleanTimer } } catch {}
         $lblStatus.Text = "Cleaner intervals and selected rules saved."
     }.GetNewClosure()) }
 
@@ -41466,8 +41440,6 @@ catch {
 }
 
 function Start-WmtCleanerAutoCleanTimer {
-param([switch]$ResetNextRun)
-
 Stop-WmtCleanerAutoCleanTimer
 if (Get-WmtDisableBackgroundJobs) { return }
 
@@ -48275,19 +48247,6 @@ function Get-WmtCompactTrackerPath {
     return $path
 }
 
-function Get-WmtCompactDefaultPoorlyCompressedExtensions {
-    # Common formats that are already compressed internally and typically gain
-    # little or nothing from NTFS/WOF compression. Kept conservative and opt-in.
-    return [string[]]@(
-        ".dl_", ".gif", ".jpg", ".jpeg", ".png", ".wmf",
-        ".mkv", ".mp4", ".wmv", ".avi", ".bik", ".bk2", ".flv", ".ogg",
-        ".mpg", ".m2v", ".m4v", ".vob", ".mp3", ".aac", ".wma", ".flac",
-        ".zip", ".xap", ".rar", ".7z", ".cab", ".lzx",
-        ".docx", ".xlsx", ".pptx", ".vssx", ".vstx", ".onepkg",
-        ".tar", ".gz", ".dmg", ".bz2", ".tgz", ".lz", ".xz", ".txz"
-    )
-}
-
 function ConvertTo-WmtCompactExtensionList {
     param([object[]]$Values)
 
@@ -50398,7 +50357,7 @@ try {
             try { Start-WmtUpdateAutoScanTimer } catch {}
         }
         try { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } catch {}
-        try { Start-WmtCleanerAutoCleanTimer -ResetNextRun } catch {}
+        try { Start-WmtCleanerAutoCleanTimer } catch {}
         return
     }
 
@@ -50444,7 +50403,7 @@ try {
     # Cleaner definition refresh and optional automatic cleanup use isolated
     # worker processes so they never block the WPF thread.
     try { Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun } catch {}
-    try { Start-WmtCleanerAutoCleanTimer -ResetNextRun } catch {}
+    try { Start-WmtCleanerAutoCleanTimer } catch {}
 }
 catch {
     try { Write-GuiLog "Background jobs failed to start: $($_.Exception.Message)" } catch {}
@@ -53868,7 +53827,7 @@ $script:preloadDeferTimer.Start()
                 Start-WmtUpdateAutoScanTimer -ResetNextRun
             }
             Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun
-            Start-WmtCleanerAutoCleanTimer -ResetNextRun
+            Start-WmtCleanerAutoCleanTimer
         }
     }
 )
