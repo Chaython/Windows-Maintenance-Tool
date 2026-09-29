@@ -3794,6 +3794,238 @@ finally {
 return $null
 }
 
+
+# Explorer-style folder chooser used where the old Shell.BrowseForFolder tree
+# dialog is too limited. This uses the Windows Common Item Dialog in
+# FOS_PICKFOLDERS mode, so users get the normal Explorer navigation pane,
+# breadcrumbs, address bar, search box, drives, pinned locations, and New Folder.
+function Select-WmtExplorerFolder {
+param(
+    [string]$Description = "Select folder",
+    [string]$InitialDirectory = "",
+    [System.Windows.Window]$Owner
+)
+
+try {
+    if (-not ("Wmt.Native.ModernFolderPicker" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Wmt.Native
+{
+    [ComImport]
+    [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    internal class FileOpenDialog
+    {
+    }
+
+    [ComImport]
+    [Guid("42F85136-DB7E-439C-85F1-E4075D135FC8")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IFileDialog
+    {
+        [PreserveSig] int Show(IntPtr parent);
+        [PreserveSig] int SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+        [PreserveSig] int SetFileTypeIndex(uint iFileType);
+        [PreserveSig] int GetFileTypeIndex(out uint piFileType);
+        [PreserveSig] int Advise(IntPtr pfde, out uint pdwCookie);
+        [PreserveSig] int Unadvise(uint dwCookie);
+        [PreserveSig] int SetOptions(uint fos);
+        [PreserveSig] int GetOptions(out uint pfos);
+        [PreserveSig] int SetDefaultFolder(IShellItem psi);
+        [PreserveSig] int SetFolder(IShellItem psi);
+        [PreserveSig] int GetFolder(out IShellItem ppsi);
+        [PreserveSig] int GetCurrentSelection(out IShellItem ppsi);
+        [PreserveSig] int SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        [PreserveSig] int GetFileName(out IntPtr pszName);
+        [PreserveSig] int SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        [PreserveSig] int SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        [PreserveSig] int SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        [PreserveSig] int GetResult(out IShellItem ppsi);
+    }
+
+    [ComImport]
+    [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellItem
+    {
+        [PreserveSig] int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetParent(out IShellItem ppsi);
+        [PreserveSig] int GetDisplayName(uint sigdnName, out IntPtr ppszName);
+    }
+
+    public static class ModernFolderPicker
+    {
+        private const uint FOS_PICKFOLDERS = 0x00000020;
+        private const uint FOS_FORCEFILESYSTEM = 0x00000040;
+        private const uint FOS_PATHMUSTEXIST = 0x00000800;
+        private const uint SIGDN_FILESYSPATH = 0x80058000;
+        private const int ERROR_CANCELLED = unchecked((int)0x800704C7);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+        private static extern int SHCreateItemFromParsingName(
+            [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+            IntPtr pbc,
+            ref Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+
+        public static string PickFolder(IntPtr owner, string title, string initialPath)
+        {
+            IFileDialog dialog = null;
+            IShellItem initialItem = null;
+            IShellItem resultItem = null;
+
+            try
+            {
+                dialog = (IFileDialog)new FileOpenDialog();
+
+                uint options;
+                int hr = dialog.GetOptions(out options);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+                hr = dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+                if (!String.IsNullOrWhiteSpace(title))
+                {
+                    dialog.SetTitle(title);
+                    dialog.SetOkButtonLabel("Select folder");
+                }
+
+                if (!String.IsNullOrWhiteSpace(initialPath))
+                {
+                    Guid shellItemGuid = typeof(IShellItem).GUID;
+                    hr = SHCreateItemFromParsingName(initialPath, IntPtr.Zero, ref shellItemGuid, out initialItem);
+                    if (hr >= 0 && initialItem != null)
+                        dialog.SetFolder(initialItem);
+                }
+
+                hr = dialog.Show(owner);
+                if (hr == ERROR_CANCELLED) return null;
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+                hr = dialog.GetResult(out resultItem);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+                IntPtr displayName = IntPtr.Zero;
+                try
+                {
+                    hr = resultItem.GetDisplayName(SIGDN_FILESYSPATH, out displayName);
+                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                    return Marshal.PtrToStringUni(displayName);
+                }
+                finally
+                {
+                    if (displayName != IntPtr.Zero) Marshal.FreeCoTaskMem(displayName);
+                }
+            }
+            finally
+            {
+                if (resultItem != null) Marshal.FinalReleaseComObject(resultItem);
+                if (initialItem != null) Marshal.FinalReleaseComObject(initialItem);
+                if (dialog != null) Marshal.FinalReleaseComObject(dialog);
+            }
+        }
+    }
+}
+'@
+    }
+
+    $initial = ([string]$InitialDirectory).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($initial) -and -not (Test-Path -LiteralPath $initial -PathType Container)) {
+        try {
+            $candidate = Split-Path -Parent $initial
+            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Container)) { $initial = $candidate }
+            else { $initial = "" }
+        }
+        catch { $initial = "" }
+    }
+
+    $ownerHandle = [IntPtr]::Zero
+    if ($Owner) {
+        try { $ownerHandle = [System.Windows.Interop.WindowInteropHelper]::new($Owner).Handle } catch {}
+    }
+
+    $selected = [Wmt.Native.ModernFolderPicker]::PickFolder($ownerHandle, $Description, $initial)
+    if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { return [string]$selected }
+    return $null
+}
+catch {
+    # Rare fallback for systems where the shell COM dialog is unavailable.
+    # This is still the Explorer-style common file dialog rather than the old
+    # BrowseForFolder tree.
+    try {
+        $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+        $dlg.Title = $Description
+        $dlg.CheckFileExists = $false
+        $dlg.CheckPathExists = $true
+        $dlg.ValidateNames = $false
+        $dlg.FileName = "Select this folder"
+        if (-not [string]::IsNullOrWhiteSpace($InitialDirectory) -and (Test-Path -LiteralPath $InitialDirectory -PathType Container)) {
+            $dlg.InitialDirectory = $InitialDirectory
+        }
+        $accepted = if ($Owner) { $dlg.ShowDialog($Owner) } else { $dlg.ShowDialog() }
+        if ($accepted -eq $true) {
+            $folder = [System.IO.Path]::GetDirectoryName([string]$dlg.FileName)
+            if (-not [string]::IsNullOrWhiteSpace($folder)) { return $folder }
+        }
+    }
+    catch {}
+}
+return $null
+}
+
+# Make the non-client/title-bar area follow WMT's current light/dark theme.
+# WPF themes the client area itself; DWM owns the native title bar.
+function Set-WmtNativeWindowTheme {
+param([System.Windows.Window]$Window)
+
+if (-not $Window) { return }
+try {
+    if (-not ("Wmt.Native.DwmTheme" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Wmt.Native
+{
+    public static class DwmTheme
+    {
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int valueSize);
+
+        public static void SetDarkMode(IntPtr hwnd, bool enabled)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            int value = enabled ? 1 : 0;
+
+            // DWMWA_USE_IMMERSIVE_DARK_MODE is 20 on current Windows 10/11;
+            // 19 covers older Windows 10 builds that exposed the attribute.
+            DwmSetWindowAttribute(hwnd, 20, ref value, sizeof(int));
+            DwmSetWindowAttribute(hwnd, 19, ref value, sizeof(int));
+        }
+    }
+}
+'@
+    }
+
+    $useDark = ([string]$script:CurrentTheme -ne "light")
+    $applyNativeTheme = {
+        param($sender, $eventArgs)
+        try {
+            $handle = [System.Windows.Interop.WindowInteropHelper]::new($Window).Handle
+            [Wmt.Native.DwmTheme]::SetDarkMode($handle, $useDark)
+        }
+        catch {}
+    }.GetNewClosure()
+
+    if ($Window.IsSourceInitialized) { & $applyNativeTheme $Window $null }
+    else { $Window.Add_SourceInitialized($applyNativeTheme) }
+}
+catch {}
+}
+
 function New-WmtDataTable {
 param(
     [string[]]$Columns,
@@ -52516,7 +52748,10 @@ $contentXaml = @'
             <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}"/>
             <TextBlock Text="Ctrl/Shift-select specific DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
         </StackPanel>
-        <ListBox Name="lstDlcs" Grid.Column="1" Height="105" SelectionMode="Extended"/>
+        <ListBox Name="lstDlcs" Grid.Column="1" Height="105" SelectionMode="Extended"
+                 Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}"
+                 BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2"/>
     </Grid>
 
     <CheckBox Name="chkKeepOpen" Grid.Row="6" Margin="150,0,0,8"
@@ -52538,6 +52773,12 @@ $contentXaml = @'
 '@
 
 $dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 610 -MinWidth 600 -MinHeight 560 -NoResize
+# The generic runtime resources theme the controls; add the selection template
+# as well so DLC rows never fall back to Aero/SystemColors, and theme the
+# native title bar to match the current WMT palette.
+Add-WmtListSelectionResources -Element $dialog
+Set-WmtNativeWindowTheme -Window $dialog
+
 $lblTitle = $dialog.FindName("lblTitle")
 $lblMetadata = $dialog.FindName("lblMetadata")
 $txtRoot = $dialog.FindName("txtRoot")
@@ -52621,7 +52862,7 @@ $btnBrowse.Add_Click({
             }
             catch {}
         }
-        $selected = Select-WmtFolder -Description "Choose GOG game library folder" -InitialDirectory $initial
+        $selected = Select-WmtExplorerFolder -Description "Choose GOG game library folder" -InitialDirectory $initial -Owner $dialog
         if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $txtRoot.Text = [string]$selected }
     }.GetNewClosure())
 
