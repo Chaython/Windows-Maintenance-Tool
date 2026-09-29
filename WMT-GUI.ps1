@@ -52361,6 +52361,154 @@ function Invoke-WmtLibraryLaunch {
 }
 
 # Helper: install a game.
+function Show-WmtGogdlInstallOptions {
+param(
+    [Parameter(Mandatory = $true)][string]$GameName,
+    [string]$DefaultRoot = ""
+)
+
+$contentXaml = @'
+<Grid Margin="18">
+    <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <StackPanel Grid.Row="0" Margin="0,0,0,14">
+        <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
+        <TextBlock Text="Choose how GOGDL should install this game. The selected path is a library/root folder; GOGDL creates the game's own folder inside it."
+                   Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}"/>
+    </StackPanel>
+
+    <Grid Grid.Row="1" Margin="0,0,0,12">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="140"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="Install root" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+        <Button Name="btnBrowse" Grid.Column="2" Content="Browse..." MinWidth="92"/>
+    </Grid>
+
+    <Grid Grid.Row="2" Margin="0,0,0,12">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="140"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="Language" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtLanguage" Grid.Column="1" Height="34" VerticalContentAlignment="Center"
+                 ToolTip="GOGDL language code/name. Leave blank to use GOGDL's default (English/en-US)."/>
+    </Grid>
+
+    <Grid Grid.Row="3" Margin="0,0,0,12">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="140"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <ComboBox Name="cboWorkers" Grid.Column="1" Height="34" VerticalContentAlignment="Center"
+                  ToolTip="Lower values use less parallel memory; higher values can download faster."/>
+    </Grid>
+
+    <StackPanel Grid.Row="4" Margin="140,0,0,8">
+        <CheckBox Name="chkDlcs" Content="Install all owned DLCs" Margin="0,0,0,8"
+                  ToolTip="Unchecked installs the base game only."/>
+        <CheckBox Name="chkKeepOpen" Content="Keep console open after GOGDL exits" IsChecked="True"
+                  ToolTip="Useful when GOGDL exits early so its final error remains visible."/>
+    </StackPanel>
+
+    <TextBlock Name="lblError" Grid.Row="5" Margin="0,4,0,0" TextWrapping="Wrap"
+               Foreground="{DynamicResource Danger}"/>
+
+    <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+        <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
+        <Button Name="btnInstall" Content="Install" Width="104" IsDefault="True"
+                Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
+    </StackPanel>
+</Grid>
+'@
+
+$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 620 -Height 420 -MinWidth 520 -MinHeight 380 -NoResize
+$lblTitle = $dialog.FindName("lblTitle")
+$txtRoot = $dialog.FindName("txtRoot")
+$txtLanguage = $dialog.FindName("txtLanguage")
+$cboWorkers = $dialog.FindName("cboWorkers")
+$chkDlcs = $dialog.FindName("chkDlcs")
+$chkKeepOpen = $dialog.FindName("chkKeepOpen")
+$lblError = $dialog.FindName("lblError")
+$btnBrowse = $dialog.FindName("btnBrowse")
+$btnInstall = $dialog.FindName("btnInstall")
+$btnCancel = $dialog.FindName("btnCancel")
+
+$lblTitle.Text = "Install $GameName"
+$txtRoot.Text = $DefaultRoot
+$txtLanguage.Text = "en-US"
+foreach ($workers in @(1, 2, 4, 8)) { [void]$cboWorkers.Items.Add([string]$workers) }
+$cboWorkers.SelectedItem = "2"
+
+$result = @{ Value = $null }
+
+$btnBrowse.Add_Click({
+        $initial = ([string]$txtRoot.Text).Trim()
+        if (-not (Test-Path -LiteralPath $initial -PathType Container)) {
+            try {
+                $parent = Split-Path -Parent $initial
+                if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) { $initial = $parent }
+                elseif ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) { $initial = $env:USERPROFILE }
+            }
+            catch {}
+        }
+        $selected = Select-WmtFolder -Description "Choose GOG game library folder" -InitialDirectory $initial
+        if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $txtRoot.Text = [string]$selected }
+    }.GetNewClosure())
+
+$btnInstall.Add_Click({
+        $root = ([string]$txtRoot.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            $lblError.Text = "Choose an install root."
+            return
+        }
+        if ($root.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) {
+            $lblError.Text = "The install path contains invalid characters."
+            return
+        }
+
+        try {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+                [void][System.IO.Directory]::CreateDirectory($root)
+            }
+        }
+        catch {
+            $lblError.Text = "Could not create the install root: $($_.Exception.Message)"
+            return
+        }
+
+        $workerCount = 2
+        [void][int]::TryParse([string]$cboWorkers.SelectedItem, [ref]$workerCount)
+        if ($workerCount -notin @(1, 2, 4, 8)) { $workerCount = 2 }
+
+        $result.Value = [PSCustomObject]@{
+            RootPath    = $root
+            Language    = ([string]$txtLanguage.Text).Trim()
+            IncludeDlcs = [bool]$chkDlcs.IsChecked
+            Workers     = $workerCount
+            KeepOpen    = [bool]$chkKeepOpen.IsChecked
+        }
+        $dialog.DialogResult = $true
+    }.GetNewClosure())
+
+$btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
+$dialog.Add_ContentRendered({ $txtRoot.Focus() | Out-Null; $txtRoot.SelectAll() }.GetNewClosure())
+[void]$dialog.ShowDialog()
+return $result.Value
+}
+
 function Invoke-WmtLibraryInstall {
     param($Item)
     if (-not $Item) { return }
@@ -52404,19 +52552,72 @@ function Invoke-WmtLibraryInstall {
                     if ($cmd -and $cmd.Source) { $gogdlExe = [string]$cmd.Source; break }
                 }
             }
-            if ($gogdlExe -and (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
-                $authConfig = Get-WmtGogdlAuthConfigPath
-                $msg = "Download '$name' via GOGDL?`n`nThis will download the DRM-free game from GOG."
-                if ((Show-WmtMessageBox -Message $msg -Title "Download Game" -Button YesNo -Image Question) -eq [System.Windows.MessageBoxResult]::Yes) {
-                    $installBase = Join-Path (Get-DataPath) "gog-games"
-                    $gameDir = Join-Path $installBase $id
-                    Start-Process -FilePath $gogdlExe -ArgumentList "--auth-config-path", "`"$authConfig`"", "download", $id, "--path", "`"$gameDir`"", "--os", "windows", "--max-workers", "4" -WindowStyle Normal
-                    Write-GuiLog "Starting GOGDL download for: $name (id $id)"
-                }
+            if (-not $gogdlExe -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL is not installed. Cannot download GOG games." -Title "Download Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $authConfig = Get-WmtGogdlAuthConfigPath
+            if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
+                $heroicAuth = Join-Path $env:APPDATA "heroic\gog_store\auth.json"
+                if (Test-Path -LiteralPath $heroicAuth -PathType Leaf) { $authConfig = $heroicAuth }
+            }
+            if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL authentication was not found. Sign in to GOG / reinstall the GOGDL provider, then try again." -Title "Download Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $defaultRoot = ""
+            if ($script:WmtGogdlLastInstallRoot -and (Test-Path -LiteralPath $script:WmtGogdlLastInstallRoot -PathType Container)) {
+                $defaultRoot = [string]$script:WmtGogdlLastInstallRoot
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                $defaultRoot = Join-Path $env:USERPROFILE "Games\GOG"
             }
             else {
-                Show-WmtMessageBox -Message "GOGDL is not installed. Cannot download GOG games." -Title "Download Failed" -Image Warning | Out-Null
+                $defaultRoot = Join-Path (Get-DataPath) "gog-games"
             }
+
+            $options = Show-WmtGogdlInstallOptions -GameName $name -DefaultRoot $defaultRoot
+            if (-not $options) { return }
+            $script:WmtGogdlLastInstallRoot = [string]$options.RootPath
+
+            $gogArgs = [System.Collections.Generic.List[string]]::new()
+            [void]$gogArgs.Add("--auth-config-path")
+            [void]$gogArgs.Add([string]$authConfig)
+            [void]$gogArgs.Add("download")
+            [void]$gogArgs.Add([string]$id)
+            [void]$gogArgs.Add("--path")
+            [void]$gogArgs.Add([string]$options.RootPath)
+            [void]$gogArgs.Add("--os")
+            [void]$gogArgs.Add("windows")
+            [void]$gogArgs.Add("--max-workers")
+            [void]$gogArgs.Add([string]$options.Workers)
+            if (-not [string]::IsNullOrWhiteSpace([string]$options.Language)) {
+                [void]$gogArgs.Add("--lang")
+                [void]$gogArgs.Add([string]$options.Language)
+            }
+            [void]$gogArgs.Add($(if ($options.IncludeDlcs) { "--with-dlcs" } else { "--skip-dlcs" }))
+
+            if ($options.KeepOpen) {
+                # Run through cmd /k so a crash or early GOGDL exit remains visible
+                # instead of the console disappearing before the user can read it.
+                function ConvertTo-WmtGogdlCmdArg([string]$Value) {
+                    if ($null -eq $Value) { return '""' }
+                    return '"' + $Value.Replace('"', '') + '"'
+                }
+                $commandParts = [System.Collections.Generic.List[string]]::new()
+                [void]$commandParts.Add((ConvertTo-WmtGogdlCmdArg $gogdlExe))
+                foreach ($arg in $gogArgs) { [void]$commandParts.Add((ConvertTo-WmtGogdlCmdArg ([string]$arg))) }
+                $commandLine = $commandParts -join " "
+                $cmdPayload = '/d /k "' + $commandLine + '"'
+                $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdPayload -PassThru -WindowStyle Normal
+            }
+            else {
+                $proc = Start-Process -FilePath $gogdlExe -ArgumentList $gogArgs.ToArray() -PassThru -WindowStyle Normal
+            }
+
+            Write-GuiLog "Starting GOGDL download for: $name (id $id) -> $($options.RootPath) | workers=$($options.Workers) | DLCs=$(if ($options.IncludeDlcs) { 'all owned' } else { 'base game only' }) | PID=$($proc.Id)"
         }
         catch {
             Show-WmtMessageBox -Message "Failed to start download: $($_.Exception.Message)" -Title "Download Failed" -Image Warning | Out-Null
