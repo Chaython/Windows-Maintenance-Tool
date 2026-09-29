@@ -3088,14 +3088,16 @@ if (-not $Element -or $Element.Resources.Contains("__WmtListSelectionResourcesAp
                             BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
                             SnapsToDevicePixels="True">
                         <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                          TextElement.Foreground="{TemplateBinding Foreground}"/>
                     </Border>
                 </ControlTemplate>
             </Setter.Value>
         </Setter>
         <Style.Triggers>
             <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+                <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
             </Trigger>
             <Trigger Property="IsSelected" Value="True">
                 <Setter Property="Background" Value="{DynamicResource Accent}"/>
@@ -3288,11 +3290,16 @@ try {
         <Setter.Value>
             <ControlTemplate TargetType="{x:Type ComboBoxItem}">
                 <Border x:Name="Bd" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
-                    <ContentPresenter/>
+                    <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"/>
                 </Border>
                 <ControlTemplate.Triggers>
                     <Trigger Property="IsHighlighted" Value="True">
-                        <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgHover}"/>
+                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+                    </Trigger>
+                    <Trigger Property="IsSelected" Value="True">
+                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
                     </Trigger>
                     <Trigger Property="IsEnabled" Value="False">
                         <Setter Property="Opacity" Value="0.55"/>
@@ -52689,7 +52696,7 @@ param(
 )
 
 $contentXaml = @'
-<Grid Margin="18">
+<Grid Margin="14">
     <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
@@ -52703,7 +52710,7 @@ $contentXaml = @'
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <StackPanel Grid.Row="0" Margin="0,0,0,14">
+    <StackPanel Grid.Row="0" Margin="0,0,0,12">
         <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
         <TextBlock Text="Choose how GOGDL should install this game. The selected path is a library/root folder; GOGDL creates the game's own folder inside it."
                    Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}"/>
@@ -52748,23 +52755,40 @@ $contentXaml = @'
             <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}"/>
             <TextBlock Text="Ctrl/Shift-select specific DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
         </StackPanel>
-        <ListBox Name="lstDlcs" Grid.Column="1" Height="105" SelectionMode="Extended"
+        <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended"
                  Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}"
                  BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
-                 ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2"/>
+                 ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2">
+            <ListBox.Template>
+                <ControlTemplate TargetType="{x:Type ListBox}">
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ScrollViewer Focusable="False"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      VerticalScrollBarVisibility="Auto"
+                                      CanContentScroll="True">
+                            <ItemsPresenter/>
+                        </ScrollViewer>
+                    </Border>
+                </ControlTemplate>
+            </ListBox.Template>
+        </ListBox>
     </Grid>
 
     <CheckBox Name="chkKeepOpen" Grid.Row="6" Margin="150,0,0,8"
               Content="Keep console open after a successful download"
               ToolTip="Failures always pause so the final GOGDL error stays visible."/>
 
-    <TextBlock Grid.Row="7" Margin="150,2,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Warning}"
+    <TextBlock Grid.Row="7" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Warning}"
                Text="Low-memory note: current GOGDL reserves a 1 GiB shared-memory block and maps it into its worker/writer processes. WMT defaults to 1 worker so Task Manager does not multiply those mappings as aggressively."/>
 
     <TextBlock Name="lblError" Grid.Row="8" Margin="0,8,0,0" TextWrapping="Wrap"
                Foreground="{DynamicResource Danger}"/>
 
-    <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+    <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,2">
         <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
         <Button Name="btnInstall" Content="Install" Width="104" IsDefault="True"
                 Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
@@ -52772,7 +52796,7 @@ $contentXaml = @'
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 610 -MinWidth 600 -MinHeight 560 -NoResize
+$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 650 -MinWidth 600 -MinHeight 610 -NoResize
 # The generic runtime resources theme the controls; add the selection template
 # as well so DLC rows never fall back to Aero/SystemColors, and theme the
 # native title bar to match the current WMT palette.
@@ -52786,6 +52810,14 @@ $cboLanguage = $dialog.FindName("cboLanguage")
 $cboBuild = $dialog.FindName("cboBuild")
 $cboWorkers = $dialog.FindName("cboWorkers")
 $lstDlcs = $dialog.FindName("lstDlcs")
+if ($lstDlcs) {
+    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowBrushKey] = New-WmtBrush "BgPanel"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowTextBrushKey] = New-WmtBrush "TextPrimary"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlBrushKey] = New-WmtBrush "BgPanel"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlTextBrushKey] = New-WmtBrush "TextPrimary"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = New-WmtBrush "Accent"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = New-WmtBrush "AccentText"
+}
 $chkKeepOpen = $dialog.FindName("chkKeepOpen")
 $lblError = $dialog.FindName("lblError")
 $btnBrowse = $dialog.FindName("btnBrowse")
@@ -52964,7 +52996,7 @@ Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootP
 
 function ConvertTo-WmtGogdlBatchArg([string]$Value) {
     if ($null -eq $Value) { return '""' }
-    $safe = $Value.Replace('"', '').Replace('%', '%%').Replace([char]13, "").Replace([char]10, "")
+    $safe = $Value.Replace('"', '').Replace('%', '%%').Replace("`r", "").Replace("`n", "")
     return '"' + $safe + '"'
 }
 
