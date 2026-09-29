@@ -52777,10 +52777,6 @@ param(
     [string]$InstallPath
 )
 
-if (-not [string]::IsNullOrWhiteSpace($InstallPath) -and (Test-Path -LiteralPath $InstallPath -PathType Container)) {
-    return [string]$InstallPath
-}
-
 $folder = Get-WmtGogdlManifestInstallFolder -Id $Id
 if (-not [string]::IsNullOrWhiteSpace($folder) -and -not [string]::IsNullOrWhiteSpace($RootPath)) {
     try {
@@ -52788,6 +52784,10 @@ if (-not [string]::IsNullOrWhiteSpace($folder) -and -not [string]::IsNullOrWhite
         if (Test-Path -LiteralPath $candidate -PathType Container) { return [string]$candidate }
     }
     catch {}
+}
+
+if (-not [string]::IsNullOrWhiteSpace($InstallPath) -and (Test-Path -LiteralPath $InstallPath -PathType Container)) {
+    return [string]$InstallPath
 }
 return ""
 }
@@ -53092,6 +53092,7 @@ try {
     }
 }
 catch {}
+$hasMetadataLanguages = ($languageItems.Count -gt 0)
 if ($languageItems.Count -eq 0) {
     [void]$languageItems.Add("en-US")
 }
@@ -53197,7 +53198,7 @@ $btnInstall.Add_Click({
                 return
             }
             $languageCode = [string]$languageMatch.Code
-            if ($languageItems.Count -gt 0 -and -not $languageItems.Contains($languageCode)) {
+            if ($hasMetadataLanguages -and -not $languageItems.Contains($languageCode)) {
                 $lblError.Text = "Language '$languageCode' is recognized by GOGDL but is not available for this game."
                 return
             }
@@ -53455,10 +53456,6 @@ function Invoke-WmtLibraryInstall {
             }
 
             $authConfig = Get-WmtGogdlResolvedAuthConfigPath
-            if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
-                $heroicAuth = Join-Path $env:APPDATA "heroic\gog_store\auth.json"
-                if (Test-Path -LiteralPath $heroicAuth -PathType Leaf) { $authConfig = $heroicAuth }
-            }
             if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
                 Show-WmtMessageBox -Message "GOGDL authentication was not found. Sign in to GOG / reinstall the GOGDL provider, then try again." -Title "Download Failed" -Image Warning | Out-Null
                 return
