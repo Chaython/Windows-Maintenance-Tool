@@ -29173,7 +29173,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <Button Name="btnToggleFabAssets" Content="Fab Assets: Hidden" Style="{StaticResource ActionBtn}" ToolTip="Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." Visibility="Collapsed"/>
                             <TextBlock Name="lblLibraryStatus" Text="" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" FontStyle="Italic" Margin="12,0,0,0"/>
                         </StackPanel>
-                        <!-- Catalog actions (always visible) -->
+                        <!-- Shared Catalog / Library actions -->
                         <StackPanel Name="pnlCatalogActions" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button Name="btnBackToUpdates" Content="Back to Updates" Style="{StaticResource ActionBtn}" ToolTip="Return to the package updates view"/>
                             <Button Name="btnCatalogInstall" Content="Install Selected" Style="{StaticResource PositiveBtn}" ToolTip="Install all selected applications using winget. May take several minutes depending on app size."/>
@@ -33023,6 +33023,9 @@ function Reset-WmtLibraryToCatalog {
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
+        if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install all selected applications using winget. May take several minutes depending on app size." }
+        if ($btnCatalogSelectAll) { $btnCatalogSelectAll.ToolTip = "Select all visible applications in the list" }
+        if ($btnCatalogClear) { $btnCatalogClear.ToolTip = "Unselect all applications" }
         if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
     }
 }
@@ -52083,13 +52086,60 @@ Add-WmtCatalogListItems -ListView $lstCatalog -Items (Get-WmtCatalogItemsByCateg
 
 if ($btnCatalogInstall -and $btnCatalogSelectAll -and $btnCatalogClear -and $lstCatalog) {
 $btnCatalogInstall.Add_Click({
+        # These controls are shared by Software Catalog and Your Library.
+        # Route the action to whichever list is actually visible.
+        if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+            $selected = @($lstLibrary.SelectedItems | Where-Object { $null -ne $_ })
+            if ($selected.Count -eq 0 -and $lstLibrary.SelectedItem) { $selected = @($lstLibrary.SelectedItem) }
+            if ($selected.Count -eq 0) { return }
+
+            foreach ($item in $selected) {
+                $isInstalled = $false
+                try {
+                    if ($item.PSObject.Properties["IsInstalled"]) {
+                        $isInstalled = [bool]$item.IsInstalled
+                    }
+                }
+                catch {}
+
+                # A GOGDL install can become tracked before the visible library
+                # row is refreshed, so do the same tracked-path check used by
+                # the context menu before offering another install.
+                if (-not $isInstalled -and ([string]$item.Source) -eq "GOG") {
+                    try {
+                        $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
+                        $isInstalled = -not [string]::IsNullOrWhiteSpace($trackedGogPath)
+                    }
+                    catch {}
+                }
+
+                if (-not $isInstalled) {
+                    Invoke-WmtLibraryInstall -Item $item
+                }
+            }
+            return
+        }
+
         $selected = @($lstCatalog.SelectedItems)
         if ($selected.Count -eq 0) { return }
         & $Script:StartWingetAction -ListItems $selected -ActionName "Install"
     })
 
-$btnCatalogSelectAll.Add_Click({ $lstCatalog.SelectAll() })
-$btnCatalogClear.Add_Click({ $lstCatalog.SelectedItems.Clear() })
+$btnCatalogSelectAll.Add_Click({
+        if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+            $lstLibrary.SelectAll()
+            return
+        }
+        $lstCatalog.SelectAll()
+    })
+
+$btnCatalogClear.Add_Click({
+        if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+            $lstLibrary.SelectedItems.Clear()
+            return
+        }
+        $lstCatalog.SelectedItems.Clear()
+    })
 }
 
 # --- YOUR LIBRARY ---
@@ -52394,6 +52444,9 @@ $btnShowLibrary.Add_Click({
             if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
             if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
             if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
+            if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install the selected uninstalled game(s) using their library provider." }
+            if ($btnCatalogSelectAll) { $btnCatalogSelectAll.ToolTip = "Select all visible games in Your Library." }
+            if ($btnCatalogClear) { $btnCatalogClear.ToolTip = "Clear the current Your Library selection." }
 
             # Highlight the Your Library button (AccentBtn style).
             if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
@@ -52430,6 +52483,9 @@ $btnBackToCatalog.Add_Click({
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
+        if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install all selected applications using winget. May take several minutes depending on app size." }
+        if ($btnCatalogSelectAll) { $btnCatalogSelectAll.ToolTip = "Select all visible applications in the list" }
+        if ($btnCatalogClear) { $btnCatalogClear.ToolTip = "Unselect all applications" }
 
         # Restore the Your Library button to ActionBtn style (gray).
         if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
@@ -52796,7 +52852,7 @@ $contentXaml = @'
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 650 -MinWidth 600 -MinHeight 610 -NoResize
+$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 610 -MinWidth 600 -MinHeight 570 -NoResize
 # The generic runtime resources theme the controls; add the selection template
 # as well so DLC rows never fall back to Aero/SystemColors, and theme the
 # native title bar to match the current WMT palette.
