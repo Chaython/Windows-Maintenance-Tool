@@ -2716,7 +2716,21 @@ $op = [PSCustomObject]@{
     OnError = $OnError
 }
 $script:WmtUiPollOperations[$Name] = $op
-Initialize-WmtUiPollTimer
+try {
+    Initialize-WmtUiPollTimer
+}
+catch {
+    # Registration is atomic: if timer initialization fails after this operation
+    # was inserted, remove only the operation object created by this call.
+    try {
+        if ($script:WmtUiPollOperations.Contains($Name) -and
+            [object]::ReferenceEquals($script:WmtUiPollOperations[$Name], $op)) {
+            [void]$script:WmtUiPollOperations.Remove($Name)
+        }
+    }
+    catch {}
+    throw
+}
 return $op
 }
 
@@ -41317,13 +41331,9 @@ try {
 }
 catch {
     # If anything after process creation fails (closure/state lookup or poller
-    # registration), do not leave an untracked cleaner worker running.
-    try {
-        if (Test-WmtUiPollOperation -Name "CleanerDefinitionRefresh") {
-            Unregister-WmtUiPollOperation -Name "CleanerDefinitionRefresh"
-        }
-    }
-    catch {}
+    # registration), do not leave an untracked cleaner worker running. Do not
+    # unregister by name here: a duplicate-registration failure may belong to
+    # an older operation, which must remain intact.
     if ($proc) {
         try {
             if (-not $proc.HasExited) {
@@ -41495,12 +41505,8 @@ try {
     Register-WmtUiPollOperation -Name "CleanerAutoClean" -IntervalMs 1000 -TestComplete $autoCleanTestComplete -OnComplete $autoCleanOnComplete | Out-Null
 }
 catch {
-    try {
-        if (Test-WmtUiPollOperation -Name "CleanerAutoClean") {
-            Unregister-WmtUiPollOperation -Name "CleanerAutoClean"
-        }
-    }
-    catch {}
+    # As above, never unregister by name from this startup-failure path; doing
+    # so could remove a pre-existing operation that this invocation does not own.
     if ($proc) {
         try {
             if (-not $proc.HasExited) {
