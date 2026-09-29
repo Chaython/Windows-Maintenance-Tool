@@ -53008,7 +53008,7 @@ $btnInstall.Add_Click({
 
         $result.Value = [PSCustomObject]@{
             RootPath          = $root
-            Language          = $(if ($null -ne $cboLanguage.SelectedItem) { ([string]$cboLanguage.SelectedItem).Trim() } else { ([string]$cboLanguage.Text).Trim() })
+            Language          = ([string]$cboLanguage.Text).Trim()
             BuildId           = [string]$cboBuild.SelectedValue
             DlcIds            = @($selectedDlcs)
             Workers           = $workerCount
