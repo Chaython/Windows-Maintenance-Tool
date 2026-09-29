@@ -9218,6 +9218,13 @@ foreach ($buttonName in @(
 }
 
 function Test-WmtDnsRunspaceBusy {
+# Treat a completed worker as busy until the shared poller has consumed its
+# result and run the completion cleanup. This closes the same exit-to-callback
+# window handled by the cleaner workers and prevents duplicate poll names.
+if ((Test-WmtUiPollOperation -Name "DnsAssignment") -or
+    (Test-WmtUiPollOperation -Name "DohAction")) {
+    return $true
+}
 return (($script:DnsRunspace -and $script:DnsAsyncResult -and -not $script:DnsAsyncResult.IsCompleted) -or
     ($script:DohRunspace -and $script:DohAsyncResult -and -not $script:DohAsyncResult.IsCompleted))
 }
@@ -51869,6 +51876,11 @@ return $result.ToArray()
 
 function Start-WmtLibraryScan {
 param([switch]$Silent)
+
+# This function intentionally replaces an earlier library scan. Reconcile the
+# old shared-poller entry before disposing/replacing the worker references so
+# duplicate-name protection cannot leave the new scan unmonitored.
+try { Unregister-WmtUiPollOperation -Name "LibraryScan" } catch {}
 
 if ($script:WmtLibraryScanRunspace) {
     try { $script:WmtLibraryScanRunspace.Stop() } catch {}
