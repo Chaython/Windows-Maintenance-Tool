@@ -52900,11 +52900,18 @@ function Invoke-WmtLibraryInstall {
             $nameRef = [string]$name
             $defaultRootRef = [string]$defaultRoot
 
+            # GetNewClosure() runs in a dynamic module, so capture the actual
+            # main-script PSVariable before the delayed metadata callback runs.
+            if (-not (Get-Variable -Name WmtGogdlLastInstallRoot -Scope Script -ErrorAction SilentlyContinue)) {
+                Set-Variable -Name WmtGogdlLastInstallRoot -Scope Script -Value ""
+            }
+            $lastInstallRootState = Get-Variable -Name WmtGogdlLastInstallRoot -Scope Script
+
             $showOptions = {
                 param($Metadata, [string]$Warning)
                 $options = Show-WmtGogdlInstallOptions -GameName $nameRef -DefaultRoot $defaultRootRef -Metadata $Metadata -MetadataWarning $Warning
                 if (-not $options) { return }
-                $script:WmtGogdlLastInstallRoot = [string]$options.RootPath
+                $lastInstallRootState.Value = [string]$options.RootPath
                 Start-WmtGogdlLibraryDownload -Name $nameRef -Id $idRef -GogdlExe $gogdlExeRef -AuthConfig $authConfigRef -Options $options -Metadata $Metadata
             }.GetNewClosure()
 
@@ -52933,7 +52940,18 @@ function Invoke-WmtLibraryInstall {
 
             $metadataError = {
                 param($errorRecord)
-                & $showOptions $null ("GOGDL metadata lookup failed: " + $errorRecord.Exception.Message + ". You can still install with manual/default options.")
+                $errorMessage = ""
+                if ($errorRecord -is [System.Exception]) {
+                    $errorMessage = $errorRecord.Message
+                }
+                elseif ($errorRecord -and $errorRecord.Exception) {
+                    $errorMessage = $errorRecord.Exception.Message
+                }
+                else {
+                    $errorMessage = [string]$errorRecord
+                }
+                if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = "unknown error" }
+                & $showOptions $null ("GOGDL metadata lookup failed: " + $errorMessage + ". You can still install with manual/default options.")
             }.GetNewClosure()
 
             Invoke-WmtUiBackgroundCommand -Name ("GogdlInstallInfo_" + $idRef) -Msg "Loading GOGDL install choices for $nameRef..." -TimeoutMs 30000 -SuppressResultLog -Sb {
