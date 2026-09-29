@@ -52765,7 +52765,7 @@ try {
     return $folder
 }
 catch {
-    Write-GuiLog "GOGDL manifest read warning for $Id: $($_.Exception.Message)"
+    Write-GuiLog "GOGDL manifest read warning for ${Id}: $($_.Exception.Message)"
     return ""
 }
 }
@@ -53301,7 +53301,7 @@ $resultPath = Join-Path $launcherDir ("gogdl-result-{0}-{1}.txt" -f (($Id -repla
 
 $exeLiteral = ConvertTo-WmtPsSingleQuotedLiteral $GogdlExe
 $resultLiteral = ConvertTo-WmtPsSingleQuotedLiteral $resultPath
-$argumentLiterals = @($gogArgs | ForEach-Object { ConvertTo-WmtPsSingleQuotedLiteral ([string]$_ })
+$argumentLiterals = @($gogArgs | ForEach-Object { ConvertTo-WmtPsSingleQuotedLiteral ([string]$_) })
 $argumentsLiteral = $argumentLiterals -join ", "
 $titleLiteral = ConvertTo-WmtPsSingleQuotedLiteral ("WMT GOGDL - " + $Name)
 $pauseSuccessLiteral = if ([bool]$Options.KeepOpenOnSuccess) { '$true' } else { '$false' }
