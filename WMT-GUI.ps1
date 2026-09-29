@@ -52121,15 +52121,21 @@ $btnCatalogInstall.Add_Click({
                 # A GOGDL install can become tracked before the visible library
                 # row is refreshed, so do the same tracked-path check used by
                 # the context menu before offering another install.
-                if (-not $isInstalled -and ([string]$item.Source) -eq "GOG") {
+                $isPending = $false
+                if (([string]$item.Source) -eq "GOG") {
                     try {
-                        $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
-                        $isInstalled = -not [string]::IsNullOrWhiteSpace($trackedGogPath)
+                        if (-not $isInstalled) {
+                            $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
+                            $isInstalled = -not [string]::IsNullOrWhiteSpace($trackedGogPath)
+                        }
+                        if (-not $isInstalled) {
+                            $isPending = Test-WmtGogdlInstallPending -Id ([string]$item.Id)
+                        }
                     }
                     catch {}
                 }
 
-                if (-not $isInstalled) {
+                if (-not $isInstalled -and -not $isPending) {
                     Invoke-WmtLibraryInstall -Item $item
                 }
             }
@@ -52204,9 +52210,26 @@ $legCacheFile = Join-Path $dataPath "legendary_library.json"
 $gogCacheFile = Join-Path $dataPath "gog_library.json"
 $steamCacheFile = Join-Path $dataPath "steam_library.json"
 
+$gogInstalledIds = [System.Collections.Generic.List[string]]::new()
+$gogPendingIds = [System.Collections.Generic.List[string]]::new()
+try {
+    $trackedGog = Get-WmtGogdlInstallMap
+    foreach ($trackedId in @($trackedGog.Keys)) {
+        $idText = [string]$trackedId
+        if ([string]::IsNullOrWhiteSpace($idText)) { continue }
+        if (-not [string]::IsNullOrWhiteSpace((Get-WmtGogdlTrackedInstallPath -Id $idText))) {
+            [void]$gogInstalledIds.Add($idText)
+        }
+        elseif (Test-WmtGogdlInstallPending -Id $idText) {
+            [void]$gogPendingIds.Add($idText)
+        }
+    }
+}
+catch {}
+
 $ps = New-WmtPooledPowerShell
 [void]$ps.AddScript({
-        param($LegCacheFile, $GogCacheFile, $SteamCacheFile)
+        param($LegCacheFile, $GogCacheFile, $SteamCacheFile, $GogInstalledIds, $GogPendingIds)
 
         $all = [System.Collections.Generic.List[object]]::new()
 
@@ -52363,13 +52386,17 @@ $ps = New-WmtPooledPowerShell
                 foreach ($game in @($library)) {
                     $title = [string]$game.Title
                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                    $gameId = [string]$game.Id
+                    $isInstalled = ($GogInstalledIds -contains $gameId)
+                    $isPending = (-not $isInstalled -and ($GogPendingIds -contains $gameId))
                     $all.Add([PSCustomObject]@{
                             Source      = "GOG"
                             Name        = $title
-                            Id          = [string]$game.Id
-                            Version     = "Owned"
+                            Id          = $gameId
+                            Version     = if ($isInstalled) { "Installed" } elseif ($isPending) { "Downloading" } else { "Owned" }
                             Available   = [string]$game.Version
-                            IsInstalled = $false
+                            IsInstalled = $isInstalled
+                            IsPending   = $isPending
                             ProviderKey = "gogdl"
                         })
                     $gogCount++
@@ -52386,7 +52413,7 @@ $ps = New-WmtPooledPowerShell
 
         Write-Output "COUNT:$($all.Count)"
         foreach ($item in $all) { Write-Output $item }
-    }).AddArgument($legCacheFile).AddArgument($gogCacheFile).AddArgument($steamCacheFile)
+    }).AddArgument($legCacheFile).AddArgument($gogCacheFile).AddArgument($steamCacheFile).AddArgument($gogInstalledIds.ToArray()).AddArgument($gogPendingIds.ToArray())
 
 $script:WmtLibraryScanRunspace = $ps
 $script:WmtLibraryScanAsyncResult = $ps.BeginInvoke()
@@ -52680,6 +52707,91 @@ function Get-WmtGogdlInstallMapPath {
 return (Join-Path (Get-DataPath) "gogdl_installs.json")
 }
 
+function Get-WmtGogdlResolvedExePath {
+$exe = Get-WmtGogdlExePath
+if (-not [string]::IsNullOrWhiteSpace($exe) -and (Test-Path -LiteralPath $exe -PathType Leaf)) { return [string]$exe }
+foreach ($cmdName in @("gogdl", "gogdl.exe", "gogdl_windows_x86_64.exe", "gogdl_windows_arm64.exe")) {
+    try {
+        $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) { return [string]$cmd.Source }
+    }
+    catch {}
+}
+return ""
+}
+
+function Get-WmtGogdlResolvedAuthConfigPath {
+$auth = Get-WmtGogdlAuthConfigPath
+if (-not [string]::IsNullOrWhiteSpace($auth) -and (Test-Path -LiteralPath $auth -PathType Leaf)) { return [string]$auth }
+try {
+    $heroicAuth = Join-Path $env:APPDATA "heroic\gog_store\auth.json"
+    if (Test-Path -LiteralPath $heroicAuth -PathType Leaf) { return [string]$heroicAuth }
+}
+catch {}
+return ""
+}
+
+function Get-WmtGogdlManifestPath {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+$base = ""
+try {
+    if (-not [string]::IsNullOrWhiteSpace($env:GOGDL_CONFIG_PATH)) {
+        $base = Join-Path $env:GOGDL_CONFIG_PATH "heroic_gogdl\manifests"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        $base = Join-Path $env:APPDATA "heroic_gogdl\manifests"
+    }
+}
+catch {}
+if ([string]::IsNullOrWhiteSpace($base)) { return "" }
+return (Join-Path $base $Id)
+}
+
+function Get-WmtGogdlManifestInstallFolder {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+$manifestPath = Get-WmtGogdlManifestPath -Id $Id
+if ([string]::IsNullOrWhiteSpace($manifestPath) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return "" }
+try {
+    $manifest = [System.IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop
+    $folder = ""
+    if ($manifest.PSObject.Properties["installDirectory"]) {
+        $folder = ([string]$manifest.installDirectory).Trim()
+    }
+    elseif ($manifest.PSObject.Properties["product"] -and $manifest.product -and $manifest.product.PSObject.Properties["installDirectory"]) {
+        $folder = ([string]$manifest.product.installDirectory).Trim()
+    }
+    return $folder
+}
+catch {
+    Write-GuiLog "GOGDL manifest read warning for $Id: $($_.Exception.Message)"
+    return ""
+}
+}
+
+function Resolve-WmtGogdlInstallPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [string]$RootPath,
+    [string]$InstallPath
+)
+
+if (-not [string]::IsNullOrWhiteSpace($InstallPath) -and (Test-Path -LiteralPath $InstallPath -PathType Container)) {
+    return [string]$InstallPath
+}
+
+$folder = Get-WmtGogdlManifestInstallFolder -Id $Id
+if (-not [string]::IsNullOrWhiteSpace($folder) -and -not [string]::IsNullOrWhiteSpace($RootPath)) {
+    try {
+        $candidate = Join-Path $RootPath $folder
+        if (Test-Path -LiteralPath $candidate -PathType Container) { return [string]$candidate }
+    }
+    catch {}
+}
+return ""
+}
+
 function Get-WmtGogdlInstallMap {
 $map = @{}
 $path = Get-WmtGogdlInstallMapPath
@@ -52702,7 +52814,8 @@ param(
     [string]$Name,
     [string]$RootPath,
     [string]$InstallPath,
-    [ValidateSet("Pending", "Installed", "Failed")][string]$Status = "Pending"
+    [ValidateSet("Pending", "Installed", "Failed")][string]$Status = "Pending",
+    [int]$ProcessId = 0
 )
 
 $map = Get-WmtGogdlInstallMap
@@ -52711,6 +52824,7 @@ $map[$Id] = [PSCustomObject]@{
     RootPath    = [string]$RootPath
     InstallPath = [string]$InstallPath
     Status      = [string]$Status
+    ProcessId   = [int]$ProcessId
     UpdatedUtc  = [DateTime]::UtcNow.ToString("o")
 }
 $path = Get-WmtGogdlInstallMapPath
@@ -52744,19 +52858,86 @@ finally {
 }
 }
 
+function Test-WmtGogdlInstallPending {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+$map = Get-WmtGogdlInstallMap
+if (-not $map.ContainsKey($Id)) { return $false }
+$entry = $map[$Id]
+if ([string]$entry.Status -ne "Pending") { return $false }
+
+$pidValue = 0
+try { if ($entry.PSObject.Properties["ProcessId"]) { $pidValue = [int]$entry.ProcessId } } catch {}
+if ($pidValue -le 0) { return $false }
+try {
+    $p = Get-Process -Id $pidValue -ErrorAction Stop
+    return [bool]($p -and -not $p.HasExited)
+}
+catch { return $false }
+}
+
 function Get-WmtGogdlTrackedInstallPath {
 param([Parameter(Mandatory = $true)][string]$Id)
 $map = Get-WmtGogdlInstallMap
 if (-not $map.ContainsKey($Id)) { return "" }
 $entry = $map[$Id]
-$installPath = [string]$entry.InstallPath
-if ([string]::IsNullOrWhiteSpace($installPath) -or -not (Test-Path -LiteralPath $installPath -PathType Container)) { return "" }
 
-$completeMarker = Join-Path $installPath ".wmt-gogdl-installed"
-if ([string]$entry.Status -eq "Installed" -or (Test-Path -LiteralPath $completeMarker -PathType Leaf)) {
-    return $installPath
+$resolved = Resolve-WmtGogdlInstallPath -Id $Id -RootPath ([string]$entry.RootPath) -InstallPath ([string]$entry.InstallPath)
+if ([string]::IsNullOrWhiteSpace($resolved)) { return "" }
+
+$completeMarker = Join-Path $resolved ".wmt-gogdl-installed"
+$manifestPath = Get-WmtGogdlManifestPath -Id $Id
+if ([string]$entry.Status -eq "Installed" -or
+    (Test-Path -LiteralPath $completeMarker -PathType Leaf) -or
+    (-not [string]::IsNullOrWhiteSpace($manifestPath) -and (Test-Path -LiteralPath $manifestPath -PathType Leaf))) {
+    return $resolved
 }
 return ""
+}
+
+function Resolve-WmtGogdlLanguageCode {
+param(
+    [Parameter(Mandatory = $true)][string]$GogdlExe,
+    [Parameter(Mandatory = $true)][string]$Language
+)
+
+$result = [PSCustomObject]@{ Valid = $false; Code = ""; Error = "" }
+$inputLanguage = $Language.Trim()
+if ([string]::IsNullOrWhiteSpace($inputLanguage)) {
+    $result.Error = "Choose a language."
+    return $result
+}
+try {
+    $quoted = ConvertTo-WmtProcessArgument $inputLanguage
+    $procResult = Invoke-WmtProcess -FilePath $GogdlExe -Arguments ("lang-match " + $quoted) -TimeoutMs 5000 -Encoding UTF8 -KillTree
+    if ($procResult.TimedOut) {
+        $result.Error = "GOGDL language validation timed out."
+        return $result
+    }
+    if ($procResult.ExitCode -ne 0) {
+        $detail = ([string]$procResult.StdErr).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = ([string]$procResult.Error).Trim() }
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit code $($procResult.ExitCode)" }
+        $result.Error = "GOGDL could not validate the language ($detail)."
+        return $result
+    }
+    $jsonText = ([string]$procResult.StdOut).Trim()
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        $result.Error = "GOGDL returned no language match."
+        return $result
+    }
+    $match = $jsonText | ConvertFrom-Json -ErrorAction Stop
+    if ($match -and $match.PSObject.Properties["code"] -and -not [string]::IsNullOrWhiteSpace([string]$match.code)) {
+        $result.Valid = $true
+        $result.Code = ([string]$match.code).Trim()
+        return $result
+    }
+    $result.Error = "'$inputLanguage' is not a language code/name recognized by GOGDL."
+}
+catch {
+    $result.Error = "Could not validate the GOG language: $($_.Exception.Message)"
+}
+return $result
 }
 
 function Show-WmtGogdlInstallOptions {
@@ -52764,7 +52945,8 @@ param(
     [Parameter(Mandatory = $true)][string]$GameName,
     [string]$DefaultRoot = "",
     $Metadata,
-    [string]$MetadataWarning = ""
+    [string]$MetadataWarning = "",
+    [string]$GogdlExe = ""
 )
 
 $contentXaml = @'
@@ -52901,7 +53083,6 @@ $lblMetadata.Text = $MetadataWarning
 $txtRoot.Text = $DefaultRoot
 
 $languageItems = [System.Collections.Generic.List[string]]::new()
-[void]$languageItems.Add("en-US")
 try {
     foreach ($language in @($Metadata.languages | Sort-Object -Unique)) {
         $code = ([string]$language).Trim()
@@ -52911,9 +53092,16 @@ try {
     }
 }
 catch {}
+if ($languageItems.Count -eq 0) {
+    [void]$languageItems.Add("en-US")
+}
+elseif ($languageItems.Contains("en-US")) {
+    [void]$languageItems.Remove("en-US")
+    $languageItems.Insert(0, "en-US")
+}
 foreach ($language in $languageItems) { [void]$cboLanguage.Items.Add($language) }
-$cboLanguage.SelectedItem = "en-US"
-$cboLanguage.Text = "en-US"
+$cboLanguage.SelectedIndex = 0
+$cboLanguage.Text = [string]$cboLanguage.SelectedItem
 $cboLanguage.Add_SelectionChanged({
         if ($null -ne $cboLanguage.SelectedItem) {
             $cboLanguage.Text = ([string]$cboLanguage.SelectedItem).Trim()
@@ -52997,6 +53185,28 @@ $btnInstall.Add_Click({
             return
         }
 
+        $languageCode = ([string]$cboLanguage.Text).Trim()
+        $knownLanguage = @($languageItems | Where-Object { [string]$_ -ieq $languageCode } | Select-Object -First 1)
+        if ($knownLanguage.Count -gt 0) {
+            $languageCode = [string]$knownLanguage[0]
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($GogdlExe) -and (Test-Path -LiteralPath $GogdlExe -PathType Leaf)) {
+            $languageMatch = Resolve-WmtGogdlLanguageCode -GogdlExe $GogdlExe -Language $languageCode
+            if (-not $languageMatch.Valid) {
+                $lblError.Text = [string]$languageMatch.Error
+                return
+            }
+            $languageCode = [string]$languageMatch.Code
+            if ($languageItems.Count -gt 0 -and -not $languageItems.Contains($languageCode)) {
+                $lblError.Text = "Language '$languageCode' is recognized by GOGDL but is not available for this game."
+                return
+            }
+        }
+        else {
+            $lblError.Text = "Could not validate the language because GOGDL is unavailable."
+            return
+        }
+
         $workerCount = 1
         [void][int]::TryParse([string]$cboWorkers.SelectedItem, [ref]$workerCount)
         if ($workerCount -notin @(1, 2, 4)) { $workerCount = 1 }
@@ -53008,7 +53218,7 @@ $btnInstall.Add_Click({
 
         $result.Value = [PSCustomObject]@{
             RootPath          = $root
-            Language          = ([string]$cboLanguage.Text).Trim()
+            Language          = $languageCode
             BuildId           = [string]$cboBuild.SelectedValue
             DlcIds            = @($selectedDlcs)
             Workers           = $workerCount
@@ -53032,6 +53242,11 @@ param(
     [Parameter(Mandatory = $true)]$Options,
     $Metadata
 )
+
+if (Test-WmtGogdlInstallPending -Id $Id) {
+    Show-WmtMessageBox -Message "'$Name' already has a GOGDL download running." -Title "Download Already Running" -Image Information | Out-Null
+    return
+}
 
 $gogArgs = [System.Collections.Generic.List[string]]::new()
 [void]$gogArgs.Add("--auth-config-path")
@@ -53070,70 +53285,57 @@ $expectedInstallPath = ""
 if (-not [string]::IsNullOrWhiteSpace($folderName)) {
     try { $expectedInstallPath = Join-Path ([string]$Options.RootPath) $folderName } catch {}
 }
-Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootPath) -InstallPath $expectedInstallPath -Status Pending
 
-function ConvertTo-WmtGogdlBatchArg([string]$Value) {
-    if ($null -eq $Value) { return '""' }
-    $safe = $Value.Replace('"', '').Replace('%', '%%').Replace("`r", "").Replace("`n", "")
-    return '"' + $safe + '"'
+function ConvertTo-WmtPsSingleQuotedLiteral([string]$Value) {
+    if ($null -eq $Value) { return "''" }
+    $safe = $Value.Replace("'", "''").Replace("`r", " ").Replace("`n", " ")
+    return "'" + $safe + "'"
 }
-
-$commandParts = [System.Collections.Generic.List[string]]::new()
-[void]$commandParts.Add((ConvertTo-WmtGogdlBatchArg $GogdlExe))
-foreach ($arg in $gogArgs) { [void]$commandParts.Add((ConvertTo-WmtGogdlBatchArg ([string]$arg))) }
-$commandLine = $commandParts -join " "
 
 $launcherDir = Join-Path (Get-DataPath) "gogdl-launchers"
 if (-not (Test-Path -LiteralPath $launcherDir -PathType Container)) {
     [void][System.IO.Directory]::CreateDirectory($launcherDir)
 }
-$batchPath = Join-Path $launcherDir ("gogdl-{0}-{1}.cmd" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
-$safeTitle = ($Name -replace '[&|<>^()]', '').Trim()
-if ([string]::IsNullOrWhiteSpace($safeTitle)) { $safeTitle = "GOGDL Download" }
+$resultPath = Join-Path $launcherDir ("gogdl-result-{0}-{1}.txt" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
 
-$completeMarker = ""
-if (-not [string]::IsNullOrWhiteSpace($expectedInstallPath)) {
-    $completeMarker = Join-Path $expectedInstallPath ".wmt-gogdl-installed"
+$exeLiteral = ConvertTo-WmtPsSingleQuotedLiteral $GogdlExe
+$resultLiteral = ConvertTo-WmtPsSingleQuotedLiteral $resultPath
+$argumentLiterals = @($gogArgs | ForEach-Object { ConvertTo-WmtPsSingleQuotedLiteral ([string]$_ })
+$argumentsLiteral = $argumentLiterals -join ", "
+$titleLiteral = ConvertTo-WmtPsSingleQuotedLiteral ("WMT GOGDL - " + $Name)
+$pauseSuccessLiteral = if ([bool]$Options.KeepOpenOnSuccess) { '$true' } else { '$false' }
+
+$launcherScript = @"
+`$ErrorActionPreference = 'Continue'
+try { `$Host.UI.RawUI.WindowTitle = $titleLiteral } catch {}
+`$exe = $exeLiteral
+`$arguments = @($argumentsLiteral)
+`$resultPath = $resultLiteral
+& `$exe @arguments
+`$exitCode = if (`$null -eq `$LASTEXITCODE) { 1 } else { [int]`$LASTEXITCODE }
+try { [System.IO.File]::WriteAllText(`$resultPath, [string]`$exitCode, [System.Text.UTF8Encoding]::new(`$false)) } catch {}
+if (`$exitCode -ne 0) {
+    Write-Host ""
+    Write-Host "[WMT] GOGDL exited before completing successfully. Exit code: `$exitCode"
+    Write-Host "[WMT] The partial download is preserved. Re-run Install from Your Library to resume."
+    Write-Host ""
+    [void](Read-Host "Press Enter to close")
 }
-$markerCommands = ""
-if (-not [string]::IsNullOrWhiteSpace($completeMarker)) {
-    $safeInstall = ConvertTo-WmtGogdlBatchArg $expectedInstallPath
-    $safeMarker = ConvertTo-WmtGogdlBatchArg $completeMarker
-    $markerCommands = @"
-if not exist $safeInstall mkdir $safeInstall >nul 2>&1
-> $safeMarker echo WMT GOGDL install completed
-"@
+else {
+    Write-Host ""
+    Write-Host "[WMT] GOGDL completed successfully."
+    if ($pauseSuccessLiteral) { [void](Read-Host "Press Enter to close") }
 }
-
-$keepOpenSuccess = if ([bool]$Options.KeepOpenOnSuccess) { "1" } else { "0" }
-$batchContent = @"
-@echo off
-setlocal DisableDelayedExpansion
-title WMT GOGDL - $safeTitle
-$commandLine
-set "WMT_GOGDL_EXIT=%ERRORLEVEL%"
-if not "%WMT_GOGDL_EXIT%"=="0" (
-    echo.
-    echo [WMT] GOGDL exited before completing successfully. Exit code: %WMT_GOGDL_EXIT%
-    echo [WMT] The partial download is preserved. Re-run Install from Your Library to resume.
-    echo.
-    pause
-) else (
-$markerCommands
-    echo.
-    echo [WMT] GOGDL completed successfully.
-    if "$keepOpenSuccess"=="1" pause
-)
-exit /b %WMT_GOGDL_EXIT%
+exit `$exitCode
 "@
-[System.IO.File]::WriteAllText($batchPath, $batchContent, [System.Text.Encoding]::ASCII)
 
-$quotedBatch = [char]34 + $batchPath + [char]34
-$proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/d", "/c", $quotedBatch -PassThru -WindowStyle Normal
-Write-GuiLog "Starting GOGDL download for: $Name (id $Id) -> $($Options.RootPath) | workers=$($Options.Workers) | build=$(if ($Options.BuildId) { $Options.BuildId } else { 'default' }) | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
+$encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherScript))
+$proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand -PassThru -WindowStyle Normal
+Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootPath) -InstallPath $expectedInstallPath -Status Pending -ProcessId $proc.Id
+Write-GuiLog "Starting GOGDL download for: $Name (id $Id) -> $($Options.RootPath) | language=$($Options.Language) | workers=$($Options.Workers) | build=$(if ($Options.BuildId) { $Options.BuildId } else { 'default' }) | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
 
 $procRef = $proc
-$batchRef = $batchPath
+$resultRef = $resultPath
 $idRef = $Id
 $nameRef = $Name
 $rootRef = [string]$Options.RootPath
@@ -53142,28 +53344,58 @@ $operationName = "GogdlLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('
 
 $testComplete = {
     param($Operation)
-    try { return [bool]($procRef -and $procRef.HasExited) } catch { return $true }
+    try {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { return $true }
+        return [bool]($procRef -and $procRef.HasExited)
+    }
+    catch { return $true }
 }.GetNewClosure()
 
 $onComplete = {
     param($Operation)
     $exitCode = 1
-    try { if ($procRef) { $exitCode = [int]$procRef.ExitCode } } catch {}
+    try {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
+            [void][int]::TryParse($exitText, [ref]$exitCode)
+        }
+        elseif ($procRef) {
+            $exitCode = [int]$procRef.ExitCode
+        }
+    }
+    catch {}
+
     if ($exitCode -eq 0) {
-        try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $installRef -Status Installed } catch {}
-        Write-GuiLog "GOGDL download completed successfully: $nameRef (id $idRef)."
+        $resolvedInstallPath = Resolve-WmtGogdlInstallPath -Id $idRef -RootPath $rootRef -InstallPath $installRef
+        if (-not [string]::IsNullOrWhiteSpace($resolvedInstallPath)) {
+            try {
+                $completeMarker = Join-Path $resolvedInstallPath ".wmt-gogdl-installed"
+                [System.IO.File]::WriteAllText($completeMarker, "WMT GOGDL install completed", [System.Text.UTF8Encoding]::new($false))
+            }
+            catch {}
+            try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $resolvedInstallPath -Status Installed -ProcessId 0 } catch {}
+            Write-GuiLog "GOGDL download completed successfully: $nameRef (id $idRef) -> $resolvedInstallPath"
+        }
+        else {
+            try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath "" -Status Installed -ProcessId 0 } catch {}
+            Write-GuiLog "GOGDL completed successfully for $nameRef (id $idRef), but WMT could not resolve the final install directory from GOGDL metadata/manifest."
+        }
     }
     else {
-        try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $installRef -Status Failed } catch {}
+        try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $installRef -Status Failed -ProcessId 0 } catch {}
         Write-GuiLog ("GOGDL download ended with exit code " + $exitCode + ": " + $nameRef + " (id " + $idRef + "). Partial files were kept for resume.")
     }
+
+    try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction SilentlyContinue } catch {}
     try { if ($procRef) { $procRef.Dispose() } } catch {}
-    try { Remove-Item -LiteralPath $batchRef -Force -ErrorAction SilentlyContinue } catch {}
+    try { Start-WmtLibraryScan -Silent } catch {}
 }.GetNewClosure()
 
 $onError = {
     param($Operation, $ErrorRecord)
-    Write-GuiLog ("GOGDL download monitor failed for " + $nameRef + ": " + $ErrorRecord.Exception.Message + ". The GOGDL process was left running.")
+    $message = ""
+    try { $message = $ErrorRecord.Exception.Message } catch { $message = [string]$ErrorRecord }
+    Write-GuiLog ("GOGDL download monitor failed for " + $nameRef + ": " + $message + ". The GOGDL process was left running.")
     try { if ($procRef) { $procRef.Dispose() } } catch {}
 }.GetNewClosure()
 
@@ -53175,7 +53407,6 @@ catch {
     try { $proc.Dispose() } catch {}
 }
 }
-
 
 function Invoke-WmtLibraryInstall {
     param($Item)
@@ -53212,19 +53443,18 @@ function Invoke-WmtLibraryInstall {
     }
     elseif ($source -eq "GOG") {
         try {
-            $gogdlExe = Get-WmtGogdlExePath
-            if ([string]::IsNullOrWhiteSpace($gogdlExe) -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
-                foreach ($cmdName in @("gogdl", "gogdl.exe", "gogdl_windows_x86_64.exe")) {
-                    $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
-                    if ($cmd -and $cmd.Source) { $gogdlExe = [string]$cmd.Source; break }
-                }
+            if (Test-WmtGogdlInstallPending -Id $id) {
+                Show-WmtMessageBox -Message "'$name' already has a GOGDL download running." -Title "Download Already Running" -Image Information | Out-Null
+                return
             }
-            if (-not $gogdlExe -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
+
+            $gogdlExe = Get-WmtGogdlResolvedExePath
+            if ([string]::IsNullOrWhiteSpace($gogdlExe) -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
                 Show-WmtMessageBox -Message "GOGDL is not installed. Cannot download GOG games." -Title "Download Failed" -Image Warning | Out-Null
                 return
             }
 
-            $authConfig = Get-WmtGogdlAuthConfigPath
+            $authConfig = Get-WmtGogdlResolvedAuthConfigPath
             if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
                 $heroicAuth = Join-Path $env:APPDATA "heroic\gog_store\auth.json"
                 if (Test-Path -LiteralPath $heroicAuth -PathType Leaf) { $authConfig = $heroicAuth }
@@ -53260,7 +53490,7 @@ function Invoke-WmtLibraryInstall {
 
             $showOptions = {
                 param($Metadata, [string]$Warning)
-                $options = Show-WmtGogdlInstallOptions -GameName $nameRef -DefaultRoot $defaultRootRef -Metadata $Metadata -MetadataWarning $Warning
+                $options = Show-WmtGogdlInstallOptions -GameName $nameRef -DefaultRoot $defaultRootRef -Metadata $Metadata -MetadataWarning $Warning -GogdlExe $gogdlExeRef
                 if (-not $options) { return }
                 $lastInstallRootState.Value = [string]$options.RootPath
                 Start-WmtGogdlLibraryDownload -Name $nameRef -Id $idRef -GogdlExe $gogdlExeRef -AuthConfig $authConfigRef -Options $options -Metadata $Metadata
@@ -53391,13 +53621,28 @@ function Invoke-WmtLibraryRepair {
                 Show-WmtMessageBox -Message "Could not find the install directory for this GOG game." -Title "Repair Failed" -Image Warning | Out-Null
                 return
             }
-            $gogdlCmd = Get-Command gogdl -ErrorAction SilentlyContinue
-            if (-not $gogdlCmd) {
-                Show-WmtMessageBox -Message "gogdl is not installed. Cannot repair GOG games." -Title "Repair Failed" -Image Warning | Out-Null
+
+            $gogdlExe = Get-WmtGogdlResolvedExePath
+            if ([string]::IsNullOrWhiteSpace($gogdlExe) -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL is not installed. Cannot repair GOG games." -Title "Repair Failed" -Image Warning | Out-Null
                 return
             }
-            Start-Process -FilePath $gogdlCmd.Source -ArgumentList "repair", $id, "--path", "`"$installDir`"" -WindowStyle Normal
-            Write-GuiLog "Repairing GOG game: $name (id $id)"
+
+            $authConfig = Get-WmtGogdlResolvedAuthConfigPath
+            if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL authentication was not found. Sign in to GOG / reinstall the GOGDL provider, then try again." -Title "Repair Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $repairArgs = @(
+                "--auth-config-path", (ConvertTo-WmtProcessArgument $authConfig),
+                "repair", (ConvertTo-WmtProcessArgument $id),
+                "--path", (ConvertTo-WmtProcessArgument $installDir),
+                "--os", "windows",
+                "--max-workers", "1"
+            )
+            Start-Process -FilePath $gogdlExe -ArgumentList $repairArgs -WindowStyle Normal
+            Write-GuiLog "Repairing GOG game: $name (id $id) -> $installDir"
         }
         catch {
             Show-WmtMessageBox -Message "Failed to start GOG repair: $($_.Exception.Message)" -Title "Repair Failed" -Image Warning | Out-Null
@@ -53520,13 +53765,22 @@ if ($ctxLibrary -and $lstLibrary) {
             }
 
             $isInstalled = $false
+            $isPending = $false
             try { if ($item.PSObject.Properties["IsInstalled"]) { $isInstalled = [bool]$item.IsInstalled } } catch {}
-            if (-not $isInstalled -and ([string]$item.Source) -eq "GOG") {
+            if (([string]$item.Source) -eq "GOG") {
                 try {
-                    $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
-                    if (-not [string]::IsNullOrWhiteSpace($trackedGogPath)) {
-                        $isInstalled = $true
-                        if ($item.PSObject.Properties["IsInstalled"]) { $item.IsInstalled = $true }
+                    if (-not $isInstalled) {
+                        $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
+                        if (-not [string]::IsNullOrWhiteSpace($trackedGogPath)) {
+                            $isInstalled = $true
+                            if ($item.PSObject.Properties["IsInstalled"]) { $item.IsInstalled = $true }
+                            if ($item.PSObject.Properties["Version"]) { $item.Version = "Installed" }
+                        }
+                    }
+                    if (-not $isInstalled) {
+                        $isPending = Test-WmtGogdlInstallPending -Id ([string]$item.Id)
+                        if ($item.PSObject.Properties["IsPending"]) { $item.IsPending = $isPending }
+                        if ($isPending -and $item.PSObject.Properties["Version"]) { $item.Version = "Downloading" }
                     }
                 }
                 catch {}
@@ -53538,8 +53792,8 @@ if ($ctxLibrary -and $lstLibrary) {
             if ($miLibRepair) { $miLibRepair.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
             if ($miLibGoToDir) { $miLibGoToDir.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
 
-            # Show Install only if NOT installed.
-            if ($miLibInstall) { $miLibInstall.Visibility = if (-not $isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            # Show Install only if NOT installed and not already downloading.
+            if ($miLibInstall) { $miLibInstall.Visibility = if (-not $isInstalled -and -not $isPending) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
 
             # Store page + Copy ID + Copy Row Data always visible.
             if ($miLibStorePage) { $miLibStorePage.Visibility = [System.Windows.Visibility]::Visible }
