@@ -3244,7 +3244,17 @@ try {
                 <Grid x:Name="templateRoot" SnapsToDevicePixels="True">
                     <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="4">
                         <Grid>
-                            <ContentPresenter Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}" Margin="{TemplateBinding Padding}" HorizontalAlignment="Left" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" IsHitTestVisible="False"/>
+                            <ContentPresenter x:Name="contentPresenter" Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}" Margin="{TemplateBinding Padding}" HorizontalAlignment="Left" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" IsHitTestVisible="False"/>
+                            <TextBox x:Name="PART_EditableTextBox"
+                                     Text="{Binding Text, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     Background="Transparent" Foreground="{TemplateBinding Foreground}"
+                                     BorderThickness="0" Padding="0"
+                                     Margin="{TemplateBinding Padding}"
+                                     HorizontalContentAlignment="Left"
+                                     VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                                     CaretBrush="{TemplateBinding Foreground}"
+                                     IsReadOnly="{TemplateBinding IsReadOnly}"
+                                     Visibility="Collapsed"/>
                             <Path x:Name="Arrow" Data="M 0 0 L 4 4 L 8 0" Stroke="{TemplateBinding Foreground}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,1,9,0" IsHitTestVisible="False"/>
                         </Grid>
                     </Border>
@@ -3268,6 +3278,12 @@ try {
                                 <RotateTransform Angle="180"/>
                             </Setter.Value>
                         </Setter>
+                    </Trigger>
+                    <Trigger Property="IsEditable" Value="True">
+                        <Setter TargetName="contentPresenter" Property="Visibility" Value="Collapsed"/>
+                        <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                        <Setter TargetName="toggleButton" Property="HorizontalAlignment" Value="Right"/>
+                        <Setter TargetName="toggleButton" Property="Width" Value="32"/>
                     </Trigger>
                     <Trigger Property="IsEnabled" Value="False">
                         <Setter Property="Opacity" Value="0.55"/>
@@ -52896,7 +52912,13 @@ try {
 }
 catch {}
 foreach ($language in $languageItems) { [void]$cboLanguage.Items.Add($language) }
+$cboLanguage.SelectedItem = "en-US"
 $cboLanguage.Text = "en-US"
+$cboLanguage.Add_SelectionChanged({
+        if ($null -ne $cboLanguage.SelectedItem) {
+            $cboLanguage.Text = ([string]$cboLanguage.SelectedItem).Trim()
+        }
+    }.GetNewClosure())
 
 $buildItems = [System.Collections.Generic.List[object]]::new()
 [void]$buildItems.Add([PSCustomObject]@{ Label = "Latest stable / GOGDL default"; Value = "" })
@@ -52986,7 +53008,7 @@ $btnInstall.Add_Click({
 
         $result.Value = [PSCustomObject]@{
             RootPath          = $root
-            Language          = ([string]$cboLanguage.Text).Trim()
+            Language          = $(if ($null -ne $cboLanguage.SelectedItem) { ([string]$cboLanguage.SelectedItem).Trim() } else { ([string]$cboLanguage.Text).Trim() })
             BuildId           = [string]$cboBuild.SelectedValue
             DlcIds            = @($selectedDlcs)
             Workers           = $workerCount
