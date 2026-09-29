@@ -2697,7 +2697,12 @@ param(
     [scriptblock]$OnError
 )
 if ([string]::IsNullOrWhiteSpace($Name)) { throw "Async operation name cannot be empty." }
-if ($script:WmtUiPollOperations.Contains($Name)) { [void]$script:WmtUiPollOperations.Remove($Name) }
+if ($script:WmtUiPollOperations.Contains($Name)) {
+    # Never silently abandon an older operation. Callers that intentionally
+    # replace work must first reconcile/unregister the existing monitor and
+    # clean up the resource it owns.
+    throw "Async operation '$Name' is already registered. Complete or explicitly unregister and clean up the existing operation before registering a replacement."
+}
 $op = [PSCustomObject]@{
     Name = $Name
     StartedAt = [DateTime]::UtcNow
@@ -41226,9 +41231,22 @@ if ($script:WmtCleanerDialogActive -or $script:WmtCleanerOperationActive) {
 }
 if (-not $Force -and -not (Test-WmtCleanerDefinitionMaintenanceDue)) { return }
 
+# A worker can exit up to one poll interval before its completion callback runs.
+# Keep the operation reserved until that callback has consumed the result and
+# disposed the exact Process instance.
+if (Test-WmtUiPollOperation -Name "CleanerDefinitionRefresh") {
+    Write-GuiLog "Cleaner definition refresh skipped because the previous refresh is still being finalized."
+    return
+}
 if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
     Write-GuiLog "Cleaner definition refresh skipped because the previous refresh is still running."
     return
+}
+if ($script:WmtCleanerRefreshProcess -and $script:WmtCleanerRefreshProcess.HasExited) {
+    # Defensive recovery for stale state left by an older build or a failed
+    # monitor registration. There is no live monitor at this point.
+    try { $script:WmtCleanerRefreshProcess.Dispose() } catch {}
+    $script:WmtCleanerRefreshProcess = $null
 }
 if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProcess.HasExited) {
     Write-GuiLog "Cleaner definition refresh deferred because automatic cleaning is running."
@@ -41238,6 +41256,7 @@ if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProc
 $resultPath = Join-Path (Get-DataPath) "cleaner-refresh-last.json"
 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
 
+$proc = $null
 try {
     $proc = Start-WmtHiddenSelfWorkerProcess -Arguments @("-CleanerRefreshWorker", "-CleanerRefreshResultPath", $resultPath)
     if (-not $proc) { throw "Worker process did not start." }
@@ -41286,12 +41305,41 @@ try {
         }
     }.GetNewClosure()
 
-    Register-WmtUiPollOperation -Name "CleanerDefinitionRefresh" -IntervalMs 1000 -TestComplete {
-        return [bool]($script:WmtCleanerRefreshProcess -and $script:WmtCleanerRefreshProcess.HasExited)
-    } -OnComplete $refreshOnComplete | Out-Null
+    # Test the captured process, not the mutable script variable. A later worker
+    # can therefore never make this monitor observe the wrong Process instance.
+    $refreshTestComplete = {
+        param($Operation)
+        try { return [bool]($refreshProcess -and $refreshProcess.HasExited) }
+        catch { return $true }
+    }.GetNewClosure()
+
+    Register-WmtUiPollOperation -Name "CleanerDefinitionRefresh" -IntervalMs 1000 -TestComplete $refreshTestComplete -OnComplete $refreshOnComplete | Out-Null
 }
 catch {
-    $script:WmtCleanerRefreshProcess = $null
+    # If anything after process creation fails (closure/state lookup or poller
+    # registration), do not leave an untracked cleaner worker running.
+    try {
+        if (Test-WmtUiPollOperation -Name "CleanerDefinitionRefresh") {
+            Unregister-WmtUiPollOperation -Name "CleanerDefinitionRefresh"
+        }
+    }
+    catch {}
+    if ($proc) {
+        try {
+            if (-not $proc.HasExited) {
+                $proc.Kill()
+                [void]$proc.WaitForExit(2000)
+            }
+        }
+        catch {}
+        try { $proc.Dispose() } catch {}
+    }
+    try {
+        if ($proc -and [object]::ReferenceEquals($script:WmtCleanerRefreshProcess, $proc)) {
+            $script:WmtCleanerRefreshProcess = $null
+        }
+    }
+    catch {}
     Write-GuiLog "Cleaner definition refresh failed to start: $($_.Exception.Message)"
 }
 }
@@ -41373,9 +41421,17 @@ if (-not (Test-WmtAnySavedCleanerSelected)) {
     return
 }
 
+if (Test-WmtUiPollOperation -Name "CleanerAutoClean") {
+    Write-GuiLog "Automatic cleaner skipped because the previous run is still being finalized."
+    return
+}
 if ($script:WmtCleanerAutoCleanProcess -and -not $script:WmtCleanerAutoCleanProcess.HasExited) {
     Write-GuiLog "Automatic cleaner skipped because the previous run is still active."
     return
+}
+if ($script:WmtCleanerAutoCleanProcess -and $script:WmtCleanerAutoCleanProcess.HasExited) {
+    try { $script:WmtCleanerAutoCleanProcess.Dispose() } catch {}
+    $script:WmtCleanerAutoCleanProcess = $null
 }
 if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.HasExited) {
     Write-GuiLog "Automatic cleaner deferred because cleaner definitions are being refreshed."
@@ -41385,6 +41441,7 @@ if ($script:WmtCleanerRefreshProcess -and -not $script:WmtCleanerRefreshProcess.
 $resultPath = Join-Path (Get-DataPath) "cleaner-auto-last.json"
 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
 
+$proc = $null
 try {
     $proc = Start-WmtHiddenSelfWorkerProcess -Arguments @("-AutoCleanWorker", "-AutoCleanResultPath", $resultPath)
     if (-not $proc) { throw "Worker process did not start." }
@@ -41429,12 +41486,37 @@ try {
         }
     }.GetNewClosure()
 
-    Register-WmtUiPollOperation -Name "CleanerAutoClean" -IntervalMs 1000 -TestComplete {
-        return [bool]($script:WmtCleanerAutoCleanProcess -and $script:WmtCleanerAutoCleanProcess.HasExited)
-    } -OnComplete $autoCleanOnComplete | Out-Null
+    $autoCleanTestComplete = {
+        param($Operation)
+        try { return [bool]($autoCleanProcess -and $autoCleanProcess.HasExited) }
+        catch { return $true }
+    }.GetNewClosure()
+
+    Register-WmtUiPollOperation -Name "CleanerAutoClean" -IntervalMs 1000 -TestComplete $autoCleanTestComplete -OnComplete $autoCleanOnComplete | Out-Null
 }
 catch {
-    $script:WmtCleanerAutoCleanProcess = $null
+    try {
+        if (Test-WmtUiPollOperation -Name "CleanerAutoClean") {
+            Unregister-WmtUiPollOperation -Name "CleanerAutoClean"
+        }
+    }
+    catch {}
+    if ($proc) {
+        try {
+            if (-not $proc.HasExited) {
+                $proc.Kill()
+                [void]$proc.WaitForExit(2000)
+            }
+        }
+        catch {}
+        try { $proc.Dispose() } catch {}
+    }
+    try {
+        if ($proc -and [object]::ReferenceEquals($script:WmtCleanerAutoCleanProcess, $proc)) {
+            $script:WmtCleanerAutoCleanProcess = $null
+        }
+    }
+    catch {}
     Write-GuiLog "Automatic cleaner failed to start: $($_.Exception.Message)"
 }
 }
