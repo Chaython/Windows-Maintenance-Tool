@@ -54382,7 +54382,7 @@ function Invoke-WmtLibraryInstall {
                     param([string]$Text)
                     if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
 
-                    $lines = @($Text -split "`r?`n" | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    $lines = @($Text -split '\r?\n' | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                     if ($lines.Count -eq 0) { return "" }
 
                     $candidate = ""
