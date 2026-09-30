@@ -3465,7 +3465,8 @@ try {
 
 <!-- The default ComboBoxItem template paints SystemColors.Window (white) and
      generated items inherit the combo's light foreground - light-on-white,
-     unreadable. Give items an opaque themed surface and a BgHover highlight. -->
+     unreadable. Give items an opaque themed surface and use the same
+     Accent/AccentText highlight inversion as selected list rows. -->
 <Style TargetType="{x:Type ComboBoxItem}">
     <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
@@ -3479,12 +3480,12 @@ try {
                 </Border>
                 <ControlTemplate.Triggers>
                     <Trigger Property="IsHighlighted" Value="True">
-                        <Setter Property="Background" Value="{DynamicResource BgHover}"/>
-                        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
                     </Trigger>
                     <Trigger Property="IsSelected" Value="True">
-                        <Setter Property="Background" Value="{DynamicResource BgHover}"/>
-                        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
                     </Trigger>
                     <Trigger Property="IsEnabled" Value="False">
                         <Setter Property="Opacity" Value="0.55"/>
@@ -23631,7 +23632,8 @@ Write-GuiLog "[Storage Benchmark] Opening drive benchmark window."
 $BrushHeaderBg = New-WmtBrush "BgPanel"
 $BrushHeaderText = New-WmtBrush "TextPrimary"
 $BrushHeaderBorder = New-WmtBrush "BorderBrush"
-$BrushHeaderSelectBg = New-WmtBrush "BgHover"
+$BrushHeaderSelectBg = New-WmtBrush "Accent"
+$BrushHeaderSelectText = New-WmtBrush "AccentText"
 
 function Set-DbSystemColors {
     param([System.Windows.FrameworkElement]$Element)
@@ -23652,7 +23654,9 @@ function Set-DbHeaderSystemColors {
     $Element.Resources[[System.Windows.SystemColors]::ControlBrushKey] = $BrushHeaderBg
     $Element.Resources[[System.Windows.SystemColors]::ControlTextBrushKey] = $BrushHeaderText
     $Element.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = $BrushHeaderSelectBg
-    $Element.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $BrushHeaderText
+    $Element.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $BrushHeaderSelectText
+    $Element.Resources[[System.Windows.SystemColors]::InactiveSelectionHighlightBrushKey] = $BrushHeaderSelectBg
+    $Element.Resources[[System.Windows.SystemColors]::InactiveSelectionHighlightTextBrushKey] = $BrushHeaderSelectText
     $Element.Resources[[System.Windows.SystemColors]::GrayTextBrushKey] = $BrushHeaderText
 }
 
@@ -40175,15 +40179,6 @@ foreach ($p in $providerDefinitions) {
         <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="Padding" Value="12,0"/>
     </Style>
-    <Style TargetType="ComboBox">
-        <Setter Property="Foreground" Value="#111827"/>
-        <Setter Property="Background" Value="#FFFFFF"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-    </Style>
-    <Style TargetType="ComboBoxItem">
-        <Setter Property="Foreground" Value="#111827"/>
-        <Setter Property="Background" Value="#FFFFFF"/>
-    </Style>
     <Style TargetType="TextBox">
         <Setter Property="Foreground" Value="#111827"/>
         <Setter Property="Background" Value="#FFFFFF"/>
@@ -40212,17 +40207,17 @@ foreach ($p in $providerDefinitions) {
                 <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="220"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                 <TextBlock Text="Auto scan" FontWeight="Bold" Grid.Row="0" Grid.Column="0"/>
-                <ComboBox Name="cmbAutoScanInterval" Grid.Row="0" Grid.Column="1" Height="28" Width="210" HorizontalAlignment="Left" SelectedValuePath="Tag" Foreground="#111827" Background="#FFFFFF">
-                    <ComboBoxItem Content="Disabled" Tag="0" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 1 minute (test)" Tag="1" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 15 minutes" Tag="15" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 30 minutes" Tag="30" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 1 hour" Tag="60" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 2 hours" Tag="120" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 4 hours" Tag="240" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 8 hours" Tag="480" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every 12 hours" Tag="720" Foreground="#111827" Background="#FFFFFF"/>
-                    <ComboBoxItem Content="Every day" Tag="1440" Foreground="#111827" Background="#FFFFFF"/>
+                <ComboBox Name="cmbAutoScanInterval" Grid.Row="0" Grid.Column="1" Height="28" Width="210" HorizontalAlignment="Left" SelectedValuePath="Tag">
+                    <ComboBoxItem Content="Disabled" Tag="0"/>
+                    <ComboBoxItem Content="Every 1 minute (test)" Tag="1"/>
+                    <ComboBoxItem Content="Every 15 minutes" Tag="15"/>
+                    <ComboBoxItem Content="Every 30 minutes" Tag="30"/>
+                    <ComboBoxItem Content="Every 1 hour" Tag="60"/>
+                    <ComboBoxItem Content="Every 2 hours" Tag="120"/>
+                    <ComboBoxItem Content="Every 4 hours" Tag="240"/>
+                    <ComboBoxItem Content="Every 8 hours" Tag="480"/>
+                    <ComboBoxItem Content="Every 12 hours" Tag="720"/>
+                    <ComboBoxItem Content="Every day" Tag="1440"/>
                 </ComboBox>
                 <CheckBox Name="chkUpdateNotifications" Grid.Row="0" Grid.Column="2" Content="Native notifications" Margin="12,0,0,0"
                           ToolTip="Show a Windows notification when an automatic background scan finds updates or fails."/>
