@@ -3544,7 +3544,23 @@ try {
                             <Path x:Name="Arrow" Data="M 0 0 L 4 4 L 8 0" Stroke="{TemplateBinding Foreground}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,1,9,0" IsHitTestVisible="False"/>
                         </Grid>
                     </Border>
-                    <ToggleButton x:Name="toggleButton" Background="Transparent" BorderBrush="Transparent" BorderThickness="0" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" Focusable="False" ClickMode="Press"/>
+                    <!-- Do not let the platform's native ToggleButton chrome paint over
+                         the themed ComboBox while the popup is hovered/pressed/open. -->
+                    <ToggleButton x:Name="toggleButton"
+                                  Background="Transparent"
+                                  BorderBrush="Transparent"
+                                  BorderThickness="0"
+                                  IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                  Focusable="False"
+                                  FocusVisualStyle="{x:Null}"
+                                  OverridesDefaultStyle="True"
+                                  ClickMode="Press">
+                        <ToggleButton.Template>
+                            <ControlTemplate TargetType="{x:Type ToggleButton}">
+                                <Border Background="Transparent"/>
+                            </ControlTemplate>
+                        </ToggleButton.Template>
+                    </ToggleButton>
                     <Popup x:Name="PART_Popup" AllowsTransparency="True" Focusable="False" IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" Placement="Bottom" PopupAnimation="Fade">
                         <Border x:Name="DropDownBorder" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="4" Margin="0,2,0,0" Padding="0,4" MinWidth="{Binding ActualWidth, ElementName=templateRoot}" MaxHeight="{TemplateBinding MaxDropDownHeight}">
                             <ScrollViewer VerticalScrollBarVisibility="Auto">
