@@ -26345,7 +26345,7 @@ exit 1
     $timer.Interval = [TimeSpan]::FromMilliseconds(350)
     $timer.Add_Tick({
             try {
-                $elapsed = (ConvertTo-Int ((Get-Date) - $startedAt) 0).TotalSeconds
+                $elapsed = [int]((Get-Date) - $startedAt).TotalSeconds
                 if ($lblCreateDetail) { $lblCreateDetail.Text = "Windows is creating the restore point... ${elapsed}s" }
 
                 if ($process -and -not $process.HasExited) { return }
