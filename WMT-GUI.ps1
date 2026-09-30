@@ -46785,7 +46785,10 @@ $script:InvokeWingetSearch = {
                     "User-Agent" = "Windows-Maintenance-Tool"
                     "Accept"     = "application/json"
                 }
-                $catalogRows = New-Object System.Collections.Generic.List[object]
+                # Use a native PowerShell array here. New-Object List[object]
+                # combined with @($list) triggers a PowerShell binder bug
+                # ("Argument types do not match") on Windows PowerShell 5.1.
+                $catalogRows = @()
                 $seenCatalogIds = @{}
 
                 $addXboxCatalogRow = {
@@ -46804,11 +46807,11 @@ $script:InvokeWingetSearch = {
 
                     $seenCatalogIds[$idKey] = $true
                     if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "-" }
-                    [void]$catalogRows.Add([PSCustomObject]@{
-                            Id      = $ProductId
-                            Title   = $Title
-                            Version = $Version
-                        })
+                    $catalogRows += [PSCustomObject]@{
+                        Id      = $ProductId
+                        Title   = $Title
+                        Version = $Version
+                    }
                 }
 
                 $addDetailedXboxProducts = {
@@ -46858,10 +46861,11 @@ $script:InvokeWingetSearch = {
                 # actual title, which previously prevented the broader search fallback.
                 # Search both Xbox and desktop device families because Xbox app entries
                 # can advertise one, the other, or both.
-                $localeCandidates = New-Object System.Collections.Generic.List[object]
-                [void]$localeCandidates.Add([PSCustomObject]@{ Market = $market; Language = $language })
+                $localeCandidates = @(
+                    [PSCustomObject]@{ Market = $market; Language = $language }
+                )
                 if ($market -ne "US" -or $language -ne "en-US") {
-                    [void]$localeCandidates.Add([PSCustomObject]@{ Market = "US"; Language = "en-US" })
+                    $localeCandidates += [PSCustomObject]@{ Market = "US"; Language = "en-US" }
                 }
 
                 foreach ($locale in @($localeCandidates)) {
