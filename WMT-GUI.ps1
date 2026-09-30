@@ -38288,7 +38288,7 @@ exit /b %WMT_EXIT%
 
                 $legendaryCommand = Get-WmtLegendaryCommandText -ForPowerShell:($act -ne "Update" -or $silentUpdateInstallEnabled)
                 $legendaryHeadlessArgs = "--max-workers 4 --dl-timeout 30 --skip-sdl --skip-dlcs"
-                if ($act -eq "Install") { $cmd = "$legendaryCommand -y install `"$id`" $legendaryHeadlessArgs" }
+                if ($act -eq "Install") { $skipReason = "Epic/Legendary installs must use WMT's interactive game installer." }
                 if ($act -eq "Update") { $cmd = "$legendaryCommand -y update `"$id`" --update-only $legendaryHeadlessArgs" }
                 if ($act -eq "Uninstall") { $cmd = "$legendaryCommand -y uninstall `"$id`"" }
                 $userCmd = $cmd
@@ -38383,7 +38383,7 @@ exit /b %WMT_EXIT%
                     }
                 }
                 elseif ($act -eq "Install") {
-                    $skipReason = "GOG game installs should be started from GOG Galaxy or Heroic; WMT updates installed GOG games."
+                    $skipReason = "GOG/GOGDL installs must use WMT's interactive game installer."
                 }
                 elseif ($act -eq "Uninstall") {
                     $skipReason = "GOG game uninstall should be handled from GOG Galaxy, Heroic, or Apps & Features."
@@ -46514,7 +46514,7 @@ $script:InvokeWingetSearch = {
                                 $latestVer = [string]$game.Version
                                 $verCol = if ($isInst -and -not [string]::IsNullOrWhiteSpace($instVer)) { $instVer } else { "-" }
                                 $availCol = if (-not [string]::IsNullOrWhiteSpace($latestVer)) { $latestVer } else { "-" }
-                                [PSCustomObject]@{ Source = "legendary"; Name = $title; Id = [string]$game.Id; Version = $verCol; Available = $availCol }
+                                [PSCustomObject]@{ Source = "legendary"; Name = $title; Id = [string]$game.Id; Version = $verCol; Available = $availCol; IsInstalled = $isInst }
                         $script:provCount++
                             }
                         }
@@ -46759,11 +46759,38 @@ $btnWingetUpdateAll.Add_Click({
     })
 }
 
+function Invoke-WmtSelectedPackageInstalls {
+    param([object[]]$Items)
+
+    $itemsToInstall = @($Items | Where-Object { $null -ne $_ })
+    if ($itemsToInstall.Count -eq 0) { return }
+
+    # Epic/Legendary and GOG/GOGDL search rows are owned-game entries, not
+    # ordinary package-manager packages. Route them through the same
+    # interactive installer used by Your Library so install location, DLCs,
+    # provider preflight, worker/memory options, and shortcut choices stay in
+    # one implementation.
+    $standardItems = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $itemsToInstall) {
+        $source = ([string]$item.Source).Trim().ToLowerInvariant()
+        if ($source -in @("epic", "legendary", "gog", "gogdl")) {
+            Invoke-WmtLibraryInstall -Item $item
+            continue
+        }
+
+        [void]$standardItems.Add($item)
+    }
+
+    if ($standardItems.Count -gt 0) {
+        & $Script:StartWingetAction -ListItems $standardItems.ToArray() -ActionName "Install"
+    }
+}
+
 # 2. Install Selected (Removed CmdTemplate so it includes --accept-agreements)
-$btnWingetInstall.Add_Click({ 
+$btnWingetInstall.Add_Click({
     $selected = @(Get-WmtUpdateListCheckedItems -FallbackToSelection)
     if ($selected.Count -eq 0) { return }
-    & $Script:StartWingetAction -ListItems $selected -ActionName "Install"
+    Invoke-WmtSelectedPackageInstalls -Items $selected
 })
 
 # 3. Uninstall Selected
@@ -52578,7 +52605,7 @@ $btnCatalogInstall.Add_Click({
 
         $selected = @($lstCatalog.SelectedItems)
         if ($selected.Count -eq 0) { return }
-        & $Script:StartWingetAction -ListItems $selected -ActionName "Install"
+        Invoke-WmtSelectedPackageInstalls -Items $selected
     })
 
 $btnCatalogSelectAll.Add_Click({
@@ -53036,7 +53063,7 @@ function Get-WmtLibraryItemInstallDir {
         }
     }
 
-    elseif ($source -eq "Epic" -or $source -eq "Legendary") {
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
         # The library cache already carries the installed directory. Opening a
         # local folder must not depend on an online `legendary info` lookup.
         $cachedPath = ([string]$Item.InstallPath).Trim()
@@ -53071,7 +53098,7 @@ function Get-WmtLibraryItemInstallDir {
         }
         catch { Write-GuiLog "Legendary install directory lookup failed for '$id': $($_.Exception.Message)" }
     }
-    elseif ($source -eq "GOG") {
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
         # Prefer installs launched by WMT, then fall back to Heroic's registry.
         $trackedPath = Get-WmtGogdlTrackedInstallPath -Id $id
         if (-not [string]::IsNullOrWhiteSpace($trackedPath)) { return $trackedPath }
@@ -54709,11 +54736,25 @@ catch {
 function Invoke-WmtLibraryInstall {
     param($Item)
     if (-not $Item) { return }
-    $source = [string]$Item.Source
+    # Normalize provider labels so package-search rows (legendary/gogdl) and
+    # Your Library rows (Epic/Legendary/GOG) share exactly the same installer.
+    $source = ([string]$Item.Source).Trim().ToLowerInvariant()
     $id = [string]$Item.Id
     $name = [string]$Item.Name
 
-    if ($source -eq "Steam") {
+    $isInstalled = $false
+    try {
+        if ($Item.PSObject.Properties["IsInstalled"]) {
+            $isInstalled = [bool]$Item.IsInstalled
+        }
+    }
+    catch {}
+    if ($isInstalled -and $source -in @("epic", "legendary", "gog", "gogdl")) {
+        Show-WmtMessageBox -Message "'$name' is already installed." -Title "Already Installed" -Image Information | Out-Null
+        return
+    }
+
+    if ($source -eq "steam") {
         Start-Process "steam://install/$id"
         Write-GuiLog "Starting Steam install for: $name (app $id)"
     }
