@@ -132,6 +132,8 @@ v6.7 is a broad maintenance and reliability update focused on background executi
 - Explicit library refreshes rebuild provider caches; Legendary installed state is merged from the local installed-game database so installed games remain visible even when live metadata is incomplete or unavailable.
 - Open supported Steam/Epic/GOG store pages directly from library/provider rows.
 - Include owned Legendary/GOG titles in package search when library searching is enabled; installing those search results opens the same full Legendary/GOGDL installer used by **Your Library** instead of a separate headless/provider-specific path.
+- Package search now tracks installed state across supported providers: uninstalled results expose **Install**, installed results expose **Uninstall/Repair** where supported, and **Update** appears only when WMT can identify a newer provider version.
+- Search-result context actions include provider-aware **Manifest / Metadata** and **Package / Store Page** access for Winget/Microsoft Store, Chocolatey, npm, NuGet/.NET tools, PowerShell Gallery, Packagist, PyPI, Scoop, crates.io, RubyGems, Steam, Epic, and GOG where applicable.
 - Optionally hide Unreal Engine / Fab marketplace assets from the visible library without hiding installed games.
 - Uses cached provider/library metadata, atomic cache writes, and background refreshes to improve repeat-load performance and preserve known-good state across provider failures.
 
