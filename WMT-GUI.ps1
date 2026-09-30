@@ -5859,78 +5859,6 @@ if ($null -eq $Value) { return '""' }
 return '"' + ($Value -replace '"', '\"') + '"'
 }
 
-function Get-WingetManifestText {
-param(
-    [object]$Item,
-    [int]$TimeoutMs = 45000
-)
-
-if (-not (Test-WingetManifestSupportedItem $Item)) {
-    return [PSCustomObject]@{
-        Success  = $false
-        ExitCode = $null
-        Text     = "App manifests are only available for winget and Microsoft Store packages."
-    }
-}
-
-$id = [string]$Item.Id
-$source = ([string]$Item.Source).ToLowerInvariant()
-$argsLine = @(
-    "show",
-    "--id", (ConvertTo-WmtProcessArgument $id),
-    "--source", (ConvertTo-WmtProcessArgument $source),
-    "--exact",
-    "--accept-source-agreements",
-    "--disable-interactivity"
-) -join " "
-
-try {
-    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pInfo.FileName = "winget"
-    $pInfo.Arguments = $argsLine
-    $pInfo.RedirectStandardOutput = $true
-    $pInfo.RedirectStandardError = $true
-    $pInfo.UseShellExecute = $false
-    $pInfo.CreateNoWindow = $true
-    $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
-
-    $proc = [System.Diagnostics.Process]::Start($pInfo)
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    if (-not $proc.WaitForExit($TimeoutMs)) {
-        try { $proc.Kill() } catch {}
-        try { [void]$proc.WaitForExit(2000) } catch {}
-        return [PSCustomObject]@{
-            Success  = $false
-            ExitCode = $null
-            Text     = "Timed out while loading the manifest for $id.`r`n`r`nCommand: winget $argsLine"
-        }
-    }
-
-    $out = $outTask.GetAwaiter().GetResult()
-    $err = $errTask.GetAwaiter().GetResult()
-    $textParts = @()
-    if (-not [string]::IsNullOrWhiteSpace($out)) { $textParts += $out.TrimEnd() }
-    if (-not [string]::IsNullOrWhiteSpace($err)) { $textParts += $err.TrimEnd() }
-    $text = ($textParts -join "`r`n`r`n")
-    if ([string]::IsNullOrWhiteSpace($text)) { $text = "No manifest output was returned for $id." }
-
-    return [PSCustomObject]@{
-        Success  = ($proc.ExitCode -eq 0)
-        ExitCode = $proc.ExitCode
-        Text     = $text
-    }
-}
-catch {
-    return [PSCustomObject]@{
-        Success  = $false
-        ExitCode = $null
-        Text     = "Failed to load manifest for $id.`r`n`r`n$($_.Exception.Message)"
-    }
-}
-}
-
 function Show-WingetPackageManifest {
 param([object]$Item)
 
@@ -6010,6 +5938,7 @@ Invoke-WmtUiBackgroundCommand -Name ("WingetManifest_" + [guid]::NewGuid().ToStr
         " --source " + $quote + $PackageSource + $quote +
         " --exact --accept-source-agreements --disable-interactivity"
 
+    $proc = $null
     try {
         $pInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $pInfo.FileName = "winget"
@@ -6057,6 +5986,9 @@ Invoke-WmtUiBackgroundCommand -Name ("WingetManifest_" + [guid]::NewGuid().ToStr
             ExitCode = $null
             Text     = "Failed to load manifest for $PackageId.`r`n`r`n$($_.Exception.Message)"
         }
+    }
+    finally {
+        if ($proc) { try { $proc.Dispose() } catch {} }
     }
 } -ArgumentList $workerArgs -OnComplete $manifestComplete -OnError $manifestError | Out-Null
 }
@@ -15062,6 +14994,7 @@ function Invoke-WmtOutOfProcessAnalyze {
         function Invoke-WorkerRecycleBinScan {
             param($Task)
 
+            $shell = $null
             try {
                 $shell = New-Object -ComObject Shell.Application
                 $bin = $shell.Namespace(0xA)
@@ -15076,6 +15009,9 @@ function Invoke-WmtOutOfProcessAnalyze {
                 }
             }
             catch {}
+            finally {
+                if ($shell) { try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) } catch {} }
+            }
         }
 
         switch ([string]$Task.Engine) {
@@ -15260,6 +15196,7 @@ try {
                         Invoke-RobustClean "$env:SystemRoot\Temp" -RuleName $itemName
                     }
                     "RecycleBin" {
+                        $shell = $null
                         try {
                             $shell = New-Object -ComObject Shell.Application
                             $bin = $shell.Namespace(0xA)
@@ -15296,6 +15233,9 @@ try {
                             }
                         }
                         catch { Write-GuiLog "Recycle Bin Error: $($_.Exception.Message)" }
+                        finally {
+                            if ($shell) { try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) } catch {} }
+                        }
                     }
                     "WER" { Invoke-RobustClean "$env:ProgramData\Microsoft\Windows\WER" -RuleName $itemName }
                     "DNS" { if (-not $isAnalyze) { Clear-DnsClientCache -ErrorAction SilentlyContinue } }
@@ -36417,7 +36357,10 @@ $wingetWorkerScript = {
             $killInfo.CreateNoWindow = $true
             $killInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
             $killProc = [System.Diagnostics.Process]::Start($killInfo)
-            if ($killProc) { [void]$killProc.WaitForExit(5000) }
+            if ($killProc) {
+                try { [void]$killProc.WaitForExit(5000) }
+                finally { $killProc.Dispose() }
+            }
         }
         catch {
             try { $Process.Kill() } catch {}
@@ -43487,6 +43430,7 @@ $btnWingetScan.Add_Click({
         [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Ruby Gems..."
+                $p = $null
                 try {
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c gem outdated")
                     $pInfo.RedirectStandardOutput = $true; $pInfo.UseShellExecute = $false; $pInfo.CreateNoWindow = $true
@@ -43505,6 +43449,7 @@ $btnWingetScan.Add_Click({
                     }
                 }
                 catch { Write-Output "LOG:Gem check failed." }
+                finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
         [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
@@ -43515,6 +43460,7 @@ $btnWingetScan.Add_Click({
         [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Cargo..."
+                $p = $null
                 try {
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c cargo install --list")
                     $pInfo.RedirectStandardOutput = $true; $pInfo.UseShellExecute = $false; $pInfo.CreateNoWindow = $true
@@ -43533,6 +43479,7 @@ $btnWingetScan.Add_Click({
                     }
                 }
                 catch { Write-Output "LOG:Cargo check failed." }
+                finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
         [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
@@ -43547,24 +43494,31 @@ $btnWingetScan.Add_Click({
 
                 function Invoke-DotnetToolCommand {
                     param([string]$Arguments, [int]$TimeoutMs = 15000)
+                    $proc = $null
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo("dotnet", $Arguments)
                     $pInfo.RedirectStandardOutput = $true
                     $pInfo.RedirectStandardError = $true
                     $pInfo.UseShellExecute = $false
                     $pInfo.CreateNoWindow = $true
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                    $proc = [System.Diagnostics.Process]::Start($pInfo)
-                    $outTask = $proc.StandardOutput.ReadToEndAsync()
-                    $errTask = $proc.StandardError.ReadToEndAsync()
-                    if (-not $proc.WaitForExit($TimeoutMs)) {
-                        try { $proc.Kill() } catch {}
-                        return [PSCustomObject]@{ TimedOut = $true; Out = ""; Err = ""; ExitCode = 124 }
+                    try {
+                        $proc = [System.Diagnostics.Process]::Start($pInfo)
+                        $outTask = $proc.StandardOutput.ReadToEndAsync()
+                        $errTask = $proc.StandardError.ReadToEndAsync()
+                        if (-not $proc.WaitForExit($TimeoutMs)) {
+                            try { $proc.Kill() } catch {}
+                            try { [void]$proc.WaitForExit(2000) } catch {}
+                            return [PSCustomObject]@{ TimedOut = $true; Out = ""; Err = ""; ExitCode = 124 }
+                        }
+                        return [PSCustomObject]@{
+                            TimedOut = $false
+                            Out      = $outTask.GetAwaiter().GetResult()
+                            Err      = $errTask.GetAwaiter().GetResult()
+                            ExitCode = $proc.ExitCode
+                        }
                     }
-                    return [PSCustomObject]@{
-                        TimedOut = $false
-                        Out      = $outTask.GetAwaiter().GetResult()
-                        Err      = $errTask.GetAwaiter().GetResult()
-                        ExitCode = $proc.ExitCode
+                    finally {
+                        if ($proc) { try { $proc.Dispose() } catch {} }
                     }
                 }
 
@@ -44365,6 +44319,7 @@ $btnWingetScan.Add_Click({
                 function Get-PortableProviderVersion {
                     param([string]$ExePath)
 
+                    $proc = $null
                     try {
                         $psi = New-Object System.Diagnostics.ProcessStartInfo
                         $psi.FileName = $ExePath
@@ -44391,6 +44346,9 @@ $btnWingetScan.Add_Click({
                         if ($match.Success) { return [string]$match.Groups[1].Value }
                     }
                     catch {}
+                    finally {
+                        if ($proc) { try { $proc.Dispose() } catch {} }
+                    }
 
                     return ""
                 }
