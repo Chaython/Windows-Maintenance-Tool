@@ -2169,7 +2169,7 @@ $result.Error = [string]$procResult.Error
 return $result
 }
 
-function Invoke-WmtLegendaryInstalledCsv {
+function Invoke-WmtLegendaryInstalledData {
 param(
     [Parameter(Mandatory = $true)][string]$LegendaryExe,
     [bool]$CheckUpdates = $false,
@@ -2179,40 +2179,102 @@ param(
 $result = [PSCustomObject]@{
     ExitCode = -1
     Rows = @()
+    Json = ""
     Csv = ""
     StdErr = ""
     TimedOut = $false
     Error = ""
     OfflineFallback = $false
+    SourceFormat = ""
 }
 if ([string]::IsNullOrWhiteSpace($LegendaryExe) -or -not (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
     $result.Error = "legendary executable was not found."
     return $result
 }
 
-$arguments = if ($CheckUpdates) {
-    "--api-timeout 30 list-installed --check-updates --csv --show-dirs"
+function ConvertFrom-WmtLegendaryInstalledJsonRows {
+param([string]$JsonText)
+$rows = [System.Collections.Generic.List[object]]::new()
+if ([string]::IsNullOrWhiteSpace($JsonText)) { return $rows.ToArray() }
+$items = $JsonText | ConvertFrom-Json -ErrorAction Stop
+foreach ($installedGame in @($items)) {
+    if ($null -eq $installedGame) { continue }
+    $installedId = ([string]$installedGame.app_name).Trim()
+    if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+    [void]$rows.Add([PSCustomObject]@{
+            'App name'          = $installedId
+            'App title'         = ([string]$installedGame.title).Trim()
+            'Installed version' = ([string]$installedGame.version).Trim()
+            'Available version' = ""
+            'Update available'  = $false
+            'Install size'      = [string]$installedGame.install_size
+            'Install path'      = ([string]$installedGame.install_path).Trim()
+            'Platform'          = ([string]$installedGame.platform).Trim()
+        })
+}
+return $rows.ToArray()
+}
+
+# For library/install-state discovery, JSON is the authoritative local source.
+# Legendary's CSV path joins each installed row to cached asset metadata and
+# omits games whose asset entry is missing; JSON emits vars(InstalledGame)
+# directly and therefore still reports every locally registered installation.
+if (-not $CheckUpdates) {
+    $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --json" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+    $result.ExitCode = [int]$procResult.ExitCode
+    $result.Json = [string]$procResult.StdOut
+    $result.StdErr = [string]$procResult.StdErr
+    $result.TimedOut = [bool]$procResult.TimedOut
+    $result.Error = [string]$procResult.Error
+
+    if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Json)) {
+        try {
+            $result.Rows = @(ConvertFrom-WmtLegendaryInstalledJsonRows -JsonText $result.Json)
+            $result.SourceFormat = "json"
+            return $result
+        }
+        catch {
+            $result.Error = "Legendary installed-game JSON parse failed: $($_.Exception.Message)"
+        }
+    }
+
+    # Compatibility fallback for older/unusual Legendary builds.
+    $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
 }
 else {
-    "list-installed --csv --show-dirs"
-}
+    $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "--api-timeout 30 list-installed --check-updates --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
 
-$procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments $arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+    # Older Legendary builds reject the global --api-timeout option.
+    if ($procResult.ExitCode -eq 2 -and
+        ([string]$procResult.StdErr) -match '(?i)unrecognized arguments[^\r\n]*--api-timeout') {
+        $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --check-updates --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+    }
 
-# Older Legendary builds reject the global --api-timeout option.
-if ($CheckUpdates -and $procResult.ExitCode -eq 2 -and
-    ([string]$procResult.StdErr) -match '(?i)unrecognized arguments[^\r\n]*--api-timeout') {
-    $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --check-updates --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
-}
-
-# Match the updater's existing resilience: if the online update check fails
-# for a network reason, retry from Legendary's local install database.
-if ($CheckUpdates -and ($procResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$procResult.StdOut))) {
-    $combinedError = (([string]$procResult.StdErr) + [Environment]::NewLine + ([string]$procResult.Error)).Trim()
-    if ($procResult.TimedOut -or
-        $combinedError -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out') {
-        $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
-        $result.OfflineFallback = $true
+    # If the online update check fails for a network reason, fall back to the
+    # complete local JSON database rather than the metadata-filtered CSV path.
+    if ($procResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$procResult.StdOut)) {
+        $combinedError = (([string]$procResult.StdErr) + [Environment]::NewLine + ([string]$procResult.Error)).Trim()
+        if ($procResult.TimedOut -or
+            $combinedError -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out') {
+            $localResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --json" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+            $result.OfflineFallback = $true
+            $result.ExitCode = [int]$localResult.ExitCode
+            $result.Json = [string]$localResult.StdOut
+            $result.StdErr = [string]$localResult.StdErr
+            $result.TimedOut = [bool]$localResult.TimedOut
+            $result.Error = [string]$localResult.Error
+            if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Json)) {
+                try {
+                    $result.Rows = @(ConvertFrom-WmtLegendaryInstalledJsonRows -JsonText $result.Json)
+                    $result.SourceFormat = "json"
+                    return $result
+                }
+                catch {
+                    $result.Error = "Legendary installed-game JSON parse failed: $($_.Exception.Message)"
+                }
+            }
+            return $result
+        }
     }
 }
 
@@ -2228,6 +2290,7 @@ if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Csv)) 
         $headerIndex = $csvText.IndexOf("App name,")
         if ($headerIndex -gt 0) { $csvText = $csvText.Substring($headerIndex) }
         $result.Rows = @($csvText | ConvertFrom-Csv -ErrorAction Stop)
+        $result.SourceFormat = "csv"
     }
     catch {
         $result.Error = "Legendary installed-game CSV parse failed: $($_.Exception.Message)"
@@ -2497,7 +2560,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledCsv", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -39279,7 +39342,7 @@ try {
     $installedByApp = @{}
     $installedQuerySucceeded = $false
     try {
-        $installedResult = Invoke-WmtLegendaryInstalledCsv -LegendaryExe $exe -TimeoutMs 30000
+        $installedResult = Invoke-WmtLegendaryInstalledData -LegendaryExe $exe -TimeoutMs 30000
         if ($installedResult.ExitCode -eq 0) {
             $installedQuerySucceeded = $true
             foreach ($installedGame in @($installedResult.Rows)) {
@@ -56690,60 +56753,35 @@ try {
     # (in case the user bought more games since the cache was last updated).
     $cacheExpiryHours = 24
 
+    # Your Library follows the provider's enabled state, not its package-search
+    # toggle. Search can be disabled while library/install/update features remain
+    # enabled, so still keep the Legendary cache current.
     if ("legendary" -in $enabled) {
-        $t = $null
-        if ($toggles -is [System.Collections.IDictionary] -and $toggles.Contains("legendary")) {
-            $t = $toggles["legendary"]
-        }
-        $searchOn = $false
-        if ($t) {
-            if ($t -is [System.Collections.IDictionary]) {
-                if ($t.Contains("Search")) { $searchOn = [bool]$t["Search"] }
+        $fileExists = (Test-Path -LiteralPath $legFile -PathType Leaf)
+        $isStale = $false
+        if ($fileExists) {
+            try {
+                $age = (Get-Date) - (Get-Item -LiteralPath $legFile).LastWriteTime
+                if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
             }
-            else {
-                try { if ($t.PSObject.Properties["Search"]) { $searchOn = [bool]$t.Search } } catch {}
-            }
+            catch {}
         }
-        if ($searchOn) {
-            $fileExists = (Test-Path -LiteralPath $legFile -PathType Leaf)
-            $isStale = $false
-            if ($fileExists) {
-                try {
-                    $age = (Get-Date) - (Get-Item -LiteralPath $legFile).LastWriteTime
-                    if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
-                }
-                catch {}
-            }
-            $needLeg = [bool]$Force -or (-not $fileExists) -or $isStale
-        }
+        $needLeg = [bool]$Force -or (-not $fileExists) -or $isStale
     }
 
+    # Same rule for GOGDL: the user's owned library is independent of whether
+    # catalog searching through that provider is enabled.
     if ("gogdl" -in $enabled) {
-        $t = $null
-        if ($toggles -is [System.Collections.IDictionary] -and $toggles.Contains("gogdl")) {
-            $t = $toggles["gogdl"]
-        }
-        $searchOn = $false
-        if ($t) {
-            if ($t -is [System.Collections.IDictionary]) {
-                if ($t.Contains("Search")) { $searchOn = [bool]$t["Search"] }
+        $fileExists = (Test-Path -LiteralPath $gogFile -PathType Leaf)
+        $isStale = $false
+        if ($fileExists) {
+            try {
+                $age = (Get-Date) - (Get-Item -LiteralPath $gogFile).LastWriteTime
+                if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
             }
-            else {
-                try { if ($t.PSObject.Properties["Search"]) { $searchOn = [bool]$t.Search } } catch {}
-            }
+            catch {}
         }
-        if ($searchOn) {
-            $fileExists = (Test-Path -LiteralPath $gogFile -PathType Leaf)
-            $isStale = $false
-            if ($fileExists) {
-                try {
-                    $age = (Get-Date) - (Get-Item -LiteralPath $gogFile).LastWriteTime
-                    if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
-                }
-                catch {}
-            }
-            $needGog = [bool]$Force -or (-not $fileExists) -or $isStale
-        }
+        $needGog = [bool]$Force -or (-not $fileExists) -or $isStale
     }
 
     # Also check PyPI index cache if pip is enabled + search on.
@@ -56852,7 +56890,7 @@ try {
                         $installedByApp = @{}
                         $installedQuerySucceeded = $false
                         try {
-                            $installedResult = Invoke-WmtLegendaryInstalledCsv -LegendaryExe $LegendaryExe -TimeoutMs 30000
+                            $installedResult = Invoke-WmtLegendaryInstalledData -LegendaryExe $LegendaryExe -TimeoutMs 30000
                             if ($installedResult.ExitCode -eq 0) {
                                 $installedQuerySucceeded = $true
                                 foreach ($installedGame in @($installedResult.Rows)) {
@@ -57347,9 +57385,11 @@ try {
                 $script:WmtLibraryCacheRunspace = $null
                 $script:WmtLibraryCacheAsyncResult = $null
             }
-            if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
-                try { Start-WmtLibraryScan -Silent } catch {}
-            }
+            # Always refresh the in-memory library snapshot when provider caches
+            # finish. Otherwise a scan preloaded before Legendary/GOGDL completed
+            # remains stale and opening Your Library later can keep showing zero
+            # provider games until another manual refresh.
+            try { Start-WmtLibraryScan -Silent } catch {}
         } | Out-Null
 }
 catch {
