@@ -4035,7 +4035,7 @@ namespace Wmt.Native
 
     $useDark = ([string]$script:CurrentTheme -ne "light")
     $applyNativeTheme = {
-        param($sender, $eventArgs)
+        param($s, $eA)
         try {
             $handle = [System.Windows.Interop.WindowInteropHelper]::new($Window).Handle
             [Wmt.Native.DwmTheme]::SetDarkMode($handle, $useDark)
