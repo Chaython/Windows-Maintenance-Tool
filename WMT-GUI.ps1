@@ -52982,6 +52982,7 @@ $contentXaml = @'
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
     <StackPanel Grid.Row="0" Margin="0,0,0,12">
