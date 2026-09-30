@@ -3695,37 +3695,6 @@ try {
 catch {}
 }
 
-function Invoke-WmtDispatcherDelay {
-param(
-    [int]$Milliseconds = 50,
-    [System.Windows.Threading.Dispatcher]$Dispatcher = $null
-)
-
-if ($Milliseconds -le 0) {
-    Invoke-WmtDispatcherPump -Dispatcher $Dispatcher
-    return
-}
-
-try {
-    if (-not $Dispatcher) { $Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher }
-    $frame = [System.Windows.Threading.DispatcherFrame]::new()
-    $timer = [System.Windows.Threading.DispatcherTimer]::new()
-    $timer.Interval = [TimeSpan]::FromMilliseconds([double]$Milliseconds)
-    $tickHandler = {
-        param($s, $eA)
-        try { $s.Stop() } catch {}
-        $frame.Continue = $false
-    }.GetNewClosure()
-    $timer.Add_Tick($tickHandler)
-    $timer.Start()
-    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
-    try { $timer.Remove_Tick($tickHandler) } catch {}
-}
-catch {
-    Invoke-WmtDispatcherPump -Dispatcher $Dispatcher
-}
-}
-
 function Show-WmtMessageBox {
 param(
     [string]$Message,
@@ -15177,7 +15146,7 @@ function Invoke-WmtOutOfProcessAnalyze {
             $pStatus.Text = "Finished: $($task.RuleName)"
         }
 
-        Invoke-WmtDispatcherDelay -Milliseconds 80 -Dispatcher $pForm.Dispatcher
+        Invoke-WmtDispatcherPump -Dispatcher $pForm.Dispatcher
         if ($progressState.Closed) {
             foreach ($entry in @($running.GetEnumerator())) {
                 try { $entry.Value.PowerShell.Stop() } catch {}
