@@ -6379,6 +6379,209 @@ try { return "https://community.chocolatey.org/packages/$([System.Uri]::EscapeDa
 catch { return "https://community.chocolatey.org/packages/$id" }
 }
 
+
+function Get-WmtPackagePageUrl {
+param([object]$Item)
+
+if (-not $Item) { return $null }
+$source = ([string]$Item.Source).Trim().ToLowerInvariant()
+$id = ([string]$Item.Id).Trim()
+$name = ([string]$Item.Name).Trim()
+if ([string]::IsNullOrWhiteSpace($id) -and [string]::IsNullOrWhiteSpace($name)) { return $null }
+
+$encodedId = [uri]::EscapeDataString($id)
+$encodedName = [uri]::EscapeDataString($name)
+switch ($source) {
+    "winget"     { return "https://github.com/microsoft/winget-pkgs/search?q=$encodedId&type=code" }
+    "msstore"    { return "https://apps.microsoft.com/detail/$encodedId" }
+    "chocolatey" { return Get-ChocoCommunityPageUrl -Item $Item }
+    "choco"      { return Get-ChocoCommunityPageUrl -Item $Item }
+    "npm"        { return "https://www.npmjs.com/package/$encodedId" }
+    "dotnet"     { return "https://www.nuget.org/packages/$encodedId" }
+    "psmodule"   { return "https://www.powershellgallery.com/packages/$encodedId" }
+    "composer"   { return "https://packagist.org/packages/$id" }
+    "pip"        { return "https://pypi.org/project/$encodedId/" }
+    "scoop"      { return "https://scoop.sh/#/apps?q=$encodedId" }
+    "cargo"      { return "https://crates.io/crates/$encodedId" }
+    "rust"       { return "https://crates.io/crates/$encodedId" }
+    "gem"        { return "https://rubygems.org/gems/$encodedId" }
+    "ruby"       { return "https://rubygems.org/gems/$encodedId" }
+    "steam"      { return "https://store.steampowered.com/app/$encodedId" }
+    "epic"       { return "https://store.epicgames.com/en-US/browse?q=$encodedName&sortBy=relevancy&sortDir=DESC&count=40" }
+    "legendary"  { return "https://store.epicgames.com/en-US/browse?q=$encodedName&sortBy=relevancy&sortDir=DESC&count=40" }
+    "gog"        { return "https://www.gog.com/en/games?query=$encodedName" }
+    "gogdl"      { return "https://www.gog.com/en/games?query=$encodedName" }
+}
+return $null
+}
+
+function Open-WmtPackagePage {
+param([object]$Item)
+
+$url = Get-WmtPackagePageUrl -Item $Item
+if ([string]::IsNullOrWhiteSpace([string]$url)) {
+    Show-WmtMessageBox -Message "No package/store page is known for this provider." -Title "Page Unavailable" -Image Information | Out-Null
+    return
+}
+try { Start-Process $url }
+catch {
+    Show-WmtMessageBox -Message "Could not open the package page: $($_.Exception.Message)" -Title "Open Page Failed" -Image Warning | Out-Null
+}
+}
+
+function Test-WmtProviderMetadataSupportedItem {
+param([object]$Item)
+
+if (-not $Item) { return $false }
+$source = ([string]$Item.Source).Trim().ToLowerInvariant()
+$id = ([string]$Item.Id).Trim()
+if ([string]::IsNullOrWhiteSpace($id)) { return $false }
+return ($source -in @("winget","msstore","chocolatey","choco","npm","dotnet","psmodule","composer","pip","scoop","cargo","rust","gem","ruby"))
+}
+
+function Show-WmtPackageProviderMetadata {
+param([object]$Item)
+
+if (-not (Test-WmtProviderMetadataSupportedItem -Item $Item)) {
+    Show-WmtMessageBox -Message "This provider does not expose a package manifest/metadata view through WMT." -Title "Metadata Unavailable" -Image Information | Out-Null
+    return
+}
+
+$source = ([string]$Item.Source).Trim().ToLowerInvariant()
+$id = ([string]$Item.Id).Trim()
+$name = ([string]$Item.Name).Trim()
+if ([string]::IsNullOrWhiteSpace($name)) { $name = $id }
+
+if ($source -in @("winget","msstore")) {
+    Show-WingetPackageManifest -Item $Item
+    return
+}
+
+$isInstalled = $false
+try { if ($Item.PSObject.Properties["IsInstalled"]) { $isInstalled = [bool]$Item.IsInstalled } } catch {}
+if ($source -in @("chocolatey","choco") -and $isInstalled) {
+    $localManifest = Find-ChocoPackageManifestPath -Item $Item
+    if (-not [string]::IsNullOrWhiteSpace([string]$localManifest)) {
+        Show-ChocoPackageManifest -Item $Item
+        return
+    }
+}
+
+Write-GuiLog "Loading provider metadata for $name ($id) from $source..."
+if ($lblWingetStatus) {
+    $lblWingetStatus.Text = "Loading $source metadata for $name..."
+    $lblWingetStatus.Visibility = "Visible"
+}
+
+$complete = {
+    param($results)
+    if ($lblWingetStatus) {
+        $lblWingetStatus.Text = "Ready"
+        $lblWingetStatus.Visibility = "Hidden"
+    }
+    $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["Text"] } | Select-Object -Last 1)
+    if ($payload.Count -eq 0) {
+        Show-WmtMessageBox -Message "The provider returned no metadata." -Title "Metadata Unavailable" -Image Information | Out-Null
+        return
+    }
+    Show-TextDialog -Title "Package Metadata - $name" -Text ([string]$payload[0].Text)
+}.GetNewClosure()
+
+$errorHandler = {
+    param($err)
+    if ($lblWingetStatus) {
+        $lblWingetStatus.Text = "Ready"
+        $lblWingetStatus.Visibility = "Hidden"
+    }
+    $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+    Write-GuiLog "Provider metadata lookup failed for $name ($source / $id): $message"
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Name ("PackageMetadata_" + [guid]::NewGuid().ToString("N")) -Msg "Loading $source metadata for $name..." -TimeoutMs 60000 -SuppressResultLog -Sb {
+    param([string]$Provider, [string]$PackageId)
+
+    function Invoke-Captured {
+        param([string]$FileName, [string]$Arguments)
+        $proc = $null
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $FileName
+            $psi.Arguments = $Arguments
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit(50000)) {
+                try { $proc.Kill() } catch {}
+                return "Metadata command timed out."
+            }
+            $out = [string]$outTask.GetAwaiter().GetResult()
+            $err = [string]$errTask.GetAwaiter().GetResult()
+            $text = (($out.TrimEnd()) + $(if (-not [string]::IsNullOrWhiteSpace($err)) { "`r`n`r`n" + $err.TrimEnd() } else { "" })).Trim()
+            if ([string]::IsNullOrWhiteSpace($text)) { $text = "The provider returned no metadata." }
+            return $text
+        }
+        catch { return "Metadata lookup failed: $($_.Exception.Message)" }
+        finally { if ($proc) { try { $proc.Dispose() } catch {} } }
+    }
+
+    $providerKey = $Provider.Trim().ToLowerInvariant()
+    $quote = [char]34
+    $quotedId = $quote + $PackageId + $quote
+    $text = ""
+    switch ($providerKey) {
+        "chocolatey" { $text = Invoke-Captured -FileName "choco" -Arguments ("info " + $quotedId + " --limit-output") }
+        "choco"      { $text = Invoke-Captured -FileName "choco" -Arguments ("info " + $quotedId + " --limit-output") }
+        "npm"        { $text = Invoke-Captured -FileName "cmd" -Arguments ("/c npm view " + $quotedId + " --json") }
+        "dotnet"     { $text = Invoke-Captured -FileName "dotnet" -Arguments ("tool search " + $quotedId + " --detail --take 1") }
+        "composer"   { $text = Invoke-Captured -FileName "cmd" -Arguments ("/c composer show " + $quotedId + " --all") }
+        "scoop"      { $text = Invoke-Captured -FileName "powershell.exe" -Arguments ("-NoProfile -Command scoop info " + $quotedId) }
+        "cargo"      { $text = Invoke-Captured -FileName "cargo" -Arguments ("info " + $quotedId) }
+        "rust"       { $text = Invoke-Captured -FileName "cargo" -Arguments ("info " + $quotedId) }
+        "gem"        { $text = Invoke-Captured -FileName "gem" -Arguments ("specification " + $quotedId + " --remote") }
+        "ruby"       { $text = Invoke-Captured -FileName "gem" -Arguments ("specification " + $quotedId + " --remote") }
+        "psmodule" {
+            try {
+                $module = Find-Module -Name $PackageId -Repository PSGallery -ErrorAction Stop
+                $text = ($module | Format-List Name,Version,Description,Author,CompanyName,ProjectUri,LicenseUri,Repository,PublishedDate,Tags | Out-String -Width 220).Trim()
+            }
+            catch { $text = "PowerShell Gallery metadata lookup failed: $($_.Exception.Message)" }
+        }
+        "pip" {
+            try {
+                $uri = "https://pypi.org/pypi/" + [uri]::EscapeDataString($PackageId) + "/json"
+                $response = Invoke-RestMethod -Uri $uri -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+                $info = $response.info
+                $summary = [ordered]@{
+                    name             = $info.name
+                    version          = $info.version
+                    summary          = $info.summary
+                    author           = $info.author
+                    maintainer       = $info.maintainer
+                    license          = $info.license
+                    project_url      = $info.project_url
+                    package_url      = $info.package_url
+                    home_page        = $info.home_page
+                    requires_python  = $info.requires_python
+                    requires_dist    = $info.requires_dist
+                    classifiers      = $info.classifiers
+                }
+                $text = $summary | ConvertTo-Json -Depth 5
+            }
+            catch { $text = "PyPI metadata lookup failed: $($_.Exception.Message)" }
+        }
+        default { $text = "No provider metadata adapter is available." }
+    }
+
+    [PSCustomObject]@{ Text = $text }
+} -ArgumentList $source, $id -OnComplete $complete -OnError $errorHandler | Out-Null
+}
+
 function Open-ChocoCommunityPage {
 param([object]$Item)
 
@@ -35487,6 +35690,16 @@ $lstWinget.Add_PreviewMouseLeftButtonUp({
     })
 }
 
+# 0. Install Selected (search results only; visibility is state-driven)
+$miInstall = New-Object System.Windows.Controls.MenuItem
+$miInstall.Header = "Install Selected"
+$miInstall.Add_Click({
+    $selected = @($lstWinget.SelectedItems)
+    if ($selected.Count -eq 0) { return }
+    Invoke-WmtSelectedPackageInstalls -Items $selected
+})
+[void]$ctxMenu.Items.Add($miInstall)
+
 # 1. Update Selected
 $miUpdate = New-Object System.Windows.Controls.MenuItem
 $miUpdate.Header = "Update Checked"
@@ -35592,6 +35805,26 @@ $miChocoPage.Add_Click({
     Open-ChocoCommunityPage -Item $selected[0]
 })
 [void]$ctxMenu.Items.Add($miChocoPage)
+
+# 4d. View provider manifest/metadata
+$miProviderMetadata = New-Object System.Windows.Controls.MenuItem
+$miProviderMetadata.Header = "View Manifest / Metadata"
+$miProviderMetadata.Add_Click({
+    $selected = @($lstWinget.SelectedItems)
+    if ($selected.Count -ne 1) { return }
+    Show-WmtPackageProviderMetadata -Item $selected[0]
+})
+[void]$ctxMenu.Items.Add($miProviderMetadata)
+
+# 4e. Open provider package/store page
+$miPackagePage = New-Object System.Windows.Controls.MenuItem
+$miPackagePage.Header = "Open Package / Store Page"
+$miPackagePage.Add_Click({
+    $selected = @($lstWinget.SelectedItems)
+    if ($selected.Count -ne 1) { return }
+    Open-WmtPackagePage -Item $selected[0]
+})
+[void]$ctxMenu.Items.Add($miPackagePage)
 
 # 5. Copy Row Data
 $miCopyRow = New-Object System.Windows.Controls.MenuItem
@@ -35702,47 +35935,86 @@ $ctxMenu.Add_Opened({
     $selected = @($lstWinget.SelectedItems)
     $checked = @(Get-WmtUpdateListCheckedItems)
     $actionable = @($lstWinget.Items | Where-Object { Test-WmtUpdateListActionableItem -Item $_ })
-    $canShowManifest = ($selected.Count -eq 1 -and (Test-WingetManifestSupportedItem $selected[0]))
-    $miUpdate.IsEnabled = ($checked.Count -gt 0 -or $selected.Count -gt 0)
+    $isSearch = Test-WmtPackageSearchMode
+    $installedSelected = @($selected | Where-Object { Test-WmtPackageItemInstalled -Item $_ })
+    $notInstalledSelected = @($selected | Where-Object { -not (Test-WmtPackageItemInstalled -Item $_) })
+    $updateSelected = @($selected | Where-Object { Test-WmtPackageItemHasUpdate -Item $_ })
+
+    $miInstall.Visibility = if ($isSearch -and $notInstalledSelected.Count -gt 0) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miInstall.IsEnabled = ($notInstalledSelected.Count -gt 0)
+
+    $miUpdate.Visibility = if (-not $isSearch -or $updateSelected.Count -gt 0) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miUpdate.IsEnabled = if ($isSearch) { $updateSelected.Count -gt 0 } else { ($checked.Count -gt 0 -or $selected.Count -gt 0) }
+
+    $miUpdateAll.Visibility = if ($isSearch) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    $miUpdateAll.IsEnabled = (-not $isSearch -and $btnWingetUpdateAll -and $btnWingetUpdateAll.Visibility -eq [System.Windows.Visibility]::Visible)
+
+    $miUninstall.Visibility = if (-not $isSearch -or $installedSelected.Count -gt 0) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miUninstall.IsEnabled = if ($isSearch) { $installedSelected.Count -gt 0 } else { $selected.Count -gt 0 }
+
+    $repairableSources = @("winget", "pip", "pip3", "npm", "npm (global)", "pnpm", "pnpm (global)", "chocolatey", "choco", "scoop", "gem", "ruby", "cargo", "rust", "dotnet", "psmodule", "composer")
+    $repairableInstalled = @($installedSelected | Where-Object { ([string]$_.Source).Trim().ToLowerInvariant() -in $repairableSources })
+    $miRepair.Visibility = if (-not $isSearch -or $repairableInstalled.Count -gt 0) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miRepair.IsEnabled = if ($isSearch) { $repairableInstalled.Count -gt 0 } else { $selected.Count -gt 0 }
+
     $miCheckSelected.IsEnabled = ($selected.Count -gt 0)
     $miUncheckSelected.IsEnabled = ($selected.Count -gt 0)
     $miCheckAll.IsEnabled = ($actionable.Count -gt 0)
     $miUncheckAll.IsEnabled = ($actionable.Count -gt 0)
-    $miUpdateAll.IsEnabled = ($btnWingetUpdateAll -and $btnWingetUpdateAll.Visibility -eq [System.Windows.Visibility]::Visible)
-    $miManifest.IsEnabled = $canShowManifest
     $miCopyRow.IsEnabled = ($selected.Count -gt 0)
+
+    $single = if ($selected.Count -eq 1) { $selected[0] } else { $null }
+    $canShowManifest = ($single -and (Test-WingetManifestSupportedItem $single))
+    $canShowChoco = ($single -and (Test-ChocoManifestSupportedItem $single))
+    $canShowProviderMetadata = ($single -and (Test-WmtProviderMetadataSupportedItem $single))
+    $packagePageUrl = if ($single) { Get-WmtPackagePageUrl -Item $single } else { $null }
+
+    # Keep the specialized manifest actions, but only show them for the
+    # provider they actually support. Generic metadata covers the rest.
+    $miManifest.Visibility = if ($canShowManifest) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miManifest.IsEnabled = [bool]$canShowManifest
+    $miChocoManifest.Visibility = if ($canShowChoco -and (Test-WmtPackageItemInstalled -Item $single)) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miChocoManifest.IsEnabled = ($canShowChoco -and (Test-WmtPackageItemInstalled -Item $single))
+    # Replaced by the generic package-page item to avoid duplicate Chocolatey entries.
+    $miChocoPage.Visibility = [System.Windows.Visibility]::Collapsed
+
+    $miProviderMetadata.Visibility = if ($canShowProviderMetadata -and -not $canShowManifest) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miProviderMetadata.IsEnabled = [bool]$canShowProviderMetadata
+    $miPackagePage.Visibility = if (-not [string]::IsNullOrWhiteSpace([string]$packagePageUrl)) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+    $miPackagePage.IsEnabled = -not [string]::IsNullOrWhiteSpace([string]$packagePageUrl)
+    if ($single) {
+        $singleSource = ([string]$single.Source).Trim().ToLowerInvariant()
+        $miPackagePage.Header = if ($singleSource -in @("steam","epic","legendary","gog","gogdl","msstore")) { "Open Store Page" } else { "Open Package Page" }
+    }
+
     $canConfigureCustomUpdate = $false
     $hasCustomUpdateCommand = $false
-    if ($selected.Count -eq 1) {
-        $selectedSource = ([string]$selected[0].Source).Trim()
-        $selectedId = ([string]$selected[0].Id).Trim()
+    if ($single) {
+        $selectedSource = ([string]$single.Source).Trim()
+        $selectedId = ([string]$single.Id).Trim()
         $canConfigureCustomUpdate = (-not [string]::IsNullOrWhiteSpace($selectedSource) -and -not [string]::IsNullOrWhiteSpace($selectedId))
+        if ($isSearch) { $canConfigureCustomUpdate = ($canConfigureCustomUpdate -and (Test-WmtPackageItemHasUpdate -Item $single)) }
         if ($canConfigureCustomUpdate) { $hasCustomUpdateCommand = -not [string]::IsNullOrWhiteSpace((Get-WmtCustomUpdateCommand -Source $selectedSource -Id $selectedId)) }
     }
+    $miCustomUpdateCommand.Visibility = if ($canConfigureCustomUpdate) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
     $miCustomUpdateCommand.IsEnabled = $canConfigureCustomUpdate
     $miCustomUpdateCommand.Header = if ($hasCustomUpdateCommand) { "Edit Custom Update Command..." } else { "Set Custom Update Command..." }
+    $miClearCustomUpdateCommand.Visibility = if ($hasCustomUpdateCommand) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
     $miClearCustomUpdateCommand.IsEnabled = $hasCustomUpdateCommand
-    $canShowChoco = ($selected.Count -eq 1 -and (Test-ChocoManifestSupportedItem $selected[0]))
-    $miChocoManifest.IsEnabled = $canShowChoco
-    $miChocoPage.IsEnabled = $canShowChoco
+
+    # Ignore is an update-scan concept, not a package-search action.
+    $miIgnore.Visibility = if ($isSearch) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+
     if ($canShowManifest) {
         $miManifest.ToolTip = "Show the winget manifest details for the selected package"
-    }
-    else {
-        $miManifest.ToolTip = "Select one winget or Microsoft Store package to view its manifest"
-    }
-    if ($canShowChoco) {
-        $miChocoManifest.ToolTip = "Show the local chocolatey manifest (nuspec) for the selected package"
-        $miChocoPage.ToolTip = "Open community.chocolatey.org for the selected package"
-    }
-    else {
-        $miChocoManifest.ToolTip = "Select one Chocolatey package to view its manifest"
-        $miChocoPage.ToolTip = "Select one Chocolatey package to open its community page"
     }
 })
 
 # 8. Attach to List
 $lstWinget.ContextMenu = $ctxMenu
+$lstWinget.Add_SelectionChanged({
+    try { Update-WmtPackageSearchActionButtons } catch {}
+})
 
 # 9. Double-click opens store page (Steam/Epic/GOG/Chocolatey) or app manifest
 $lstWinget.Add_MouseDoubleClick({
@@ -35753,16 +36025,13 @@ $lstWinget.Add_MouseDoubleClick({
         $hitTest = $s.InputHitTest($e.GetPosition($s))
         if ($hitTest -is [System.Windows.Controls.CheckBox]) { return }
         $item = $selected[0]
-        $source = [string]$item.Source
-        $id = [string]$item.Id
-        $name = [string]$item.Name
-        $url = $null
-        if ($source -eq "Steam" -or $source -eq "steam") { $url = "https://store.steampowered.com/app/$id" }
-        elseif ($source -eq "legendary" -or $source -eq "Epic") { $url = "https://store.epicgames.com/p/$($id.ToLowerInvariant())" }
-        elseif ($source -eq "gogdl" -or $source -eq "GOG") { $url = "https://www.gog.com/en/game/$name" }
-        elseif ($source -ieq "chocolatey" -or $source -ieq "choco") { $url = Get-ChocoCommunityPageUrl -Item $item }
-        if ($url) { Start-Process $url }
-        else { Show-WingetPackageManifest -Item $item }
+        $url = Get-WmtPackagePageUrl -Item $item
+        if (-not [string]::IsNullOrWhiteSpace([string]$url)) {
+            Start-Process $url
+        }
+        elseif (Test-WmtProviderMetadataSupportedItem -Item $item) {
+            Show-WmtPackageProviderMetadata -Item $item
+        }
     }
     catch {}
 })
@@ -35858,6 +36127,7 @@ $btnWingetClearSearch.Add_Click({
         $btnWingetInstall.Visibility = "Collapsed"
         $btnWingetUpdateSel.Visibility = "Visible"
         if ($btnWingetUpdateAll) { $btnWingetUpdateAll.Visibility = "Visible" }
+        if ($btnWingetUninstall) { $btnWingetUninstall.Visibility = "Visible" }
         $script:WmtPackageSearchActive = $false
         Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
     }
@@ -45699,7 +45969,8 @@ $script:InvokeWingetSearch = {
     $lblWingetStatus.Text = "Searching all providers..."; $lblWingetStatus.Visibility = "Visible"
     $btnWingetUpdateSel.Visibility = "Collapsed"
     if ($btnWingetUpdateAll) { $btnWingetUpdateAll.Visibility = "Collapsed" }
-    $btnWingetInstall.Visibility = "Visible"
+    $btnWingetInstall.Visibility = "Collapsed"
+    if ($btnWingetUninstall) { $btnWingetUninstall.Visibility = "Collapsed" }
 
     # Save current scan results so clear button can restore them
     $script:WingetSavedScanItems = @($lstWinget.Items | ForEach-Object { $_ })
@@ -46764,11 +47035,59 @@ $res = [System.Windows.MessageBox]::Show($msg, "Restart Warning", [System.Window
 return ($res -eq [System.Windows.MessageBoxResult]::Yes)
 }
 
+function Test-WmtPackageSearchMode {
+if ($script:WmtPackageSearchActive) { return $true }
+try {
+    return ($lblWingetTitle -and ([string]$lblWingetTitle.Text).StartsWith("Search Results:", [System.StringComparison]::OrdinalIgnoreCase))
+}
+catch { return $false }
+}
+
+function Test-WmtPackageItemInstalled {
+param([object]$Item)
+if (-not $Item) { return $false }
+try {
+    if ($Item.PSObject.Properties["IsInstalled"]) { return [bool]$Item.IsInstalled }
+}
+catch {}
+# Normal update-scan rows represent installed software with an available update.
+return (-not (Test-WmtPackageSearchMode))
+}
+
+function Test-WmtPackageItemHasUpdate {
+param([object]$Item)
+if (-not $Item) { return $false }
+if (-not (Test-WmtPackageSearchMode)) { return $true }
+try {
+    if ($Item.PSObject.Properties["HasUpdate"]) { return [bool]$Item.HasUpdate }
+}
+catch {}
+return $false
+}
+
+function Update-WmtPackageSearchActionButtons {
+if (-not (Test-WmtPackageSearchMode) -or -not $lstWinget) { return }
+
+$selected = @($lstWinget.SelectedItems | Where-Object { $null -ne $_ })
+$hasInstall = @($selected | Where-Object { -not (Test-WmtPackageItemInstalled -Item $_) }).Count -gt 0
+$hasInstalled = @($selected | Where-Object { Test-WmtPackageItemInstalled -Item $_ }).Count -gt 0
+$hasUpdate = @($selected | Where-Object { Test-WmtPackageItemHasUpdate -Item $_ }).Count -gt 0
+
+if ($btnWingetInstall) { $btnWingetInstall.Visibility = if ($hasInstall) { "Visible" } else { "Collapsed" } }
+if ($btnWingetUpdateSel) { $btnWingetUpdateSel.Visibility = if ($hasUpdate) { "Visible" } else { "Collapsed" } }
+if ($btnWingetUpdateAll) { $btnWingetUpdateAll.Visibility = "Collapsed" }
+if ($btnWingetUninstall) { $btnWingetUninstall.Visibility = if ($hasInstalled) { "Visible" } else { "Collapsed" } }
+}
+
 # 1. Update Selected (Removed CmdTemplate to allow smart logic)
-$btnWingetUpdateSel.Add_Click({ 
+$btnWingetUpdateSel.Add_Click({
     $selected = @(Get-WmtUpdateListCheckedItems -FallbackToSelection)
+    if (Test-WmtPackageSearchMode) {
+        $selected = @($selected | Where-Object { Test-WmtPackageItemHasUpdate -Item $_ })
+    }
     if ($selected.Count -eq 0) {
-        Show-WmtMessageBox -Message "Check one or more update rows first, or select rows as a fallback." -Title "No Updates Checked" -Image Information | Out-Null
+        $message = if (Test-WmtPackageSearchMode) { "None of the selected search results has an available update." } else { "Check one or more update rows first, or select rows as a fallback." }
+        Show-WmtMessageBox -Message $message -Title "No Updates Selected" -Image Information | Out-Null
         return
     }
     if (-not (Show-WingetRestartRiskWarning -Items $selected -Action "Update")) {
@@ -46883,7 +47202,15 @@ function Invoke-WmtSelectedPackageInstalls {
     param([object[]]$Items)
 
     $itemsToInstall = @($Items | Where-Object { $null -ne $_ })
-    if ($itemsToInstall.Count -eq 0) { return }
+    if (Test-WmtPackageSearchMode) {
+        $itemsToInstall = @($itemsToInstall | Where-Object { -not (Test-WmtPackageItemInstalled -Item $_) })
+    }
+    if ($itemsToInstall.Count -eq 0) {
+        if (Test-WmtPackageSearchMode) {
+            Show-WmtMessageBox -Message "The selected search result(s) are already installed." -Title "Nothing to Install" -Image Information | Out-Null
+        }
+        return
+    }
 
     # Epic/Legendary and GOG/GOGDL search rows are owned-game entries, not
     # ordinary package-manager packages. Route them through the same
@@ -46914,9 +47241,17 @@ $btnWingetInstall.Add_Click({
 })
 
 # 3. Uninstall Selected
-$btnWingetUninstall.Add_Click({ 
+$btnWingetUninstall.Add_Click({
     $selected = @($lstWinget.SelectedItems)
-    if ($selected.Count -eq 0) { return }
+    if (Test-WmtPackageSearchMode) {
+        $selected = @($selected | Where-Object { Test-WmtPackageItemInstalled -Item $_ })
+    }
+    if ($selected.Count -eq 0) {
+        if (Test-WmtPackageSearchMode) {
+            Show-WmtMessageBox -Message "None of the selected search results is installed." -Title "Nothing to Uninstall" -Image Information | Out-Null
+        }
+        return
+    }
 
     $msg = "Are you sure you want to uninstall $($selected.Count) application(s)?"
     if ((Show-WmtMessageBox -Message $msg -Title "Confirm" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
