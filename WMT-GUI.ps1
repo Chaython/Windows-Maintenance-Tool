@@ -53137,7 +53137,7 @@ $contentXaml = @'
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <TextBlock Text="Game library folder" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
         <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"
-                 ToolTip="Parent folder that contains your Epic games, for example D:GamesEpic."/>
+                 ToolTip="Parent folder that contains your Epic games, for example D:\Games\Epic."/>
         <Button Name="btnBrowse" Grid.Column="2" Content="Browse..." MinWidth="92"/>
     </Grid>
 
@@ -53281,7 +53281,7 @@ $refreshDestinationPreview = {
     }
     else {
         try { $txtDestinationPreview.Text = Join-Path $rootText $folderText }
-        catch { $txtDestinationPreview.Text = $rootText + "" + $folderText }
+        catch { $txtDestinationPreview.Text = $rootText + "\" + $folderText }
     }
 }.GetNewClosure()
 $txtRoot.Add_TextChanged({ & $refreshDestinationPreview }.GetNewClosure())
