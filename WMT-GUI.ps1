@@ -3345,12 +3345,12 @@ try {
                 </Border>
                 <ControlTemplate.Triggers>
                     <Trigger Property="IsHighlighted" Value="True">
-                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
-                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+                        <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
                     </Trigger>
                     <Trigger Property="IsSelected" Value="True">
-                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
-                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+                        <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
                     </Trigger>
                     <Trigger Property="IsEnabled" Value="False">
                         <Setter Property="Opacity" Value="0.55"/>
@@ -53123,57 +53123,67 @@ $contentXaml = @'
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
     <StackPanel Grid.Row="0" Margin="0,0,0,12">
         <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-        <TextBlock Text="Choose how Legendary should install this game. The selected path is a library/root folder; Legendary creates the game's folder inside it."
+        <TextBlock Text="Choose where this game should be installed. Pick the parent game-library folder below; the final game directory is shown separately."
                    Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}"/>
         <TextBlock Name="lblMetadata" Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Warning}"/>
     </StackPanel>
 
     <Grid Grid.Row="1" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Install root" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+        <TextBlock Text="Game library folder" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"
+                 ToolTip="Parent folder that contains your Epic games, for example D:GamesEpic."/>
         <Button Name="btnBrowse" Grid.Column="2" Content="Browse..." MinWidth="92"/>
     </Grid>
 
     <Grid Grid.Row="2" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Game folder" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBlock Text="Game subfolder (optional)" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
         <TextBox Name="txtGameFolder" Grid.Column="1" Height="34" VerticalContentAlignment="Center"
-                 ToolTip="Optional folder name inside the install root. Leave blank to use Legendary/Epic metadata."/>
+                 ToolTip="Optional final folder name inside the game library folder. Leave blank (recommended) to let Legendary/Epic choose the normal game folder name."/>
     </Grid>
 
     <Grid Grid.Row="3" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Final destination" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtDestinationPreview" Grid.Column="1" Height="34" IsReadOnly="True"
+                 VerticalContentAlignment="Center"
+                 ToolTip="Shows the exact final path when you provide a custom game subfolder. If blank, Legendary chooses the final folder from Epic metadata."/>
+    </Grid>
+
+    <Grid Grid.Row="4" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <TextBlock Text="Platform" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
         <ComboBox Name="cboPlatform" Grid.Column="1" Height="34"
                   ToolTip="Platforms reported by Legendary for this title. Windows is preferred on Windows."/>
     </Grid>
 
-    <Grid Grid.Row="4" Margin="0,0,0,10">
+    <Grid Grid.Row="5" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <TextBlock Text="Version / size" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
         <TextBox Name="txtVersion" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center"/>
     </Grid>
 
-    <Grid Grid.Row="5" Margin="0,0,0,10">
+    <Grid Grid.Row="6" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
         <ComboBox Name="cboWorkers" Grid.Column="1" Height="34"
                   ToolTip="Higher values may improve throughput but increase CPU, memory, network, and disk pressure."/>
     </Grid>
 
-    <Grid Grid.Row="6" Margin="0,0,0,10">
+    <Grid Grid.Row="7" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <TextBlock Text="Shared memory" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
         <ComboBox Name="cboSharedMemory" Grid.Column="1" Height="34"
                   ToolTip="Legendary download-manager shared memory limit in MiB."/>
     </Grid>
 
-    <Grid Grid.Row="7" Margin="0,0,0,10">
+    <Grid Grid.Row="8" Margin="0,0,0,10">
         <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <StackPanel>
             <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}"/>
@@ -53198,10 +53208,10 @@ $contentXaml = @'
         </ListBox>
     </Grid>
 
-    <CheckBox Name="chkReorder" Grid.Row="8" Margin="150,0,0,5"
+    <CheckBox Name="chkReorder" Grid.Row="9" Margin="150,0,0,5"
               Content="Enable download reordering (lower RAM usage)"
               ToolTip="Passes Legendary --enable-reordering. Legendary notes this can have adverse results for some titles."/>
-    <StackPanel Grid.Row="9" Margin="150,0,0,8">
+    <StackPanel Grid.Row="10" Margin="150,0,0,8">
         <CheckBox Name="chkKeepOpen" Margin="0,0,0,5"
                   Content="Keep console open after a successful download"
                   ToolTip="Failures always pause so the final Legendary error stays visible."/>
@@ -53213,11 +53223,11 @@ $contentXaml = @'
                   ToolTip="Creates an entry under Start menu > Programs > WMT Games only after a successful install."/>
     </StackPanel>
 
-    <TextBlock Grid.Row="10" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}"
+    <TextBlock Grid.Row="11" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}"
                Text="Legendary installs resumably. WMT tracks the running install, selected DLCs, and final install path when Legendary reports it."/>
-    <TextBlock Name="lblError" Grid.Row="11" Margin="0,8,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Danger}"/>
+    <TextBlock Name="lblError" Grid.Row="12" Margin="0,8,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Danger}"/>
 
-    <StackPanel Grid.Row="12" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,2">
+    <StackPanel Grid.Row="13" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,2">
         <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
         <Button Name="btnInstall" Content="Install" Width="104" IsDefault="True"
                 Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
@@ -53225,7 +53235,7 @@ $contentXaml = @'
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "Legendary Install Options" -ContentXaml $contentXaml -Width 700 -Height 730 -MinWidth 600 -MinHeight 690 -NoResize
+$dialog = New-WmtWindowFromXaml -Title "Legendary Install Options" -ContentXaml $contentXaml -Width 700 -Height 770 -MinWidth 600 -MinHeight 730 -NoResize
 Add-WmtListSelectionResources -Element $dialog
 Set-WmtNativeWindowTheme -Window $dialog
 
@@ -53233,6 +53243,7 @@ $lblTitle = $dialog.FindName("lblTitle")
 $lblMetadata = $dialog.FindName("lblMetadata")
 $txtRoot = $dialog.FindName("txtRoot")
 $txtGameFolder = $dialog.FindName("txtGameFolder")
+$txtDestinationPreview = $dialog.FindName("txtDestinationPreview")
 $cboPlatform = $dialog.FindName("cboPlatform")
 $txtVersion = $dialog.FindName("txtVersion")
 $cboWorkers = $dialog.FindName("cboWorkers")
@@ -53258,6 +53269,24 @@ if ($lstDlcs) {
 
 $lblTitle.Text = "Install $GameName"
 $txtRoot.Text = $DefaultRoot
+
+$refreshDestinationPreview = {
+    $rootText = ([string]$txtRoot.Text).Trim()
+    $folderText = ([string]$txtGameFolder.Text).Trim()
+    if ([string]::IsNullOrWhiteSpace($rootText)) {
+        $txtDestinationPreview.Text = "Choose a game library folder"
+    }
+    elseif ([string]::IsNullOrWhiteSpace($folderText)) {
+        $txtDestinationPreview.Text = $rootText + "  [Legendary chooses the game's folder]"
+    }
+    else {
+        try { $txtDestinationPreview.Text = Join-Path $rootText $folderText }
+        catch { $txtDestinationPreview.Text = $rootText + "" + $folderText }
+    }
+}.GetNewClosure()
+$txtRoot.Add_TextChanged({ & $refreshDestinationPreview }.GetNewClosure())
+$txtGameFolder.Add_TextChanged({ & $refreshDestinationPreview }.GetNewClosure())
+& $refreshDestinationPreview
 
 $metadataNotes = [System.Collections.Generic.List[string]]::new()
 if (-not [string]::IsNullOrWhiteSpace($MetadataWarning)) { [void]$metadataNotes.Add($MetadataWarning) }
@@ -53347,7 +53376,7 @@ $btnBrowse.Add_Click({
             }
             catch {}
         }
-        $selected = Select-WmtExplorerFolder -Description "Choose Epic / Legendary game library folder" -InitialDirectory $initial -Owner $dialog
+        $selected = Select-WmtExplorerFolder -Description "Choose the parent folder that should contain your Epic games" -InitialDirectory $initial -Owner $dialog
         if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $txtRoot.Text = [string]$selected }
     }.GetNewClosure())
 
@@ -53438,7 +53467,7 @@ function ConvertTo-WmtLegendaryPsLiteral([string]$Value) {
 }
 
 $baseArgs = [System.Collections.Generic.List[string]]::new()
-foreach ($arg in @("-y", "install", $Id, "--base-path", [string]$Options.RootPath, "--platform", [string]$Options.Platform,
+foreach ($arg in @("-y", "--api-timeout", "30", "install", $Id, "--base-path", [string]$Options.RootPath, "--platform", [string]$Options.Platform,
         "--max-workers", [string]$Options.Workers, "--max-shared-memory", [string]$Options.SharedMemoryMiB,
         "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs")) {
     [void]$baseArgs.Add([string]$arg)
@@ -53460,10 +53489,10 @@ $resultPath = Join-Path $launcherDir ("legendary-result-{0}-{1}.json" -f (($Id -
 $exeLiteral = ConvertTo-WmtLegendaryPsLiteral $LegendaryExe
 $resultLiteral = ConvertTo-WmtLegendaryPsLiteral $resultPath
 $appLiteral = ConvertTo-WmtLegendaryPsLiteral $Id
-$titleLiteral = ConvertTo-WmtLegendaryPsLiteral ("WMT Legendary - " + $Name)
+$titleLiteral = ConvertTo-WmtLegendaryPsLiteral ("WMT Legendary Install - " + $Name + " [" + $Id + "]")
 $baseArgsLiteral = "@(" + (@($baseArgs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
 $dlcLiteral = "@(" + (@($selectedDlcs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
-$dlcCommon = @("-y", "install", "--platform", [string]$Options.Platform, "--max-workers", [string]$Options.Workers,
+$dlcCommon = @("-y", "--api-timeout", "30", "install", "--platform", [string]$Options.Platform, "--max-workers", [string]$Options.Workers,
     "--max-shared-memory", [string]$Options.SharedMemoryMiB, "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs")
 if ([bool]$Options.EnableReordering) { $dlcCommon += "--enable-reordering" }
 $dlcCommonLiteral = "@(" + (@($dlcCommon | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
@@ -53485,7 +53514,7 @@ if ($exitCode -eq 0 -and $dlcs.Count -gt 0) {
     foreach ($dlc in $dlcs) {
         Write-Host ""
         Write-Host ("[WMT] Installing selected DLC: " + $dlc)
-        $dlcArgs = @("-y", "install", $dlc) + $dlcCommon[2..($dlcCommon.Count - 1)]
+        $dlcArgs = @("-y", "--api-timeout", "30", "install", $dlc) + $dlcCommon[4..($dlcCommon.Count - 1)]
         & $exe @dlcArgs
         $dlcExit = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
         if ($dlcExit -ne 0) {
