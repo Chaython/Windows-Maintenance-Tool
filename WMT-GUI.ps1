@@ -49162,6 +49162,70 @@ function Resolve-WmtCompactTarget {
 }
 
 
+function Repair-WmtCompactStorageAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$Files = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root)) { throw "Compact storage root is empty." }
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        New-Item -ItemType Directory -Path $Root -Force -ErrorAction Stop | Out-Null
+    }
+
+    $systemGrant = "*S-1-5-18:(OI)(CI)F"
+    $adminsGrant = "*S-1-5-32-544:(OI)(CI)F"
+
+    $secureRoot = {
+        $output = & icacls.exe $Root /inheritance:r /grant:r $systemGrant $adminsGrant /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls exit code $LASTEXITCODE. $($output -join ' ')"
+        }
+    }.GetNewClosure()
+
+    try {
+        & $secureRoot
+    }
+    catch {
+        # Older WMT builds could leave this directory or its children owned by
+        # SYSTEM with a protected ACL. An elevated administrator can recover
+        # ownership, reset the root DACL, and then apply WMT's restricted ACL.
+        $takeOwnOutput = & takeown.exe /F $Root /A 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not take ownership of Compact storage. $($takeOwnOutput -join ' ')"
+        }
+        $resetOutput = & icacls.exe $Root /reset /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not reset Compact storage ACL. $($resetOutput -join ' ')"
+        }
+        & $secureRoot
+    }
+
+    foreach ($file in @($Files | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+
+        # Reset the file first so stale explicit deny/protected ACEs from older
+        # versions cannot override the secure parent ACL.
+        $resetOutput = & icacls.exe $file /reset /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $takeOwnOutput = & takeown.exe /F $file /A 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Could not take ownership of '$file'. $($takeOwnOutput -join ' ')"
+            }
+            $resetOutput = & icacls.exe $file /reset /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Could not reset ACL for '$file'. $($resetOutput -join ' ')"
+            }
+        }
+
+        $fileAclOutput = & icacls.exe $file /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not secure '$file'. $($fileAclOutput -join ' ')"
+        }
+    }
+}
+
+
 function Get-WmtCompactTrackerPath {
     if (-not [string]::IsNullOrWhiteSpace([string]$script:WmtCompactTrackerPath)) {
         try {
@@ -49175,15 +49239,8 @@ function Get-WmtCompactTrackerPath {
     # live in WMT's normal user-writable data directory. Keep the tracker beside
     # the secured worker and migrate the legacy tracker once.
     $root = Join-Path $env:ProgramData "WindowsMaintenanceTool"
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        New-Item -ItemType Directory -Path $root -Force | Out-Null
-    }
-
     try {
-        $aclOutput = & icacls.exe $root /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "icacls exit code $LASTEXITCODE. $($aclOutput -join ' ')"
-        }
+        Repair-WmtCompactStorageAcl -Root $root
     }
     catch {
         throw "Could not secure Compact tracker storage: $($_.Exception.Message)"
@@ -49200,6 +49257,15 @@ function Get-WmtCompactTrackerPath {
         catch {
             throw "Could not migrate the Compact tracker to secured storage: $($_.Exception.Message)"
         }
+    }
+
+    # Repair an existing tracker as well as the directory. Older builds could
+    # leave a protected file ACL behind even after the parent was corrected.
+    try {
+        Repair-WmtCompactStorageAcl -Root $root -Files @($path)
+    }
+    catch {
+        throw "Could not repair Compact tracker permissions: $($_.Exception.Message)"
     }
 
     $script:WmtCompactTrackerPath = $path
@@ -49304,6 +49370,7 @@ function Save-WmtCompactTrackerData {
         $json = $Data | ConvertTo-Json -Depth 6
         [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
         Move-Item -LiteralPath $temp -Destination $path -Force
+        Repair-WmtCompactStorageAcl -Root (Split-Path -Parent $path) -Files @($path)
     }
     finally {
         if (Test-Path -LiteralPath $temp -PathType Leaf) {
@@ -49404,7 +49471,7 @@ function Write-WmtCompactRecompressWorker {
     # Bump this whenever the generated worker's behavior changes. The worker
     # also compares its complete generated content, so accidental version-bump
     # omissions still self-heal the next time WMT starts.
-    $workerVersion = 2
+    $workerVersion = 3
     $trackerPath = Get-WmtCompactTrackerPath
 
     # Scheduled tasks run this worker as SYSTEM. Keep executable script content
@@ -49802,6 +49869,13 @@ try {
     $json = $latest | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temp -Destination $TrackerPath -Force
+
+    # The temp file normally inherits the secured directory ACL, but explicitly
+    # normalize the replacement tracker so an old protected ACL cannot return.
+    try {
+        & icacls.exe $TrackerPath /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" /C | Out-Null
+    }
+    catch {}
 }
 catch {
     Write-WorkerLog ("Worker failed: " + $_.Exception.Message)
@@ -49835,13 +49909,10 @@ catch {
         Write-GuiLog "[Compact] Refreshed standalone recompression worker to version $workerVersion."
     }
 
-    # Restrict the worker directory to SYSTEM and Administrators. Use SIDs so
-    # this works on non-English Windows installations.
+    # Restrict the worker storage to SYSTEM and Administrators, and repair
+    # stale file-level ACLs left by older versions.
     try {
-        $aclOutput = & icacls.exe $workerRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "icacls exit code $LASTEXITCODE. $($aclOutput -join ' ')"
-        }
+        Repair-WmtCompactStorageAcl -Root $workerRoot -Files @($workerPath, $trackerPath, $logPath)
     }
     catch {
         throw "Could not secure the Compact recompression worker directory: $($_.Exception.Message)"
