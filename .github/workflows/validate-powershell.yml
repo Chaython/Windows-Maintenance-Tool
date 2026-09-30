@@ -80,6 +80,252 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Test Legendary library recovery
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Load production functions and the real cache worker without starting the GUI.
+          $repoRoot = (Get-Location).Path
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $repoRoot 'WMT-GUI.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
+          foreach ($name in @('Invoke-WmtLegendaryLibraryJson', 'Invoke-WmtLegendaryInstalledData',
+                  'Get-WmtLegendaryCachedLibrary', 'Merge-WmtLegendaryCachedDetails', 'Set-WmtJsonCacheFile', 'New-WmtRunspaceInitialState', 'Start-WmtLibraryCacheBuilder', 'Get-WmtLibraryItemInstallDir')) {
+              $fn = $ast.Find({ param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if ($fn) { Invoke-Expression $fn.Extent.Text }
+          }
+          $builder = $ast.Find({ param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-WmtLibraryCacheBuilder'
+          }, $true)
+          $worker = $builder.Find({ param($n)
+              $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+              $n.ScriptBlock.ParamBlock.Parameters.Count -eq 11
+          }, $true).ScriptBlock.Extent.Text
+          $worker = $worker.Substring(1, $worker.Length - 2)
+          $scan = $ast.Find({ param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-WmtLibraryScan'
+          }, $true)
+          $scanWorker = $scan.Find({ param($n)
+              $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+              $n.ScriptBlock.ParamBlock.Parameters.Count -eq 5
+          }, $true).ScriptBlock.Extent.Text
+          $scanWorker = $scanWorker.Substring(1, $scanWorker.Length - 2)
+
+          # Only the external process is faked. Parsing, runspace registration, merging,
+          # and atomic cache writes are production code. No Epic credentials are used.
+          function Invoke-WmtProcess {
+              param($FilePath, $Arguments, $TimeoutMs, $Encoding, [switch]$KillTree)
+              if ($Arguments -eq 'list-installed --json' -and
+                  -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $FilePath) 'fail-installed'))) {
+                  $rows = @(1..9 | ForEach-Object {
+                      @{ app_name = "game$_"; title = "Installed game $_"; version = '1.0';
+                         install_path = "C:\Games\Game$_"; platform = 'Windows'; install_size = 1024 }
+                  })
+                  return [pscustomobject]@{ ExitCode = 0; StdOut = ($rows | ConvertTo-Json); StdErr = ''; TimedOut = $false; Error = '' }
+              }
+              return [pscustomobject]@{ ExitCode = -1; StdOut = ''; StdErr = 'Epic API read timed out'; TimedOut = $true; Error = '' }
+          }
+
+          $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('WmtLegendaryTests-' + [guid]::NewGuid().ToString('N'))
+          $originalConfig = $env:LEGENDARY_CONFIG_PATH
+          $failures = [System.Collections.Generic.List[string]]::new()
+
+          function Test-Case([string]$Name, [scriptblock]$Body) {
+              try { & $Body; Write-Host "PASS: $Name" }
+              catch { [void]$failures.Add("${Name}: $($_.Exception.Message)"); Write-Host "FAIL: ${Name}: $($_.Exception.Message)" }
+          }
+          function Invoke-TestWorker([string]$Directory) {
+              [void][IO.Directory]::CreateDirectory($Directory)
+              $cachePath = Join-Path $Directory 'legendary_library.json'
+              $rs = [runspacefactory]::CreateRunspace((New-WmtRunspaceInitialState))
+              $ps = [PowerShell]::Create()
+              try {
+                  $rs.Open()
+                  $ps.Runspace = $rs
+                  [void]$ps.AddScript($worker).AddArgument($true).AddArgument($false).
+                      AddArgument((Join-Path $testRoot 'legendary.exe')).AddArgument($cachePath)
+                  $logs = @($ps.Invoke())
+                  if ($ps.HadErrors) { throw ($ps.Streams.Error -join '; ') }
+                  if (-not (Test-Path -LiteralPath $cachePath)) { throw "Cache was not written. $($logs -join '; ')" }
+                  $rows = [IO.File]::ReadAllText($cachePath) | ConvertFrom-Json
+                  return [pscustomobject]@{ Rows = @($rows); Logs = $logs }
+              }
+              finally { $ps.Dispose(); $rs.Dispose() }
+          }
+
+          try {
+              [void][IO.Directory]::CreateDirectory($testRoot)
+              [IO.File]::WriteAllText((Join-Path $testRoot 'legendary.exe'), '')
+              $env:LEGENDARY_CONFIG_PATH = Join-Path $testRoot 'config'
+              [void][IO.Directory]::CreateDirectory($env:LEGENDARY_CONFIG_PATH)
+
+              Test-Case 'A displayed Legendary library row opens its cached directory without a CLI query' {
+                  $installDirectory = Join-Path $testRoot 'Installed [Epic] Game'
+                  [void][IO.Directory]::CreateDirectory($installDirectory)
+                  $libraryFile = Join-Path $testRoot 'folder-library.json'
+                  $fixture = @(@{ Id = 'game1'; Title = 'Installed game'; IsInstalled = $true;
+                      InstalledVersion = '1.0'; InstallPath = $installDirectory; Platform = 'Windows' })
+                  [IO.File]::WriteAllText($libraryFile, (ConvertTo-Json -InputObject $fixture))
+                  $ps = [PowerShell]::Create()
+                  try {
+                      [void]$ps.AddScript($scanWorker).AddArgument($libraryFile).
+                          AddArgument((Join-Path $testRoot 'missing-gog.json')).AddArgument('').AddArgument(@()).AddArgument(@())
+                      $scanOutput = @($ps.Invoke())
+                      if ($ps.HadErrors) { throw ($ps.Streams.Error -join '; ') }
+                      $row = $scanOutput | Where-Object { $_ -isnot [string] -and $_.Id -eq 'game1' }
+                      if (-not $row -or $row.InstallPath -ne $installDirectory) { throw 'The library scan dropped the installed directory.' }
+                      function Invoke-WmtProcess { throw 'Opening a cached folder must not require the CLI.' }
+                      if ((Get-WmtLibraryItemInstallDir -Item $row) -ne $installDirectory) { throw 'The folder action ignored the cached directory.' }
+                  }
+                  finally { $ps.Dispose() }
+              }
+
+              Test-Case 'Legendary folder lookup recovers missing and stale paths from local installed JSON' {
+                  $installDirectory = Join-Path $testRoot 'Recovered [Epic] Game'
+                  [void][IO.Directory]::CreateDirectory($installDirectory)
+                  $fixtureFile = Join-Path $testRoot 'not-a-directory.txt'
+                  [IO.File]::WriteAllText($fixtureFile, '')
+                  function Get-WmtLegendaryExePath { Join-Path $testRoot 'legendary.exe' }
+                  function Invoke-WmtProcess {
+                      param($FilePath, $Arguments, $TimeoutMs, $Encoding, [switch]$KillTree)
+                      if ($Arguments -ne 'list-installed --json') { throw 'Folder resolution must use the local installed list.' }
+                      $rows = @(
+                          @{ app_name = 'another-game'; title = 'Other'; install_path = $testRoot; version = '1'; platform = 'Windows' },
+                          @{ app_name = 'game1'; title = 'Installed'; install_path = $installDirectory; version = '1'; platform = 'Windows' }
+                      )
+                      [pscustomobject]@{ ExitCode = 0; StdOut = ($rows | ConvertTo-Json); StdErr = ''; Error = ''; TimedOut = $false }
+                  }
+                  foreach ($source in @('Epic', 'Legendary')) {
+                      foreach ($oldPath in @('', (Join-Path $testRoot 'missing-directory'), $fixtureFile)) {
+                          $row = [pscustomobject]@{ Id = 'GAME1'; Source = $source; InstallPath = $oldPath; IsInstalled = $true }
+                          if ((Get-WmtLibraryItemInstallDir -Item $row) -ne $installDirectory) { throw "Could not recover $source directory from the local installed list." }
+                      }
+                  }
+              }
+
+              Test-Case 'An API failure still writes all nine installed games' {
+                  $r = Invoke-TestWorker (Join-Path $testRoot 'installed-only')
+                  if ($r.Rows.Count -ne 9 -or @($r.Rows | Where-Object IsInstalled).Count -ne 9) {
+                      throw "Expected 9 installed games, got $($r.Rows.Count) rows."
+                  }
+                  if (($r.Rows | Where-Object Id -eq 'game1').InstallPath -ne 'C:\Games\Game1') { throw 'Install path was lost.' }
+              }
+
+              $assets = @(1..2000 | ForEach-Object {
+                  @{ app_name = "asset$_"; namespace = 'ue'; catalog_item_id = "catalog$_"; build_version = '5.4' }
+              }) + @(@{ app_name = 'game1'; namespace = 'game'; catalog_item_id = 'game-catalog'; build_version = '2.0' })
+              [IO.File]::WriteAllText((Join-Path $env:LEGENDARY_CONFIG_PATH 'assets.json'), (@{ Windows = $assets } | ConvertTo-Json -Depth 5))
+              $metadataRoot = Join-Path $env:LEGENDARY_CONFIG_PATH 'metadata'
+              [void][IO.Directory]::CreateDirectory($metadataRoot)
+              [IO.File]::WriteAllText((Join-Path $metadataRoot 'game1.json'), '{"app_name":"game1","app_title":"Owned game one","metadata":{"id":"game-catalog","namespace":"game"}}')
+              [IO.File]::WriteAllText((Join-Path $metadataRoot 'asset1.json'), '{"app_name":"asset1","app_title":"Fab asset one","metadata":{"id":"catalog1","namespace":"ue"}}')
+
+              Test-Case 'An API failure recovers thousands of cached assets and merges installs without duplicates' {
+                  $directory = Join-Path $testRoot 'with-assets'
+                  [void][IO.Directory]::CreateDirectory($directory)
+                  [IO.File]::WriteAllText((Join-Path $directory 'settings.json'), '{"HideLegendaryUeAssets":false}')
+                  $r = Invoke-TestWorker $directory
+                  if ($r.Rows.Count -ne 2009) { throw "Expected 2009 rows, got $($r.Rows.Count)." }
+                  if (@($r.Rows | Where-Object IsInstalled).Count -ne 9) { throw 'Installed count must be 9.' }
+                  if (@($r.Rows | Where-Object IsUe).Count -ne 2000) { throw 'Fab assets must retain their namespace tag.' }
+                  $game = @($r.Rows | Where-Object Id -eq 'game1')
+                  if ($game.Count -ne 1 -or $game[0].Title -ne 'Owned game one' -or $game[0].Version -ne '2.0') { throw 'Owned/installed merge lost the title or current version.' }
+                  if (($r.Rows | Where-Object Id -eq 'asset1').Title -ne 'Fab asset one') { throw 'Cached asset title was lost.' }
+                  if (($r.Logs -join '; ') -notmatch '(?i)using.*local.*catalog') { throw 'Catalog fallback must be reported.' }
+              }
+
+              Test-Case 'Hiding Fab assets keeps the nine installed games' {
+                  $r = Invoke-TestWorker (Join-Path $testRoot 'hide-assets')
+                  if ($r.Rows.Count -ne 9 -or @($r.Rows | Where-Object IsUe).Count -ne 0) { throw 'Hidden assets leaked into the game library.' }
+              }
+
+              Test-Case 'Offline recovery preserves known titles and installed state if the install query fails' {
+                  $directory = Join-Path $testRoot 'preserve-cache'
+                  [void][IO.Directory]::CreateDirectory($directory)
+                  $oldRows = @(
+                      @{ Id = 'asset2'; Title = 'Known Fab title'; Version = '5.4'; IsInstalled = $false; IsUe = $true },
+                      @{ Id = 'game1'; Title = 'Known installed game'; Version = '2.0'; IsInstalled = $true;
+                         InstalledVersion = '1.0'; InstallPath = 'C:\Games\Game1'; Platform = 'Windows'; IsUe = $false },
+                      @{ Id = 'previous-only'; Title = 'Previously owned'; Version = '1'; IsInstalled = $false; IsUe = $false }
+                  )
+                  [IO.File]::WriteAllText((Join-Path $directory 'legendary_library.json'), ($oldRows | ConvertTo-Json))
+                  [IO.File]::WriteAllText((Join-Path $directory 'settings.json'), '{"HideLegendaryUeAssets":false}')
+                  $failureFlag = Join-Path $testRoot 'fail-installed'
+                  [IO.File]::WriteAllText($failureFlag, '')
+                  try {
+                      $r = Invoke-TestWorker $directory
+                      $game = $r.Rows | Where-Object Id -eq 'game1'
+                      if (-not $game.IsInstalled -or $game.InstalledVersion -ne '1.0' -or $game.InstallPath -ne 'C:\Games\Game1') { throw 'An unavailable installed query erased the last known install.' }
+                      if (($r.Rows | Where-Object Id -eq 'asset2').Title -ne 'Known Fab title') { throw 'A cached title was replaced with an app ID.' }
+                      if (@($r.Rows | Where-Object Id -eq 'previous-only').Count -ne 0) { throw 'Fallback imported an entry absent from the active account assets.' }
+                  }
+                  finally { Remove-Item -LiteralPath $failureFlag }
+              }
+
+              # Exercise the scheduler and completion callback too: a fresh [] cache used
+              # to suppress rebuilding for 24 hours, and runspace errors were discarded.
+              function Get-WmtSettings { @{ EnabledProviders = @('legendary') } }
+              function Get-WmtProviderToggles { param($Settings) @{} }
+              function Get-DataPath { Join-Path $testRoot 'scheduler' }
+              function Get-WmtLegendaryExePath { Join-Path $testRoot 'legendary.exe' }
+              function Get-WmtGogdlAuthConfigPath { Join-Path $testRoot 'missing-auth.json' }
+              function Write-GuiLog { param($Message) [void]$script:testLogs.Add([string]$Message) }
+              function Unregister-WmtUiPollOperation { param($Name) }
+              function Start-WmtLibraryScan { param([switch]$Silent) }
+              function Register-WmtUiPollOperation {
+                  param($Name, $IntervalMs, $TestComplete, $OnComplete)
+                  $script:testOnComplete = $OnComplete
+              }
+              function New-WmtPooledPowerShell {
+                  $script:testRunspace = [runspacefactory]::CreateRunspace((New-WmtRunspaceInitialState))
+                  $script:testRunspace.Open()
+                  $ps = [PowerShell]::Create()
+                  $ps.Runspace = $script:testRunspace
+                  # Non-terminating errors are not thrown by EndInvoke.
+                  [void]$ps.AddScript('Write-Error "Diagnostic stream regression"')
+                  return $ps
+              }
+              foreach ($cacheText in @('[]', '{broken')) {
+                  Test-Case "A fresh invalid cache ($cacheText) rebuilds and reports worker errors" {
+                      $script:testLogs = [System.Collections.Generic.List[string]]::new()
+                      $script:testOnComplete = $null
+                      $script:WmtLibraryCacheRunspace = $null
+                      $script:WmtLibraryCacheAsyncResult = $null
+                      $directory = Get-DataPath
+                      [void][IO.Directory]::CreateDirectory($directory)
+                      [IO.File]::WriteAllText((Join-Path $directory 'legendary_library.json'), $cacheText)
+                      try {
+                          Start-WmtLibraryCacheBuilder
+                          if (-not $script:WmtLibraryCacheAsyncResult) { throw 'Invalid cache suppressed the rebuild.' }
+                          if (-not $script:WmtLibraryCacheAsyncResult.AsyncWaitHandle.WaitOne(15000)) { throw 'Worker did not finish.' }
+                          & $script:testOnComplete
+                          $rows = [IO.File]::ReadAllText((Join-Path $directory 'legendary_library.json')) | ConvertFrom-Json
+                          if (@($rows).Count -ne 9) { throw 'Scheduler did not rebuild the installed library.' }
+                          if (($script:testLogs -join '; ') -notmatch 'Diagnostic stream regression') { throw 'Worker error stream was swallowed.' }
+                      }
+                      finally {
+                          if ($script:WmtLibraryCacheRunspace) { $script:WmtLibraryCacheRunspace.Dispose() }
+                          if ($script:testRunspace) { $script:testRunspace.Dispose() }
+                      }
+                  }
+              }
+          }
+          finally {
+              $env:LEGENDARY_CONFIG_PATH = $originalConfig
+              $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
+              $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+              if ($resolvedTestRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                  [IO.Path]::GetFileName($resolvedTestRoot).StartsWith('WmtLegendaryTests-')) {
+                  Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
+              }
+          }
+          if ($failures.Count) { throw ($failures -join [Environment]::NewLine) }
+
       - name: Smoke test settings persistence
         shell: powershell
         run: |

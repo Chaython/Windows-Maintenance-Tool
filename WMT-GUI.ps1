@@ -2136,6 +2136,102 @@ try {
 catch { return "" }
 }
 
+function Get-WmtLegendaryCachedLibrary {
+param([bool]$IncludeUe = $false)
+
+$result = [PSCustomObject]@{ Json = ""; Count = 0; MissingTitles = 0; Error = "" }
+# Use the same config precedence as Legendary; do not merge another account's
+# Heroic/legacy cache into the active account's library.
+$configRoot = if (-not [string]::IsNullOrWhiteSpace($env:LEGENDARY_CONFIG_PATH)) { $env:LEGENDARY_CONFIG_PATH }
+elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) { Join-Path $env:XDG_CONFIG_HOME "legendary" }
+else { Join-Path ([string]$env:USERPROFILE) ".config\legendary" }
+
+try {
+    $assetsPath = Join-Path $configRoot "assets.json"
+    if (-not (Test-Path -LiteralPath $assetsPath -PathType Leaf)) { return $result }
+    $assets = [System.IO.File]::ReadAllText($assetsPath) | ConvertFrom-Json -ErrorAction Stop
+    $windowsAssets = $assets.Windows
+    if (-not $windowsAssets) { return $result }
+    if ($windowsAssets -is [System.Management.Automation.PSCustomObject]) {
+        $windowsAssets = @($windowsAssets.PSObject.Properties | ForEach-Object { $_.Value })
+    }
+
+    $metadataByApp = @{}
+    $metadataByCatalog = @{}
+    $metadataRoot = Join-Path $configRoot "metadata"
+    if (Test-Path -LiteralPath $metadataRoot -PathType Container) {
+        $badMetadata = 0
+        foreach ($file in Get-ChildItem -LiteralPath $metadataRoot -Filter "*.json" -File -ErrorAction Stop) {
+            try {
+                $game = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -ErrorAction Stop
+                $appName = ([string]$game.app_name).Trim()
+                if ($appName) { $metadataByApp[$appName] = $game }
+                $catalogId = ([string]$game.metadata.id).Trim()
+                if ($catalogId) { $metadataByCatalog[([string]$game.metadata.namespace + ':' + $catalogId)] = $game }
+            }
+            catch { $badMetadata++ }
+        }
+        if ($badMetadata) { $result.Error = "Skipped $badMetadata unreadable Legendary metadata file(s)." }
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    foreach ($asset in $windowsAssets) {
+        $appName = ([string]$asset.app_name).Trim()
+        if (-not $appName -or $seen.ContainsKey($appName)) { continue }
+        $seen[$appName] = $true
+        $game = $metadataByApp[$appName]
+        if (-not $game) { $game = $metadataByCatalog[([string]$asset.namespace + ':' + [string]$asset.catalog_item_id)] }
+        # New Fab assets can have a different namespace but still carry the
+        # Unreal UserContent build marker. Retain the tag in the fallback JSON.
+        $isUe = ([string]$asset.namespace -eq 'ue' -or [string]$asset.build_version -match '(?i)\+UE\d+-UserContent')
+        if (-not $IncludeUe -and $isUe) { continue }
+        # Match Legendary's top-level game list; DLC remains part of its parent.
+        if ($game -and $game.metadata.mainGameItem) { continue }
+        $title = ([string]$game.app_title).Trim()
+        if (-not $title) { $title = ([string]$game.metadata.title).Trim() }
+        if (-not $title) { $title = $appName; $result.MissingTitles++ }
+        [void]$rows.Add([PSCustomObject]@{
+            app_name = $appName; app_title = $title; app_version = [string]$asset.build_version
+            is_ue = $isUe; metadata = @{ namespace = [string]$asset.namespace }
+        })
+    }
+    $result.Count = $rows.Count
+    if ($rows.Count) { $result.Json = ConvertTo-Json -InputObject $rows.ToArray() -Depth 4 -Compress }
+}
+catch { $result.Error = "Legendary local catalog read failed: $($_.Exception.Message)" }
+return $result
+}
+
+function Merge-WmtLegendaryCachedDetails {
+param([object[]]$Rows, [string]$CacheFile, [bool]$PreserveTitles, [bool]$PreserveInstalledState)
+
+if (-not $PreserveTitles -and -not $PreserveInstalledState) { return }
+if (-not (Test-Path -LiteralPath $CacheFile -PathType Leaf)) { return }
+try {
+    $previous = [System.IO.File]::ReadAllText($CacheFile) | ConvertFrom-Json -ErrorAction Stop
+    $previousById = @{}
+    foreach ($item in $previous) {
+        if ($item -and -not [string]::IsNullOrWhiteSpace([string]$item.Id)) { $previousById[[string]$item.Id] = $item }
+    }
+    foreach ($row in $Rows) {
+        $cached = $previousById[[string]$row.Id]
+        if (-not $cached) { continue }
+        if ($PreserveTitles -and $row.Title -eq $row.Id -and -not [string]::IsNullOrWhiteSpace([string]$cached.Title)) {
+            $row.Title = [string]$cached.Title
+        }
+        if ($PreserveInstalledState) {
+            foreach ($field in @('IsInstalled', 'InstalledVersion', 'InstallPath', 'Platform')) {
+                if ($cached.PSObject.Properties[$field]) {
+                    $row | Add-Member -MemberType NoteProperty -Name $field -Value $cached.$field -Force
+                }
+            }
+        }
+    }
+}
+catch { return "Legendary previous cache could not be merged: $($_.Exception.Message)" }
+}
+
 function Invoke-WmtLegendaryLibraryJson {
 param(
     [Parameter(Mandatory = $true)][string]$LegendaryExe,
@@ -2144,7 +2240,7 @@ param(
     [int]$TimeoutMs = 30000
 )
 
-$result = [PSCustomObject]@{ ExitCode = -1; Json = ""; StdErr = ""; TimedOut = $false; Error = "" }
+$result = [PSCustomObject]@{ ExitCode = -1; Json = ""; StdErr = ""; TimedOut = $false; Error = ""; OfflineFallback = $false; CachedCount = 0; MissingTitles = 0 }
 if ([string]::IsNullOrWhiteSpace($LegendaryExe) -or -not (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
     $result.Error = "legendary executable was not found."
     return $result
@@ -2166,6 +2262,27 @@ $result.Json = [string]$procResult.StdOut
 $result.StdErr = [string]$procResult.StdErr
 $result.TimedOut = [bool]$procResult.TimedOut
 $result.Error = [string]$procResult.Error
+
+$hasCatalog = $false
+if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Json)) {
+    try {
+        $catalog = $result.Json | ConvertFrom-Json -ErrorAction Stop
+        $hasCatalog = (@($catalog | Where-Object { $_ -and $_.app_name }).Count -gt 0)
+    }
+    catch { $result.Error = "Legendary library JSON parse failed: $($_.Exception.Message)" }
+}
+if (-not $hasCatalog) {
+    # `list` always contacts Epic, even with --offline. Recover from its local
+    # assets/metadata directly when the service fails or a large refresh expires.
+    $cached = Get-WmtLegendaryCachedLibrary -IncludeUe:$IncludeUe
+    if ($cached.Error) { $result.Error = (@($result.Error, $cached.Error) | Where-Object { $_ }) -join ' ' }
+    if ($cached.Count -gt 0) {
+        $result.Json = $cached.Json
+        $result.OfflineFallback = $true
+        $result.CachedCount = $cached.Count
+        $result.MissingTitles = $cached.MissingTitles
+    }
+}
 return $result
 }
 
@@ -2560,7 +2677,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -39337,6 +39454,11 @@ try {
     $stdout = [string]$procResult.Json
     $stderr = [string]$procResult.StdErr
 
+    if ($procResult.TimedOut) { Write-GuiLog "Legendary library fetch timed out after 30 seconds." }
+    if ($procResult.Error) { Write-GuiLog ([string]$procResult.Error) }
+    if ($procResult.ExitCode -ne 0 -and $stderr) { Write-GuiLog "Legendary library fetch failed (exit $($procResult.ExitCode)): $($stderr.Trim())" }
+    if ($procResult.OfflineFallback) { Write-GuiLog "Legendary: using local cached catalog ($($procResult.CachedCount) entries; $($procResult.MissingTitles) titles awaiting metadata)." }
+
     # Legendary deliberately separates owned-library metadata ("list") from
     # local installation records ("list-installed"). Merge them by app_name.
     $installedByApp = @{}
@@ -39383,7 +39505,7 @@ try {
                     # marker). 'namespace' is not a top-level JSON key (it is a
                     # Python property there); it lives in asset_infos (per
                     # platform) and in the EGS metadata blob.
-                    $legIsUe = $false
+                    $legIsUe = [bool]$game.is_ue
                     try {
                         if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
                             foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
@@ -39508,7 +39630,7 @@ try {
 
     if ($installedQuerySucceeded -and $installedByApp.Count -gt 0) {
         $seenIds = @{}
-        foreach ($existing in @($result)) {
+        foreach ($existing in $result.ToArray()) {
             $existingId = ([string]$existing.Id).Trim()
             if (-not [string]::IsNullOrWhiteSpace($existingId)) { $seenIds[$existingId.ToLowerInvariant()] = $true }
         }
@@ -39543,6 +39665,9 @@ catch {
     Write-GuiLog "Legendary library enumeration failed: $($_.Exception.Message)"
 }
 
+$cacheFile = Join-Path (Get-DataPath) "legendary_library.json"
+$mergeWarning = Merge-WmtLegendaryCachedDetails -Rows $result.ToArray() -CacheFile $cacheFile -PreserveTitles:([bool]$procResult.OfflineFallback) -PreserveInstalledState:(-not $installedQuerySucceeded)
+if ($mergeWarning) { Write-GuiLog $mergeWarning }
 $script:WmtLegendaryLibraryCache = $result.ToArray()
 
 # Write to cache file for use by the search runspace.
@@ -45743,7 +45868,7 @@ $script:InvokeWingetSearch = {
                                             }
                                             # Tag UE/Fab assets from the JSON namespace data
                                             # (asset_infos per platform, or the metadata blob).
-                                            $legIsUe = $false
+                                            $legIsUe = [bool]$game.is_ue
                                             try {
                                                 if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
                                                     foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
@@ -52589,6 +52714,7 @@ $ps = New-WmtPooledPowerShell
                             Version     = if ($isInst -and -not [string]::IsNullOrWhiteSpace($instVer)) { $instVer } else { "Not installed" }
                             Available   = if (-not [string]::IsNullOrWhiteSpace($latestVer)) { $latestVer } else { "-" }
                             IsInstalled = $isInst
+                            InstallPath = [string]$game.InstallPath
                             ProviderKey = "legendary"
                             IsUe        = $legIsUe
                         })
@@ -52828,8 +52954,16 @@ function Get-WmtLibraryItemInstallDir {
         }
     }
 
-    elseif ($source -eq "Epic") {
-        # Check legendary installed games.
+    elseif ($source -eq "Epic" -or $source -eq "Legendary") {
+        # The library cache already carries the installed directory. Opening a
+        # local folder must not depend on an online `legendary info` lookup.
+        $cachedPath = ([string]$Item.InstallPath).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($cachedPath) -and
+            (Test-Path -LiteralPath $cachedPath -PathType Container)) { return $cachedPath }
+        if ([string]::IsNullOrWhiteSpace($id)) { return "" }
+
+        # Older library rows may lack a path, or the game may have moved since
+        # the scan. Query the same local install database used by the builder.
         try {
             $legExe = Get-WmtLegendaryExePath
             if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
@@ -52837,18 +52971,23 @@ function Get-WmtLibraryItemInstallDir {
                 if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
             }
             if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
-                $procResult = Invoke-WmtProcess -FilePath $legExe -Arguments "info `"$id`"" -TimeoutMs 10000 -Encoding UTF8 -KillTree
-                $stdout = [string]$procResult.StdOut
-                # Look for "Install path:" line
-                foreach ($line in ($stdout -split "`r?`n")) {
-                    if ($line -match "(?i)install\s*(?:path|location)\s*:?\s*(.+)") {
-                        $p = $matches[1].Trim()
-                        if ((Test-Path -LiteralPath $p)) { return $p }
+                $installedResult = Invoke-WmtLegendaryInstalledData -LegendaryExe $legExe -TimeoutMs 10000
+                if ($installedResult.ExitCode -eq 0) {
+                    foreach ($game in $installedResult.Rows) {
+                        if (([string]$game.'App name').Trim() -ne $id) { continue }
+                        $p = ([string]$game.'Install path').Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($p) -and
+                            (Test-Path -LiteralPath $p -PathType Container)) { return $p }
                     }
+                }
+                if ($installedResult.TimedOut) { Write-GuiLog "Legendary install directory lookup timed out for '$id'." }
+                if ($installedResult.Error) { Write-GuiLog "Legendary install directory lookup failed for '$id': $($installedResult.Error)" }
+                if ($installedResult.ExitCode -ne 0 -and $installedResult.StdErr) {
+                    Write-GuiLog "Legendary install directory lookup failed for '$id': $(([string]$installedResult.StdErr).Trim())"
                 }
             }
         }
-        catch {}
+        catch { Write-GuiLog "Legendary install directory lookup failed for '$id': $($_.Exception.Message)" }
     }
     elseif ($source -eq "GOG") {
         # Prefer installs launched by WMT, then fall back to Heroic's registry.
@@ -56727,6 +56866,9 @@ try {
                 foreach ($line in $priorResults) {
                     if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog ($line.Substring(4)) }
                 }
+                foreach ($workerError in $script:WmtLibraryCacheRunspace.Streams.Error) {
+                    Write-GuiLog "Library cache worker error: $workerError | $($workerError.ScriptStackTrace)"
+                }
             }
         }
         catch {
@@ -56763,8 +56905,15 @@ try {
             try {
                 $age = (Get-Date) - (Get-Item -LiteralPath $legFile).LastWriteTime
                 if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
+                if (-not $isStale) {
+                    $cachedLibrary = [System.IO.File]::ReadAllText($legFile) | ConvertFrom-Json -ErrorAction Stop
+                    if (@($cachedLibrary | Where-Object { $_ -and $_.Id }).Count -eq 0) { $isStale = $true }
+                }
             }
-            catch {}
+            catch {
+                $isStale = $true
+                Write-GuiLog "Legendary library cache is unreadable; rebuilding: $($_.Exception.Message)"
+            }
         }
         $needLeg = [bool]$Force -or (-not $fileExists) -or $isStale
     }
@@ -56913,14 +57062,19 @@ try {
                             elseif (-not [string]::IsNullOrWhiteSpace([string]$installedResult.StdErr)) {
                                 Write-Output "LOG:Legendary installed-state query failed: $(([string]$installedResult.StdErr).Trim())"
                             }
+                            if ($installedResult.Error) { Write-Output "LOG:Legendary installed-state error: $($installedResult.Error)" }
                         }
                         catch {
                             Write-Output "LOG:Legendary installed-state query failed: $($_.Exception.Message)"
                         }
 
                         if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
-                        elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
-                            Write-Output "LOG:Legendary library fetch failed: $(([string]$legendaryResult.StdErr).Trim())"
+                        if ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
+                            Write-Output "LOG:Legendary library fetch failed (exit $($legendaryResult.ExitCode)): $(([string]$legendaryResult.StdErr).Trim())"
+                        }
+                        if ($legendaryResult.Error) { Write-Output "LOG:Legendary library error: $($legendaryResult.Error)" }
+                        if ($legendaryResult.OfflineFallback) {
+                            Write-Output "LOG:Legendary: using local cached catalog ($($legendaryResult.CachedCount) entries; $($legendaryResult.MissingTitles) titles awaiting metadata)."
                         }
 
                         $parsed = $false
@@ -56942,7 +57096,7 @@ try {
                                         if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                                         # Tag UE/Fab assets from the JSON namespace data
                                         # (asset_infos per platform, or the metadata blob).
-                                        $legIsUe = $false
+                                        $legIsUe = [bool]$game.is_ue
                                         try {
                                             if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
                                                 foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
@@ -56978,7 +57132,7 @@ try {
                                 }
                             }
                             catch {
-                                # JSON parse failed � fall through to text parsing
+                                Write-Output "LOG:Legendary library JSON conversion failed: $($_.Exception.Message) | $($_.ScriptStackTrace)"
                             }
                         }
 
@@ -57073,7 +57227,7 @@ try {
 
                     if ($installedQuerySucceeded) {
                         $seenIds = @{}
-                        foreach ($existing in @($result)) {
+                        foreach ($existing in $result.ToArray()) {
                             $existingId = ([string]$existing.Id).Trim()
                             if ([string]::IsNullOrWhiteSpace($existingId)) { continue }
                             $key = $existingId.ToLowerInvariant()
@@ -57121,14 +57275,17 @@ try {
                         }
                     }
 
+                    $mergeWarning = Merge-WmtLegendaryCachedDetails -Rows $result.ToArray() -CacheFile $LegCacheFile -PreserveTitles:([bool]$legendaryResult.OfflineFallback) -PreserveInstalledState:(-not $installedQuerySucceeded)
+                    if ($mergeWarning) { Write-Output "LOG:$mergeWarning" }
                     $arr = $result.ToArray()
                     if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
                         Set-WmtJsonCacheFile -Path $LegCacheFile -InputObject $arr -Depth 3
                     }
-                    Write-Output "LOG:Legendary library cached: $($arr.Count) game(s), including $($installedByApp.Count) installed."
+                    $installedCount = @($arr | Where-Object { $_.IsInstalled }).Count
+                    Write-Output "LOG:Legendary library cached: $($arr.Count) game(s), including $installedCount installed."
                 }
                 catch {
-                    Write-Output "LOG:Legendary library cache failed: $($_.Exception.Message)"
+                    Write-Output "LOG:Legendary library cache failed: $($_.Exception.Message) | $($_.ScriptStackTrace)"
                 }
             }
 
@@ -57378,8 +57535,13 @@ try {
                 foreach ($line in @($results)) {
                     if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog ($line.Substring(4)) }
                 }
+                foreach ($workerError in $script:WmtLibraryCacheRunspace.Streams.Error) {
+                    Write-GuiLog "Library cache worker error: $workerError | $($workerError.ScriptStackTrace)"
+                }
             }
-            catch {}
+            catch {
+                Write-GuiLog "Library cache build finalization failed: $($_.Exception.Message) | $($_.ScriptStackTrace)"
+            }
             finally {
                 try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
                 $script:WmtLibraryCacheRunspace = $null
