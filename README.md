@@ -61,21 +61,34 @@ VirusTotal maintains a broader vendor contact directory here: https://docs.virus
 <details>
 <summary><strong>What's new in v6.7</strong></summary>
 
-Recent v6.7 work includes substantial performance, automation, and maintenance improvements:
+v6.7 is a broad maintenance and reliability update focused on background execution, automation, package/game providers, cleanup, compression, memory usage, and UI responsiveness.
 
-- Added the **Compact Compression** tracker, tracked folder/drive history, automatic recompression, custom schedules, change detection, and optional skip lists for already-compressed file formats.
-- Added configurable cleaner **local cache refresh**, **upstream list update check**, and **automatic cleaning** intervals. Automatic cleaning uses the saved cleaner selections and runs in a separate hidden worker process while WMT is open or in the tray.
-- Added **Show Enabled** filtering and additional race/coordination hardening to the advanced cleaner UI/background workers.
-- Added fast firewall protocol/port metadata preloading through `HNetCfg.FwPolicy2`, while retaining lazy/fallback detail loading.
-- Expanded and themed the system-tray context menu with direct shortcuts to Updates, System Health, Cleanup, Drivers, Utilities, and theme switching.
-- Added **custom updater commands** for individual pending package rows, including `{id}`, `{name}`, `{source}`, `{version}`, and `{available}` placeholders.
+- Added a full **GOG / GOGDL install flow** to Your Library. Owned GOG games can now be installed with a selectable install root, language, build/version, individual owned DLCs, and configurable download-worker count.
+- Added persistent GOGDL install tracking so WMT can distinguish **Owned**, **Downloading**, and **Installed** titles, prevent duplicate downloads, resolve completed install paths from GOGDL manifests, and better handle repair/relaunch scenarios.
+- Improved GOGDL authentication/path discovery, including compatible Heroic GOG authentication fallback, language validation, install-path resolution, themed install UI, and lower-memory defaults.
 - Added portable **Legendary** and **GOGDL** provider-binary update checks to the normal Updates flow.
-- Hardened Steam ownership filtering so Steam-installed games are less likely to appear as duplicate/unknown-version Winget updates.
-- Reworked shared background execution, process running, polling, Steam parsing, and driver operations to move more blocking work off the WPF thread.
-- Added UTF-8 Steam manifest handling so registered/trademark/accented titles render correctly.
-- Added PowerShell syntax validation workflow support and release-workflow improvements.
-- Added tweak configuration **Export JSON / Import JSON** support.
+- Added the **Compact Compression** tracker with persistent folder/drive history, automatic recompression, custom schedules, change detection, per-target state/results, and optional skip lists for already-compressed or poor-compression file formats.
+- Added Windows Task Scheduler integration for Compact recompression so scheduled compression can run even when WMT itself is closed.
+- Added configurable cleaner **local cache refresh**, **upstream definition checks**, and **automatic cleaning** intervals.
+- Automatic cleaning uses only explicitly saved cleaner selections and runs in a separate hidden worker process while WMT is open or hidden in the tray; overlapping runs are prevented and the global **BG Jobs** toggle disables new cleaner background work.
+- Added **Show Enabled** filtering and substantial cleaner worker/poller race, closure, startup, cancellation, and completion-state hardening.
+- Restored aggressive **Reduce RAM while hidden in tray** behavior and now releases large reloadable CleanerML, Winapp2, Winapp3, game-library, and related caches while hidden.
+- Reworked settings persistence with safer value copying, atomic writes, backup recovery, corrupt-file preservation, external-edit cache invalidation, cleaner interval persistence, and persistent debug/verbose logging state.
+- Reworked shared background execution, runspace pools, process running, polling, cancellation, Steam parsing, provider startup, BitLocker/Winget preflight handling, and driver operations to move more blocking work off the WPF thread.
+- Added atomic provider/library cache writes and preserves known-good caches when a refresh unexpectedly returns no useful data.
+- Hardened Steam ownership detection so Steam-installed games are less likely to appear as duplicate or unknown-version Winget updates.
+- Added UTF-8 Steam manifest handling so registered, trademarked, and accented titles render correctly.
+- Added per-package **custom updater commands** for pending update rows, including `{id}`, `{name}`, `{source}`, `{version}`, and `{available}` placeholders.
+- Improved Firewall Manager background loading and bulk protocol/port preloading using persistent-store `Get-NetFirewallPortFilter` data, while retaining lazy/fallback detail loading.
+- Expanded and themed the system-tray context menu with direct shortcuts to Updates, System Health, Cleanup, Drivers, Utilities, and theme switching.
+- Added tweak configuration **Export JSON / Import JSON** support and fixed Tweaks loading-overlay state leaking onto other tabs.
+- Fixed AppX selection theming, Updates status-text overlap, Firewall Manager action alignment, tray theme-state text, and several other UI consistency issues.
 - Expanded registry-cleaner handling for BAM/DAM and `PendingFileRenameOperations`, including safer pair-preserving rewrites and review-only handling where automatic changes are unsafe.
+- Invalid Microsoft Defender exclusions now use the supported Defender API (`Remove-MpPreference`) with result verification instead of attempting direct deletion of protected Defender registry values.
+- Fixed self-update script-path resolution when WMT is launched directly through PowerShell, resolving **#161**.
+- Expanded PowerShell CI from syntax parsing into regression/smoke testing for settings persistence/recovery, cleaner worker state, closure hazards, and shared runspace helper loading.
+- Improved the PS2EXE release workflow with SHA-256 generation, safer release existence checks, GitHub release asset replacement, and optional WinGet/Chocolatey publishing when the required package entries/secrets are available.
+- Refreshed and reorganized the README for v6.7, including updated screenshots, troubleshooting, safety notes, community/sponsor links, and release/development documentation.
 
 </details>
 
