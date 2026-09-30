@@ -52939,6 +52939,547 @@ catch {
 return $result
 }
 
+
+function Test-WmtLegendaryInstallPending {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+if (-not (Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:WmtLegendaryInstallProcesses = @{}
+}
+if (-not $script:WmtLegendaryInstallProcesses.ContainsKey($Id)) { return $false }
+
+$proc = $script:WmtLegendaryInstallProcesses[$Id]
+try {
+    if ($proc -and -not $proc.HasExited) { return $true }
+}
+catch {}
+
+try { if ($proc) { $proc.Dispose() } } catch {}
+[void]$script:WmtLegendaryInstallProcesses.Remove($Id)
+return $false
+}
+
+function Show-WmtLegendaryInstallOptions {
+param(
+    [Parameter(Mandatory = $true)][string]$GameName,
+    [string]$DefaultRoot = "",
+    $Metadata,
+    [string]$MetadataWarning = ""
+)
+
+$contentXaml = @'
+<Grid Margin="14">
+    <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <StackPanel Grid.Row="0" Margin="0,0,0,12">
+        <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
+        <TextBlock Text="Choose how Legendary should install this game. The selected path is a library/root folder; Legendary creates the game's folder inside it."
+                   Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBlock Name="lblMetadata" Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Warning}"/>
+    </StackPanel>
+
+    <Grid Grid.Row="1" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Install root" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+        <Button Name="btnBrowse" Grid.Column="2" Content="Browse..." MinWidth="92"/>
+    </Grid>
+
+    <Grid Grid.Row="2" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Game folder" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtGameFolder" Grid.Column="1" Height="34" VerticalContentAlignment="Center"
+                 ToolTip="Optional folder name inside the install root. Leave blank to use Legendary/Epic metadata."/>
+    </Grid>
+
+    <Grid Grid.Row="3" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Platform" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <ComboBox Name="cboPlatform" Grid.Column="1" Height="34"
+                  ToolTip="Platforms reported by Legendary for this title. Windows is preferred on Windows."/>
+    </Grid>
+
+    <Grid Grid.Row="4" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Version / size" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <TextBox Name="txtVersion" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center"/>
+    </Grid>
+
+    <Grid Grid.Row="5" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <ComboBox Name="cboWorkers" Grid.Column="1" Height="34"
+                  ToolTip="Higher values may improve throughput but increase CPU, memory, network, and disk pressure."/>
+    </Grid>
+
+    <Grid Grid.Row="6" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock Text="Shared memory" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
+        <ComboBox Name="cboSharedMemory" Grid.Column="1" Height="34"
+                  ToolTip="Legendary download-manager shared memory limit in MiB."/>
+    </Grid>
+
+    <Grid Grid.Row="7" Margin="0,0,0,10">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <StackPanel>
+            <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}"/>
+            <TextBlock Text="Ctrl/Shift-select specific installable DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
+        </StackPanel>
+        <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended"
+                 Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}"
+                 BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2">
+            <ListBox.Template>
+                <ControlTemplate TargetType="{x:Type ListBox}">
+                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ScrollViewer Focusable="False" HorizontalScrollBarVisibility="Disabled"
+                                      VerticalScrollBarVisibility="Auto" CanContentScroll="True">
+                            <ItemsPresenter/>
+                        </ScrollViewer>
+                    </Border>
+                </ControlTemplate>
+            </ListBox.Template>
+        </ListBox>
+    </Grid>
+
+    <CheckBox Name="chkReorder" Grid.Row="8" Margin="150,0,0,5"
+              Content="Enable download reordering (lower RAM usage)"
+              ToolTip="Passes Legendary --enable-reordering. Legendary notes this can have adverse results for some titles."/>
+    <CheckBox Name="chkKeepOpen" Grid.Row="9" Margin="150,0,0,8"
+              Content="Keep console open after a successful download"
+              ToolTip="Failures always pause so the final Legendary error stays visible."/>
+
+    <TextBlock Grid.Row="10" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}"
+               Text="Legendary installs resumably. WMT tracks the running install, selected DLCs, and final install path when Legendary reports it."/>
+    <TextBlock Name="lblError" Grid.Row="11" Margin="0,8,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Danger}"/>
+
+    <StackPanel Grid.Row="12" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,2">
+        <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
+        <Button Name="btnInstall" Content="Install" Width="104" IsDefault="True"
+                Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
+    </StackPanel>
+</Grid>
+'@
+
+$dialog = New-WmtWindowFromXaml -Title "Legendary Install Options" -ContentXaml $contentXaml -Width 700 -Height 680 -MinWidth 600 -MinHeight 640 -NoResize
+Add-WmtListSelectionResources -Element $dialog
+Set-WmtNativeWindowTheme -Window $dialog
+
+$lblTitle = $dialog.FindName("lblTitle")
+$lblMetadata = $dialog.FindName("lblMetadata")
+$txtRoot = $dialog.FindName("txtRoot")
+$txtGameFolder = $dialog.FindName("txtGameFolder")
+$cboPlatform = $dialog.FindName("cboPlatform")
+$txtVersion = $dialog.FindName("txtVersion")
+$cboWorkers = $dialog.FindName("cboWorkers")
+$cboSharedMemory = $dialog.FindName("cboSharedMemory")
+$lstDlcs = $dialog.FindName("lstDlcs")
+$chkReorder = $dialog.FindName("chkReorder")
+$chkKeepOpen = $dialog.FindName("chkKeepOpen")
+$lblError = $dialog.FindName("lblError")
+$btnBrowse = $dialog.FindName("btnBrowse")
+$btnInstall = $dialog.FindName("btnInstall")
+$btnCancel = $dialog.FindName("btnCancel")
+
+if ($lstDlcs) {
+    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowBrushKey] = New-WmtBrush "BgPanel"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowTextBrushKey] = New-WmtBrush "TextPrimary"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlBrushKey] = New-WmtBrush "BgPanel"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlTextBrushKey] = New-WmtBrush "TextPrimary"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = New-WmtBrush "Accent"
+    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = New-WmtBrush "AccentText"
+}
+
+$lblTitle.Text = "Install $GameName"
+$txtRoot.Text = $DefaultRoot
+
+$metadataNotes = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($MetadataWarning)) { [void]$metadataNotes.Add($MetadataWarning) }
+
+$latestVersion = ""
+$downloadBytes = [int64]0
+$diskBytes = [int64]0
+try { $latestVersion = ([string]$Metadata.game.version).Trim() } catch {}
+try { $downloadBytes = [int64]$Metadata.manifest.download_size } catch {}
+try { $diskBytes = [int64]$Metadata.manifest.disk_size } catch {}
+
+$versionParts = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($latestVersion)) { [void]$versionParts.Add($latestVersion) }
+if ($downloadBytes -gt 0) { [void]$versionParts.Add(("download {0:N2} GiB" -f ($downloadBytes / 1GB))) }
+if ($diskBytes -gt 0) { [void]$versionParts.Add(("installed {0:N2} GiB" -f ($diskBytes / 1GB))) }
+$txtVersion.Text = if ($versionParts.Count -gt 0) { $versionParts -join " | " } else { "Latest available version" }
+
+$platforms = [System.Collections.Generic.List[string]]::new()
+try {
+    foreach ($prop in @($Metadata.game.platform_versions.PSObject.Properties)) {
+        $platformName = ([string]$prop.Name).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($platformName) -and -not $platforms.Contains($platformName)) {
+            [void]$platforms.Add($platformName)
+        }
+    }
+}
+catch {}
+if ($platforms.Count -eq 0) { [void]$platforms.Add("Windows") }
+foreach ($platform in @($platforms | Sort-Object)) { [void]$cboPlatform.Items.Add($platform) }
+$windowsPlatform = @($cboPlatform.Items | Where-Object { ([string]$_) -ieq "Windows" } | Select-Object -First 1)
+if ($windowsPlatform.Count -gt 0) { $cboPlatform.SelectedItem = $windowsPlatform[0] }
+else { $cboPlatform.SelectedIndex = 0 }
+
+foreach ($workers in @(1, 2, 4, 8, 16)) { [void]$cboWorkers.Items.Add([string]$workers) }
+$cboWorkers.SelectedItem = "4"
+foreach ($memory in @(256, 512, 1024, 2048)) { [void]$cboSharedMemory.Items.Add([string]$memory) }
+$cboSharedMemory.SelectedItem = "1024"
+
+$dlcItems = [System.Collections.Generic.List[object]]::new()
+try {
+    foreach ($dlc in @($Metadata.game.owned_dlc)) {
+        $appName = ([string]$dlc.app_name).Trim()
+        if ([string]::IsNullOrWhiteSpace($appName)) {
+            try { $appName = ([string]$dlc.installable[0].appId).Trim() } catch {}
+        }
+        if ([string]::IsNullOrWhiteSpace($appName)) { continue }
+        $title = ([string]$dlc.title).Trim()
+        if ([string]::IsNullOrWhiteSpace($title)) { $title = $appName }
+        [void]$dlcItems.Add([PSCustomObject]@{ Title = $title; AppName = $appName })
+    }
+}
+catch {}
+$lstDlcs.DisplayMemberPath = "Title"
+$lstDlcs.ItemsSource = $dlcItems
+if ($dlcItems.Count -eq 0) { $lstDlcs.IsEnabled = $false }
+
+try {
+    $selectedRoot = ([string]$txtRoot.Text).Trim()
+    if ($diskBytes -gt 0 -and -not [string]::IsNullOrWhiteSpace($selectedRoot)) {
+        $probePath = $selectedRoot
+        while (-not (Test-Path -LiteralPath $probePath -PathType Container)) {
+            $parent = Split-Path -Parent $probePath
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probePath) { break }
+            $probePath = $parent
+        }
+        if (Test-Path -LiteralPath $probePath -PathType Container) {
+            $rootPath = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $probePath).Path)
+            $drive = New-Object System.IO.DriveInfo($rootPath)
+            if ($drive.AvailableFreeSpace -lt $diskBytes) {
+                [void]$metadataNotes.Add(("Warning: selected drive currently has {0:N2} GiB free; manifest reports about {1:N2} GiB installed." -f ($drive.AvailableFreeSpace / 1GB), ($diskBytes / 1GB)))
+            }
+        }
+    }
+}
+catch {}
+$lblMetadata.Text = $metadataNotes -join [Environment]::NewLine
+
+$result = @{ Value = $null }
+
+$btnBrowse.Add_Click({
+        $initial = ([string]$txtRoot.Text).Trim()
+        if (-not (Test-Path -LiteralPath $initial -PathType Container)) {
+            try {
+                $parent = Split-Path -Parent $initial
+                if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) { $initial = $parent }
+                elseif ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) { $initial = $env:USERPROFILE }
+            }
+            catch {}
+        }
+        $selected = Select-WmtExplorerFolder -Description "Choose Epic / Legendary game library folder" -InitialDirectory $initial -Owner $dialog
+        if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $txtRoot.Text = [string]$selected }
+    }.GetNewClosure())
+
+$btnInstall.Add_Click({
+        $root = ([string]$txtRoot.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            $lblError.Text = "Choose an install root."
+            return
+        }
+        if ($root.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) {
+            $lblError.Text = "The install path contains invalid characters."
+            return
+        }
+        try {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+                [void][System.IO.Directory]::CreateDirectory($root)
+            }
+        }
+        catch {
+            $lblError.Text = "Could not create the install root: $($_.Exception.Message)"
+            return
+        }
+
+        $gameFolder = ([string]$txtGameFolder.Text).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($gameFolder)) {
+            if ([System.IO.Path]::IsPathRooted($gameFolder)) {
+                $lblError.Text = "Game folder must be a relative folder inside the install root."
+                return
+            }
+            if ($gameFolder.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) {
+                $lblError.Text = "The game folder contains invalid characters."
+                return
+            }
+        }
+
+        $workers = 4
+        [void][int]::TryParse([string]$cboWorkers.SelectedItem, [ref]$workers)
+        if ($workers -notin @(1, 2, 4, 8, 16)) { $workers = 4 }
+
+        $sharedMemory = 1024
+        [void][int]::TryParse([string]$cboSharedMemory.SelectedItem, [ref]$sharedMemory)
+        if ($sharedMemory -notin @(256, 512, 1024, 2048)) { $sharedMemory = 1024 }
+
+        $selectedDlcs = @()
+        foreach ($dlc in @($lstDlcs.SelectedItems)) {
+            if ($dlc -and -not [string]::IsNullOrWhiteSpace([string]$dlc.AppName)) {
+                $selectedDlcs += [string]$dlc.AppName
+            }
+        }
+
+        $result.Value = [PSCustomObject]@{
+            RootPath          = $root
+            GameFolder        = $gameFolder
+            Platform          = [string]$cboPlatform.SelectedItem
+            Workers           = $workers
+            SharedMemoryMiB   = $sharedMemory
+            DlcAppNames       = @($selectedDlcs)
+            EnableReordering  = [bool]$chkReorder.IsChecked
+            KeepOpenOnSuccess = [bool]$chkKeepOpen.IsChecked
+        }
+        $dialog.DialogResult = $true
+    }.GetNewClosure())
+
+$btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
+$dialog.Add_ContentRendered({ $txtRoot.Focus() | Out-Null; $txtRoot.SelectAll() }.GetNewClosure())
+[void]$dialog.ShowDialog()
+return $result.Value
+}
+
+function Start-WmtLegendaryLibraryInstall {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$LegendaryExe,
+    [Parameter(Mandatory = $true)]$Options
+)
+
+if (Test-WmtLegendaryInstallPending -Id $Id) {
+    Show-WmtMessageBox -Message "'$Name' already has a Legendary install running." -Title "Install Already Running" -Image Information | Out-Null
+    return
+}
+
+function ConvertTo-WmtLegendaryPsLiteral([string]$Value) {
+    if ($null -eq $Value) { return "''" }
+    return "'" + $Value.Replace("'", "''").Replace([Environment]::NewLine, " ") + "'"
+}
+
+$baseArgs = [System.Collections.Generic.List[string]]::new()
+foreach ($arg in @("-y", "install", $Id, "--base-path", [string]$Options.RootPath, "--platform", [string]$Options.Platform,
+        "--max-workers", [string]$Options.Workers, "--max-shared-memory", [string]$Options.SharedMemoryMiB,
+        "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs")) {
+    [void]$baseArgs.Add([string]$arg)
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$Options.GameFolder)) {
+    [void]$baseArgs.Add("--game-folder")
+    [void]$baseArgs.Add([string]$Options.GameFolder)
+}
+if ([bool]$Options.EnableReordering) { [void]$baseArgs.Add("--enable-reordering") }
+
+$selectedDlcs = @($Options.DlcAppNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+
+$launcherDir = Join-Path (Get-DataPath) "legendary-launchers"
+if (-not (Test-Path -LiteralPath $launcherDir -PathType Container)) {
+    [void][System.IO.Directory]::CreateDirectory($launcherDir)
+}
+$resultPath = Join-Path $launcherDir ("legendary-result-{0}-{1}.json" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
+
+$exeLiteral = ConvertTo-WmtLegendaryPsLiteral $LegendaryExe
+$resultLiteral = ConvertTo-WmtLegendaryPsLiteral $resultPath
+$appLiteral = ConvertTo-WmtLegendaryPsLiteral $Id
+$titleLiteral = ConvertTo-WmtLegendaryPsLiteral ("WMT Legendary - " + $Name)
+$baseArgsLiteral = "@(" + (@($baseArgs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
+$dlcLiteral = "@(" + (@($selectedDlcs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
+$dlcCommon = @("-y", "install", "--platform", [string]$Options.Platform, "--max-workers", [string]$Options.Workers,
+    "--max-shared-memory", [string]$Options.SharedMemoryMiB, "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs")
+if ([bool]$Options.EnableReordering) { $dlcCommon += "--enable-reordering" }
+$dlcCommonLiteral = "@(" + (@($dlcCommon | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
+$pauseSuccessLiteral = if ([bool]$Options.KeepOpenOnSuccess) { '$true' } else { '$false' }
+
+$launcherTemplate = @'
+$ErrorActionPreference = 'Continue'
+try { $Host.UI.RawUI.WindowTitle = __TITLE__ } catch {}
+$exe = __EXE__
+$appId = __APP__
+$resultPath = __RESULT__
+$baseArgs = __BASEARGS__
+$dlcs = __DLCS__
+$dlcCommon = __DLCCOMMON__
+& $exe @baseArgs
+$exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+
+if ($exitCode -eq 0 -and $dlcs.Count -gt 0) {
+    foreach ($dlc in $dlcs) {
+        Write-Host ""
+        Write-Host ("[WMT] Installing selected DLC: " + $dlc)
+        $dlcArgs = @("-y", "install", $dlc) + $dlcCommon[2..($dlcCommon.Count - 1)]
+        & $exe @dlcArgs
+        $dlcExit = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+        if ($dlcExit -ne 0) {
+            $exitCode = $dlcExit
+            Write-Host ("[WMT] DLC install failed with exit code " + $dlcExit + ": " + $dlc)
+            break
+        }
+    }
+}
+
+$installPath = ""
+if ($exitCode -eq 0) {
+    try {
+        $installedJson = (& $exe list-installed --json 2>$null | Out-String).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($installedJson)) {
+            $installed = @($installedJson | ConvertFrom-Json)
+            $match = @($installed | Where-Object { ([string]$_.app_name) -eq $appId } | Select-Object -First 1)
+            if ($match.Count -gt 0) { $installPath = [string]$match[0].install_path }
+        }
+    }
+    catch {}
+}
+
+try {
+    [PSCustomObject]@{ ExitCode = $exitCode; InstallPath = $installPath } |
+        ConvertTo-Json -Compress |
+        Set-Content -LiteralPath $resultPath -Encoding UTF8 -Force
+}
+catch {}
+
+if ($exitCode -ne 0) {
+    Write-Host ""
+    Write-Host ("[WMT] Legendary exited before completing successfully. Exit code: " + $exitCode)
+    Write-Host "[WMT] Partial download data is preserved. Re-run Install from Your Library to resume."
+    Write-Host ""
+    [void](Read-Host "Press Enter to close")
+}
+else {
+    Write-Host ""
+    Write-Host "[WMT] Legendary install completed successfully."
+    if (__PAUSESUCCESS__) { [void](Read-Host "Press Enter to close") }
+}
+exit $exitCode
+'@
+
+$launcherScript = $launcherTemplate.Replace("__TITLE__", $titleLiteral).
+    Replace("__EXE__", $exeLiteral).
+    Replace("__APP__", $appLiteral).
+    Replace("__RESULT__", $resultLiteral).
+    Replace("__BASEARGS__", $baseArgsLiteral).
+    Replace("__DLCS__", $dlcLiteral).
+    Replace("__DLCCOMMON__", $dlcCommonLiteral).
+    Replace("__PAUSESUCCESS__", $pauseSuccessLiteral)
+
+$encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherScript))
+$proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand -PassThru -WindowStyle Normal
+
+if (-not (Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:WmtLegendaryInstallProcesses = @{}
+}
+$script:WmtLegendaryInstallProcesses[$Id] = $proc
+$pendingInstallState = Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script
+
+$expectedInstallPath = ""
+if (-not [string]::IsNullOrWhiteSpace([string]$Options.GameFolder)) {
+    try { $expectedInstallPath = Join-Path ([string]$Options.RootPath) ([string]$Options.GameFolder) } catch {}
+}
+
+Write-GuiLog "Starting Legendary install for: $Name (app $Id) -> $($Options.RootPath) | platform=$($Options.Platform) | workers=$($Options.Workers) | shared-memory=$($Options.SharedMemoryMiB) MiB | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
+
+$procRef = $proc
+$resultRef = $resultPath
+$idRef = $Id
+$nameRef = $Name
+$rootRef = [string]$Options.RootPath
+$expectedRef = $expectedInstallPath
+$operationName = "LegendaryLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
+
+$testComplete = {
+    param($Operation)
+    try {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { return $true }
+        return [bool]($procRef -and $procRef.HasExited)
+    }
+    catch { return $true }
+}.GetNewClosure()
+
+$onComplete = {
+    param($Operation)
+    $exitCode = 1
+    $installedPath = ""
+    try {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            $resultJson = Get-Content -LiteralPath $resultRef -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $exitCode = [int]$resultJson.ExitCode
+            $installedPath = ([string]$resultJson.InstallPath).Trim()
+        }
+        elseif ($procRef) {
+            $exitCode = [int]$procRef.ExitCode
+        }
+    }
+    catch {}
+
+    if ([string]::IsNullOrWhiteSpace($installedPath) -and -not [string]::IsNullOrWhiteSpace($expectedRef) -and
+        (Test-Path -LiteralPath $expectedRef -PathType Container)) {
+        $installedPath = $expectedRef
+    }
+
+    if ($exitCode -eq 0) {
+        if (-not [string]::IsNullOrWhiteSpace($installedPath)) {
+            Write-GuiLog "Legendary install completed successfully: $nameRef (app $idRef) -> $installedPath"
+        }
+        else {
+            Write-GuiLog "Legendary install completed successfully: $nameRef (app $idRef) under $rootRef."
+        }
+    }
+    else {
+        Write-GuiLog ("Legendary install ended with exit code " + $exitCode + ": " + $nameRef + " (app " + $idRef + "). Partial files were kept for resume.")
+    }
+
+    try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction SilentlyContinue } catch {}
+    try {
+        if ($pendingInstallState.Value -and $pendingInstallState.Value.ContainsKey($idRef) -and
+            [object]::ReferenceEquals($pendingInstallState.Value[$idRef], $procRef)) {
+            [void]$pendingInstallState.Value.Remove($idRef)
+        }
+    }
+    catch {}
+    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    try { Start-WmtLibraryScan -Silent } catch {}
+}.GetNewClosure()
+
+$onError = {
+    param($Operation, $ErrorRecord)
+    $message = ""
+    try { $message = $ErrorRecord.Exception.Message } catch { $message = [string]$ErrorRecord }
+    Write-GuiLog ("Legendary install monitor failed for " + $nameRef + ": " + $message + ". The Legendary process was left running.")
+}.GetNewClosure()
+
+try {
+    Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+}
+catch {
+    Write-GuiLog "Legendary started, but WMT could not monitor its completion: $($_.Exception.Message)"
+}
+}
+
 function Show-WmtGogdlInstallOptions {
 param(
     [Parameter(Mandatory = $true)][string]$GameName,
@@ -53421,26 +53962,121 @@ function Invoke-WmtLibraryInstall {
         Start-Process "steam://install/$id"
         Write-GuiLog "Starting Steam install for: $name (app $id)"
     }
-    elseif ($source -eq "Epic") {
+    elseif ($source -eq "Epic" -or $source -eq "Legendary") {
         try {
             $legExe = Get-WmtLegendaryExePath
             if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
                 $cmd = Get-Command legendary -ErrorAction SilentlyContinue
                 if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
             }
-            if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
-                $msg = "Install '$name' via Legendary?`n`nThis will download the game from Epic Games."
-                if ((Show-WmtMessageBox -Message $msg -Title "Install Game" -Button YesNo -Image Question) -eq [System.Windows.MessageBoxResult]::Yes) {
-                    Start-Process -FilePath $legExe -ArgumentList "-y", "install", $id, "--max-workers", "4", "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs" -WindowStyle Normal
-                    Write-GuiLog "Starting Legendary install for: $name (app $id)"
-                }
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                Show-WmtMessageBox -Message "Legendary is not installed. Cannot install Epic games." -Title "Install Failed" -Image Warning | Out-Null
+                return
+            }
+            if (Test-WmtLegendaryInstallPending -Id $id) {
+                Show-WmtMessageBox -Message "'$name' already has a Legendary install running." -Title "Install Already Running" -Image Information | Out-Null
+                return
+            }
+
+            $defaultRoot = ""
+            if ($script:WmtLegendaryLastInstallRoot -and (Test-Path -LiteralPath $script:WmtLegendaryLastInstallRoot -PathType Container)) {
+                $defaultRoot = [string]$script:WmtLegendaryLastInstallRoot
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                $defaultRoot = Join-Path $env:USERPROFILE "Games\Epic"
             }
             else {
-                Show-WmtMessageBox -Message "Legendary is not installed. Cannot install Epic games." -Title "Install Failed" -Image Warning | Out-Null
+                $defaultRoot = Join-Path (Get-DataPath) "legendary-games"
             }
+
+            $legExeRef = [string]$legExe
+            $idRef = [string]$id
+            $nameRef = [string]$name
+            $defaultRootRef = [string]$defaultRoot
+
+            if (-not (Get-Variable -Name WmtLegendaryLastInstallRoot -Scope Script -ErrorAction SilentlyContinue)) {
+                Set-Variable -Name WmtLegendaryLastInstallRoot -Scope Script -Value ""
+            }
+            $lastInstallRootState = Get-Variable -Name WmtLegendaryLastInstallRoot -Scope Script
+
+            $showOptions = {
+                param($Metadata, [string]$Warning)
+                $options = Show-WmtLegendaryInstallOptions -GameName $nameRef -DefaultRoot $defaultRootRef -Metadata $Metadata -MetadataWarning $Warning
+                if (-not $options) { return }
+                $lastInstallRootState.Value = [string]$options.RootPath
+                Start-WmtLegendaryLibraryInstall -Name $nameRef -Id $idRef -LegendaryExe $legExeRef -Options $options
+            }.GetNewClosure()
+
+            $metadataDone = {
+                param($results)
+                $envelope = @($results | Where-Object { $_ -and $_.PSObject.Properties["Json"] } | Select-Object -Last 1)
+                $metadata = $null
+                $warning = ""
+                if ($envelope.Count -gt 0) {
+                    $entry = $envelope[0]
+                    if ([int]$entry.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$entry.Json)) {
+                        try { $metadata = ([string]$entry.Json | ConvertFrom-Json -ErrorAction Stop) }
+                        catch { $warning = "Legendary metadata could not be parsed. DLC/version choices may be unavailable." }
+                    }
+                    else {
+                        $detail = ([string]$entry.Error).Trim()
+                        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit code $($entry.ExitCode)" }
+                        $warning = "Legendary metadata lookup failed ($detail). You can still install with manual/default options."
+                    }
+                }
+                else {
+                    $warning = "Legendary metadata lookup returned no result. You can still install with manual/default options."
+                }
+                & $showOptions $metadata $warning
+            }.GetNewClosure()
+
+            $metadataError = {
+                param($errorRecord)
+                $errorMessage = ""
+                if ($errorRecord -is [System.Exception]) { $errorMessage = $errorRecord.Message }
+                elseif ($errorRecord -and $errorRecord.Exception) { $errorMessage = $errorRecord.Exception.Message }
+                else { $errorMessage = [string]$errorRecord }
+                if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = "unknown error" }
+                & $showOptions $null ("Legendary metadata lookup failed: " + $errorMessage + ". You can still install with manual/default options.")
+            }.GetNewClosure()
+
+            Invoke-WmtUiBackgroundCommand -Name ("LegendaryInstallInfo_" + $idRef) -Msg "Loading Legendary install choices for $nameRef..." -TimeoutMs 45000 -SuppressResultLog -Sb {
+                param($ExePath, $GameId)
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName = $ExePath
+                $quote = [char]34
+                $psi.Arguments = "info " + $quote + $GameId + $quote + " --json --platform Windows"
+                $psi.UseShellExecute = $false
+                $psi.CreateNoWindow = $true
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+                $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+                $proc = [System.Diagnostics.Process]::new()
+                $proc.StartInfo = $psi
+                try {
+                    if (-not $proc.Start()) { throw "Could not start Legendary metadata query." }
+                    $outTask = $proc.StandardOutput.ReadToEndAsync()
+                    $errTask = $proc.StandardError.ReadToEndAsync()
+                    if (-not $proc.WaitForExit(40000)) {
+                        try { $proc.Kill() } catch {}
+                        try { [void]$proc.WaitForExit(2000) } catch {}
+                        return [PSCustomObject]@{ ExitCode = 124; Json = ""; Error = "metadata query timed out" }
+                    }
+                    $proc.WaitForExit()
+                    [PSCustomObject]@{
+                        ExitCode = [int]$proc.ExitCode
+                        Json     = [string]$outTask.GetAwaiter().GetResult()
+                        Error    = [string]$errTask.GetAwaiter().GetResult()
+                    }
+                }
+                finally {
+                    try { $proc.Dispose() } catch {}
+                }
+            } -ArgumentList $legExeRef, $idRef -OnComplete $metadataDone -OnError $metadataError | Out-Null
         }
         catch {
-            Show-WmtMessageBox -Message "Failed to start install: $($_.Exception.Message)" -Title "Install Failed" -Image Warning | Out-Null
+            Show-WmtMessageBox -Message "Failed to prepare Legendary install: $($_.Exception.Message)" -Title "Install Failed" -Image Warning | Out-Null
         }
     }
     elseif ($source -eq "GOG") {
