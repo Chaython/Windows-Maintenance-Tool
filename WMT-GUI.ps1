@@ -2560,6 +2560,27 @@ Register-WmtUiPollOperation -Name $operationName -IntervalMs 500 -TestComplete $
 return $async
 }
 
+function Remove-WmtFileDeferred {
+param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [int]$DelayMs = 2000
+)
+
+if ([string]::IsNullOrWhiteSpace($Path)) { return }
+try {
+    $cleanupPs = New-WmtPooledPowerShell -PoolKind Background
+    [void]$cleanupPs.AddScript({
+            param([string]$FilePath, [int]$WaitMs)
+            if ($WaitMs -gt 0) { Start-Sleep -Milliseconds $WaitMs }
+            Remove-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        }).AddArgument($Path).AddArgument([Math]::Max(0, $DelayMs))
+    [void](Start-WmtDetachedPowerShell -PowerShell $cleanupPs -Name "Deferred temp-file cleanup")
+}
+catch {
+    try { if ($script:WmtDebug) { Write-GuiLog "Deferred temp-file cleanup could not start for '$Path': $($_.Exception.Message)" } } catch {}
+}
+}
+
 function Stop-WmtPowerShellInvocationAsync {
 param(
     [System.Management.Automation.PowerShell]$PowerShell,
@@ -3672,6 +3693,37 @@ try {
     $Dispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::Background)
 }
 catch {}
+}
+
+function Invoke-WmtDispatcherDelay {
+param(
+    [int]$Milliseconds = 50,
+    [System.Windows.Threading.Dispatcher]$Dispatcher = $null
+)
+
+if ($Milliseconds -le 0) {
+    Invoke-WmtDispatcherPump -Dispatcher $Dispatcher
+    return
+}
+
+try {
+    if (-not $Dispatcher) { $Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher }
+    $frame = [System.Windows.Threading.DispatcherFrame]::new()
+    $timer = [System.Windows.Threading.DispatcherTimer]::new()
+    $timer.Interval = [TimeSpan]::FromMilliseconds([double]$Milliseconds)
+    $tickHandler = {
+        param($s, $eA)
+        try { $s.Stop() } catch {}
+        $frame.Continue = $false
+    }.GetNewClosure()
+    $timer.Add_Tick($tickHandler)
+    $timer.Start()
+    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    try { $timer.Remove_Tick($tickHandler) } catch {}
+}
+catch {
+    Invoke-WmtDispatcherPump -Dispatcher $Dispatcher
+}
 }
 
 function Show-WmtMessageBox {
@@ -10428,10 +10480,9 @@ try {
 catch {
     Write-GuiLog "[CHKDSK] Failed to launch: $($_.Exception.Message)"
 }
-# PowerShell reads -File scripts into memory before execution, so the temp
-# file can be cleaned up on a short delay without breaking the child process.
-Start-Sleep -Seconds 2
-Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
+# PowerShell reads -File scripts into memory before execution. Clean up the
+# temporary script after a short background delay without blocking the WPF thread.
+Remove-WmtFileDeferred -Path $tmpScript -DelayMs 2000
 }
 # ==========================================
 # WINAPP2.INI INTEGRATION
@@ -10879,8 +10930,7 @@ function Save-WmtCleanerSourceState {
 param([Parameter(Mandatory = $true)]$State)
 $path = Get-WmtCleanerSourceStatePath -Source ([string]$State.Source)
 try {
-    $json = $State | ConvertTo-Json -Depth 4
-    [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+    Set-WmtJsonCacheFile -Path $path -InputObject $State -Depth 4
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "Cleaner source state write failed: $($_.Exception.Message)" } }
 }
@@ -10924,8 +10974,7 @@ try {
     $stamp = [DateTime]::UtcNow.ToString("o")
     if ($meta.PSObject.Properties["LastLocalRefreshUtc"]) { $meta.LastLocalRefreshUtc = $stamp }
     else { $meta | Add-Member -MemberType NoteProperty -Name "LastLocalRefreshUtc" -Value $stamp -Force }
-    $json = $meta | ConvertTo-Json -Depth 6
-    [System.IO.File]::WriteAllText($MetaPath, $json, [System.Text.UTF8Encoding]::new($false))
+    Set-WmtJsonCacheFile -Path $MetaPath -InputObject $meta -Depth 6
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "Cleaner local refresh stamp failed: $($_.Exception.Message)" } }
 }
@@ -11466,14 +11515,14 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
         if ($cachedRules.Count -gt 0) {
             if (($sourceSignature.FileCount -gt 0) -and -not (Test-Path $cacheMetaPath)) {
                 try {
-                    [PSCustomObject]@{
+                    Set-WmtJsonCacheFile -Path $cacheMetaPath -InputObject ([PSCustomObject]@{
                         CacheVersion        = $cacheVersion
                         FileCount           = [int]$sourceSignature.FileCount
                         TotalLength         = [int64]$sourceSignature.TotalLength
                         LatestWriteUtcTicks = [int64]$sourceSignature.LatestWriteUtcTicks
                         LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
                         Files               = @($sourceSignature.Files)
-                    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheMetaPath -Force
+                    }) -Depth 5
                 }
                 catch {}
             }
@@ -11497,15 +11546,15 @@ foreach ($file in $xmlFiles) {
 $final = @($allRules.ToArray() | Group-Object ID | ForEach-Object { $_.Group[0] } | Sort-Object Section, AppGroup, Name)
 
 try {
-    $final | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $cachePath -Force
-    [PSCustomObject]@{
+    Set-WmtJsonCacheFile -Path $cachePath -InputObject $final -Depth 7
+    Set-WmtJsonCacheFile -Path $cacheMetaPath -InputObject ([PSCustomObject]@{
         CacheVersion        = $cacheVersion
         FileCount           = [int]$sourceSignature.FileCount
         TotalLength         = [int64]$sourceSignature.TotalLength
         LatestWriteUtcTicks = [int64]$sourceSignature.LatestWriteUtcTicks
         LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
         Files               = @($sourceSignature.Files)
-    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheMetaPath -Force
+    }) -Depth 5
     $memoryKey = "{0}|{1}|{2}|{3}" -f $cacheVersion, [int]$sourceSignature.FileCount, [int64]$sourceSignature.TotalLength, [int64]$sourceSignature.LatestWriteUtcTicks
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "CleanerML cache write error: $($_.Exception.Message)" } }
@@ -11610,12 +11659,12 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
             if ((Test-Path $iniPath) -and -not (Test-Path $cacheMetaPath)) {
                 try {
                     $iniInfo = Get-Item -LiteralPath $iniPath -ErrorAction Stop
-                    [PSCustomObject]@{
+                    Set-WmtJsonCacheFile -Path $cacheMetaPath -InputObject ([PSCustomObject]@{
                         CacheVersion    = $cacheVersion
                         IniLength       = [int64]$iniInfo.Length
                         IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
                         LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
-                    } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
+                    }) -Depth 3
                 }
                 catch {}
             }
@@ -11806,15 +11855,15 @@ foreach ($app in $finalList) {
 }
 
 try {
-    $finalList | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cachePath -Force
+    Set-WmtJsonCacheFile -Path $cachePath -InputObject $finalList -Depth 5
     if (Test-Path $iniPath) {
         $iniInfo = Get-Item -LiteralPath $iniPath -ErrorAction Stop
-        [PSCustomObject]@{
+        Set-WmtJsonCacheFile -Path $cacheMetaPath -InputObject ([PSCustomObject]@{
             CacheVersion    = $cacheVersion
             IniLength       = [int64]$iniInfo.Length
             IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
             LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
-        } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
+        }) -Depth 3
         $memoryKey = "{0}|{1}|{2}" -f $cacheVersion, [int64]$iniInfo.Length, $iniInfo.LastWriteTimeUtc.Ticks
     }
 }
@@ -11916,12 +11965,12 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
             if ((Test-Path $iniPath) -and -not (Test-Path $cacheMetaPath)) {
                 try {
                     $iniInfo = Get-Item -LiteralPath $iniPath -ErrorAction Stop
-                    [PSCustomObject]@{
+                    Set-WmtJsonCacheFile -Path $cacheMetaPath -InputObject ([PSCustomObject]@{
                         CacheVersion    = $cacheVersion
                         IniLength       = [int64]$iniInfo.Length
                         IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
                         LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
-                    } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
+                    }) -Depth 3
                 }
                 catch {}
             }
@@ -12079,15 +12128,15 @@ foreach ($app in $finalList) {
     }
 }
 try {
-    $finalList | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cachePath -Force
+    Set-WmtJsonCacheFile -Path $cachePath -InputObject $finalList -Depth 5
     if (Test-Path $iniPath) {
         $iniInfo = Get-Item -LiteralPath $iniPath -ErrorAction Stop
-        [PSCustomObject]@{
+        Set-WmtJsonCacheFile -Path $cacheMetaPath -InputObject ([PSCustomObject]@{
             CacheVersion    = $cacheVersion
             IniLength       = [int64]$iniInfo.Length
             IniLastWriteUtc = $iniInfo.LastWriteTimeUtc
             LastLocalRefreshUtc = [DateTime]::UtcNow.ToString("o")
-        } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cacheMetaPath -Force
+        }) -Depth 3
         $memoryKey = "{0}|{1}|{2}" -f $cacheVersion, [int64]$iniInfo.Length, $iniInfo.LastWriteTimeUtc.Ticks
     }
 }
@@ -15047,8 +15096,7 @@ function Invoke-WmtOutOfProcessAnalyze {
             $pStatus.Text = "Finished: $($task.RuleName)"
         }
 
-        Invoke-WmtDispatcherPump -Dispatcher $pForm.Dispatcher
-        Start-Sleep -Milliseconds 80
+        Invoke-WmtDispatcherDelay -Milliseconds 80 -Dispatcher $pForm.Dispatcher
         if ($progressState.Closed) {
             foreach ($entry in @($running.GetEnumerator())) {
                 try { $entry.Value.PowerShell.Stop() } catch {}
@@ -23347,8 +23395,7 @@ try {
 catch {
     Write-GuiLog "[Trim] Failed to launch: $($_.Exception.Message)"
 }
-Start-Sleep -Seconds 2
-Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
+Remove-WmtFileDeferred -Path $tmpScript -DelayMs 2000
 }
 
 function Start-DiskManagementGui {
@@ -25946,8 +25993,7 @@ catch {
     Write-GuiLog "Quick Fix launch failed: $($_.Exception.Message)"
     Show-WmtMessageBox -Message "Could not start Quick Fix: $($_.Exception.Message)" -Title "Quick Fix" -Button OK -Image Error | Out-Null
 }
-Start-Sleep -Seconds 2
-Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
+Remove-WmtFileDeferred -Path $tmpScript -DelayMs 2000
 }
 
 # --- SYSTEM RESTORE MANAGER ---
@@ -31870,23 +31916,24 @@ try {
     # only become visible once Explorer reloads. Restart it automatically so
     # the desktop matches the freshly applied buttons. Harmless for non-shell
     # tweaks; uses the same sequence as the "Restart Explorer" button.
-    $explorerRestarted = $false
+    $explorerRestartQueued = $false
     if ($applied -gt 0) {
         try {
-            Write-GuiLog "Tweaks import: restarting Explorer so shell tweaks take effect immediately..."
-            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-            Start-Process explorer
-            $explorerRestarted = $true
-            Write-GuiLog "Explorer restarted."
+            $restartJob = Invoke-WmtUiBackgroundCommand -Msg "Tweaks import: restarting Explorer so shell tweaks take effect immediately..." -Sb {
+                Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 500
+                Start-Process explorer
+                Write-Output "Explorer restarted."
+            }
+            $explorerRestartQueued = ($null -ne $restartJob)
         }
         catch {
-            Write-GuiLog "Tweaks import: Explorer restart failed: $($_.Exception.Message)"
+            Write-GuiLog "Tweaks import: Explorer restart failed to start: $($_.Exception.Message)"
         }
     }
 
     Write-GuiLog "Tweaks import finished: $applied applied, $failed failed, $($plan.AlreadyOk) already correct, $converged converged, $($plan.RedundantPairs) paired-redundant, $($plan.Skipped) skipped."
-    $summary = "Import finished.`n`nApplied: $applied$(if ($failed -gt 0) { "`nFailed: $failed" })`nAlready correct: $($plan.AlreadyOk)$(if ($converged -gt 0) { "`nConverged (paired toggle already switched): $converged" })$(if ($plan.RedundantPairs -gt 0) { "`nPaired My Device entries handled via main toggle: $($plan.RedundantPairs)" })$(if ($plan.Skipped -gt 0) { "`nSkipped (unsupported/disabled on this system): $($plan.Skipped)" })$(if ($explorerRestarted) { "`n`nExplorer was restarted so shell tweaks take effect immediately." })"
+    $summary = "Import finished.`n`nApplied: $applied$(if ($failed -gt 0) { "`nFailed: $failed" })`nAlready correct: $($plan.AlreadyOk)$(if ($converged -gt 0) { "`nConverged (paired toggle already switched): $converged" })$(if ($plan.RedundantPairs -gt 0) { "`nPaired My Device entries handled via main toggle: $($plan.RedundantPairs)" })$(if ($plan.Skipped -gt 0) { "`nSkipped (unsupported/disabled on this system): $($plan.Skipped)" })$(if ($explorerRestartQueued) { "`n`nExplorer restart was queued so shell tweaks can take effect immediately." })"
     if ($plan.Skipped -gt 0) { $summary += "`n$(Format-WmtNameList -Names $plan.SkippedNames -Max 6)" }
     $summaryImage = [System.Windows.MessageBoxImage]::Information
     if ($failed -gt 0) { $summaryImage = [System.Windows.MessageBoxImage]::Warning }
@@ -52217,11 +52264,11 @@ try {
     foreach ($trackedId in @($trackedGog.Keys)) {
         $idText = [string]$trackedId
         if ([string]::IsNullOrWhiteSpace($idText)) { continue }
-        if (-not [string]::IsNullOrWhiteSpace((Get-WmtGogdlTrackedInstallPath -Id $idText))) {
-            [void]$gogInstalledIds.Add($idText)
-        }
-        elseif (Test-WmtGogdlInstallPending -Id $idText) {
+        if (Test-WmtGogdlInstallPending -Id $idText) {
             [void]$gogPendingIds.Add($idText)
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace((Get-WmtGogdlTrackedInstallPath -Id $idText))) {
+            [void]$gogInstalledIds.Add($idText)
         }
     }
 }
@@ -52815,7 +52862,8 @@ param(
     [string]$RootPath,
     [string]$InstallPath,
     [ValidateSet("Pending", "Installed", "Failed")][string]$Status = "Pending",
-    [int]$ProcessId = 0
+    [int]$ProcessId = 0,
+    [int64]$ProcessStartUtcTicks = 0
 )
 
 $map = Get-WmtGogdlInstallMap
@@ -52824,8 +52872,9 @@ $map[$Id] = [PSCustomObject]@{
     RootPath    = [string]$RootPath
     InstallPath = [string]$InstallPath
     Status      = [string]$Status
-    ProcessId   = [int]$ProcessId
-    UpdatedUtc  = [DateTime]::UtcNow.ToString("o")
+    ProcessId           = [int]$ProcessId
+    ProcessStartUtcTicks = [int64]$ProcessStartUtcTicks
+    UpdatedUtc           = [DateTime]::UtcNow.ToString("o")
 }
 $path = Get-WmtGogdlInstallMapPath
 $dir = Split-Path -Parent $path
@@ -52867,11 +52916,30 @@ $entry = $map[$Id]
 if ([string]$entry.Status -ne "Pending") { return $false }
 
 $pidValue = 0
+$expectedStartTicks = [int64]0
 try { if ($entry.PSObject.Properties["ProcessId"]) { $pidValue = [int]$entry.ProcessId } } catch {}
+try { if ($entry.PSObject.Properties["ProcessStartUtcTicks"]) { $expectedStartTicks = [int64]$entry.ProcessStartUtcTicks } } catch {}
 if ($pidValue -le 0) { return $false }
+
 try {
     $p = Get-Process -Id $pidValue -ErrorAction Stop
-    return [bool]($p -and -not $p.HasExited)
+    if (-not $p -or $p.HasExited) { return $false }
+
+    $actualStartUtc = $p.StartTime.ToUniversalTime()
+    if ($expectedStartTicks -gt 0) {
+        return ([int64]$actualStartUtc.Ticks -eq $expectedStartTicks)
+    }
+
+    # Backward compatibility for Pending entries created before start-time
+    # tracking was added. Only trust the PID when the process start time closely
+    # matches the tracker's update timestamp; otherwise Windows may have reused it.
+    $trackedUtc = [DateTime]::MinValue
+    if ($entry.PSObject.Properties["UpdatedUtc"] -and
+        [DateTime]::TryParse([string]$entry.UpdatedUtc, [ref]$trackedUtc)) {
+        $deltaSeconds = [Math]::Abs(($actualStartUtc - $trackedUtc.ToUniversalTime()).TotalSeconds)
+        return ($deltaSeconds -le 10)
+    }
+    return $false
 }
 catch { return $false }
 }
@@ -52881,6 +52949,10 @@ param([Parameter(Mandatory = $true)][string]$Id)
 $map = Get-WmtGogdlInstallMap
 if (-not $map.ContainsKey($Id)) { return "" }
 $entry = $map[$Id]
+
+# A live tracked download takes precedence over a manifest or pre-created
+# install directory. GOGDL can create those before the download has finished.
+if ([string]$entry.Status -eq "Pending" -and (Test-WmtGogdlInstallPending -Id $Id)) { return "" }
 
 $resolved = Resolve-WmtGogdlInstallPath -Id $Id -RootPath ([string]$entry.RootPath) -InstallPath ([string]$entry.InstallPath)
 if ([string]::IsNullOrWhiteSpace($resolved)) { return "" }
@@ -53332,7 +53404,9 @@ exit `$exitCode
 
 $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherScript))
 $proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand -PassThru -WindowStyle Normal
-Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootPath) -InstallPath $expectedInstallPath -Status Pending -ProcessId $proc.Id
+$procStartUtcTicks = [int64]0
+try { $procStartUtcTicks = [int64]$proc.StartTime.ToUniversalTime().Ticks } catch {}
+Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootPath) -InstallPath $expectedInstallPath -Status Pending -ProcessId $proc.Id -ProcessStartUtcTicks $procStartUtcTicks
 Write-GuiLog "Starting GOGDL download for: $Name (id $Id) -> $($Options.RootPath) | language=$($Options.Language) | workers=$($Options.Workers) | build=$(if ($Options.BuildId) { $Options.BuildId } else { 'default' }) | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
 
 $procRef = $proc
