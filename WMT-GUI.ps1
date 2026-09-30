@@ -53570,6 +53570,24 @@ $launcherScript = $launcherTemplate.Replace("__TITLE__", $titleLiteral).
     Replace("__PAUSESUCCESS__", $pauseSuccessLiteral)
 
 $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherScript))
+
+# Snapshot the selected library root before Legendary starts.  This is only a
+# last-resort path resolver: if Legendary's own installed registry cannot be
+# read after a successful install, a single newly-created game directory can
+# still be identified without guessing from the display title.
+$preInstallDirectories = @()
+try {
+    $installRootSnapshot = ([string]$Options.RootPath).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($installRootSnapshot) -and
+        (Test-Path -LiteralPath $installRootSnapshot -PathType Container)) {
+        $preInstallDirectories = @(
+            Get-ChildItem -LiteralPath $installRootSnapshot -Directory -Force -ErrorAction Stop |
+                ForEach-Object { [System.IO.Path]::GetFullPath([string]$_.FullName).TrimEnd([System.IO.Path]::DirectorySeparatorChar) }
+        )
+    }
+}
+catch {}
+
 $proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand -PassThru -WindowStyle Normal
 
 if (-not (Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script -ErrorAction SilentlyContinue)) {
@@ -53594,6 +53612,7 @@ $expectedRef = $expectedInstallPath
 $legendaryExeRef = [string]$LegendaryExe
 $createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
 $createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
+$preInstallDirectoriesRef = @($preInstallDirectories)
 $operationName = "LegendaryLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
 
 $testComplete = {
@@ -53621,9 +53640,95 @@ $onComplete = {
     }
     catch {}
 
+    if (-not [string]::IsNullOrWhiteSpace($installedPath) -and
+        -not (Test-Path -LiteralPath $installedPath -PathType Container)) {
+        $installedPath = ""
+    }
+
+    # Legendary stores the authoritative installed-game map in installed.json,
+    # keyed by app name.  Resolve by the stable app id rather than by the Epic
+    # display title (which may contain punctuation such as ">observer_").
+    if ($exitCode -eq 0 -and [string]::IsNullOrWhiteSpace($installedPath)) {
+        try {
+            $configRoots = [System.Collections.Generic.List[string]]::new()
+            if (-not [string]::IsNullOrWhiteSpace($env:LEGENDARY_CONFIG_PATH)) {
+                [void]$configRoots.Add(([string]$env:LEGENDARY_CONFIG_PATH).Trim())
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+                [void]$configRoots.Add((Join-Path ([string]$env:XDG_CONFIG_HOME) "legendary"))
+            }
+            if (-not [string]::IsNullOrWhiteSpace($HOME)) {
+                [void]$configRoots.Add((Join-Path ([string]$HOME) ".config\legendary"))
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                [void]$configRoots.Add((Join-Path ([string]$env:USERPROFILE) ".config\legendary"))
+            }
+
+            foreach ($configRoot in @($configRoots | Select-Object -Unique)) {
+                if ([string]::IsNullOrWhiteSpace([string]$configRoot)) { continue }
+                $installedRegistryPath = Join-Path ([string]$configRoot) "installed.json"
+                if (-not (Test-Path -LiteralPath $installedRegistryPath -PathType Leaf)) { continue }
+
+                $registry = [System.IO.File]::ReadAllText($installedRegistryPath) | ConvertFrom-Json -ErrorAction Stop
+                $entry = $null
+                $property = $registry.PSObject.Properties[[string]$idRef]
+                if ($property) {
+                    $entry = $property.Value
+                }
+                else {
+                    foreach ($candidateProperty in @($registry.PSObject.Properties)) {
+                        $candidate = $candidateProperty.Value
+                        if ($candidate -and ([string]$candidate.app_name) -eq [string]$idRef) {
+                            $entry = $candidate
+                            break
+                        }
+                    }
+                }
+
+                if ($entry) {
+                    $candidatePath = ([string]$entry.install_path).Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and
+                        (Test-Path -LiteralPath $candidatePath -PathType Container)) {
+                        $installedPath = [System.IO.Path]::GetFullPath($candidatePath)
+                        break
+                    }
+                }
+            }
+        }
+        catch {}
+    }
+
     if ([string]::IsNullOrWhiteSpace($installedPath) -and -not [string]::IsNullOrWhiteSpace($expectedRef) -and
         (Test-Path -LiteralPath $expectedRef -PathType Container)) {
         $installedPath = $expectedRef
+    }
+
+    # Last-resort resolver for new installs: compare the root's immediate
+    # directories with the pre-install snapshot.  Only accept an unambiguous
+    # single new directory; never guess among multiple candidates.
+    if ($exitCode -eq 0 -and [string]::IsNullOrWhiteSpace($installedPath) -and
+        -not [string]::IsNullOrWhiteSpace($rootRef) -and
+        (Test-Path -LiteralPath $rootRef -PathType Container)) {
+        try {
+            $before = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($path in @($preInstallDirectoriesRef)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                    [void]$before.Add(([System.IO.Path]::GetFullPath([string]$path)).TrimEnd([System.IO.Path]::DirectorySeparatorChar))
+                }
+            }
+
+            $newDirectories = @(
+                Get-ChildItem -LiteralPath $rootRef -Directory -Force -ErrorAction Stop |
+                    Where-Object {
+                        $full = ([System.IO.Path]::GetFullPath([string]$_.FullName)).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+                        -not $before.Contains($full)
+                    }
+            )
+            if ($newDirectories.Count -eq 1) {
+                $installedPath = [System.IO.Path]::GetFullPath([string]$newDirectories[0].FullName)
+            }
+        }
+        catch {}
     }
 
     if ($exitCode -eq 0) {
