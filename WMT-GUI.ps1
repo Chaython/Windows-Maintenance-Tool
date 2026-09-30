@@ -46779,65 +46779,125 @@ $script:InvokeWingetSearch = {
                 }
                 catch {}
 
-                $encodedXboxQuery = [uri]::EscapeDataString(([string]$Query).Trim())
-                $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
+                $queryText = ([string]$Query).Trim()
+                $encodedXboxQuery = [uri]::EscapeDataString($queryText)
+                $headers = @{
+                    "User-Agent" = "Windows-Maintenance-Tool"
+                    "Accept"     = "application/json"
+                }
                 $catalogRows = New-Object System.Collections.Generic.List[object]
                 $seenCatalogIds = @{}
 
-                # Public unauthenticated Xbox/Store catalog endpoint used by Xbox catalog clients.
-                $suggestUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest?market=$market&languages=$language&platformdependencyname=windows.xbox&productFamilyNames=Games&query=$encodedXboxQuery&topProducts=25"
-                $suggest = Invoke-RestMethod -Uri $suggestUrl -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
+                $addXboxCatalogRow = {
+                    param(
+                        [string]$ProductId,
+                        [string]$Title,
+                        [string]$Version = "-"
+                    )
 
-                foreach ($family in @($suggest.Results)) {
-                    foreach ($product in @($family.Products)) {
+                    $ProductId = ([string]$ProductId).Trim()
+                    $Title = ([string]$Title).Trim()
+                    if ([string]::IsNullOrWhiteSpace($ProductId) -or [string]::IsNullOrWhiteSpace($Title)) { return }
+
+                    $idKey = $ProductId.ToLowerInvariant()
+                    if ($seenCatalogIds.ContainsKey($idKey)) { return }
+
+                    $seenCatalogIds[$idKey] = $true
+                    if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "-" }
+                    [void]$catalogRows.Add([PSCustomObject]@{
+                            Id      = $ProductId
+                            Title   = $Title
+                            Version = $Version
+                        })
+                }
+
+                $addDetailedXboxProducts = {
+                    param($Response)
+
+                    foreach ($product in @($Response.Products)) {
+                        if (-not $product) { continue }
+
                         $productId = ([string]$product.ProductId).Trim()
-                        $title = ([string]$product.Title).Trim()
-                        if ([string]::IsNullOrWhiteSpace($productId) -or [string]::IsNullOrWhiteSpace($title)) { continue }
-                        $idKey = $productId.ToLowerInvariant()
-                        if ($seenCatalogIds.ContainsKey($idKey)) { continue }
-                        $seenCatalogIds[$idKey] = $true
-                        [void]$catalogRows.Add([PSCustomObject]@{ Id = $productId; Title = $title; Version = "-" })
+                        $title = ""
+                        try {
+                            if ($product.LocalizedProperties -and @($product.LocalizedProperties).Count -gt 0) {
+                                $title = ([string]$product.LocalizedProperties[0].ProductTitle).Trim()
+                            }
+                        }
+                        catch {}
+
+                        $remoteVersion = "-"
+                        try {
+                            foreach ($skuAvailability in @($product.DisplaySkuAvailabilities)) {
+                                $candidateVersion = ([string]$skuAvailability.Sku.Properties.VersionString).Trim()
+                                if (-not [string]::IsNullOrWhiteSpace($candidateVersion)) {
+                                    $remoteVersion = $candidateVersion
+                                    break
+                                }
+                            }
+                        }
+                        catch {}
+
+                        & $addXboxCatalogRow -ProductId $productId -Title $title -Version $remoteVersion
                     }
                 }
 
-                # Autosuggest is deliberately small. If it returns nothing, try the
-                # broader Games endpoint before giving up.
-                if ($catalogRows.Count -eq 0) {
-                    try {
-                        $fullUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/Games/products?query=$encodedXboxQuery&market=$market&languages=$language&fieldsTemplate=details&platformdependencyname=windows.xbox"
-                        $full = Invoke-RestMethod -Uri $fullUrl -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
-                        foreach ($product in @($full.Products)) {
-                            $productId = ([string]$product.ProductId).Trim()
-                            $title = ""
-                            try {
-                                if ($product.LocalizedProperties -and @($product.LocalizedProperties).Count -gt 0) {
-                                    $title = ([string]$product.LocalizedProperties[0].ProductTitle).Trim()
-                                }
-                            }
-                            catch {}
-                            if ([string]::IsNullOrWhiteSpace($productId) -or [string]::IsNullOrWhiteSpace($title)) { continue }
+                $addSuggestedXboxProducts = {
+                    param($Response)
 
-                            $remoteVersion = "-"
-                            try {
-                                foreach ($skuAvailability in @($product.DisplaySkuAvailabilities)) {
-                                    $candidateVersion = ([string]$skuAvailability.Sku.Properties.VersionString).Trim()
-                                    if (-not [string]::IsNullOrWhiteSpace($candidateVersion)) {
-                                        $remoteVersion = $candidateVersion
-                                        break
-                                    }
-                                }
-                            }
-                            catch {}
-
-                            $idKey = $productId.ToLowerInvariant()
-                            if ($seenCatalogIds.ContainsKey($idKey)) { continue }
-                            $seenCatalogIds[$idKey] = $true
-                            [void]$catalogRows.Add([PSCustomObject]@{ Id = $productId; Title = $title; Version = $remoteVersion })
+                    foreach ($family in @($Response.Results)) {
+                        foreach ($product in @($family.Products)) {
+                            if (-not $product) { continue }
+                            & $addXboxCatalogRow -ProductId ([string]$product.ProductId) -Title ([string]$product.Title) -Version "-"
                         }
                     }
-                    catch {
-                        Log "Xbox Store broad catalog fallback failed: $($_.Exception.Message)"
+                }
+
+                # Query the real DisplayCatalog search endpoint first. Autosuggest is
+                # intentionally limited and can return a non-empty set that omits the
+                # actual title, which previously prevented the broader search fallback.
+                # Search both Xbox and desktop device families because Xbox app entries
+                # can advertise one, the other, or both.
+                $localeCandidates = New-Object System.Collections.Generic.List[object]
+                [void]$localeCandidates.Add([PSCustomObject]@{ Market = $market; Language = $language })
+                if ($market -ne "US" -or $language -ne "en-US") {
+                    [void]$localeCandidates.Add([PSCustomObject]@{ Market = "US"; Language = "en-US" })
+                }
+
+                foreach ($locale in @($localeCandidates)) {
+                    $localeMarket = [string]$locale.Market
+                    $localeLanguage = [string]$locale.Language
+                    $countBeforeLocale = $catalogRows.Count
+
+                    foreach ($platform in @("windows.xbox", "windows.desktop")) {
+                        try {
+                            $fullUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/Games/products?query=$encodedXboxQuery&market=$localeMarket&languages=$localeLanguage&fieldsTemplate=details&platformdependencyname=$platform"
+                            $full = Invoke-RestMethod -Uri $fullUrl -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
+                            & $addDetailedXboxProducts -Response $full
+                        }
+                        catch {
+                            Log "Xbox Store catalog search failed for $platform ($localeMarket/$localeLanguage): $($_.Exception.Message)"
+                        }
                     }
+
+                    # The official/open-source Xbox clients still expose autosuggest,
+                    # so keep it as a secondary source. Include Games,Apps because
+                    # some Xbox storefront entries are catalogued outside Games.
+                    foreach ($platform in @("windows.xbox", "windows.desktop")) {
+                        try {
+                            $suggestUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest?market=$localeMarket&languages=$localeLanguage&platformdependencyname=$platform&productFamilyNames=Games,Apps&query=$encodedXboxQuery&topProducts=25"
+                            $suggest = Invoke-RestMethod -Uri $suggestUrl -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
+                            & $addSuggestedXboxProducts -Response $suggest
+                        }
+                        catch {
+                            Log "Xbox Store autosuggest fallback failed for $platform ($localeMarket/$localeLanguage): $($_.Exception.Message)"
+                        }
+                    }
+
+                    # If the user's locale produced anything, do not add duplicate
+                    # US-localized catalogue entries. US/en-US is only a resilience
+                    # fallback for regional catalogue/search gaps.
+                    if ($catalogRows.Count -gt $countBeforeLocale) { break }
                 }
 
                 foreach ($catalogRow in @($catalogRows)) {
