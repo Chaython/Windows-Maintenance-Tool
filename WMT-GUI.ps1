@@ -5992,30 +5992,111 @@ if ($lblWingetStatus) {
     $lblWingetStatus.Text = "Loading manifest for $name..."
     $lblWingetStatus.Visibility = "Visible"
 }
-
 Set-WmtBusyCursor -Busy
-try {
-    $result = Get-WingetManifestText -Item $Item
-    if (-not $result.Success) {
-        Write-GuiLog "Manifest lookup failed for $id$(if ($null -ne $result.ExitCode) { " (exit $($result.ExitCode))" })."
-    }
-    else {
-        Write-GuiLog "Manifest loaded for $id."
-    }
 
-    $header = "Package: $name`r`nID: $id`r`nSource: $source`r`nCommand: winget show --id `"$id`" --source $source --exact`r`n"
-    $separator = ("-" * 80)
-    # Clear the busy cursor BEFORE opening the dialog
-    Set-WmtBusyCursor
-    Show-TextDialog -Title "App Manifest - $name" -Text "$header`r`n$separator`r`n`r`n$($result.Text)"
-}
-finally {
+$finishManifestUi = {
     Set-WmtBusyCursor
     if ($lblWingetStatus) {
         $lblWingetStatus.Text = "Ready"
         $lblWingetStatus.Visibility = "Hidden"
     }
-}
+}.GetNewClosure()
+
+$manifestComplete = {
+    param($results)
+    try {
+        $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["Text"] } | Select-Object -Last 1)
+        if ($payload.Count -eq 0) {
+            Write-GuiLog "Manifest lookup failed for $id (no result)."
+            return
+        }
+
+        $result = $payload[0]
+        if ([bool]$result.Success) {
+            Write-GuiLog "Manifest loaded for $id."
+        }
+        else {
+            Write-GuiLog "Manifest lookup failed for $id."
+        }
+
+        $header = "Package: $name`r`nID: $id`r`nSource: $source`r`nCommand: winget show --id `"$id`" --source $source --exact`r`n"
+        $separator = ("-" * 80)
+        & $finishManifestUi
+        Show-TextDialog -Title "App Manifest - $name" -Text "$header`r`n$separator`r`n`r`n$($result.Text)"
+    }
+    finally {
+        & $finishManifestUi
+    }
+}.GetNewClosure()
+
+$manifestError = {
+    param($err)
+    & $finishManifestUi
+    $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+    Write-GuiLog ("Manifest lookup failed for " + $id + ": " + $message)
+}.GetNewClosure()
+
+$workerArgs = [object[]]@($id, $source)
+Invoke-WmtUiBackgroundCommand -Name ("WingetManifest_" + [guid]::NewGuid().ToString("N")) -Msg "Loading app manifest for $name..." -TimeoutMs 50000 -SuppressResultLog -Sb {
+    param(
+        [string]$PackageId,
+        [string]$PackageSource
+    )
+
+    $quote = [char]34
+    $argsLine = "show --id " + $quote + $PackageId + $quote +
+        " --source " + $quote + $PackageSource + $quote +
+        " --exact --accept-source-agreements --disable-interactivity"
+
+    try {
+        $pInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $pInfo.FileName = "winget"
+        $pInfo.Arguments = $argsLine
+        $pInfo.RedirectStandardOutput = $true
+        $pInfo.RedirectStandardError = $true
+        $pInfo.UseShellExecute = $false
+        $pInfo.CreateNoWindow = $true
+        $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+
+        $proc = [System.Diagnostics.Process]::Start($pInfo)
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit(45000)) {
+            try { $proc.Kill() } catch {}
+            try { [void]$proc.WaitForExit(2000) } catch {}
+            return [PSCustomObject]@{
+                Success  = $false
+                ExitCode = $null
+                Text     = "Timed out while loading the manifest for $PackageId."
+            }
+        }
+
+        $out = $outTask.GetAwaiter().GetResult()
+        $err = $errTask.GetAwaiter().GetResult()
+        $parts = @()
+        if (-not [string]::IsNullOrWhiteSpace($out)) { $parts += $out.TrimEnd() }
+        if (-not [string]::IsNullOrWhiteSpace($err)) { $parts += $err.TrimEnd() }
+        $manifestText = ($parts -join "`r`n`r`n")
+        if ([string]::IsNullOrWhiteSpace($manifestText)) {
+            $manifestText = "No manifest output was returned for $PackageId."
+        }
+
+        [PSCustomObject]@{
+            Success  = ($proc.ExitCode -eq 0)
+            ExitCode = $proc.ExitCode
+            Text     = $manifestText
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            Success  = $false
+            ExitCode = $null
+            Text     = "Failed to load manifest for $PackageId.`r`n`r`n$($_.Exception.Message)"
+        }
+    }
+} -ArgumentList $workerArgs -OnComplete $manifestComplete -OnError $manifestError | Out-Null
 }
 
 function Test-ChocoManifestSupportedItem {
