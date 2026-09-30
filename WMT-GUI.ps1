@@ -6394,7 +6394,6 @@ $encodedName = [uri]::EscapeDataString($name)
 switch ($source) {
     "winget"     { return "https://github.com/microsoft/winget-pkgs/search?q=$encodedId&type=code" }
     "msstore"    { return "https://apps.microsoft.com/detail/$encodedId" }
-    "xboxstore"  { return "https://apps.microsoft.com/detail/$encodedId" }
     "chocolatey" { return Get-ChocoCommunityPageUrl -Item $Item }
     "choco"      { return Get-ChocoCommunityPageUrl -Item $Item }
     "npm"        { return "https://www.npmjs.com/package/$encodedId" }
@@ -7196,7 +7195,7 @@ $defaults = @{
     CleanerLocalRefreshMinutes = 60
     CleanerRemoteCheckMinutes  = 1440
     CleanerAutoCleanMinutes    = 0
-    EnabledProviders           = @("winget", "msstore", "xboxstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
+    EnabledProviders           = @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     WuCategoryToggles          = @{}
     ProviderToggles            = @{}
     CustomDnsServers           = @()
@@ -35985,7 +35984,7 @@ $ctxMenu.Add_Opened({
     $miPackagePage.IsEnabled = -not [string]::IsNullOrWhiteSpace([string]$packagePageUrl)
     if ($single) {
         $singleSource = ([string]$single.Source).Trim().ToLowerInvariant()
-        $miPackagePage.Header = if ($singleSource -in @("steam","epic","legendary","gog","gogdl","msstore","xboxstore")) { "Open Store Page" } else { "Open Package Page" }
+        $miPackagePage.Header = if ($singleSource -in @("steam","epic","legendary","gog","gogdl","msstore")) { "Open Store Page" } else { "Open Package Page" }
     }
 
     $canConfigureCustomUpdate = $false
@@ -36183,7 +36182,7 @@ $script:WingetActionStoreUpdateOnly = (
     $totalItems -gt 0 -and
     @($uniqueItems | Where-Object { ([string]$_.Source).ToLowerInvariant() -eq "msstore" }).Count -eq $totalItems
 )
-$script:WingetActionHasStoreCli = @($uniqueItems | Where-Object { ([string]$_.Source).ToLowerInvariant() -in @("msstore","xboxstore") -and $ActionName -eq "Install" }).Count -gt 0
+$script:WingetActionHasStoreCli = @($uniqueItems | Where-Object { ([string]$_.Source).ToLowerInvariant() -eq "msstore" -and $ActionName -eq "Install" }).Count -gt 0
 $script:WingetStoreResourcesInUseSeen = $false
 $script:WingetStoreErrorLogSeen = @{}
 $script:WingetStoreFallbackSeen = @{}
@@ -38419,10 +38418,10 @@ exit /b %WMT_EXIT%
                 if ($act -eq "Uninstall") { $wingetArgs = "uninstall --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget uninstall --id `"$id`" $userFlags" }
                 if ($act -eq "Repair") { $wingetArgs = "repair --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget repair --id `"$id`" $userFlags" }
             }
-            # --- MICROSOFT / XBOX STORE ---
-            elseif ($srcKey -in @("msstore", "xboxstore")) {
+            # --- MICROSOFT STORE ---
+            elseif ($src -eq "msstore") {
                 $safeStoreId = Get-StoreCliProductId $id
-                $preferStoreUpdateScan = if ($srcKey -eq "msstore") { Test-WmtStoreUpdateScanPreferredItem -Name $name -Id $id } else { $false }
+                $preferStoreUpdateScan = Test-WmtStoreUpdateScanPreferredItem -Name $name -Id $id
                 if ($act -eq "Install" -and $preferStoreUpdateScan) {
                     $storeForceUpdateScan = $true
                     $storeFallbackUri = "ms-windows-store://downloadsandupdates"
@@ -38791,7 +38790,6 @@ exit /b %WMT_EXIT%
                 $windowTag = switch -Regex ($src) {
                     "^(winget)$" { "Winget"; break }
                     "^(msstore)$" { "MSStore"; break }
-                    "^(xboxstore)$" { "XboxStore"; break }
                     "^(pip|pip3)$" { "PIP"; break }
                     "^(npm|npm \(global\))$" { "NPM"; break }
                     "^(pnpm|pnpm \(global\))$" { "PNPM"; break }
@@ -39541,7 +39539,6 @@ function Get-WmtProviderCapabilities {
 return [ordered]@{
     winget        = @{ Search = $true; Library = $false }
     msstore       = @{ Search = $true; Library = $false }
-    xboxstore     = @{ Search = $true; Library = $false; Scan = $false }
     windowsupdate = @{ Search = $false; Library = $false }
     pip           = @{ Search = $true; Library = $false }
     npm           = @{ Search = $true; Library = $false }
@@ -39565,19 +39562,9 @@ param([string]$ProviderKey)
 $caps = Get-WmtProviderCapabilities
 $key = ([string]$ProviderKey).Trim().ToLowerInvariant()
 $cap = if ($caps.Contains($key)) { $caps[$key] } else { @{ Search = $false; Library = $false } }
-$scanSupported = $true
-try {
-    if ($cap -is [System.Collections.IDictionary] -and $cap.Contains("Scan")) {
-        $scanSupported = [bool]$cap["Scan"]
-    }
-    elseif ($cap.PSObject.Properties["Scan"]) {
-        $scanSupported = [bool]$cap.Scan
-    }
-}
-catch {}
 return [ordered]@{
     Search     = [bool]$cap.Search
-    Scan       = $scanSupported
+    Scan       = $true
     Headless   = $false
     AutoUpdate = $false
 }
@@ -40472,7 +40459,7 @@ function Show-ProviderManager {
 # 1. Load Current Settings
 $settings = Get-WmtSettings
 if (-not $settings.EnabledProviders) {
-    $settings | Add-Member -MemberType NoteProperty -Name "EnabledProviders" -Value @("winget", "msstore", "xboxstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl") -Force
+    $settings | Add-Member -MemberType NoteProperty -Name "EnabledProviders" -Value @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl") -Force
 }
 $enabled = $settings.EnabledProviders
 $providerToggles = Get-WmtProviderToggles -Settings $settings
@@ -40483,7 +40470,6 @@ $providerCapabilities = Get-WmtProviderCapabilities
 $providerDefinitions = @(
     [PSCustomObject]@{ Key = "winget"; DisplayName = "Winget"; Commands = [string[]]@("winget"); Label = "lblProviderWingetStatus"; Button = "btnProviderWingetAction"; LockedOn = $true; ToolTip = "Windows Package Manager" },
     [PSCustomObject]@{ Key = "msstore"; DisplayName = "Store CLI"; Commands = [string[]]@("store"); Label = "lblProviderMsStoreStatus"; Button = "btnProviderMsStoreAction"; LockedOn = $false; ToolTip = "Microsoft Store Apps via store.exe" },
-    [PSCustomObject]@{ Key = "xboxstore"; DisplayName = "Xbox Store"; Commands = [string[]]@(); Label = "lblProviderXboxStoreStatus"; Button = "btnProviderXboxStoreAction"; LockedOn = $false; BuiltIn = $true; ToolTip = "Search the Xbox/Microsoft game catalog directly through Microsoft DisplayCatalog. Search-only provider for PC/Xbox catalog titles that msstore/winget may omit." },
     [PSCustomObject]@{ Key = "windowsupdate"; DisplayName = "Windows Update"; Commands = [string[]]@("powershell"); Label = "lblWindowsUpdateStatus"; Button = "btnProviderWindowsUpdateAction"; LockedOn = $false; ToolTip = "Windows Update Agent. Scans both regular and optional Windows updates, including drivers when offered." },
     [PSCustomObject]@{ Key = "pip"; DisplayName = "Python (Pip)"; Commands = [string[]]@("pip", "pip3"); Label = "lblPipStatus"; Button = "btnProviderPipAction"; LockedOn = $false; ToolTip = "Python package manager" },
     [PSCustomObject]@{ Key = "npm"; DisplayName = "Node (Npm)"; Commands = [string[]]@("npm"); Label = "lblNpmStatus"; Button = "btnProviderNpmAction"; LockedOn = $false; ToolTip = "Node.js package manager" },
@@ -40509,29 +40495,18 @@ function Format-WmtProviderRowXaml {
     $locked = [bool]$Provider.LockedOn
     $caps = $providerCapabilities[$key]
     $searchSupported = [bool]$caps.Search
-    $scanSupported = $true
-    try {
-        if ($caps -is [System.Collections.IDictionary] -and $caps.Contains("Scan")) {
-            $scanSupported = [bool]$caps["Scan"]
-        }
-        elseif ($caps.PSObject.Properties["Scan"]) {
-            $scanSupported = [bool]$caps.Scan
-        }
-    }
-    catch {}
 
     $chkAttr = if ($locked) { 'IsChecked="True" IsEnabled="False"' } else { '' }
     $searchEnabled = if ($searchSupported) { 'True' } else { 'False' }
-    $scanEnabled = if ($scanSupported) { 'True' } else { 'False' }
     $t = $providerToggles[$key]
     $searchVal = if ($t -is [System.Collections.IDictionary]) { $t["Search"] } else { $t.Search }
     $scanVal = if ($t -is [System.Collections.IDictionary]) { $t["Scan"] } else { $t.Scan }
     $headVal = if ($t -is [System.Collections.IDictionary]) { $t["Headless"] } else { $t.Headless }
     $autoVal = if ($t -is [System.Collections.IDictionary]) { $t["AutoUpdate"] } else { $t.AutoUpdate }
     $searchIsChecked = if ($searchSupported -and [bool]$searchVal) { 'True' } else { 'False' }
-    $scanIsChecked = if ($scanSupported -and [bool]$scanVal) { 'True' } else { 'False' }
-    $headlessIsChecked = if ($scanSupported -and [bool]$headVal) { 'True' } else { 'False' }
-    $autoIsChecked = if ($scanSupported -and [bool]$autoVal) { 'True' } else { 'False' }
+    $scanIsChecked = if ([bool]$scanVal) { 'True' } else { 'False' }
+    $headlessIsChecked = if ([bool]$headVal) { 'True' } else { 'False' }
+    $autoIsChecked = if ([bool]$autoVal) { 'True' } else { 'False' }
 
     $searchToolTip = if ($searchSupported) {
         "Allow searching this provider's catalog or owned library from the WMT search box."
@@ -40573,9 +40548,9 @@ function Format-WmtProviderRowXaml {
                 </Grid>
                 <StackPanel Orientation="Horizontal" Margin="30,6,0,0">
                     <ToggleButton Name="chk${key}Search"     Content="Search"     Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$searchIsChecked"    IsEnabled="$searchEnabled" ToolTip="$searchToolTip"/>
-                    <ToggleButton Name="chk${key}Scan"       Content="Scan"       Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$scanIsChecked"       IsEnabled="$scanEnabled" ToolTip="Include this provider in update scans. Disabling also disables Headless and Auto-update for this provider."/>
-                    <ToggleButton Name="chk${key}Headless"   Content="Headless"   Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$headlessIsChecked"   IsEnabled="$scanEnabled" ToolTip="Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."/>
-                    <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update" Margin="0,0,8,0" Padding="10,3" MinWidth="70" IsChecked="$autoIsChecked"       IsEnabled="$scanEnabled" ToolTip="After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan to be enabled."/>
+                    <ToggleButton Name="chk${key}Scan"       Content="Scan"       Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$scanIsChecked"       ToolTip="Include this provider in update scans. Disabling also disables Headless and Auto-update for this provider."/>
+                    <ToggleButton Name="chk${key}Headless"   Content="Headless"   Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$headlessIsChecked"   ToolTip="Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."/>
+                    <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update" Margin="0,0,8,0" Padding="10,3" MinWidth="70" IsChecked="$autoIsChecked"       ToolTip="After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan to be enabled."/>
                     $includeUnknownToggle
                 </StackPanel>
                 $wuCategorySection
@@ -41560,7 +41535,6 @@ $testProviderInstalled = {
     param($Provider)
 
     if (-not $Provider) { return $false }
-    if ($Provider.PSObject.Properties["BuiltIn"] -and [bool]$Provider.BuiltIn) { return $true }
     & $updateProviderPathEnvironment
     foreach ($cmd in @($Provider.Commands)) {
         if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
@@ -41585,21 +41559,6 @@ $updateProviderStatuses = {
     foreach ($provider in $providerDefinitions) {
         $labelCtrl = & $getWinCtrl $provider.Label
         $buttonCtrl = & $getWinCtrl $provider.Button
-
-        if ($provider.PSObject.Properties["BuiltIn"] -and [bool]$provider.BuiltIn) {
-            $providerInstallState[$provider.Key] = $true
-            if ($labelCtrl) {
-                $labelCtrl.Text = "Built in"
-                Set-WmtThemedBrush -Object $labelCtrl -Property ([System.Windows.Controls.TextBlock]::ForegroundProperty) -ColorOrKey "Success"
-            }
-            if ($buttonCtrl) {
-                $buttonCtrl.Content = "Catalog"
-                $buttonCtrl.ToolTip = "This provider uses Microsoft's online Xbox catalog and does not require a local package manager."
-                $buttonCtrl.IsEnabled = $false
-            }
-            continue
-        }
-
         $installed = [bool](& $testProviderInstalled -Provider $provider)
         $providerInstallState[$provider.Key] = $installed
 
@@ -41837,18 +41796,8 @@ $updateProviderToggleState = {
     if (-not $controls) { return }
     $caps = $providerCapabilities[$ProviderKey]
     $searchSupported = [bool]$caps.Search
-    $scanSupported = $true
-    try {
-        if ($caps -is [System.Collections.IDictionary] -and $caps.Contains("Scan")) {
-            $scanSupported = [bool]$caps["Scan"]
-        }
-        elseif ($caps.PSObject.Properties["Scan"]) {
-            $scanSupported = [bool]$caps.Scan
-        }
-    }
-    catch {}
     $mainChecked = [bool]$controls.Main.IsChecked
-    $scanChecked = ($scanSupported -and [bool]$controls.Scan.IsChecked)
+    $scanChecked = [bool]$controls.Scan.IsChecked
 
     # Get provider display name for tooltip messages.
     $provider = @($providerDefinitions | Where-Object { $_.Key -eq $ProviderKey } | Select-Object -First 1)
@@ -41862,7 +41811,7 @@ $updateProviderToggleState = {
     if ($ProviderKey -eq "winget") { $isInstalled = $true }
 
     # Base tooltips (shown when enabled).
-    $mainTip = if ($scanSupported) { "Enable or disable $dispName for scanning and updates." } else { "Enable or disable $dispName for package search." }
+    $mainTip = "Enable or disable $dispName for scanning and updates."
     $searchTip = "Allow searching this provider's catalog or owned library from the WMT search box."
     $scanTip = "Include this provider in update scans. Disabling also disables Headless and Auto-update."
     $headlessTip = "Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."
@@ -41919,27 +41868,8 @@ $updateProviderToggleState = {
         }
     }
 
-    # Search-only providers intentionally do not participate in update scans.
-    if (-not $scanSupported) {
-        if ($controls.Scan) {
-            $controls.Scan.IsChecked = $false
-            $controls.Scan.IsEnabled = $false
-            $controls.Scan.ToolTip = "$dispName is a search-only catalog provider."
-        }
-        if ($controls.Headless) {
-            $controls.Headless.IsChecked = $false
-            $controls.Headless.IsEnabled = $false
-            $controls.Headless.ToolTip = "$dispName does not run update/install scans."
-        }
-        if ($controls.AutoUpdate) {
-            $controls.AutoUpdate.IsChecked = $false
-            $controls.AutoUpdate.IsEnabled = $false
-            $controls.AutoUpdate.ToolTip = "$dispName does not provide update scans."
-        }
-    }
-
     # Scan toggle
-    if ($scanSupported -and $controls.Scan) {
+    if ($controls.Scan) {
         if (-not $mainChecked) {
             $controls.Scan.IsEnabled = $false
             $controls.Scan.ToolTip = "Enable $dispName (check the box on the left) to use scanning."
@@ -41951,7 +41881,7 @@ $updateProviderToggleState = {
     }
 
     # Headless toggle
-    if ($scanSupported -and $controls.Headless) {
+    if ($controls.Headless) {
         if (-not $mainChecked) {
             $controls.Headless.IsEnabled = $false
             $controls.Headless.ToolTip = "Enable $dispName and Scan to use headless mode."
@@ -41967,7 +41897,7 @@ $updateProviderToggleState = {
     }
 
     # AutoUpdate toggle
-    if ($scanSupported -and $controls.AutoUpdate) {
+    if ($controls.AutoUpdate) {
         if (-not $mainChecked) {
             $controls.AutoUpdate.IsEnabled = $false
             $controls.AutoUpdate.ToolTip = "Enable $dispName and Scan to use auto-update."
@@ -42087,9 +42017,9 @@ foreach ($provider in $providerDefinitions) {
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $key
             $togglesToSave[$key] = [ordered]@{
                 Search     = if ($defaults.Search -and $chkSearch) { [bool]$chkSearch.IsChecked }   else { $false }
-                Scan       = if ($defaults.Scan -and $chkScan) { [bool]$chkScan.IsChecked } else { $false }
-                Headless   = if ($defaults.Scan -and $chkHeadless) { [bool]$chkHeadless.IsChecked } else { $false }
-                AutoUpdate = if ($defaults.Scan -and $chkAuto) { [bool]$chkAuto.IsChecked } else { $false }
+                Scan       = if ($chkScan) { [bool]$chkScan.IsChecked }     else { $true }
+                Headless   = if ($chkHeadless) { [bool]$chkHeadless.IsChecked } else { $false }
+                AutoUpdate = if ($chkAuto) { [bool]$chkAuto.IsChecked }     else { $false }
             }
         }
         if ($current -is [System.Collections.IDictionary]) {
@@ -43280,7 +43210,7 @@ $btnWingetScan.Add_Click({
         $settings.EnabledProviders 
     }
     else { 
-        @("winget", "msstore", "xboxstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
+        @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     }
     $ignoreList = if ($settings.WingetIgnore) { $settings.WingetIgnore } else { @() }
     $includeUnknown = Get-WmtWingetIncludeUnknown -Settings $settings
@@ -46057,7 +45987,7 @@ $script:InvokeWingetSearch = {
         $settings.EnabledProviders 
     }
     else { 
-        @("winget", "msstore", "xboxstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
+        @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     }
 
     # Respect per-provider Search toggle: providers with Search=false are
@@ -46450,7 +46380,7 @@ $script:InvokeWingetSearch = {
             param([string]$Provider)
 
             $providerKey = ([string]$Provider).Trim().ToLowerInvariant()
-            if ($providerKey -in @("msstore", "xboxstore")) { $providerKey = "winget" }
+            if ($providerKey -eq "msstore") { $providerKey = "winget" }
             if ($script:WmtSearchInstalledMaps.ContainsKey($providerKey)) {
                 return $script:WmtSearchInstalledMaps[$providerKey]
             }
@@ -46752,172 +46682,6 @@ $script:InvokeWingetSearch = {
                 }
             }
             catch { Log "Winget Error: $_" }
-        }
-
-
-        # --- A2. XBOX STORE (DisplayCatalog) ---
-        if ("xboxstore" -in $Enabled) {
-            Write-Output "PROVIDER_START:xboxstore"
-            $script:provCount = 0
-            Log "Searching Xbox Store catalog..."
-
-            try {
-                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-
-                $market = "US"
-                $language = "en-US"
-                try {
-                    $region = [System.Globalization.RegionInfo]::CurrentRegion
-                    if ($region -and -not [string]::IsNullOrWhiteSpace([string]$region.TwoLetterISORegionName)) {
-                        $market = ([string]$region.TwoLetterISORegionName).ToUpperInvariant()
-                    }
-                }
-                catch {}
-                try {
-                    $cultureName = [string][System.Globalization.CultureInfo]::CurrentUICulture.Name
-                    if (-not [string]::IsNullOrWhiteSpace($cultureName)) { $language = $cultureName }
-                }
-                catch {}
-
-                $queryText = ([string]$Query).Trim()
-                $encodedXboxQuery = [uri]::EscapeDataString($queryText)
-                $headers = @{
-                    "User-Agent" = "Windows-Maintenance-Tool"
-                    "Accept"     = "application/json"
-                }
-                # Use a native PowerShell array here. New-Object List[object]
-                # combined with @($list) triggers a PowerShell binder bug
-                # ("Argument types do not match") on Windows PowerShell 5.1.
-                $catalogRows = @()
-                $seenCatalogIds = @{}
-
-                $addXboxCatalogRow = {
-                    param(
-                        [string]$ProductId,
-                        [string]$Title,
-                        [string]$Version = "-"
-                    )
-
-                    $ProductId = ([string]$ProductId).Trim()
-                    $Title = ([string]$Title).Trim()
-                    if ([string]::IsNullOrWhiteSpace($ProductId) -or [string]::IsNullOrWhiteSpace($Title)) { return }
-
-                    $idKey = $ProductId.ToLowerInvariant()
-                    if ($seenCatalogIds.ContainsKey($idKey)) { return }
-
-                    $seenCatalogIds[$idKey] = $true
-                    if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "-" }
-                    $catalogRows += [PSCustomObject]@{
-                        Id      = $ProductId
-                        Title   = $Title
-                        Version = $Version
-                    }
-                }
-
-                $addDetailedXboxProducts = {
-                    param($Response)
-
-                    foreach ($product in @($Response.Products)) {
-                        if (-not $product) { continue }
-
-                        $productId = ([string]$product.ProductId).Trim()
-                        $title = ""
-                        try {
-                            if ($product.LocalizedProperties -and @($product.LocalizedProperties).Count -gt 0) {
-                                $title = ([string]$product.LocalizedProperties[0].ProductTitle).Trim()
-                            }
-                        }
-                        catch {}
-
-                        $remoteVersion = "-"
-                        try {
-                            foreach ($skuAvailability in @($product.DisplaySkuAvailabilities)) {
-                                $candidateVersion = ([string]$skuAvailability.Sku.Properties.VersionString).Trim()
-                                if (-not [string]::IsNullOrWhiteSpace($candidateVersion)) {
-                                    $remoteVersion = $candidateVersion
-                                    break
-                                }
-                            }
-                        }
-                        catch {}
-
-                        & $addXboxCatalogRow -ProductId $productId -Title $title -Version $remoteVersion
-                    }
-                }
-
-                $addSuggestedXboxProducts = {
-                    param($Response)
-
-                    foreach ($family in @($Response.Results)) {
-                        foreach ($product in @($family.Products)) {
-                            if (-not $product) { continue }
-                            & $addXboxCatalogRow -ProductId ([string]$product.ProductId) -Title ([string]$product.Title) -Version "-"
-                        }
-                    }
-                }
-
-                # Query the real DisplayCatalog search endpoint first. Autosuggest is
-                # intentionally limited and can return a non-empty set that omits the
-                # actual title, which previously prevented the broader search fallback.
-                # Search both Xbox and desktop device families because Xbox app entries
-                # can advertise one, the other, or both.
-                $localeCandidates = @(
-                    [PSCustomObject]@{ Market = $market; Language = $language }
-                )
-                if ($market -ne "US" -or $language -ne "en-US") {
-                    $localeCandidates += [PSCustomObject]@{ Market = "US"; Language = "en-US" }
-                }
-
-                foreach ($locale in @($localeCandidates)) {
-                    $localeMarket = [string]$locale.Market
-                    $localeLanguage = [string]$locale.Language
-                    $countBeforeLocale = $catalogRows.Count
-
-                    foreach ($platform in @("windows.xbox", "windows.desktop")) {
-                        try {
-                            $fullUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/Games/products?query=$encodedXboxQuery&market=$localeMarket&languages=$localeLanguage&fieldsTemplate=details&platformdependencyname=$platform"
-                            $full = Invoke-RestMethod -Uri $fullUrl -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
-                            & $addDetailedXboxProducts -Response $full
-                        }
-                        catch {
-                            Log "Xbox Store catalog search failed for $platform ($localeMarket/$localeLanguage): $($_.Exception.Message)"
-                        }
-                    }
-
-                    # The official/open-source Xbox clients still expose autosuggest,
-                    # so keep it as a secondary source. Include Games,Apps because
-                    # some Xbox storefront entries are catalogued outside Games.
-                    foreach ($platform in @("windows.xbox", "windows.desktop")) {
-                        try {
-                            $suggestUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest?market=$localeMarket&languages=$localeLanguage&platformdependencyname=$platform&productFamilyNames=Games,Apps&query=$encodedXboxQuery&topProducts=25"
-                            $suggest = Invoke-RestMethod -Uri $suggestUrl -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
-                            & $addSuggestedXboxProducts -Response $suggest
-                        }
-                        catch {
-                            Log "Xbox Store autosuggest fallback failed for $platform ($localeMarket/$localeLanguage): $($_.Exception.Message)"
-                        }
-                    }
-
-                    # If the user's locale produced anything, do not add duplicate
-                    # US-localized catalogue entries. US/en-US is only a resilience
-                    # fallback for regional catalogue/search gaps.
-                    if ($catalogRows.Count -gt $countBeforeLocale) { break }
-                }
-
-                foreach ($catalogRow in @($catalogRows)) {
-                    New-WmtPackageSearchResult -Source "xboxstore" -Name ([string]$catalogRow.Title) -Id ([string]$catalogRow.Id) -RemoteVersion ([string]$catalogRow.Version)
-                    $script:provCount++
-                }
-
-                if ($script:provCount -eq 0) {
-                    Log "Xbox Store returned no matching PC/Xbox catalog titles for '$Query'."
-                }
-            }
-            catch {
-                Log "Xbox Store search failed: $($_.Exception.Message)"
-            }
-
-            Write-Output "PROVIDER_DONE:xboxstore:$script:provCount"
         }
 
         # --- B. NPM ---
