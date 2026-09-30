@@ -3613,8 +3613,8 @@ try {
                 </Border>
                 <ControlTemplate.Triggers>
                     <Trigger Property="IsHighlighted" Value="True">
-                        <Setter Property="Background" Value="{DynamicResource Accent}"/>
-                        <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+                        <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
                     </Trigger>
                     <Trigger Property="IsSelected" Value="True">
                         <Setter Property="Background" Value="{DynamicResource Accent}"/>
