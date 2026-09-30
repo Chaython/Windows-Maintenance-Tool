@@ -43,7 +43,7 @@ VirusTotal maintains a broader vendor contact directory here: https://docs.virus
 - Updates panel covering Windows/package managers, language ecosystems, PowerShell tooling, Steam, Epic/Legendary, and GOG/GOGDL.
 - Per-provider update, package-search, library-search, and metadata controls where supported.
 - Custom per-package PowerShell updater commands with placeholders for package metadata.
-- Unified game/software library with Steam, Epic/Legendary, GOG, and package-provider integration.
+- Unified game/software library with Steam, Epic/Legendary, GOG, and package-provider integration, including owned-title install flows and installed-state recovery.
 - Rebuilt Drivers page that inventories third-party Driver Store packages and classifies in-use, old/superseded, unattached, and inactive packages.
 - Advanced cleanup with internal rules, Winapp2, Winapp3, BleachBit CleanerML, preview/analyze mode, configurable cache/update refresh intervals, and optional automatic cleanup.
 - Compact Compression utility for folders and drives with persistent tracking, skip lists, change-aware recompression, and scheduled auto-recompression that can run without the WMT window being open.
@@ -63,12 +63,18 @@ VirusTotal maintains a broader vendor contact directory here: https://docs.virus
 
 v6.7 is a broad maintenance and reliability update focused on background execution, automation, package/game providers, cleanup, compression, memory usage, and UI responsiveness.
 
+- Added a full **Epic / Legendary install flow** to Your Library. Owned Epic titles can now be installed with a selectable library root, optional game-folder override, platform, download-worker count, shared-memory limit, owned DLC selection, and Legendary's optional file-reordering mode.
+- Added Legendary credential and metadata preflight. WMT checks the local saved-login state, validates Epic access before install when possible, offers to open Legendary authentication when credentials are missing/invalid, and can fall back to cached metadata when live metadata is unavailable.
+- Hardened Legendary install tracking and destination handling with duplicate/pending-install guards, longer-running install support, improved final-path resolution, clearer destination reporting, and post-install **desktop / Start menu shortcut** creation.
+- Reworked Legendary library refresh and recovery around Legendary's local installed-game JSON. WMT merges installed state and install paths with owned/cached metadata, preserves known-good library data when live Epic metadata is unavailable, recovers stale/missing installed folders for library actions, and rebuilds provider caches during an explicit library refresh.
 - Added a full **GOG / GOGDL install flow** to Your Library. Owned GOG games can now be installed with a selectable install root, language, build/version, individual owned DLCs, and configurable download-worker count.
 - Added persistent GOGDL install tracking so WMT can distinguish **Owned**, **Downloading**, and **Installed** titles, prevent duplicate downloads, resolve completed install paths from GOGDL manifests, and better handle repair/relaunch scenarios.
 - Improved GOGDL authentication/path discovery, including compatible Heroic GOG authentication fallback, language validation, install-path resolution, themed install UI, and lower-memory defaults.
+- Added optional post-install **desktop shortcuts and Start menu entries** for both Legendary and GOGDL installs.
 - Added portable **Legendary** and **GOGDL** provider-binary update checks to the normal Updates flow.
 - Added the **Compact Compression** tracker with persistent folder/drive history, automatic recompression, custom schedules, change detection, per-target state/results, and optional skip lists for already-compressed or poor-compression file formats.
 - Added Windows Task Scheduler integration for Compact recompression so scheduled compression can run even when WMT itself is closed.
+- Hardened Compact tracker persistence, including automatic recovery/repair when stale ACLs on the ProgramData tracker block WMT from reading or updating it.
 - Added configurable cleaner **local cache refresh**, **upstream definition checks**, and **automatic cleaning** intervals.
 - Automatic cleaning uses only explicitly saved cleaner selections and runs in a separate hidden worker process while WMT is open or hidden in the tray; overlapping runs are prevented and the global **BG Jobs** toggle disables new cleaner background work.
 - Added **Show Enabled** filtering and substantial cleaner worker/poller race, closure, startup, cancellation, and completion-state hardening.
@@ -82,7 +88,7 @@ v6.7 is a broad maintenance and reliability update focused on background executi
 - Improved Firewall Manager background loading and bulk protocol/port preloading using persistent-store `Get-NetFirewallPortFilter` data, while retaining lazy/fallback detail loading.
 - Expanded and themed the system-tray context menu with direct shortcuts to Updates, System Health, Cleanup, Drivers, Utilities, and theme switching.
 - Added tweak configuration **Export JSON / Import JSON** support and fixed Tweaks loading-overlay state leaking onto other tabs.
-- Fixed AppX selection theming, Updates status-text overlap, Firewall Manager action alignment, tray theme-state text, and several other UI consistency issues.
+- Fixed AppX selection theming, Updates status-text overlap, Firewall Manager action alignment, tray theme-state text, and several other UI consistency issues. ComboBox/dropdown hover and selection colors now follow the same theme inversion as list views, including the GOGDL/Legendary installer dialogs, and folder-selection flows use the Explorer-style picker.
 - Expanded registry-cleaner handling for BAM/DAM and `PendingFileRenameOperations`, including safer pair-preserving rewrites and review-only handling where automatic changes are unsafe.
 - Invalid Microsoft Defender exclusions now use the supported Defender API (`Remove-MpPreference`) with result verification instead of attempting direct deletion of protected Defender registry values.
 - Fixed self-update script-path resolution when WMT is launched directly through PowerShell, resolving **#161**.
@@ -116,13 +122,18 @@ v6.7 is a broad maintenance and reliability update focused on background executi
 <details>
 <summary><strong>Game & Software Library</strong></summary>
 
-- View installed Steam, Epic/Legendary, and GOG games in one combined library.
+- View installed Steam games plus owned/installed Epic/Legendary and GOG titles in one combined library.
 - Search/filter the library by title/provider and sort list columns.
-- Launch installed titles and use supported install/uninstall actions.
+- Install owned Epic games through a themed Legendary options dialog with library-root/folder selection, platform, workers, shared-memory limit, owned DLC selection, and optional file reordering.
+- Install owned GOG games through the GOGDL options dialog with install root, language, build/version, owned DLC selection, and download-worker controls.
+- Optionally create a desktop shortcut and/or a **Start menu > Programs > WMT Games** entry after a successful Legendary or GOGDL install.
+- Legendary install preflight validates saved Epic credentials and metadata when possible and can offer re-authentication when the saved login is missing or invalid.
+- Launch installed titles and use supported install/uninstall/folder actions. Legendary folder actions can recover missing or stale paths from Legendary's local installed-game registry.
+- Explicit library refreshes rebuild provider caches; Legendary installed state is merged from the local installed-game database so installed games remain visible even when live metadata is incomplete or unavailable.
 - Open supported Steam/Epic/GOG store pages directly from library/provider rows.
 - Include owned Legendary/GOG titles in package search when library searching is enabled.
-- Optionally hide Unreal Engine / Fab marketplace assets from the visible library without disabling their update checks.
-- Uses cached provider/library metadata and background refreshes to improve repeat-load performance.
+- Optionally hide Unreal Engine / Fab marketplace assets from the visible library without hiding installed games.
+- Uses cached provider/library metadata, atomic cache writes, and background refreshes to improve repeat-load performance and preserve known-good state across provider failures.
 
 </details>
 
