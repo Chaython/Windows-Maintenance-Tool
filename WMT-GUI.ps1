@@ -2140,6 +2140,7 @@ function Invoke-WmtLegendaryLibraryJson {
 param(
     [Parameter(Mandatory = $true)][string]$LegendaryExe,
     [bool]$IncludeUe = $false,
+    [bool]$ForceRefresh = $false,
     [int]$TimeoutMs = 30000
 )
 
@@ -2150,12 +2151,13 @@ if ([string]::IsNullOrWhiteSpace($LegendaryExe) -or -not (Test-Path -LiteralPath
 }
 
 $ueFlag = if ($IncludeUe) { " --include-ue" } else { "" }
-$arguments = "--api-timeout 30 list --json$ueFlag"
+$refreshFlag = if ($ForceRefresh) { " --force-refresh" } else { "" }
+$arguments = "--api-timeout 30 list --json$ueFlag$refreshFlag"
 $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments $arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
 
 # Legendary versions before 0.20.27 do not support --api-timeout.
 if ($procResult.ExitCode -eq 2 -and ([string]$procResult.StdErr) -match '(?i)unrecognized arguments[^\r\n]*--api-timeout') {
-    $arguments = "list --json$ueFlag"
+    $arguments = "list --json$ueFlag$refreshFlag"
     $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments $arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
 }
 
@@ -39222,8 +39224,8 @@ try {
     # and deadlock while WMT is waiting on the other.
     $ueFlag = ""
     try { if (-not (Get-WmtHideLegendaryUeAssets)) { $ueFlag = " --include-ue" } } catch {}
-    $procResult = Invoke-WmtProcess -FilePath $exe -Arguments "--api-timeout 30 list --json$ueFlag" -TimeoutMs 30000 -Encoding UTF8 -KillTree
-    $stdout = [string]$procResult.StdOut
+    $procResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $exe -IncludeUe:($ueFlag -ne "") -ForceRefresh:([bool]$Force) -TimeoutMs 30000
+    $stdout = [string]$procResult.Json
     $stderr = [string]$procResult.StdErr
 
     # Legendary deliberately separates owned-library metadata ("list") from
@@ -45570,7 +45572,7 @@ $script:InvokeWingetSearch = {
                                 }
                             }
                             catch {}
-                            $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -TimeoutMs 30000
+                            $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -ForceRefresh:$true -TimeoutMs 30000
                             $stdout = [string]$legendaryResult.Json
                             if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
                             elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
