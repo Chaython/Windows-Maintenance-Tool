@@ -25143,7 +25143,8 @@ Invoke-UiCommand {
 # [PSCustomObject] with: PublishedName, OriginalName, Provider, Class, Signer,
 # Version ([Version]), DisplayVer, SortDate, DisplayDate.
 function Get-WmtDriverStorePackages {
-$rawOutput = pnputil.exe /enum-drivers 2>&1
+param([object[]]$RawOutput = $null)
+$rawOutput = if ($null -ne $RawOutput) { @($RawOutput) } else { @(pnputil.exe /enum-drivers 2>&1) }
 $drivers = [System.Collections.Generic.List[object]]::new()
 $current = $null
 
@@ -25233,17 +25234,48 @@ return @($drivers)
 }
 
 function Show-DriverCleanupDialog {
-$drivers = Get-WmtDriverStorePackages
+param(
+    [object[]]$DriverOutput = $null,
+    [string[]]$InUseInfs = $null
+)
 
-# Protect drivers currently in use by active devices to prevent hardware breakage
-$inUseInfs = @()
-try {
-    $inUseInfs = @(
-        Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
-        Where-Object { $_.InfName -match '^oem\d+\.inf$' } |
-        Select-Object -ExpandProperty InfName -Unique
-    )
-} catch {}
+if ($null -eq $DriverOutput) {
+    $scanComplete = {
+        param($results)
+        $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["DriverOutput"] } | Select-Object -Last 1)
+        if ($payload.Count -eq 0) {
+            Show-WmtMessageBox -Message "Driver store scan returned no result." -Title "Clean Old Drivers" -Image Warning | Out-Null
+            return
+        }
+        Show-DriverCleanupDialog -DriverOutput @($payload[0].DriverOutput) -InUseInfs @($payload[0].InUseInfs)
+    }.GetNewClosure()
+    $scanError = {
+        param($err)
+        $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+        Show-WmtMessageBox -Message ("Could not scan the driver store. " + $message) -Title "Clean Old Drivers" -Image Warning | Out-Null
+    }.GetNewClosure()
+
+    Invoke-WmtUiBackgroundCommand -Name "DriverCleanupScan" -Msg "Scanning driver store..." -TimeoutMs 120000 -SuppressResultLog -Sb {
+        $driverOutput = @(pnputil.exe /enum-drivers 2>&1 | ForEach-Object { [string]$_ })
+        $inUse = @()
+        try {
+            $inUse = @(
+                Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                Where-Object { $_.InfName -match '^oem\d+\.inf$' } |
+                Select-Object -ExpandProperty InfName -Unique
+            )
+        }
+        catch {}
+        [PSCustomObject]@{
+            DriverOutput = $driverOutput
+            InUseInfs    = [string[]]$inUse
+        }
+    } -OnComplete $scanComplete -OnError $scanError | Out-Null
+    return
+}
+
+$drivers = Get-WmtDriverStorePackages -RawOutput $DriverOutput
+$inUseInfs = @($InUseInfs)
 
 $toDelete = @()
 $skippedInUse = 0
@@ -25368,70 +25400,207 @@ $doRemove = {
     $mode = & $chooseCleanupMode -Count $itemsToRemove.Count
     if ($mode -eq "Cancel") { return }
 
-    Set-WmtBusyCursor -Busy
-    $backupCount = 0
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmm'
     $mainBkPath = Join-Path (Get-DataPath) "Drivers_Backup_$timestamp"
-    try {
-        if ($mode -eq "Backup") {
-            if (-not (Test-Path $mainBkPath)) { New-Item -Path $mainBkPath -ItemType Directory -Force | Out-Null }
-            $i = 1
-            foreach ($item in $itemsToRemove) {
-                $dialog.Title = "Backing up ($i/$($itemsToRemove.Count)): $($item.OriginalName)..."
-                Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
-                $folderName = if ($item.OriginalName) { $item.OriginalName } else { $item.PublishedName }
-                $drvPath = Join-Path $mainBkPath $folderName
-                New-Item -Path $drvPath -ItemType Directory -Force | Out-Null
-                $proc = Start-Process pnputil.exe -ArgumentList "/export-driver", $item.PublishedName, "`"$drvPath`"" -NoNewWindow -Wait -PassThru
-                if ($proc.ExitCode -eq 0) { $backupCount++ }
-                $i++
+    $workItems = @(
+        $itemsToRemove | ForEach-Object {
+            [PSCustomObject]@{
+                PublishedName = [string]$_.PublishedName
+                OriginalName  = [string]$_.OriginalName
+                Class         = [string]$_.Class
+            }
+        }
+    )
+
+    $btnRemoveAll.IsEnabled = $false
+    $btnRemoveSel.IsEnabled = $false
+    $btnClose.IsEnabled = $false
+    $dialog.Title = if ($mode -eq "Backup") { "Backing up and removing drivers..." } else { "Removing drivers..." }
+    Set-WmtBusyCursor -Busy
+
+    $finalizeCleanup = {
+        param(
+            [string[]]$RemovedInfs,
+            [int]$FailedCount,
+            [int]$BackupCount,
+            [string]$BackupPath
+        )
+
+        $removedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($inf in @($RemovedInfs)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$inf)) {
+                [void]$removedSet.Add([string]$inf)
             }
         }
 
-        $deleted = 0
-        $failed = 0
-        $removedInfs = [System.Collections.Generic.List[string]]::new()
-        foreach ($item in $itemsToRemove) {
-            $name = [string]$item.PublishedName
-            $dialog.Title = "Removing $name..."
-            Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
-            $driverDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments "/delete-driver $name /uninstall" -TimeoutMs 120000 -Encoding OEM -KillTree
-            $stdOut = [string]$driverDelete.StdOut
-            $stdErr = [string]$driverDelete.StdErr
-            $driverExitCode = [int]$driverDelete.ExitCode
-            if ($driverExitCode -eq 0 -or $driverExitCode -eq 3010) { $deleted++; [void]$removedInfs.Add($name) }
-            else {
-                if ($driverDelete.TimedOut) { $stdErr = (($stdErr + "`nDriver removal timed out.").Trim()) }
-                $warnMsg = "Driver: $($item.OriginalName) ($name)`n`nError:`n$($stdOut)`n$($stdErr)`n`nForce delete?"
-                if ((Show-WmtMessageBox -Owner $dialog -Message $warnMsg -Title "Deletion Failed" -Button YesNo -Image Error) -eq [System.Windows.MessageBoxResult]::Yes) {
-                    $forceDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments "/delete-driver $name /uninstall /force" -TimeoutMs 120000 -Encoding OEM -KillTree
-                    if ($forceDelete.ExitCode -eq 0 -or $forceDelete.ExitCode -eq 3010) { $deleted++; [void]$removedInfs.Add($name) } else { $failed++ }
-                }
-                else { $failed++ }
-            }
-        }
-
-        $resMsg = "Done.`nDeleted: $deleted`nFailed: $failed"
-        if ($mode -eq "Backup") { $resMsg += "`nBackups: $backupCount`nPath: $mainBkPath" }
-        Show-WmtMessageBox -Owner $dialog -Message $resMsg -Title "Result" -Image Information | Out-Null
-
-        if ($deleted -gt 0) {
-            foreach ($item in $itemsToRemove) {
-                for ($idx = $currentList.Count - 1; $idx -ge 0; $idx--) {
-                    if ($currentList[$idx].PublishedName -eq $item.PublishedName) { $currentList.RemoveAt($idx) }
+        if ($removedSet.Count -gt 0) {
+            for ($idx = $currentList.Count - 1; $idx -ge 0; $idx--) {
+                if ($removedSet.Contains([string]$currentList[$idx].PublishedName)) {
+                    $currentList.RemoveAt($idx)
                 }
             }
             & $loadGrid
-            # Keep the main Drivers page cache in sync without a full recheck:
-            # drop exactly the packages pnputil deleted from the cached list.
-            Remove-DriverRowsFromCache -RemovedInfs @($removedInfs)
+            Remove-DriverRowsFromCache -RemovedInfs @($removedSet)
         }
-    }
-    finally {
+
+        $resMsg = "Done.`nDeleted: $($removedSet.Count)`nFailed: $FailedCount"
+        if ($mode -eq "Backup") {
+            $resMsg += "`nBackups: $BackupCount`nPath: $BackupPath"
+        }
+        Show-WmtMessageBox -Owner $dialog -Message $resMsg -Title "Result" -Image Information | Out-Null
+
         $dialog.Title = "Clean Old Drivers"
+        $btnRemoveAll.IsEnabled = $true
+        $btnRemoveSel.IsEnabled = $true
+        $btnClose.IsEnabled = $true
         Set-WmtBusyCursor
-    }
-    if ($CloseWindow) { $dialog.Close() }
+        if ($CloseWindow) { $dialog.Close() }
+    }.GetNewClosure()
+
+    $firstPassComplete = {
+        param($results)
+
+        $payload = @(
+            $results |
+            Where-Object { $_ -and $_.PSObject.Properties["Deleted"] -and $_.PSObject.Properties["Failures"] } |
+            Select-Object -Last 1
+        )
+        if ($payload.Count -eq 0) {
+            & $finalizeCleanup @() $itemsToRemove.Count 0 $mainBkPath
+            return
+        }
+
+        $result = $payload[0]
+        $deleted = @($result.Deleted)
+        $failures = @($result.Failures)
+        $forceItems = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($failure in $failures) {
+            $detail = (([string]$failure.StdOut + "`n" + [string]$failure.StdErr).Trim())
+            if ([bool]$failure.TimedOut) {
+                $detail = ($detail + "`nDriver removal timed out.").Trim()
+            }
+            $warnMsg = "Driver: $($failure.OriginalName) ($($failure.PublishedName))`n`nError:`n$detail`n`nForce delete?"
+            if ((Show-WmtMessageBox -Owner $dialog -Message $warnMsg -Title "Deletion Failed" -Button YesNo -Image Error) -eq [System.Windows.MessageBoxResult]::Yes) {
+                [void]$forceItems.Add($failure)
+            }
+        }
+
+        if ($forceItems.Count -eq 0) {
+            & $finalizeCleanup $deleted $failures.Count ([int]$result.BackupCount) ([string]$result.BackupPath)
+            return
+        }
+
+        $forceComplete = {
+            param($forceResults)
+            $forcePayload = @(
+                $forceResults |
+                Where-Object { $_ -and $_.PSObject.Properties["Deleted"] -and $_.PSObject.Properties["Failed"] } |
+                Select-Object -Last 1
+            )
+            $forcedDeleted = @()
+            $forcedFailed = $forceItems.Count
+            if ($forcePayload.Count -gt 0) {
+                $forcedDeleted = @($forcePayload[0].Deleted)
+                $forcedFailed = [int]$forcePayload[0].Failed
+            }
+            & $finalizeCleanup @($deleted + $forcedDeleted) $forcedFailed ([int]$result.BackupCount) ([string]$result.BackupPath)
+        }.GetNewClosure()
+
+        $forceError = {
+            param($err)
+            & $finalizeCleanup $deleted $forceItems.Count ([int]$result.BackupCount) ([string]$result.BackupPath)
+        }.GetNewClosure()
+
+        $forceArgs = [object[]]@((, @($forceItems.ToArray())))
+        Invoke-WmtUiBackgroundCommand -Name ("DriverCleanupForce_" + [guid]::NewGuid().ToString("N")) -Msg "Force-removing selected driver packages..." -TimeoutMs ([Math]::Max(120000, 125000 * $forceItems.Count)) -SuppressResultLog -Sb {
+            param($Items)
+
+            $deleted = [System.Collections.Generic.List[string]]::new()
+            $failed = 0
+            foreach ($item in @($Items)) {
+                $name = [string]$item.PublishedName
+                $forceDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments ("/delete-driver " + $name + " /uninstall /force") -TimeoutMs 120000 -Encoding OEM -KillTree
+                if ($forceDelete.ExitCode -eq 0 -or $forceDelete.ExitCode -eq 3010) {
+                    [void]$deleted.Add($name)
+                }
+                else {
+                    $failed++
+                }
+            }
+
+            [PSCustomObject]@{
+                Deleted = $deleted.ToArray()
+                Failed  = $failed
+            }
+        } -ArgumentList $forceArgs -OnComplete $forceComplete -OnError $forceError | Out-Null
+    }.GetNewClosure()
+
+    $firstPassError = {
+        param($err)
+        $dialog.Title = "Clean Old Drivers"
+        $btnRemoveAll.IsEnabled = $true
+        $btnRemoveSel.IsEnabled = $true
+        $btnClose.IsEnabled = $true
+        Set-WmtBusyCursor
+        $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+        Show-WmtMessageBox -Owner $dialog -Message ("Driver cleanup failed: " + $message) -Title "Clean Old Drivers" -Image Error | Out-Null
+    }.GetNewClosure()
+
+    $workerArgs = [object[]]@((, @($workItems)), $mode, $mainBkPath)
+    Invoke-WmtUiBackgroundCommand -Name ("DriverCleanup_" + [guid]::NewGuid().ToString("N")) -Msg "Cleaning old driver packages..." -TimeoutMs ([Math]::Max(120000, 125000 * $workItems.Count)) -SuppressResultLog -Sb {
+        param(
+            $Items,
+            [string]$Mode,
+            [string]$BackupRoot
+        )
+
+        $backupCount = 0
+        $deleted = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[object]]::new()
+
+        if ($Mode -eq "Backup") {
+            if (-not (Test-Path -LiteralPath $BackupRoot)) {
+                New-Item -Path $BackupRoot -ItemType Directory -Force | Out-Null
+            }
+            foreach ($item in @($Items)) {
+                $folderName = if (-not [string]::IsNullOrWhiteSpace([string]$item.OriginalName)) {
+                    [string]$item.OriginalName
+                }
+                else {
+                    [string]$item.PublishedName
+                }
+                $drvPath = Join-Path $BackupRoot $folderName
+                New-Item -Path $drvPath -ItemType Directory -Force | Out-Null
+                $proc = Start-Process pnputil.exe -ArgumentList "/export-driver", ([string]$item.PublishedName), ('"' + $drvPath + '"') -NoNewWindow -Wait -PassThru
+                if ($proc.ExitCode -eq 0) { $backupCount++ }
+            }
+        }
+
+        foreach ($item in @($Items)) {
+            $name = [string]$item.PublishedName
+            $driverDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments ("/delete-driver " + $name + " /uninstall") -TimeoutMs 120000 -Encoding OEM -KillTree
+            if ($driverDelete.ExitCode -eq 0 -or $driverDelete.ExitCode -eq 3010) {
+                [void]$deleted.Add($name)
+            }
+            else {
+                [void]$failures.Add([PSCustomObject]@{
+                        PublishedName = $name
+                        OriginalName  = [string]$item.OriginalName
+                        StdOut        = [string]$driverDelete.StdOut
+                        StdErr        = [string]$driverDelete.StdErr
+                        TimedOut      = [bool]$driverDelete.TimedOut
+                    })
+            }
+        }
+
+        [PSCustomObject]@{
+            Deleted     = $deleted.ToArray()
+            Failures    = $failures.ToArray()
+            BackupCount = $backupCount
+            BackupPath  = $BackupRoot
+        }
+    } -ArgumentList $workerArgs -OnComplete $firstPassComplete -OnError $firstPassError | Out-Null
 }.GetNewClosure()
 
 $btnRemoveAll.Add_Click({ & $doRemove -Items @($currentList.ToArray()) -CloseWindow $true }.GetNewClosure())
