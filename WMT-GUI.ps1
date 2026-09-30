@@ -53049,10 +53049,10 @@ function Get-WmtSelectedLibraryItem {
 function Get-WmtLibraryItemInstallDir {
     param($Item)
     if (-not $Item) { return "" }
-    $source = [string]$Item.Source
+    $source = ([string]$Item.Source).Trim().ToLowerInvariant()
     $id = [string]$Item.Id
 
-    if ($source -eq "Steam") {
+    if ($source -eq "steam") {
         foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
             if ([string]$manifest.Id -ne $id) { continue }
             $installDirName=[string]$manifest.InstallDir
@@ -54747,6 +54747,10 @@ function Invoke-WmtLibraryInstall {
         if ($Item.PSObject.Properties["IsInstalled"]) {
             $isInstalled = [bool]$Item.IsInstalled
         }
+        if (-not $isInstalled -and $source -in @("epic", "legendary", "gog", "gogdl")) {
+            $knownInstallPath = Get-WmtLibraryItemInstallDir -Item $Item
+            $isInstalled = -not [string]::IsNullOrWhiteSpace([string]$knownInstallPath)
+        }
     }
     catch {}
     if ($isInstalled -and $source -in @("epic", "legendary", "gog", "gogdl")) {
@@ -54758,7 +54762,7 @@ function Invoke-WmtLibraryInstall {
         Start-Process "steam://install/$id"
         Write-GuiLog "Starting Steam install for: $name (app $id)"
     }
-    elseif ($source -eq "Epic" -or $source -eq "Legendary") {
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
         try {
             $legExe = Get-WmtLegendaryExePath
             if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
@@ -55138,7 +55142,7 @@ function Invoke-WmtLibraryInstall {
             Show-WmtMessageBox -Message "Failed to prepare Legendary install: $($_.Exception.Message)" -Title "Install Failed" -Image Warning | Out-Null
         }
     }
-    elseif ($source -eq "GOG") {
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
         try {
             if (Test-WmtGogdlInstallPending -Id $id) {
                 Show-WmtMessageBox -Message "'$name' already has a GOGDL download running." -Title "Download Already Running" -Image Information | Out-Null
