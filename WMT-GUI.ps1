@@ -47154,11 +47154,62 @@ $res = [System.Windows.MessageBox]::Show($msg, "Restart Warning", [System.Window
 return ($res -eq [System.Windows.MessageBoxResult]::Yes)
 }
 
+function Test-WmtPackageSearchMode {
+if ($script:WmtPackageSearchActive) { return $true }
+try {
+    return ($lblWingetTitle -and ([string]$lblWingetTitle.Text).StartsWith("Search Results:", [System.StringComparison]::OrdinalIgnoreCase))
+}
+catch { return $false }
+}
+
+function Test-WmtPackageItemInstalled {
+param([object]$Item)
+if (-not $Item) { return $false }
+try {
+    if ($Item.PSObject.Properties["IsInstalled"]) { return [bool]$Item.IsInstalled }
+}
+catch {}
+# Normal update-scan rows are installed packages with an available update.
+return (-not (Test-WmtPackageSearchMode))
+}
+
+function Test-WmtPackageItemHasUpdate {
+param([object]$Item)
+if (-not $Item) { return $false }
+if (-not (Test-WmtPackageSearchMode)) { return $true }
+try {
+    if ($Item.PSObject.Properties["HasUpdate"]) { return [bool]$Item.HasUpdate }
+}
+catch {}
+return $false
+}
+
+function Update-WmtPackageSearchActionButtons {
+if (-not (Test-WmtPackageSearchMode) -or -not $lstWinget) { return }
+
+$selected = @($lstWinget.SelectedItems | Where-Object { $null -ne $_ })
+$checked = @(Get-WmtUpdateListCheckedItems)
+$targets = if ($selected.Count -gt 0) { $selected } else { $checked }
+
+$hasInstall = @($targets | Where-Object { -not (Test-WmtPackageItemInstalled -Item $_) }).Count -gt 0
+$hasInstalled = @($targets | Where-Object { Test-WmtPackageItemInstalled -Item $_ }).Count -gt 0
+$hasUpdate = @($targets | Where-Object { Test-WmtPackageItemHasUpdate -Item $_ }).Count -gt 0
+
+if ($btnWingetInstall) { $btnWingetInstall.Visibility = if ($hasInstall) { "Visible" } else { "Collapsed" } }
+if ($btnWingetUpdateSel) { $btnWingetUpdateSel.Visibility = if ($hasUpdate) { "Visible" } else { "Collapsed" } }
+if ($btnWingetUpdateAll) { $btnWingetUpdateAll.Visibility = "Collapsed" }
+if ($btnWingetUninstall) { $btnWingetUninstall.Visibility = if ($hasInstalled) { "Visible" } else { "Collapsed" } }
+}
+
 # 1. Update Selected (Removed CmdTemplate to allow smart logic)
-$btnWingetUpdateSel.Add_Click({ 
+$btnWingetUpdateSel.Add_Click({
     $selected = @(Get-WmtUpdateListCheckedItems -FallbackToSelection)
+    if (Test-WmtPackageSearchMode) {
+        $selected = @($selected | Where-Object { Test-WmtPackageItemHasUpdate -Item $_ })
+    }
     if ($selected.Count -eq 0) {
-        Show-WmtMessageBox -Message "Check one or more update rows first, or select rows as a fallback." -Title "No Updates Checked" -Image Information | Out-Null
+        $message = if (Test-WmtPackageSearchMode) { "None of the selected search results has an available update." } else { "Check one or more update rows first, or select rows as a fallback." }
+        Show-WmtMessageBox -Message $message -Title "No Updates Selected" -Image Information | Out-Null
         return
     }
     if (-not (Show-WingetRestartRiskWarning -Items $selected -Action "Update")) {
@@ -47273,7 +47324,15 @@ function Invoke-WmtSelectedPackageInstalls {
     param([object[]]$Items)
 
     $itemsToInstall = @($Items | Where-Object { $null -ne $_ })
-    if ($itemsToInstall.Count -eq 0) { return }
+    if (Test-WmtPackageSearchMode) {
+        $itemsToInstall = @($itemsToInstall | Where-Object { -not (Test-WmtPackageItemInstalled -Item $_) })
+    }
+    if ($itemsToInstall.Count -eq 0) {
+        if (Test-WmtPackageSearchMode) {
+            Show-WmtMessageBox -Message "The selected search result(s) are already installed." -Title "Nothing to Install" -Image Information | Out-Null
+        }
+        return
+    }
 
     # Epic/Legendary and GOG/GOGDL search rows are owned-game entries, not
     # ordinary package-manager packages. Route them through the same
@@ -47303,14 +47362,49 @@ $btnWingetInstall.Add_Click({
     Invoke-WmtSelectedPackageInstalls -Items $selected
 })
 
+function Invoke-WmtSelectedPackageUninstalls {
+    param(
+        [object[]]$Items,
+        [switch]$SkipGameConfirmation
+    )
+
+    $itemsToUninstall = @($Items | Where-Object { $null -ne $_ })
+    if (Test-WmtPackageSearchMode) {
+        $itemsToUninstall = @($itemsToUninstall | Where-Object { Test-WmtPackageItemInstalled -Item $_ })
+    }
+    if ($itemsToUninstall.Count -eq 0) { return }
+
+    $standardItems = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $itemsToUninstall) {
+        $source = ([string]$item.Source).Trim().ToLowerInvariant()
+        if ($source -in @("steam", "epic", "legendary", "gog", "gogdl")) {
+            Invoke-WmtLibraryUninstall -Item $item -SkipConfirmation:$SkipGameConfirmation
+            continue
+        }
+        [void]$standardItems.Add($item)
+    }
+
+    if ($standardItems.Count -gt 0) {
+        & $Script:StartWingetAction -ListItems $standardItems.ToArray() -ActionName "Uninstall"
+    }
+}
+
 # 3. Uninstall Selected
-$btnWingetUninstall.Add_Click({ 
+$btnWingetUninstall.Add_Click({
     $selected = @($lstWinget.SelectedItems)
-    if ($selected.Count -eq 0) { return }
+    if (Test-WmtPackageSearchMode) {
+        $selected = @($selected | Where-Object { Test-WmtPackageItemInstalled -Item $_ })
+    }
+    if ($selected.Count -eq 0) {
+        if (Test-WmtPackageSearchMode) {
+            Show-WmtMessageBox -Message "None of the selected search results is installed." -Title "Nothing to Uninstall" -Image Information | Out-Null
+        }
+        return
+    }
 
     $msg = "Are you sure you want to uninstall $($selected.Count) application(s)?"
     if ((Show-WmtMessageBox -Message $msg -Title "Confirm" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
-        & $Script:StartWingetAction -ListItems $selected -ActionName "Uninstall"
+        Invoke-WmtSelectedPackageUninstalls -Items $selected -SkipGameConfirmation
     }
 })
 
@@ -55905,20 +55999,25 @@ function Invoke-WmtLibraryRepair {
 }
 
 function Invoke-WmtLibraryUninstall {
-    param($Item)
+    param(
+        $Item,
+        [switch]$SkipConfirmation
+    )
     if (-not $Item) { return }
-    $source = [string]$Item.Source
+    $source = ([string]$Item.Source).Trim().ToLowerInvariant()
     $id = [string]$Item.Id
     $name = [string]$Item.Name
 
-    $msg = "Uninstall '$name'?`n`nThis will remove the game from your system."
-    if ((Show-WmtMessageBox -Message $msg -Title "Uninstall Game" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    if (-not $SkipConfirmation) {
+        $msg = "Uninstall '$name'?`n`nThis will remove the game from your system."
+        if ((Show-WmtMessageBox -Message $msg -Title "Uninstall Game" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    }
 
-    if ($source -eq "Steam") {
+    if ($source -eq "steam") {
         Start-Process "steam://uninstall/$id"
         Write-GuiLog "Starting Steam uninstall for: $name (app $id)"
     }
-    elseif ($source -eq "Epic") {
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
         try {
             $legExe = Get-WmtLegendaryExePath
             if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
@@ -55937,7 +56036,7 @@ function Invoke-WmtLibraryUninstall {
             Show-WmtMessageBox -Message "Failed to start uninstall: $($_.Exception.Message)" -Title "Uninstall Failed" -Image Warning | Out-Null
         }
     }
-    elseif ($source -eq "GOG") {
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
         # GOGDL games are DRM-free � just delete the install directory.
         $installDir = Get-WmtLibraryItemInstallDir -Item $Item
         if (-not [string]::IsNullOrWhiteSpace($installDir) -and (Test-Path -LiteralPath $installDir)) {
