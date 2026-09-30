@@ -2169,26 +2169,72 @@ $result.Error = [string]$procResult.Error
 return $result
 }
 
-function Invoke-WmtLegendaryInstalledJson {
+function Invoke-WmtLegendaryInstalledCsv {
 param(
     [Parameter(Mandatory = $true)][string]$LegendaryExe,
-    [int]$TimeoutMs = 15000
+    [bool]$CheckUpdates = $false,
+    [int]$TimeoutMs = 30000
 )
 
-$result = [PSCustomObject]@{ ExitCode = -1; Json = ""; StdErr = ""; TimedOut = $false; Error = "" }
+$result = [PSCustomObject]@{
+    ExitCode = -1
+    Rows = @()
+    Csv = ""
+    StdErr = ""
+    TimedOut = $false
+    Error = ""
+    OfflineFallback = $false
+}
 if ([string]::IsNullOrWhiteSpace($LegendaryExe) -or -not (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
     $result.Error = "legendary executable was not found."
     return $result
 }
 
-# list-installed is local-only unless --check-updates is supplied, so this is a
-# fast and authoritative source for install path/version/status.
-$procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --json" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+$arguments = if ($CheckUpdates) {
+    "--api-timeout 30 list-installed --check-updates --csv --show-dirs"
+}
+else {
+    "list-installed --csv --show-dirs"
+}
+
+$procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments $arguments -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+
+# Older Legendary builds reject the global --api-timeout option.
+if ($CheckUpdates -and $procResult.ExitCode -eq 2 -and
+    ([string]$procResult.StdErr) -match '(?i)unrecognized arguments[^\r\n]*--api-timeout') {
+    $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --check-updates --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+}
+
+# Match the updater's existing resilience: if the online update check fails
+# for a network reason, retry from Legendary's local install database.
+if ($CheckUpdates -and ($procResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$procResult.StdOut))) {
+    $combinedError = (([string]$procResult.StdErr) + [Environment]::NewLine + ([string]$procResult.Error)).Trim()
+    if ($procResult.TimedOut -or
+        $combinedError -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out') {
+        $procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --csv --show-dirs" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+        $result.OfflineFallback = $true
+    }
+}
+
 $result.ExitCode = [int]$procResult.ExitCode
-$result.Json = [string]$procResult.StdOut
+$result.Csv = [string]$procResult.StdOut
 $result.StdErr = [string]$procResult.StdErr
 $result.TimedOut = [bool]$procResult.TimedOut
 $result.Error = [string]$procResult.Error
+
+if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Csv)) {
+    try {
+        $csvText = [string]$result.Csv
+        $headerIndex = $csvText.IndexOf("App name,")
+        if ($headerIndex -gt 0) { $csvText = $csvText.Substring($headerIndex) }
+        $result.Rows = @($csvText | ConvertFrom-Csv -ErrorAction Stop)
+    }
+    catch {
+        $result.Error = "Legendary installed-game CSV parse failed: $($_.Exception.Message)"
+        $result.Rows = @()
+    }
+}
+
 return $result
 }
 
@@ -2451,7 +2497,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledJson", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledCsv", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -39231,17 +39277,21 @@ try {
     # Legendary deliberately separates owned-library metadata ("list") from
     # local installation records ("list-installed"). Merge them by app_name.
     $installedByApp = @{}
+    $installedQuerySucceeded = $false
     try {
-        $installedResult = Invoke-WmtLegendaryInstalledJson -LegendaryExe $exe -TimeoutMs 15000
-        if ($installedResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$installedResult.Json)) {
-            $installedJson = [string]$installedResult.Json | ConvertFrom-Json -ErrorAction Stop
-            foreach ($installedGame in @($installedJson)) {
-                $installedId = ([string]$installedGame.app_name).Trim()
+        $installedResult = Invoke-WmtLegendaryInstalledCsv -LegendaryExe $exe -TimeoutMs 30000
+        if ($installedResult.ExitCode -eq 0) {
+            $installedQuerySucceeded = $true
+            foreach ($installedGame in @($installedResult.Rows)) {
+                $installedId = ([string]$installedGame.'App name').Trim()
                 if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
                 $installedByApp[$installedId.ToLowerInvariant()] = [PSCustomObject]@{
-                    Version     = ([string]$installedGame.version).Trim()
-                    InstallPath = ([string]$installedGame.install_path).Trim()
-                    Platform    = ([string]$installedGame.platform).Trim()
+                    Id               = $installedId
+                    Title            = ([string]$installedGame.'App title').Trim()
+                    Version          = ([string]$installedGame.'Installed version').Trim()
+                    AvailableVersion = ([string]$installedGame.'Available version').Trim()
+                    InstallPath      = ([string]$installedGame.'Install path').Trim()
+                    Platform         = ([string]$installedGame.Platform).Trim()
                 }
             }
         }
@@ -39297,6 +39347,8 @@ try {
                             Version          = $latestVer
                             InstalledVersion = $installedVer
                             IsInstalled      = $isInstalled
+                            InstallPath      = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                            Platform         = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
                             Source           = "legendary"
                             Kind             = "Library"
                             IsUe             = $legIsUe
@@ -39382,6 +39434,8 @@ try {
                     Version          = $ver
                     InstalledVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
                     IsInstalled      = ($null -ne $installedRecord)
+                    InstallPath      = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                    Platform         = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
                     Source           = "legendary"
                     Kind             = "Library"
                     IsUe             = $legIsUe
@@ -39389,8 +39443,37 @@ try {
         }
     }
 
+    if ($installedQuerySucceeded -and $installedByApp.Count -gt 0) {
+        $seenIds = @{}
+        foreach ($existing in @($result)) {
+            $existingId = ([string]$existing.Id).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($existingId)) { $seenIds[$existingId.ToLowerInvariant()] = $true }
+        }
+        foreach ($installedRecord in @($installedByApp.Values)) {
+            $installedId = ([string]$installedRecord.Id).Trim()
+            if ([string]::IsNullOrWhiteSpace($installedId) -or $seenIds.ContainsKey($installedId.ToLowerInvariant())) { continue }
+            $title = ([string]$installedRecord.Title).Trim()
+            if ([string]::IsNullOrWhiteSpace($title)) { $title = $installedId }
+            $latest = ([string]$installedRecord.AvailableVersion).Trim()
+            if ([string]::IsNullOrWhiteSpace($latest)) { $latest = [string]$installedRecord.Version }
+            $result.Add([PSCustomObject]@{
+                    Provider         = "legendary"
+                    Title            = $title
+                    Id               = $installedId
+                    Version          = $latest
+                    InstalledVersion = [string]$installedRecord.Version
+                    IsInstalled      = $true
+                    InstallPath      = [string]$installedRecord.InstallPath
+                    Platform         = [string]$installedRecord.Platform
+                    Source           = "legendary"
+                    Kind             = "Library"
+                    IsUe             = $false
+                })
+        }
+    }
+
     if ($result.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($stderr)) {
-        Write-GuiLog "Legendary library enumeration produced no results. stderr: $(([string]$stderr).Trim())"
+        Write-GuiLog "Legendary owned-library enumeration produced no results. Local installed-game enumeration also returned no rows. stderr: $(([string]$stderr).Trim())"
     }
 }
 catch {
@@ -56767,23 +56850,30 @@ try {
                         $stdout = [string]$legendaryResult.Json
 
                         $installedByApp = @{}
+                        $installedQuerySucceeded = $false
                         try {
-                            $installedResult = Invoke-WmtLegendaryInstalledJson -LegendaryExe $LegendaryExe -TimeoutMs 15000
-                            if ($installedResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$installedResult.Json)) {
-                                $installedJson = [string]$installedResult.Json | ConvertFrom-Json -ErrorAction Stop
-                                foreach ($installedGame in @($installedJson)) {
-                                    $installedId = ([string]$installedGame.app_name).Trim()
+                            $installedResult = Invoke-WmtLegendaryInstalledCsv -LegendaryExe $LegendaryExe -TimeoutMs 30000
+                            if ($installedResult.ExitCode -eq 0) {
+                                $installedQuerySucceeded = $true
+                                foreach ($installedGame in @($installedResult.Rows)) {
+                                    $installedId = ([string]$installedGame.'App name').Trim()
                                     if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
                                     $installedByApp[$installedId.ToLowerInvariant()] = [PSCustomObject]@{
-                                        Version     = ([string]$installedGame.version).Trim()
-                                        InstallPath = ([string]$installedGame.install_path).Trim()
-                                        Platform    = ([string]$installedGame.platform).Trim()
+                                        Id               = $installedId
+                                        Title            = ([string]$installedGame.'App title').Trim()
+                                        Version          = ([string]$installedGame.'Installed version').Trim()
+                                        AvailableVersion = ([string]$installedGame.'Available version').Trim()
+                                        InstallPath      = ([string]$installedGame.'Install path').Trim()
+                                        Platform         = ([string]$installedGame.Platform).Trim()
                                     }
                                 }
-                                Write-Output "LOG:Legendary installed-state registry: $($installedByApp.Count) installed app(s)."
+                                Write-Output "LOG:Legendary local install database: $($installedByApp.Count) installed app(s)."
                             }
                             elseif ($installedResult.TimedOut) {
-                                Write-Output "LOG:Legendary installed-state query timed out; owned library will still refresh."
+                                Write-Output "LOG:Legendary installed-state query timed out; preserving cached install state."
+                            }
+                            elseif (-not [string]::IsNullOrWhiteSpace([string]$installedResult.StdErr)) {
+                                Write-Output "LOG:Legendary installed-state query failed: $(([string]$installedResult.StdErr).Trim())"
                             }
                         }
                         catch {
@@ -56922,6 +57012,8 @@ try {
                                         Version          = $ver
                                         InstalledVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
                                         IsInstalled      = ($null -ne $installedRecord)
+                                        InstallPath      = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                                        Platform         = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
                                         Source           = "legendary"
                                         Kind             = "Library"
                                         IsUe             = $legIsUe
@@ -56930,13 +57022,72 @@ try {
                         }
                     }
 
+                    if ($result.Count -eq 0 -and (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
+                        try {
+                            $previousLibrary = [System.IO.File]::ReadAllText($LegCacheFile) | ConvertFrom-Json -ErrorAction Stop
+                            foreach ($cachedGame in @($previousLibrary)) { if ($cachedGame) { [void]$result.Add($cachedGame) } }
+                            if ($result.Count -gt 0) {
+                                Write-Output "LOG:Legendary owned-catalog refresh returned zero games; preserving $($result.Count) cached owned game(s)."
+                            }
+                        }
+                        catch {}
+                    }
+
+                    if ($installedQuerySucceeded) {
+                        $seenIds = @{}
+                        foreach ($existing in @($result)) {
+                            $existingId = ([string]$existing.Id).Trim()
+                            if ([string]::IsNullOrWhiteSpace($existingId)) { continue }
+                            $key = $existingId.ToLowerInvariant()
+                            $seenIds[$key] = $true
+                            $installedRecord = $installedByApp[$key]
+                            $isInstalled = ($null -ne $installedRecord)
+                            try {
+                                if ($existing.PSObject.Properties["IsInstalled"]) { $existing.IsInstalled = $isInstalled }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name IsInstalled -Value $isInstalled -Force }
+                                $installedVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                                if ($existing.PSObject.Properties["InstalledVersion"]) { $existing.InstalledVersion = $installedVersion }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name InstalledVersion -Value $installedVersion -Force }
+                                $installPath = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                                if ($existing.PSObject.Properties["InstallPath"]) { $existing.InstallPath = $installPath }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name InstallPath -Value $installPath -Force }
+                                $platform = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
+                                if ($existing.PSObject.Properties["Platform"]) { $existing.Platform = $platform }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name Platform -Value $platform -Force }
+                            }
+                            catch {}
+                        }
+
+                        foreach ($installedRecord in @($installedByApp.Values)) {
+                            $installedId = ([string]$installedRecord.Id).Trim()
+                            if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+                            $key = $installedId.ToLowerInvariant()
+                            if ($seenIds.ContainsKey($key)) { continue }
+                            $title = ([string]$installedRecord.Title).Trim()
+                            if ([string]::IsNullOrWhiteSpace($title)) { $title = $installedId }
+                            $latest = ([string]$installedRecord.AvailableVersion).Trim()
+                            if ([string]::IsNullOrWhiteSpace($latest)) { $latest = [string]$installedRecord.Version }
+                            [void]$result.Add([PSCustomObject]@{
+                                    Provider         = "legendary"
+                                    Title            = $title
+                                    Id               = $installedId
+                                    Version          = $latest
+                                    InstalledVersion = [string]$installedRecord.Version
+                                    IsInstalled      = $true
+                                    InstallPath      = [string]$installedRecord.InstallPath
+                                    Platform         = [string]$installedRecord.Platform
+                                    Source           = "legendary"
+                                    Kind             = "Library"
+                                    IsUe             = $false
+                                })
+                        }
+                    }
+
                     $arr = $result.ToArray()
-                    # Guard: never wipe an existing cache with an empty result (e.g. a
-                    # network outage during the fetch) — keep the last good list.
                     if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
                         Set-WmtJsonCacheFile -Path $LegCacheFile -InputObject $arr -Depth 3
                     }
-                    Write-Output "LOG:Legendary library cached: $($arr.Count) games."
+                    Write-Output "LOG:Legendary library cached: $($arr.Count) game(s), including $($installedByApp.Count) installed."
                 }
                 catch {
                     Write-Output "LOG:Legendary library cache failed: $($_.Exception.Message)"
