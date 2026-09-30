@@ -45572,7 +45572,7 @@ $script:InvokeWingetSearch = {
                                 }
                             }
                             catch {}
-                            $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -ForceRefresh:$true -TimeoutMs 30000
+                            $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -TimeoutMs 30000
                             $stdout = [string]$legendaryResult.Json
                             if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
                             elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
@@ -56763,7 +56763,7 @@ try {
                             }
                         }
                         catch {}
-                        $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -TimeoutMs 30000
+                        $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -ForceRefresh:$true -TimeoutMs 30000
                         $stdout = [string]$legendaryResult.Json
 
                         $installedByApp = @{}
