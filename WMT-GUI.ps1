@@ -26,6 +26,7 @@ $script:WmtDebug = $false
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Get-WmtCurrentProcessPath {
+$proc = $null
 try {
     $proc = [System.Diagnostics.Process]::GetCurrentProcess()
     if ($proc -and $proc.MainModule -and $proc.MainModule.FileName) {
@@ -33,6 +34,9 @@ try {
     }
 }
 catch {}
+finally {
+    if ($proc) { try { $proc.Dispose() } catch {} }
+}
 return $null
 }
 
@@ -87,6 +91,8 @@ public class TokenManipulator {
     internal static extern bool AdjustTokenPrivileges(IntPtr htok, bool disall, ref TokPriv1Luid newst, int len, IntPtr prev, IntPtr relen);
     [DllImport("kernel32.dll", ExactSpelling = true)]
     internal static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    internal static extern bool CloseHandle(IntPtr hObject);
     [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern bool OpenProcessToken(IntPtr h, int acc, ref IntPtr phtok);
     [DllImport("advapi32.dll", SetLastError = true)]
@@ -97,26 +103,34 @@ public class TokenManipulator {
     internal const int TOKEN_ADJUST_PRIVILEGES = 0x00000020;
     internal const int TOKEN_QUERY = 0x00000008;
     public static bool EnablePrivilege(string privilege) {
+        IntPtr htok = IntPtr.Zero;
         try {
-            IntPtr htok = IntPtr.Zero;
             if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref htok)) return false;
             TokPriv1Luid tp; tp.Count = 1; tp.Attr = SE_PRIVILEGE_ENABLED; tp.Luid = 0;
             if (!LookupPrivilegeValue(null, privilege, ref tp.Luid)) return false;
             if (!AdjustTokenPrivileges(htok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
             return true;
         } catch { return false; }
+        finally {
+            if (htok != IntPtr.Zero) CloseHandle(htok);
+        }
     }
 }
 }
 '@
 }
+$startupProc = $null
 try {
-$hwnd = [System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle
+$startupProc = [System.Diagnostics.Process]::GetCurrentProcess()
+$hwnd = $startupProc.MainWindowHandle
 if ($hwnd -ne [IntPtr]::Zero) {
     [WmtNativeStartup.Native]::ShowWindow($hwnd, 0) | Out-Null
 }
 }
 catch {}
+finally {
+    if ($startupProc) { try { $startupProc.Dispose() } catch {} }
+}
 
 # ADMIN CHECK
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
