@@ -49672,17 +49672,6 @@ $compactExe = Join-Path $env:SystemRoot "System32\compact.exe"
 if (-not (Test-Path -LiteralPath $compactExe -PathType Leaf)) { $compactExe = "compact.exe" }
 
 
-function Get-DefaultPoorlyCompressedExtensions {
-    return [string[]]@(
-        ".dl_", ".gif", ".jpg", ".jpeg", ".png", ".wmf",
-        ".mkv", ".mp4", ".wmv", ".avi", ".bik", ".bk2", ".flv", ".ogg",
-        ".mpg", ".m2v", ".m4v", ".vob", ".mp3", ".aac", ".wma", ".flac",
-        ".zip", ".xap", ".rar", ".7z", ".cab", ".lzx",
-        ".docx", ".xlsx", ".pptx", ".vssx", ".vstx", ".onepkg",
-        ".tar", ".gz", ".dmg", ".bz2", ".tgz", ".lz", ".xz", ".txz"
-    )
-}
-
 function Get-ManualSkipExtensionSet {
     $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($SkipPoorlyCompressed) {
