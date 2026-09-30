@@ -5561,6 +5561,68 @@ $legendaryDir = Join-Path (Get-DataPath) "legendary"
 return (Join-Path $legendaryDir "legendary.exe")
 }
 
+function Get-WmtLegendaryLocalCredentialState {
+$configRoot = ""
+try {
+    if (-not [string]::IsNullOrWhiteSpace($env:LEGENDARY_CONFIG_PATH)) {
+        $configRoot = [string]$env:LEGENDARY_CONFIG_PATH
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+        $configRoot = Join-Path ([string]$env:XDG_CONFIG_HOME) "legendary"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($HOME)) {
+        $configRoot = Join-Path ([string]$HOME) ".config\legendary"
+    }
+}
+catch {}
+
+$userPath = if ([string]::IsNullOrWhiteSpace($configRoot)) { "" } else { Join-Path $configRoot "user.json" }
+$result = [PSCustomObject]@{
+    State           = "Missing"
+    Path            = $userPath
+    Account         = ""
+    ExpiresAt       = ""
+    SessionExpired  = $false
+    HasRefreshToken = $false
+}
+
+if ([string]::IsNullOrWhiteSpace($userPath) -or -not (Test-Path -LiteralPath $userPath -PathType Leaf)) {
+    return $result
+}
+
+try {
+    $raw = [System.IO.File]::ReadAllText($userPath).Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $result.State = "Missing"
+        return $result
+    }
+
+    $user = $raw | ConvertFrom-Json -ErrorAction Stop
+    $refreshToken = ""
+    try { $refreshToken = ([string]$user.refresh_token).Trim() } catch {}
+    if ([string]::IsNullOrWhiteSpace($refreshToken)) {
+        $result.State = "Missing"
+        return $result
+    }
+
+    $result.HasRefreshToken = $true
+    $result.State = "Present"
+    try { $result.Account = ([string]$user.displayName).Trim() } catch {}
+    try { $result.ExpiresAt = ([string]$user.expires_at).Trim() } catch {}
+
+    if (-not [string]::IsNullOrWhiteSpace($result.ExpiresAt)) {
+        $expires = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($result.ExpiresAt, [ref]$expires)) {
+            $result.SessionExpired = ($expires.ToUniversalTime() -le [DateTimeOffset]::UtcNow)
+        }
+    }
+}
+catch {
+    $result.State = "Corrupt"
+}
+return $result
+}
+
 function Get-WmtGogdlRootPath {
 return (Join-Path (Get-DataPath) "gogdl")
 }
@@ -54117,6 +54179,29 @@ function Invoke-WmtLibraryInstall {
                 Show-WmtMessageBox -Message "Legendary is not installed. Cannot install Epic games." -Title "Install Failed" -Image Warning | Out-Null
                 return
             }
+
+            $localCredentialState = Get-WmtLegendaryLocalCredentialState
+            if ([string]$localCredentialState.State -ne "Present") {
+                $credentialReason = if ([string]$localCredentialState.State -eq "Corrupt") {
+                    "Legendary's saved Epic credential file is unreadable or malformed."
+                }
+                else {
+                    "Legendary does not currently have a saved Epic login with a refresh token."
+                }
+                $credentialPrompt = $credentialReason + "`n`nOpen Legendary authentication now? After signing in, retry the install."
+                $credentialChoice = Show-WmtMessageBox -Message $credentialPrompt -Title "Epic Login Required" -Button YesNo -Image Warning
+                if ($credentialChoice -eq [System.Windows.MessageBoxResult]::Yes) {
+                    try {
+                        Start-Process -FilePath $legExe -ArgumentList "auth" -WindowStyle Normal | Out-Null
+                        Write-GuiLog "Started Legendary authentication because Epic credentials were $(([string]$localCredentialState.State).ToLowerInvariant())."
+                    }
+                    catch {
+                        Show-WmtMessageBox -Message "Could not start Legendary authentication: $($_.Exception.Message)" -Title "Authentication Failed" -Image Warning | Out-Null
+                    }
+                }
+                return
+            }
+
             if (Test-WmtLegendaryInstallPending -Id $id) {
                 Show-WmtMessageBox -Message "'$name' already has a Legendary install running." -Title "Install Already Running" -Image Information | Out-Null
                 return
@@ -54153,24 +54238,62 @@ function Invoke-WmtLibraryInstall {
 
             $metadataDone = {
                 param($results)
-                $envelope = @($results | Where-Object { $_ -and $_.PSObject.Properties["Json"] } | Select-Object -Last 1)
+
+                $entry = @($results | Where-Object { $_ -and $_.PSObject.Properties["Stage"] } | Select-Object -Last 1)
+                if ($entry.Count -eq 0) {
+                    & $showOptions $null "Legendary credential/metadata validation returned no usable result. You can still configure the install, but live Epic data is unavailable."
+                    return
+                }
+
+                $entry = $entry[0]
+                $stage = ([string]$entry.Stage).Trim()
+                $category = ([string]$entry.Category).Trim()
+                $shortError = ([string]$entry.Error).Trim()
+                $account = ([string]$entry.Account).Trim()
+
+                if ($stage -eq "Auth" -and $category -in @("MissingCredentials", "Credentials", "CorruptCredentials")) {
+                    if ([string]::IsNullOrWhiteSpace($shortError)) {
+                        $shortError = "Legendary's saved Epic login is missing or no longer valid."
+                    }
+                    $authMessage = $shortError + "`n`nOpen Legendary authentication now? After signing in, retry the install."
+                    $authChoice = Show-WmtMessageBox -Message $authMessage -Title "Epic Login Required" -Button YesNo -Image Warning
+                    if ($authChoice -eq [System.Windows.MessageBoxResult]::Yes) {
+                        try {
+                            Start-Process -FilePath $legExeRef -ArgumentList "auth" -WindowStyle Normal | Out-Null
+                            Write-GuiLog "Started Legendary re-authentication after credential validation failed for $nameRef."
+                        }
+                        catch {
+                            Show-WmtMessageBox -Message "Could not start Legendary authentication: $($_.Exception.Message)" -Title "Authentication Failed" -Image Warning | Out-Null
+                        }
+                    }
+                    return
+                }
+
                 $metadata = $null
                 $warning = ""
-                if ($envelope.Count -gt 0) {
-                    $entry = $envelope[0]
-                    if ([int]$entry.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$entry.Json)) {
-                        try { $metadata = ([string]$entry.Json | ConvertFrom-Json -ErrorAction Stop) }
-                        catch { $warning = "Legendary metadata could not be parsed. DLC/version choices may be unavailable." }
-                    }
-                    else {
-                        $detail = ([string]$entry.Error).Trim()
-                        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit code $($entry.ExitCode)" }
-                        $warning = "Legendary metadata lookup failed ($detail). You can still install with manual/default options."
-                    }
+                $jsonText = ([string]$entry.Json).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($jsonText)) {
+                    try { $metadata = ($jsonText | ConvertFrom-Json -ErrorAction Stop) }
+                    catch { $warning = "Legendary returned metadata that WMT could not parse. Manual/default choices are still available." }
                 }
-                else {
-                    $warning = "Legendary metadata lookup returned no result. You can still install with manual/default options."
+
+                if (-not [string]::IsNullOrWhiteSpace($shortError)) {
+                    $warning = $shortError
                 }
+                elseif ($category -eq "OfflineFallback") {
+                    $warning = "Live Epic metadata was unavailable, so WMT is using Legendary's cached metadata."
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($account) -and [bool]$entry.AuthVerified) {
+                    Write-GuiLog "Legendary Epic credential validation succeeded for account '$account' before installing $nameRef."
+                }
+                elseif ([bool]$entry.AuthVerified) {
+                    Write-GuiLog "Legendary Epic credential validation succeeded before installing $nameRef."
+                }
+                elseif ($category -in @("Network", "RateLimit", "Service", "OfflineFallback")) {
+                    Write-GuiLog "Legendary online credential validation could not be completed for $nameRef ($category); continuing only with the available metadata/cache state."
+                }
+
                 & $showOptions $metadata $warning
             }.GetNewClosure()
 
@@ -54180,42 +54303,244 @@ function Invoke-WmtLibraryInstall {
                 if ($errorRecord -is [System.Exception]) { $errorMessage = $errorRecord.Message }
                 elseif ($errorRecord -and $errorRecord.Exception) { $errorMessage = $errorRecord.Exception.Message }
                 else { $errorMessage = [string]$errorRecord }
-                if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = "unknown error" }
-                & $showOptions $null ("Legendary metadata lookup failed: " + $errorMessage + ". You can still install with manual/default options.")
+                if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = "unknown internal error" }
+                & $showOptions $null ("Legendary preflight failed inside WMT: " + $errorMessage + ". Manual/default install choices are still available.")
             }.GetNewClosure()
 
-            Invoke-WmtUiBackgroundCommand -Name ("LegendaryInstallInfo_" + $idRef) -Msg "Loading Legendary install choices for $nameRef..." -TimeoutMs 45000 -SuppressResultLog -Sb {
+            Invoke-WmtUiBackgroundCommand -Name ("LegendaryInstallInfo_" + $idRef) -Msg "Validating Epic login and loading Legendary install choices for $nameRef..." -TimeoutMs 90000 -SuppressResultLog -Sb {
                 param($ExePath, $GameId)
-                $psi = [System.Diagnostics.ProcessStartInfo]::new()
-                $psi.FileName = $ExePath
-                $quote = [char]34
-                $psi.Arguments = "info " + $quote + $GameId + $quote + " --json --platform Windows"
-                $psi.UseShellExecute = $false
-                $psi.CreateNoWindow = $true
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError = $true
-                $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
-                $proc = [System.Diagnostics.Process]::new()
-                $proc.StartInfo = $psi
-                try {
-                    if (-not $proc.Start()) { throw "Could not start Legendary metadata query." }
-                    $outTask = $proc.StandardOutput.ReadToEndAsync()
-                    $errTask = $proc.StandardError.ReadToEndAsync()
-                    if (-not $proc.WaitForExit(40000)) {
-                        try { $proc.Kill() } catch {}
-                        try { [void]$proc.WaitForExit(2000) } catch {}
-                        return [PSCustomObject]@{ ExitCode = 124; Json = ""; Error = "metadata query timed out" }
+
+                function Invoke-LegendaryCaptured {
+                    param(
+                        [string]$Arguments,
+                        [int]$TimeoutMs
+                    )
+
+                    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                    $psi.FileName = $ExePath
+                    $psi.Arguments = $Arguments
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+                    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+
+                    $proc = [System.Diagnostics.Process]::new()
+                    $proc.StartInfo = $psi
+                    try {
+                        if (-not $proc.Start()) { throw "Could not start Legendary." }
+                        $outTask = $proc.StandardOutput.ReadToEndAsync()
+                        $errTask = $proc.StandardError.ReadToEndAsync()
+                        $timedOut = -not $proc.WaitForExit($TimeoutMs)
+                        if ($timedOut) {
+                            try { $proc.Kill() } catch {}
+                            try { [void]$proc.WaitForExit(3000) } catch {}
+                        }
+                        else {
+                            $proc.WaitForExit()
+                        }
+
+                        $stdout = ""
+                        $stderr = ""
+                        try { $stdout = [string]$outTask.GetAwaiter().GetResult() } catch {}
+                        try { $stderr = [string]$errTask.GetAwaiter().GetResult() } catch {}
+                        $exitCode = if ($timedOut) { 124 } else { try { [int]$proc.ExitCode } catch { 1 } }
+
+                        return [PSCustomObject]@{
+                            ExitCode = $exitCode
+                            TimedOut = $timedOut
+                            StdOut   = $stdout
+                            StdErr   = $stderr
+                        }
                     }
-                    $proc.WaitForExit()
-                    [PSCustomObject]@{
-                        ExitCode = [int]$proc.ExitCode
-                        Json     = [string]$outTask.GetAwaiter().GetResult()
-                        Error    = [string]$errTask.GetAwaiter().GetResult()
+                    finally {
+                        try { $proc.Dispose() } catch {}
                     }
                 }
-                finally {
-                    try { $proc.Dispose() } catch {}
+
+                function Get-LegendaryFailureCategory {
+                    param(
+                        [string]$Text,
+                        [bool]$TimedOut
+                    )
+                    if ($TimedOut -or $Text -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|TimeoutError|timed out') {
+                        return "Network"
+                    }
+                    if ($Text -match '(?i)429|Too Many Requests|rate.?limit') { return "RateLimit" }
+                    if ($Text -match '(?i)Stored credentials are no longer valid|invalid credentials|invalid_grant|errors\.com\.epicgames\.account\.oauth|authentication failed|Login failed') {
+                        return "Credentials"
+                    }
+                    if ($Text -match '(?i)No saved credentials|not logged in|login is not configured') { return "MissingCredentials" }
+                    if ($Text -match '(?i)\b50[0-9]\b|\b51[0-9]\b|\b52[0-9]\b|\b53[0-9]\b|Service Unavailable|Bad Gateway|Gateway Timeout') {
+                        return "Service"
+                    }
+                    return "Unknown"
+                }
+
+                function Get-LegendaryShortError {
+                    param([string]$Text)
+                    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+
+                    $lines = @($Text -split "`r?`n" | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($lines.Count -eq 0) { return "" }
+
+                    $candidate = ""
+                    foreach ($line in $lines) {
+                        if ($line -match '(?i)(ERROR|WARNING|ReadTimeout|ConnectTimeout|ConnectionError|HTTPSConnectionPool|invalid credentials|Stored credentials|Login failed|No saved credentials|Too Many Requests|Service Unavailable|Bad Gateway|Gateway Timeout)') {
+                            $candidate = $line
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($candidate)) {
+                        $candidate = [string]$lines[$lines.Count - 1]
+                    }
+
+                    $candidate = $candidate -replace '^\[[^\]]+\]\s*(ERROR|WARNING):\s*', ''
+                    if ($candidate.Length -gt 420) { $candidate = $candidate.Substring(0, 417) + "..." }
+                    return $candidate
+                }
+
+                $configRoot = ""
+                try {
+                    if (-not [string]::IsNullOrWhiteSpace($env:LEGENDARY_CONFIG_PATH)) {
+                        $configRoot = [string]$env:LEGENDARY_CONFIG_PATH
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+                        $configRoot = Join-Path ([string]$env:XDG_CONFIG_HOME) "legendary"
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace($HOME)) {
+                        $configRoot = Join-Path ([string]$HOME) ".config\legendary"
+                    }
+                }
+                catch {}
+
+                $account = ""
+                $userPath = if ([string]::IsNullOrWhiteSpace($configRoot)) { "" } else { Join-Path $configRoot "user.json" }
+                if ([string]::IsNullOrWhiteSpace($userPath) -or -not (Test-Path -LiteralPath $userPath -PathType Leaf)) {
+                    return [PSCustomObject]@{
+                        Stage = "Auth"; Category = "MissingCredentials"; Error = "Legendary has no saved Epic login. Authenticate Legendary before installing Epic games."
+                        Json = ""; Account = ""; AuthVerified = $false
+                    }
+                }
+
+                try {
+                    $userData = [System.IO.File]::ReadAllText($userPath) | ConvertFrom-Json -ErrorAction Stop
+                    $refreshTokenPresent = -not [string]::IsNullOrWhiteSpace(([string]$userData.refresh_token).Trim())
+                    try { $account = ([string]$userData.displayName).Trim() } catch {}
+                    if (-not $refreshTokenPresent) {
+                        return [PSCustomObject]@{
+                            Stage = "Auth"; Category = "MissingCredentials"; Error = "Legendary's saved Epic login does not contain a refresh token. Re-authenticate Legendary."
+                            Json = ""; Account = $account; AuthVerified = $false
+                        }
+                    }
+                }
+                catch {
+                    return [PSCustomObject]@{
+                        Stage = "Auth"; Category = "CorruptCredentials"; Error = "Legendary's saved Epic credential file is unreadable or malformed. Re-authenticate Legendary."
+                        Json = ""; Account = ""; AuthVerified = $false
+                    }
+                }
+
+                $quote = [char]34
+                $authVerified = $false
+                $authWarning = ""
+
+                # get-token performs a real login/session refresh without opening an
+                # interactive browser. Its token JSON is deliberately parsed and discarded.
+                $authProbe = Invoke-LegendaryCaptured -Arguments "--api-timeout 15 get-token --json" -TimeoutMs 22000
+                if (-not $authProbe.TimedOut -and -not [string]::IsNullOrWhiteSpace([string]$authProbe.StdOut)) {
+                    try {
+                        $tokenProbe = ([string]$authProbe.StdOut).Trim() | ConvertFrom-Json -ErrorAction Stop
+                        if ($tokenProbe -and
+                            ((-not [string]::IsNullOrWhiteSpace([string]$tokenProbe.code)) -or
+                             (-not [string]::IsNullOrWhiteSpace([string]$tokenProbe.access_token)))) {
+                            $authVerified = $true
+                        }
+                    }
+                    catch {}
+                }
+
+                if (-not $authVerified) {
+                    $authText = (([string]$authProbe.StdErr) + "`n" + ([string]$authProbe.StdOut)).Trim()
+                    $authCategory = Get-LegendaryFailureCategory -Text $authText -TimedOut ([bool]$authProbe.TimedOut)
+                    $authDetail = Get-LegendaryShortError -Text $authText
+
+                    if ($authCategory -in @("Credentials", "MissingCredentials")) {
+                        return [PSCustomObject]@{
+                            Stage = "Auth"; Category = $authCategory
+                            Error = if ($authCategory -eq "Credentials") { "Legendary's saved Epic credentials are no longer valid. Re-authenticate Legendary." } else { "Legendary has no usable Epic login. Authenticate Legendary before installing." }
+                            Json = ""; Account = $account; AuthVerified = $false
+                        }
+                    }
+
+                    if ($authCategory -eq "Network") {
+                        $authWarning = "Epic login validation timed out. WMT will still try the game metadata request before deciding whether the saved credentials are unusable."
+                    }
+                    elseif ($authCategory -eq "RateLimit") {
+                        $authWarning = "Epic temporarily rate-limited the login validation request."
+                    }
+                    elseif ($authCategory -eq "Service") {
+                        $authWarning = "Epic's authentication service returned a temporary server error."
+                    }
+                    else {
+                        $authWarning = if ([string]::IsNullOrWhiteSpace($authDetail)) { "WMT could not conclusively validate the saved Epic login." } else { "WMT could not conclusively validate the saved Epic login: $authDetail" }
+                    }
+                }
+
+                $metadataArgs = "--api-timeout 25 info " + $quote + $GameId + $quote + " --json --platform Windows"
+                $metadataProbe = Invoke-LegendaryCaptured -Arguments $metadataArgs -TimeoutMs 35000
+                if (-not $metadataProbe.TimedOut -and $metadataProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$metadataProbe.StdOut)) {
+                    return [PSCustomObject]@{
+                        Stage = "Metadata"; Category = "Ok"; Error = ""; Json = ([string]$metadataProbe.StdOut).Trim()
+                        Account = $account; AuthVerified = $true
+                    }
+                }
+
+                $metadataText = (([string]$metadataProbe.StdErr) + "`n" + ([string]$metadataProbe.StdOut)).Trim()
+                $metadataCategory = Get-LegendaryFailureCategory -Text $metadataText -TimedOut ([bool]$metadataProbe.TimedOut)
+                $metadataDetail = Get-LegendaryShortError -Text $metadataText
+
+                if ($metadataCategory -in @("Credentials", "MissingCredentials")) {
+                    return [PSCustomObject]@{
+                        Stage = "Auth"; Category = $metadataCategory; Error = "Legendary's Epic login was rejected while requesting game metadata. Re-authenticate Legendary."
+                        Json = ""; Account = $account; AuthVerified = $false
+                    }
+                }
+
+                $offlineArgs = "info " + $quote + $GameId + $quote + " --offline --json --platform Windows"
+                $offlineProbe = Invoke-LegendaryCaptured -Arguments $offlineArgs -TimeoutMs 15000
+                if (-not $offlineProbe.TimedOut -and $offlineProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$offlineProbe.StdOut)) {
+                    $offlineWarning = switch ($metadataCategory) {
+                        "Network"   { "Epic's metadata service timed out, so WMT is using cached Legendary metadata." }
+                        "RateLimit" { "Epic rate-limited the metadata request, so WMT is using cached Legendary metadata." }
+                        "Service"   { "Epic's metadata service returned a server error, so WMT is using cached Legendary metadata." }
+                        default     { "Live Epic metadata was unavailable, so WMT is using cached Legendary metadata." }
+                    }
+                    if (-not $authVerified -and -not [string]::IsNullOrWhiteSpace($authWarning)) {
+                        $offlineWarning += " " + $authWarning
+                    }
+                    return [PSCustomObject]@{
+                        Stage = "Metadata"; Category = "OfflineFallback"; Error = $offlineWarning; Json = ([string]$offlineProbe.StdOut).Trim()
+                        Account = $account; AuthVerified = $authVerified
+                    }
+                }
+
+                $finalError = switch ($metadataCategory) {
+                    "Network" {
+                        if ($authVerified) { "Epic login validated, but Epic's game metadata service timed out. You can retry later or continue with manual/default install options." }
+                        else { "Epic services timed out before WMT could validate the saved login or load game metadata. Retry when Epic is reachable; manual/default install options remain available." }
+                    }
+                    "RateLimit" { "Epic temporarily rate-limited the metadata request. Wait a little and retry; manual/default install options remain available." }
+                    "Service"   { "Epic's metadata service returned a temporary server error. Retry later; manual/default install options remain available." }
+                    default {
+                        if ([string]::IsNullOrWhiteSpace($metadataDetail)) { "Legendary could not load live or cached metadata. Manual/default install options remain available." }
+                        else { "Legendary could not load metadata: $metadataDetail" }
+                    }
+                }
+
+                return [PSCustomObject]@{
+                    Stage = "Metadata"; Category = $metadataCategory; Error = $finalError; Json = ""
+                    Account = $account; AuthVerified = $authVerified
                 }
             } -ArgumentList $legExeRef, $idRef -OnComplete $metadataDone -OnError $metadataError | Out-Null
         }
