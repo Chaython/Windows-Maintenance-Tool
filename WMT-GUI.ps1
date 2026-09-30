@@ -3818,27 +3818,6 @@ $dialog.ShowDialog() | Out-Null
 return $result.Value
 }
 
-function Select-WmtFolder {
-param(
-    [string]$Description = "Select folder",
-    [string]$InitialDirectory = ""
-)
-
-$shell = $null
-try {
-    $shell = New-Object -ComObject Shell.Application
-    $root = if (-not [string]::IsNullOrWhiteSpace($InitialDirectory) -and (Test-Path -LiteralPath $InitialDirectory)) { $InitialDirectory } else { 0 }
-    $folder = $shell.BrowseForFolder(0, $Description, 0, $root)
-    if ($folder -and $folder.Self) { return [string]$folder.Self.Path }
-}
-catch {}
-finally {
-    try { if ($shell) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } } catch {}
-}
-return $null
-}
-
-
 # Explorer-style folder chooser used where the old Shell.BrowseForFolder tree
 # dialog is too limited. This uses the Windows Common Item Dialog in
 # FOS_PICKFOLDERS mode, so users get the normal Explorer navigation pane,
@@ -25710,7 +25689,7 @@ if ($backups -and $backups.Count -gt 0) {
 }
 
 if (-not $selectedPath) {
-    $selectedPath = Select-WmtFolder -Description "Select DriverBackup folder" -InitialDirectory $dataPath
+    $selectedPath = Select-WmtExplorerFolder -Description "Select DriverBackup folder" -InitialDirectory $dataPath
     if ([string]::IsNullOrWhiteSpace($selectedPath)) { return }
 }
 
@@ -25770,7 +25749,7 @@ Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairFull" -Msg "Running full
 }
 
 function Invoke-SystemReports {
-$selectedFolder = Select-WmtFolder -Description "Select output folder for system reports" -InitialDirectory (Get-DataPath)
+$selectedFolder = Select-WmtExplorerFolder -Description "Select output folder for system reports" -InitialDirectory (Get-DataPath)
 if ([string]::IsNullOrWhiteSpace($selectedFolder)) { return }
 $outdir = Join-Path $selectedFolder ("SystemReports_{0}" -f (Get-Date -Format "yyyy-MM-dd_HHmm"))
 if (-not (Test-Path $outdir)) { New-Item -ItemType Directory -Path $outdir | Out-Null }
