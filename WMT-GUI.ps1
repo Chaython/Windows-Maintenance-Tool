@@ -2167,6 +2167,29 @@ $result.Error = [string]$procResult.Error
 return $result
 }
 
+function Invoke-WmtLegendaryInstalledJson {
+param(
+    [Parameter(Mandatory = $true)][string]$LegendaryExe,
+    [int]$TimeoutMs = 15000
+)
+
+$result = [PSCustomObject]@{ ExitCode = -1; Json = ""; StdErr = ""; TimedOut = $false; Error = "" }
+if ([string]::IsNullOrWhiteSpace($LegendaryExe) -or -not (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
+    $result.Error = "legendary executable was not found."
+    return $result
+}
+
+# list-installed is local-only unless --check-updates is supplied, so this is a
+# fast and authoritative source for install path/version/status.
+$procResult = Invoke-WmtProcess -FilePath $LegendaryExe -Arguments "list-installed --json" -TimeoutMs $TimeoutMs -Encoding UTF8 -KillTree
+$result.ExitCode = [int]$procResult.ExitCode
+$result.Json = [string]$procResult.StdOut
+$result.StdErr = [string]$procResult.StdErr
+$result.TimedOut = [bool]$procResult.TimedOut
+$result.Error = [string]$procResult.Error
+return $result
+}
+
 function Set-WmtJsonCacheFile {
 param(
     [Parameter(Mandatory = $true)][string]$Path,
@@ -2426,7 +2449,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledJson", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -39203,6 +39226,26 @@ try {
     $stdout = [string]$procResult.StdOut
     $stderr = [string]$procResult.StdErr
 
+    # Legendary deliberately separates owned-library metadata ("list") from
+    # local installation records ("list-installed"). Merge them by app_name.
+    $installedByApp = @{}
+    try {
+        $installedResult = Invoke-WmtLegendaryInstalledJson -LegendaryExe $exe -TimeoutMs 15000
+        if ($installedResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$installedResult.Json)) {
+            $installedJson = [string]$installedResult.Json | ConvertFrom-Json -ErrorAction Stop
+            foreach ($installedGame in @($installedJson)) {
+                $installedId = ([string]$installedGame.app_name).Trim()
+                if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+                $installedByApp[$installedId.ToLowerInvariant()] = [PSCustomObject]@{
+                    Version     = ([string]$installedGame.version).Trim()
+                    InstallPath = ([string]$installedGame.install_path).Trim()
+                    Platform    = ([string]$installedGame.platform).Trim()
+                }
+            }
+        }
+    }
+    catch {}
+
     $parsed = $false
 
     # Attempt 1: JSON parsing (legendary >= 0.20.x supports --json)
@@ -39215,15 +39258,12 @@ try {
                     $title = [string]$game.app_title
                     if ([string]::IsNullOrWhiteSpace($title)) { $title = [string]$game.title }
                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
-                    # Legendary JSON: is_installed boolean, version = installed version, app_version = latest
-                    $isInstalled = $false
-                    try { if ($game.PSObject.Properties["is_installed"]) { $isInstalled = [bool]$game.is_installed } } catch {}
-                    $installedVer = ""
+                    $gameId = ([string]$game.app_name).Trim()
+                    $installedRecord = if ([string]::IsNullOrWhiteSpace($gameId)) { $null } else { $installedByApp[$gameId.ToLowerInvariant()] }
+                    $isInstalled = ($null -ne $installedRecord)
+                    $installedVer = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
                     $latestVer = [string]$game.app_version
-                    if ($isInstalled) {
-                        try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
-                        if ([string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
-                    }
+                    if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                     # Tag UE/Fab assets (namespace 'ue', legendary's own skip
                     # marker). 'namespace' is not a top-level JSON key (it is a
                     # Python property there); it lives in asset_infos (per
@@ -39332,14 +39372,17 @@ try {
                     break
                 }
             }
+            $installedRecord = if ([string]::IsNullOrWhiteSpace($app)) { $null } else { $installedByApp[$app.ToLowerInvariant()] }
             $result.Add([PSCustomObject]@{
-                    Provider = "legendary"
-                    Title    = $title
-                    Id       = $app
-                    Version  = $ver
-                    Source   = "legendary"
-                    Kind     = "Library"
-                    IsUe     = $legIsUe
+                    Provider         = "legendary"
+                    Title            = $title
+                    Id               = $app
+                    Version          = $ver
+                    InstalledVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                    IsInstalled      = ($null -ne $installedRecord)
+                    Source           = "legendary"
+                    Kind             = "Library"
+                    IsUe             = $legIsUe
                 })
         }
     }
@@ -52571,7 +52614,10 @@ $btnBackToCatalog.Add_Click({
     })
 
 $btnLibraryRefresh.Add_Click({
-        try { Start-WmtLibraryScan }
+        try {
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Refreshing provider libraries..." }
+            Start-WmtLibraryCacheBuilder -Force
+        }
         catch {
             Write-WmtLastCrash -Context "Library refresh failed" -Exception $_.Exception -ErrorRecord $_
             Write-GuiLog "ERROR: Library refresh failed: $($_.Exception.Message)"
@@ -53768,7 +53814,7 @@ $onComplete = {
     }
     catch {}
     try { if ($procRef) { $procRef.Dispose() } } catch {}
-    try { Start-WmtLibraryScan -Silent } catch {}
+    try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
 }.GetNewClosure()
 
 $onError = {
@@ -56517,6 +56563,7 @@ $script:WmtLibraryCacheRunspace = $null
 $script:WmtLibraryCacheAsyncResult = $null
 
 function Start-WmtLibraryCacheBuilder {
+param([switch]$Force)
 try {
     if ($script:WmtLibraryCacheAsyncResult) {
         if (-not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
@@ -56582,7 +56629,7 @@ try {
                 }
                 catch {}
             }
-            $needLeg = (-not $fileExists) -or $isStale
+            $needLeg = [bool]$Force -or (-not $fileExists) -or $isStale
         }
     }
 
@@ -56610,7 +56657,7 @@ try {
                 }
                 catch {}
             }
-            $needGog = (-not $fileExists) -or $isStale
+            $needGog = [bool]$Force -or (-not $fileExists) -or $isStale
         }
     }
 
@@ -56716,6 +56763,31 @@ try {
                         catch {}
                         $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -TimeoutMs 30000
                         $stdout = [string]$legendaryResult.Json
+
+                        $installedByApp = @{}
+                        try {
+                            $installedResult = Invoke-WmtLegendaryInstalledJson -LegendaryExe $LegendaryExe -TimeoutMs 15000
+                            if ($installedResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$installedResult.Json)) {
+                                $installedJson = [string]$installedResult.Json | ConvertFrom-Json -ErrorAction Stop
+                                foreach ($installedGame in @($installedJson)) {
+                                    $installedId = ([string]$installedGame.app_name).Trim()
+                                    if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+                                    $installedByApp[$installedId.ToLowerInvariant()] = [PSCustomObject]@{
+                                        Version     = ([string]$installedGame.version).Trim()
+                                        InstallPath = ([string]$installedGame.install_path).Trim()
+                                        Platform    = ([string]$installedGame.platform).Trim()
+                                    }
+                                }
+                                Write-Output "LOG:Legendary installed-state registry: $($installedByApp.Count) installed app(s)."
+                            }
+                            elseif ($installedResult.TimedOut) {
+                                Write-Output "LOG:Legendary installed-state query timed out; owned library will still refresh."
+                            }
+                        }
+                        catch {
+                            Write-Output "LOG:Legendary installed-state query failed: $($_.Exception.Message)"
+                        }
+
                         if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
                         elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
                             Write-Output "LOG:Legendary library fetch failed: $(([string]$legendaryResult.StdErr).Trim())"
@@ -56732,14 +56804,12 @@ try {
                                         $title = [string]$game.app_title
                                         if ([string]::IsNullOrWhiteSpace($title)) { $title = [string]$game.title }
                                         if ([string]::IsNullOrWhiteSpace($title)) { continue }
-                                        $isInstalled = $false
-                                        try { if ($game.PSObject.Properties["is_installed"]) { $isInstalled = [bool]$game.is_installed } } catch {}
-                                        $installedVer = ""
+                                        $gameId = ([string]$game.app_name).Trim()
+                                        $installedRecord = if ([string]::IsNullOrWhiteSpace($gameId)) { $null } else { $installedByApp[$gameId.ToLowerInvariant()] }
+                                        $isInstalled = ($null -ne $installedRecord)
+                                        $installedVer = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
                                         $latestVer = [string]$game.app_version
-                                        if ($isInstalled) {
-                                            try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
-                                            if ([string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
-                                        }
+                                        if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                                         # Tag UE/Fab assets from the JSON namespace data
                                         # (asset_infos per platform, or the metadata blob).
                                         $legIsUe = $false
@@ -56842,14 +56912,17 @@ try {
                                         break
                                     }
                                 }
+                                $installedRecord = if ([string]::IsNullOrWhiteSpace($app)) { $null } else { $installedByApp[$app.ToLowerInvariant()] }
                                 $result.Add([PSCustomObject]@{
-                                        Provider = "legendary"
-                                        Title    = $title
-                                        Id       = $app
-                                        Version  = $ver
-                                        Source   = "legendary"
-                                        Kind     = "Library"
-                                        IsUe     = $legIsUe
+                                        Provider         = "legendary"
+                                        Title            = $title
+                                        Id               = $app
+                                        Version          = $ver
+                                        InstalledVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                                        IsInstalled      = ($null -ne $installedRecord)
+                                        Source           = "legendary"
+                                        Kind             = "Library"
+                                        IsUe             = $legIsUe
                                     })
                             }
                         }
