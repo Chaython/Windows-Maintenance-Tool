@@ -52940,6 +52940,84 @@ return $result
 }
 
 
+function New-WmtGameLaunchShortcuts {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$TargetPath,
+    [string]$Arguments = "",
+    [string]$WorkingDirectory = "",
+    [string]$IconLocation = "",
+    [bool]$Desktop = $false,
+    [bool]$StartMenu = $false
+)
+
+if (-not $Desktop -and -not $StartMenu) { return @() }
+if ([string]::IsNullOrWhiteSpace($TargetPath) -or -not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+    throw "Shortcut target does not exist: $TargetPath"
+}
+
+$safeName = ($Name -replace '[<>:"/\\|?*]', '_').Trim()
+while (-not [string]::IsNullOrWhiteSpace($safeName) -and ($safeName.EndsWith(".") -or $safeName.EndsWith(" "))) {
+    $safeName = $safeName.Substring(0, $safeName.Length - 1)
+}
+if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = "Game" }
+
+$destinationDirectories = [System.Collections.Generic.List[string]]::new()
+if ($Desktop) {
+    $desktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+    if ([string]::IsNullOrWhiteSpace($desktopDirectory)) { throw "Windows did not return a Desktop directory." }
+    if (-not (Test-Path -LiteralPath $desktopDirectory -PathType Container)) {
+        [void][System.IO.Directory]::CreateDirectory($desktopDirectory)
+    }
+    [void]$destinationDirectories.Add($desktopDirectory)
+}
+if ($StartMenu) {
+    $programsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+    if ([string]::IsNullOrWhiteSpace($programsDirectory)) { throw "Windows did not return a Start menu Programs directory." }
+    $wmtProgramsDirectory = Join-Path $programsDirectory "WMT Games"
+    if (-not (Test-Path -LiteralPath $wmtProgramsDirectory -PathType Container)) {
+        [void][System.IO.Directory]::CreateDirectory($wmtProgramsDirectory)
+    }
+    [void]$destinationDirectories.Add($wmtProgramsDirectory)
+}
+
+$created = [System.Collections.Generic.List[string]]::new()
+$wshShell = $null
+try {
+    $wshShell = New-Object -ComObject WScript.Shell
+    foreach ($directory in $destinationDirectories) {
+        $shortcutPath = Join-Path $directory ($safeName + ".lnk")
+        $shortcut = $null
+        try {
+            $shortcut = $wshShell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = $TargetPath
+            $shortcut.Arguments = $Arguments
+            if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+                $shortcut.WorkingDirectory = $WorkingDirectory
+            }
+            if (-not [string]::IsNullOrWhiteSpace($IconLocation) -and (Test-Path -LiteralPath $IconLocation -PathType Leaf)) {
+                $shortcut.IconLocation = $IconLocation + ",0"
+            }
+            $shortcut.Description = "Launch $Name"
+            $shortcut.Save()
+            [void]$created.Add($shortcutPath)
+        }
+        finally {
+            if ($null -ne $shortcut -and [System.Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+                try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) } catch {}
+            }
+        }
+    }
+}
+finally {
+    if ($null -ne $wshShell -and [System.Runtime.InteropServices.Marshal]::IsComObject($wshShell)) {
+        try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($wshShell) } catch {}
+    }
+}
+return @($created)
+}
+
+
 function Test-WmtLegendaryInstallPending {
 param([Parameter(Mandatory = $true)][string]$Id)
 
@@ -53061,9 +53139,17 @@ $contentXaml = @'
     <CheckBox Name="chkReorder" Grid.Row="8" Margin="150,0,0,5"
               Content="Enable download reordering (lower RAM usage)"
               ToolTip="Passes Legendary --enable-reordering. Legendary notes this can have adverse results for some titles."/>
-    <CheckBox Name="chkKeepOpen" Grid.Row="9" Margin="150,0,0,8"
-              Content="Keep console open after a successful download"
-              ToolTip="Failures always pause so the final Legendary error stays visible."/>
+    <StackPanel Grid.Row="9" Margin="150,0,0,8">
+        <CheckBox Name="chkKeepOpen" Margin="0,0,0,5"
+                  Content="Keep console open after a successful download"
+                  ToolTip="Failures always pause so the final Legendary error stays visible."/>
+        <CheckBox Name="chkDesktopShortcut" Margin="0,0,0,5"
+                  Content="Create a desktop shortcut after install"
+                  ToolTip="Creates the shortcut only after Legendary finishes successfully."/>
+        <CheckBox Name="chkStartMenuShortcut"
+                  Content="Create a Start menu entry after install"
+                  ToolTip="Creates an entry under Start menu > Programs > WMT Games only after a successful install."/>
+    </StackPanel>
 
     <TextBlock Grid.Row="10" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}"
                Text="Legendary installs resumably. WMT tracks the running install, selected DLCs, and final install path when Legendary reports it."/>
@@ -53077,7 +53163,7 @@ $contentXaml = @'
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "Legendary Install Options" -ContentXaml $contentXaml -Width 700 -Height 680 -MinWidth 600 -MinHeight 640 -NoResize
+$dialog = New-WmtWindowFromXaml -Title "Legendary Install Options" -ContentXaml $contentXaml -Width 700 -Height 730 -MinWidth 600 -MinHeight 690 -NoResize
 Add-WmtListSelectionResources -Element $dialog
 Set-WmtNativeWindowTheme -Window $dialog
 
@@ -53092,6 +53178,8 @@ $cboSharedMemory = $dialog.FindName("cboSharedMemory")
 $lstDlcs = $dialog.FindName("lstDlcs")
 $chkReorder = $dialog.FindName("chkReorder")
 $chkKeepOpen = $dialog.FindName("chkKeepOpen")
+$chkDesktopShortcut = $dialog.FindName("chkDesktopShortcut")
+$chkStartMenuShortcut = $dialog.FindName("chkStartMenuShortcut")
 $lblError = $dialog.FindName("lblError")
 $btnBrowse = $dialog.FindName("btnBrowse")
 $btnInstall = $dialog.FindName("btnInstall")
@@ -53255,8 +53343,10 @@ $btnInstall.Add_Click({
             Workers           = $workers
             SharedMemoryMiB   = $sharedMemory
             DlcAppNames       = @($selectedDlcs)
-            EnableReordering  = [bool]$chkReorder.IsChecked
-            KeepOpenOnSuccess = [bool]$chkKeepOpen.IsChecked
+            EnableReordering        = [bool]$chkReorder.IsChecked
+            KeepOpenOnSuccess       = [bool]$chkKeepOpen.IsChecked
+            CreateDesktopShortcut   = [bool]$chkDesktopShortcut.IsChecked
+            CreateStartMenuShortcut = [bool]$chkStartMenuShortcut.IsChecked
         }
         $dialog.DialogResult = $true
     }.GetNewClosure())
@@ -53410,6 +53500,9 @@ $idRef = $Id
 $nameRef = $Name
 $rootRef = [string]$Options.RootPath
 $expectedRef = $expectedInstallPath
+$legendaryExeRef = [string]$LegendaryExe
+$createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
+$createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
 $operationName = "LegendaryLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
 
 $testComplete = {
@@ -53445,9 +53538,25 @@ $onComplete = {
     if ($exitCode -eq 0) {
         if (-not [string]::IsNullOrWhiteSpace($installedPath)) {
             Write-GuiLog "Legendary install completed successfully: $nameRef (app $idRef) -> $installedPath"
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                try {
+                    $safeId = $idRef.Replace('"', "")
+                    $launchArguments = 'launch "' + $safeId + '"'
+                    $shortcutPaths = @(New-WmtGameLaunchShortcuts -Name $nameRef -TargetPath $legendaryExeRef -Arguments $launchArguments -WorkingDirectory $installedPath -IconLocation $legendaryExeRef -Desktop $createDesktopShortcutRef -StartMenu $createStartMenuShortcutRef)
+                    if ($shortcutPaths.Count -gt 0) {
+                        Write-GuiLog ("Created Legendary game shortcut(s): " + ($shortcutPaths -join "; "))
+                    }
+                }
+                catch {
+                    Write-GuiLog "Legendary install succeeded, but shortcut creation failed for ${nameRef}: $($_.Exception.Message)"
+                }
+            }
         }
         else {
             Write-GuiLog "Legendary install completed successfully: $nameRef (app $idRef) under $rootRef."
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                Write-GuiLog "Legendary shortcut creation was requested for $nameRef, but the final install path could not be resolved."
+            }
         }
     }
     else {
@@ -53573,9 +53682,17 @@ $contentXaml = @'
         </ListBox>
     </Grid>
 
-    <CheckBox Name="chkKeepOpen" Grid.Row="6" Margin="150,0,0,8"
-              Content="Keep console open after a successful download"
-              ToolTip="Failures always pause so the final GOGDL error stays visible."/>
+    <StackPanel Grid.Row="6" Margin="150,0,0,8">
+        <CheckBox Name="chkKeepOpen" Margin="0,0,0,5"
+                  Content="Keep console open after a successful download"
+                  ToolTip="Failures always pause so the final GOGDL error stays visible."/>
+        <CheckBox Name="chkDesktopShortcut" Margin="0,0,0,5"
+                  Content="Create a desktop shortcut after install"
+                  ToolTip="Creates the shortcut only after GOGDL finishes successfully."/>
+        <CheckBox Name="chkStartMenuShortcut"
+                  Content="Create a Start menu entry after install"
+                  ToolTip="Creates an entry under Start menu > Programs > WMT Games only after a successful install."/>
+    </StackPanel>
 
     <TextBlock Grid.Row="7" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Warning}"
                Text="Low-memory note: current GOGDL reserves a 1 GiB shared-memory block and maps it into its worker/writer processes. WMT defaults to 1 worker so Task Manager does not multiply those mappings as aggressively."/>
@@ -53591,7 +53708,7 @@ $contentXaml = @'
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 610 -MinWidth 600 -MinHeight 570 -NoResize
+$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 660 -MinWidth 600 -MinHeight 620 -NoResize
 # The generic runtime resources theme the controls; add the selection template
 # as well so DLC rows never fall back to Aero/SystemColors, and theme the
 # native title bar to match the current WMT palette.
@@ -53614,6 +53731,8 @@ if ($lstDlcs) {
     $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = New-WmtBrush "AccentText"
 }
 $chkKeepOpen = $dialog.FindName("chkKeepOpen")
+$chkDesktopShortcut = $dialog.FindName("chkDesktopShortcut")
+$chkStartMenuShortcut = $dialog.FindName("chkStartMenuShortcut")
 $lblError = $dialog.FindName("lblError")
 $btnBrowse = $dialog.FindName("btnBrowse")
 $btnInstall = $dialog.FindName("btnInstall")
@@ -53763,8 +53882,10 @@ $btnInstall.Add_Click({
             Language          = $languageCode
             BuildId           = [string]$cboBuild.SelectedValue
             DlcIds            = @($selectedDlcs)
-            Workers           = $workerCount
-            KeepOpenOnSuccess = [bool]$chkKeepOpen.IsChecked
+            Workers                 = $workerCount
+            KeepOpenOnSuccess       = [bool]$chkKeepOpen.IsChecked
+            CreateDesktopShortcut   = [bool]$chkDesktopShortcut.IsChecked
+            CreateStartMenuShortcut = [bool]$chkStartMenuShortcut.IsChecked
         }
         $dialog.DialogResult = $true
     }.GetNewClosure())
@@ -53884,6 +54005,10 @@ $idRef = $Id
 $nameRef = $Name
 $rootRef = [string]$Options.RootPath
 $installRef = $expectedInstallPath
+$gogdlExeRef = [string]$GogdlExe
+$authConfigRef = [string]$AuthConfig
+$createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
+$createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
 $operationName = "GogdlLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
 
 $testComplete = {
@@ -53919,10 +54044,28 @@ $onComplete = {
             catch {}
             try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $resolvedInstallPath -Status Installed -ProcessId 0 } catch {}
             Write-GuiLog "GOGDL download completed successfully: $nameRef (id $idRef) -> $resolvedInstallPath"
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                try {
+                    $safeAuthConfig = $authConfigRef.Replace('"', "")
+                    $safeInstallPath = $resolvedInstallPath.Replace('"', "")
+                    $safeId = $idRef.Replace('"', "")
+                    $launchArguments = '--auth-config-path "' + $safeAuthConfig + '" launch "' + $safeInstallPath + '" "' + $safeId + '" --platform windows'
+                    $shortcutPaths = @(New-WmtGameLaunchShortcuts -Name $nameRef -TargetPath $gogdlExeRef -Arguments $launchArguments -WorkingDirectory $resolvedInstallPath -IconLocation $gogdlExeRef -Desktop $createDesktopShortcutRef -StartMenu $createStartMenuShortcutRef)
+                    if ($shortcutPaths.Count -gt 0) {
+                        Write-GuiLog ("Created GOGDL game shortcut(s): " + ($shortcutPaths -join "; "))
+                    }
+                }
+                catch {
+                    Write-GuiLog "GOGDL download succeeded, but shortcut creation failed for ${nameRef}: $($_.Exception.Message)"
+                }
+            }
         }
         else {
             try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath "" -Status Installed -ProcessId 0 } catch {}
             Write-GuiLog "GOGDL completed successfully for $nameRef (id $idRef), but WMT could not resolve the final install directory from GOGDL metadata/manifest."
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                Write-GuiLog "GOGDL shortcut creation was requested for $nameRef, but the final install path could not be resolved."
+            }
         }
     }
     else {
