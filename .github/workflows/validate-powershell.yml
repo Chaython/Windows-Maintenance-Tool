@@ -80,6 +80,1303 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Test shared WPF controls
+        shell: powershell -NoProfile -STA -ExecutionPolicy Bypass -File {0}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = (Get-Location).Path
+          $SourcePath = Join-Path $repoRoot 'WMT-GUI.ps1'
+          Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+          if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Run with powershell.exe -STA.' }
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $SourcePath).Path, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
+          # Load helpers without elevation, startup, network access, or maintenance actions.
+          foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+              Invoke-Expression $fn.Extent.Text
+          }
+          # This UI helper is nested in the startup-manager dialog.
+          $gridMenuFunction = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-GridContextMenu' }, $true)
+          Invoke-Expression $gridMenuFunction.Extent.Text
+          $paletteAssignment = $ast.Find({ param($n)
+              $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:ThemePalettes'
+          }, $true)
+          Invoke-Expression $paletteAssignment.Extent.Text
+          $script:CurrentTheme = 'dark'
+          $script:WmtThemedElements = [Collections.ArrayList]::new()
+          $script:WmtUiBackgroundCommands = @{}
+          $script:WmtUiPollOperations = @{}
+          # Use isolated real workers rather than WMT's pool, which loads system helpers.
+          function New-WmtPooledPowerShell { param($PoolKind) [PowerShell]::Create() }
+          function Write-GuiLog { param($Message) }
+          $failures = [Collections.Generic.List[string]]::new()
+          function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
+          function Test-Case([string]$Name, [scriptblock]$Body) {
+              try { & $Body; Write-Host "PASS: $Name" }
+              catch { $failures.Add("${Name}: $($_.Exception.Message)"); Write-Host "FAIL: ${Name}: $($_.Exception.Message)" }
+          }
+          function Arrange-Window([string]$Content) {
+              New-WmtWindowFromXaml -Title 'Component test' -ContentXaml $Content -NoOwner
+          }
+          function Measure-Window($Dialog, [double]$Width = 600, [double]$Height = 400) {
+              # Settle queued column sizing after the real scroll viewport is measured.
+              for ($pass=0; $pass -lt 3; $pass++) {
+                  $Dialog.Content.Measure([Windows.Size]::new($Width, $Height))
+                  $Dialog.Content.Arrange([Windows.Rect]::new(0, 0, $Width, $Height))
+                  $Dialog.Content.UpdateLayout()
+                  Invoke-WmtDispatcherPump
+              }
+          }
+          function Wait-Progress($Progress, [int]$TimeoutMs = 5000) {
+              $watch = [Diagnostics.Stopwatch]::StartNew()
+              while ($Progress.State -eq 'Running' -and $watch.ElapsedMilliseconds -lt $TimeoutMs) {
+                  Invoke-WmtDispatcherPump
+                  Start-Sleep -Milliseconds 20
+              }
+              Assert ($Progress.State -ne 'Running') 'The progress component never finished.'
+          }
+          function Find-TextBlocks($Element) {
+              if ($Element -is [Windows.Controls.TextBlock]) { $Element }
+              for ($i=0; $i -lt [Windows.Media.VisualTreeHelper]::GetChildrenCount($Element); $i++) {
+                  Find-TextBlocks ([Windows.Media.VisualTreeHelper]::GetChild($Element,$i))
+              }
+          }
+          function Find-VisualsOfType($Element, [type]$Type) {
+              if ($Element -is $Type) { $Element }
+              for ($i=0; $i -lt [Windows.Media.VisualTreeHelper]::GetChildrenCount($Element); $i++) {
+                  Find-VisualsOfType ([Windows.Media.VisualTreeHelper]::GetChild($Element,$i)) $Type
+              }
+          }
+
+          Test-Case 'Shared named resources are available while window XAML loads' {
+              $d = Arrange-Window '<ComboBox Style="{StaticResource WmtComboBoxStyle}"/>'
+              try { Assert ($null -ne $d.Content.Style) 'Shared style was not resolved.' }
+              finally { $d.Close() }
+          }
+          Test-Case 'Selected ComboBox items retain readable brushes across both themes' {
+              $d = Arrange-Window '<ComboBox Name="combo"><ComboBoxItem Content="A"/><ComboBoxItem Content="B"/></ComboBox>'
+              try {
+                  $c = $d.FindName('combo'); $c.SelectedIndex = 1
+                  foreach ($theme in @('dark', 'light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $d
+                      $item = $c.Items[1]; [void]$item.ApplyTemplate()
+                      Assert ($item.Foreground.Color -eq $d.Resources['AccentText'].Color) "Unreadable selection in $theme."
+                      Assert ($item.Background.Color -eq $d.Resources['Accent'].Color) "Wrong selected background in $theme."
+                      Assert ($c.Foreground.Color -eq $d.Resources['TextPrimary'].Color) "Wrong closed selection in $theme."
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Editable ComboBox typing leaves space for the dropdown arrow' {
+              $d = Arrange-Window '<ComboBox Name="combo" IsEditable="True" Width="220" Height="34"/>'
+              try {
+                  Measure-Window $d
+                  $c = $d.FindName('combo'); [void]$c.ApplyTemplate()
+                  $text = $c.Template.FindName('PART_EditableTextBox',$c)
+                  $text.Text = 'en-US'
+                  Assert ($c.Text -eq 'en-US') 'Typed text did not reach the combo.'
+                  Assert ($text.ActualWidth -le $c.ActualWidth - 32) 'Editable text extends under the arrow.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Shared ListView and DataGrid selection follows theme brushes' {
+              $d = Arrange-Window '<Grid><Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions><ListView Name="list"><ListView.View><GridView><GridViewColumn Header="Name" DisplayMemberBinding="{Binding Name}"/></GridView></ListView.View></ListView><DataGrid Grid.Row="1" Name="grid" AutoGenerateColumns="True"/></Grid>'
+              try {
+                  $list=$d.FindName('list'); $grid=$d.FindName('grid')
+                  $list.ItemsSource=@([pscustomobject]@{Name='Selected row'})
+                  $grid.ItemsSource=@([pscustomobject]@{Name='Selected row'})
+                  $list.SelectedIndex=0; $grid.SelectedIndex=0
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $d
+                      foreach ($control in @($list,$grid)) {
+                          $row=$control.ItemContainerGenerator.ContainerFromIndex(0)
+                          Assert ($null -ne $row) 'No selected row was generated.'
+                          Assert ($row.Background.Color -eq $d.Resources['Accent'].Color) "$theme selected row background is incorrect."
+                          Assert ($row.Foreground.Color -eq $d.Resources['AccentText'].Color) "$theme selected row text is incorrect."
+                      }
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'DataGrid status text inherits readable selection colors and restores status colors' {
+              $d=Arrange-Window '<DataGrid Name="grid" IsReadOnly="True"/>'
+              try {
+                  $grid=$d.FindName('grid')
+                  Set-WmtDataGridColumns -DataGrid $grid -Columns @('Name','State','Action')
+                  $grid.ItemsSource=@([pscustomobject]@{Name='Example'; State='Enabled'; Action='Delete'})
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      $grid.SelectedIndex=-1
+                      Measure-Window $d
+                      $row=$grid.ItemContainerGenerator.ContainerFromIndex(0)
+                      $status=@(Find-TextBlocks $row | Where-Object Text -eq 'Enabled')[0]
+                      $statusColor=$status.Foreground.Color
+                      $grid.SelectedIndex=0
+                      Measure-Window $d
+                      foreach ($text in @(Find-TextBlocks $row)) {
+                          Assert ($text.Foreground.Color -eq $d.Resources['AccentText'].Color) "$theme selected text '$($text.Text)' ignores the selection foreground."
+                      }
+                      $grid.SelectedIndex=-1
+                      Measure-Window $d
+                      Assert ($status.Foreground.Color -eq $statusColor) "$theme deselection lost the status color."
+                      $cell=@(Find-VisualsOfType $row ([Windows.Controls.DataGridCell]))[0]
+                      $label=@(Find-TextBlocks $cell)[0]
+                      $position=$label.TranslatePoint([Windows.Point]::new(0,0),$cell)
+                      Assert ($position.Y -ge 4 -and $cell.ActualHeight - $position.Y - $label.ActualHeight -ge 4) 'DataGrid text has no breathing room inside its row.'
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Themed DataGrid headers preserve sorting and column resizing' {
+              $d=Arrange-Window '<DataGrid Name="grid" IsReadOnly="True"/>'
+              try {
+                  $grid=$d.FindName('grid')
+                  Set-WmtDataGridColumns -DataGrid $grid -Columns @('Name','State')
+                  $grid.ItemsSource=@([pscustomobject]@{Name='Zebra';State='Enabled'},[pscustomobject]@{Name='Alpha';State='Disabled'})
+                  Measure-Window $d
+                  $header=@(Find-VisualsOfType $grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object Content -eq 'Name')[0]
+                  $click=$header.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')
+                  [void]$click.Invoke($header,$null)
+                  Measure-Window $d
+                  Assert ($grid.Items[0].Name -eq 'Alpha' -and $grid.Columns[0].SortDirection -eq 'Ascending') 'The themed header cannot sort ascending.'
+                  Assert (@(Find-VisualsOfType $header ([Windows.Shapes.Path]) | Where-Object Visibility -eq 'Visible').Count -eq 1) 'The sorted column has no direction indicator.'
+                  [void]$click.Invoke($header,$null)
+                  Measure-Window $d
+                  Assert ($grid.Items[0].Name -eq 'Zebra' -and $grid.Columns[0].SortDirection -eq 'Descending') 'The themed header cannot sort descending.'
+                  $width=$grid.Columns[0].ActualWidth
+                  $gripper=$header.Template.FindName('PART_RightHeaderGripper',$header)
+                  Assert ($gripper.Visibility -eq 'Visible' -and $gripper.ActualWidth -gt 0) 'The themed header lost its resize handle.'
+                  $gripper.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                  $gripper.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(30,0))
+                  $gripper.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(30,0,$false))
+                  Measure-Window $d
+                  Assert ($grid.Columns[0].ActualWidth -gt $width+20) 'Dragging the themed divider does not resize its column.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Startup pages and shortcut grids use shared chrome through theme changes' {
+              $startup=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-StartupManager'},$true)
+              foreach ($name in @('Set-StartupButtonRole','New-StartupPage')) {
+                  $fn=$startup.Body.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)
+                  Invoke-Expression $fn.Extent.Text
+              }
+              $assignment=$startup.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$content'},$false)
+              Invoke-Expression $assignment.Extent.Text
+              $dialog=Arrange-Window $content
+              try {
+                  $mainHost=$dialog.FindName('mainHost'); $tabs=@{}
+                  $pages=@(foreach ($title in @('Windows','Scheduled Tasks','Context Menu','Services')) {
+                      $page=New-StartupPage $title
+                      Set-WmtDataGridColumns -DataGrid $page.Grid -Columns @('Name','State')
+                      $page.Grid.ItemsSource=@([pscustomobject]@{Name='Zebra';State='Enabled'},[pscustomobject]@{Name='Alpha';State='Disabled'})
+                      $page
+                  })
+                  foreach ($page in $pages) {
+                      foreach ($other in $pages) { $other.Root.Visibility='Collapsed' }
+                      $page.Root.Visibility='Visible'
+                      foreach ($theme in @('dark','light')) {
+                          Set-WmtThemeResources -Element $dialog -Palette $script:ThemePalettes[$theme]
+                          Measure-Window $dialog 960 560
+                          Assert ($page.Root.Background.Color -eq $dialog.Resources['BgDark'].Color) "$theme startup page retains the previous theme background."
+                          Assert ($page.Grid.GridLinesVisibility -eq 'None') 'Startup overrides the shared grid separators.'
+                          $headers=@(Find-VisualsOfType $page.Grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $null -ne $_.Column })
+                          Assert ($headers.Count -eq 2) "$($page.Header) did not render its column headers."
+                          foreach ($header in $headers) {
+                              Assert ($header.Style.BasedOn -eq $dialog.TryFindResource('WmtColumnHeaderStyle') -and $null -ne $header.Style.BasedOn) "$($page.Header) bypasses shared column header styling."
+                              Assert ($header.Template.FindName('HeaderBorder',$header).Background.Color -eq $dialog.Resources['BgPanel'].Color) "$($page.Header) renders headers with the wrong background."
+                              $handle=$header.Template.FindName('PART_RightHeaderGripper',$header)
+                              Assert ($handle.Style -eq $dialog.TryFindResource('WmtColumnHeaderGripperStyle')) "$($page.Header) bypasses shared column divider styling."
+                          }
+                      }
+                      $header=$headers[0]
+                      $click=$header.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')
+                      [void]$click.Invoke($header,$null)
+                      Assert ($page.Grid.Items[0].Name -eq 'Alpha') "$($page.Header) lost column sorting."
+                      $vC=$header.Column
+                      $oldWidth=$vC.ActualWidth
+                      $handle=$header.Template.FindName('PART_RightHeaderGripper',$header)
+                      $handle.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                      $handle.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(30,0))
+                      $handle.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(30,0,$false))
+                      Measure-Window $dialog 960 560
+                      Assert ($vC.ActualWidth -gt $oldWidth+20) "$($page.Header) lost column resizing."
+                  }
+              } finally { $dialog.Close() }
+              $shortcuts=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-BrokenShortcuts'},$true)
+              $assignment=$shortcuts.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$content'},$false)
+              Invoke-Expression $assignment.Extent.Text
+              $dialog=Arrange-Window $content
+              try {
+                  $grid=$dialog.FindName('dgShortcuts')
+                  Set-WmtDataGridColumns -DataGrid $grid -Columns @('Shortcut','Action')
+                  $grid.ItemsSource=@([pscustomobject]@{Shortcut='Example.lnk';Action='Fix'})
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $dialog -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $dialog 940 560
+                      Assert ($grid.Background.Color -eq $dialog.Resources['BgDark'].Color -and $grid.GridLinesVisibility -eq 'None') "$theme shortcut grid overrides the shared theme."
+                      $position=$grid.TranslatePoint([Windows.Point]::new(0,0),$dialog.Content)
+                      Assert ($dialog.Content.Margin -eq [Windows.Thickness]::new(0) -and $position.X -eq 0 -and $position.Y -eq 0 -and [Math]::Abs($grid.ActualWidth-$dialog.Content.ActualWidth) -lt 1) 'Shortcut fixer still has outer padding around the table.'
+                  }
+              } finally { $dialog.Close() }
+          }
+          Test-Case 'Scrollbars share visible themed thumbs in main and dialog windows on both axes' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              foreach ($main in @($false,$true)) {
+                  if ($main) {
+                      $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+                      $d.Content=[Windows.Markup.XamlReader]::Parse('<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"><Border Width="1000" Height="1000"/></ScrollViewer>')
+                  } else {
+                      $d=Arrange-Window '<ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"><Border Width="1000" Height="1000"/></ScrollViewer>'
+                  }
+                  try {
+                      foreach ($theme in @('dark','light')) {
+                          Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                          Measure-Window $d 500 260
+                          $viewer=$d.Content
+                          $bars=@(Find-VisualsOfType $viewer ([Windows.Controls.Primitives.ScrollBar]))
+                          Assert ($bars.Count -eq 2) 'The fixture did not render both scrollbar axes.'
+                          $corner=@(Find-VisualsOfType $viewer ([Windows.Shapes.Rectangle]))[0]
+                          Assert ($corner.Fill.Color -eq $d.Resources['BgPanel'].Color) "$theme scrollbar corner retains the native system color."
+                          foreach ($bar in $bars) {
+                              $track=$bar.Template.FindName('PART_Track',$bar)
+                              $thumb=$track.Thumb
+                              Assert ($thumb.Background.Color -eq $d.Resources['TextMuted'].Color) "$theme scrollbar thumb is too faint against a panel."
+                              Assert ($track.Orientation -eq $bar.Orientation) 'Scrollbar track uses the wrong axis.'
+                              if ($bar.Orientation -eq 'Horizontal') {
+                                  Assert ($bar.ActualWidth -gt 400 -and $thumb.ActualWidth -gt 0) 'Horizontal scrollbar does not fill its viewport.'
+                              } else {
+                                  Assert ($bar.ActualHeight -gt 200 -and $thumb.ActualHeight -gt 0) 'Vertical scrollbar does not fill its viewport.'
+                              }
+                          }
+                          $viewer.ScrollToHorizontalOffset(180)
+                          $viewer.ScrollToVerticalOffset(240)
+                          Measure-Window $d 500 260
+                          Assert ($viewer.HorizontalOffset -eq 180 -and $viewer.VerticalOffset -eq 240) 'The themed scrollbar prevents scrolling on either axis.'
+                      }
+                  } finally { $d.Close() }
+              }
+          }
+          Test-Case 'My Device and Tweaks scrollbars reach the right edge and the Tweaks overlay covers the viewport' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+              try {
+                  $d.FindName('pnlUpdates').Visibility='Collapsed'
+                  $d.FindName('txtDeviceOS').Text=('Example system detail' + [Environment]::NewLine)*40
+                  $mainGrid=[Windows.LogicalTreeHelper]::GetParent($d.FindName('pnlMyDevice'))
+                  $contentBorder=[Windows.LogicalTreeHelper]::GetParent($mainGrid)
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      foreach ($name in @('pnlMyDevice','pnlTweaks')) {
+                          $d.FindName('pnlMyDevice').Visibility='Collapsed'; $d.FindName('pnlTweaks').Visibility='Collapsed'
+                          $page=$d.FindName($name); $page.Visibility='Visible'
+                          foreach ($width in @(1100,1600)) {
+                              Measure-Window $d $width 700
+                              $bar=@(Find-VisualsOfType $page ([Windows.Controls.Primitives.ScrollBar]) | Where-Object { $_.Orientation -eq 'Vertical' -and $_.Visibility -eq 'Visible' })[0]
+                              Assert ($null -ne $bar -and $page.ScrollableHeight -gt 0) "$name did not render a working scrollbar."
+                              $edge=$bar.TranslatePoint([Windows.Point]::new($bar.ActualWidth,0),$contentBorder)
+                              Assert ([Math]::Abs($contentBorder.ActualWidth-$edge.X) -le 1) "$name leaves padding to the right of its scrollbar at width $width."
+                              $page.ScrollToVerticalOffset(120)
+                              Measure-Window $d $width 700
+                              Assert ($page.VerticalOffset -eq 120) "$name cannot scroll after reaching the right edge."
+                              if ($name -eq 'pnlTweaks') {
+                                  $overlay=$d.FindName('tweaksLoadingOverlay'); $overlay.Visibility='Visible'
+                                  Measure-Window $d $width 700
+                                  $overlayEdge=$overlay.TranslatePoint([Windows.Point]::new($overlay.ActualWidth,0),$contentBorder)
+                                  Assert ([Math]::Abs($contentBorder.ActualWidth-$overlayEdge.X) -le 1) 'The Tweaks loading overlay stops before the scrollbar.'
+                                  $overlay.Visibility='Collapsed'
+                              }
+                          }
+                      }
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Cleanup options keep a compact header and search remains accessible when narrowed' {
+              $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-WmtAdvancedCleanupSelectionWpf'},$true)
+              $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$cleanupSelectionXaml'},$true)
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $cleanupSelectionXaml -NoOwner
+              try {
+                  $d.FindName('lblCleanerFreshness').Text='Definitions are current.'
+                  $d.FindName('lblStatus').Text='Select rules to analyze or clean.'
+                  foreach ($width in @(920,760)) {
+                      Measure-Window $d $width 650
+                      $header=$d.Content.Children[0]
+                      Assert ($header.ActualHeight -lt 180) "Cleanup header wastes vertical space at width $width."
+                      foreach ($name in @('txtSearch','chkToggleWinapp2','chkToggleWinapp3','chkToggleCleanerML','chkToggleCleanerMLPending','chkSkipDownloads','chkCacheOnly','btnShowEnabled','txtCleanerLocalRefresh','txtCleanerRemoteRefresh','txtCleanerAutoClean','btnApplyCleanerIntervals','btnRefreshCleanerSources')) {
+                          $control=$d.FindName($name)
+                          $position=$control.TranslatePoint([Windows.Point]::new(0,0),$header)
+                          Assert ($position.X -ge 0 -and $position.X+$control.ActualWidth -le $header.ActualWidth+0.5 -and $position.Y+$control.ActualHeight -le $header.ActualHeight+0.5) "$name is clipped at cleanup width $width."
+                      }
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Cleanup header ends just below freshness text when its status is empty' {
+              $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-WmtAdvancedCleanupSelectionWpf'},$true)
+              $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$cleanupSelectionXaml'},$true)
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $cleanupSelectionXaml -NoOwner
+              try {
+                  $freshness=$d.FindName('lblCleanerFreshness')
+                  $status=$d.FindName('lblStatus')
+                  $freshness.Text='Winapp2: checked 2026-10-01 22:56, updated 2026-09-25 19:06 | Winapp3: checked 2026-10-01 22:56, updated 2026-09-25 19:07 | CleanerML: checked 2026-10-01 22:56, updated 2026-09-25 19:06'
+                  foreach ($width in @(920,760)) {
+                      $status.Text=''
+                      Measure-Window $d $width 650
+                      $header=$d.Content.Children[0]
+                      $position=$freshness.TranslatePoint([Windows.Point]::new(0,0),$header)
+                      Assert ($status.Visibility -eq 'Collapsed') 'The empty status reserves a blank text row.'
+                      Assert ($header.ActualHeight-$position.Y-$freshness.ActualHeight -le 6) "Cleanup header leaves room for another text row at width $width."
+                      $idleHeight=$header.ActualHeight
+                      $status.Text='Loading cleaner rules...'
+                      Measure-Window $d $width 650
+                      $position=$status.TranslatePoint([Windows.Point]::new(0,0),$header)
+                      Assert ($status.Visibility -eq 'Visible' -and $header.ActualHeight -gt $idleHeight) 'A nonempty status is hidden or overlaps the rules.'
+                      Assert ($header.ActualHeight-$position.Y-$status.ActualHeight -le 6) 'The active status still leaves unnecessary bottom space.'
+                  }
+                  $status.Text=''; $freshness.Text=''
+                  Measure-Window $d 760 650
+                  Assert ($freshness.Visibility -eq 'Collapsed') 'Empty freshness text reserves another blank row.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Registry scan targets have no gap beside the scrollbar and retain their selections' {
+              $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-RegScanSelection'},$true)
+              $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$regScanXaml'},$true)
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $regScanXaml -NoOwner
+              try {
+                  $checks=$d.FindName('pnlChecks')
+                  for ($i=0; $i -lt 60; $i++) {
+                      $check=[Windows.Controls.CheckBox]::new(); $check.Content="Scan target $i"; $check.Tag=$i; $check.IsChecked=($i -eq 0)
+                      [void]$checks.Children.Add($check)
+                  }
+                  $viewer=[Windows.LogicalTreeHelper]::GetParent($checks)
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      foreach ($width in @(620,800)) {
+                          Measure-Window $d $width 640
+                          $bar=@(Find-VisualsOfType $viewer ([Windows.Controls.Primitives.ScrollBar]) | Where-Object { $_.Orientation -eq 'Vertical' -and $_.Visibility -eq 'Visible' })[0]
+                          Assert ($null -ne $bar -and $viewer.ScrollableHeight -gt 0) 'Registry target list did not render a working scrollbar.'
+                          $edge=$bar.TranslatePoint([Windows.Point]::new($bar.ActualWidth,0),$d.Content)
+                          Assert ([Math]::Abs($d.Content.ActualWidth+$d.Content.Margin.Right-$edge.X) -le 1) 'Registry scan targets leave padding to the right of the scrollbar.'
+                          $viewer.ScrollToVerticalOffset(120)
+                          Measure-Window $d $width 640
+                          Assert ($viewer.VerticalOffset -eq 120 -and $checks.Children[0].IsChecked -and -not $checks.Children[1].IsChecked) 'Registry target resizing loses scrolling or the selected targets.'
+                      }
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Cleanup preview fills wider and narrower windows while preserving manually resized columns' {
+              $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-WmtCleanupPreviewWpf'},$true)
+              $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$cleanupPreviewXaml'},$true)
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $cleanupPreviewXaml -NoOwner
+              try {
+                  $grid=$d.FindName('dgPreview')
+                  $rows=@(1..60 | ForEach-Object { [pscustomobject]@{RuleName='Temporary files';Protection='';FilePath="C:\Temp\example$_.tmp";SizeText='1 KB';Size=1024} })
+                  $grid.ItemsSource=$rows; $grid.SelectedIndex=0
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      $narrowPathWidth=0
+                      foreach ($width in @(960,1400,760,960)) {
+                          Measure-Window $d $width 500
+                          $viewer=Get-WmtVisualDescendant -Element $grid -DescendantType ([Windows.Controls.ScrollViewer])
+                          $total=($grid.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                          Assert ([Math]::Abs($total-$viewer.ViewportWidth) -le 2 -and $viewer.ScrollableWidth -eq 0) "Cleanup preview leaves unused width or overflows at window width $width."
+                          if ($width -eq 1400) { Assert ($grid.Columns[2].ActualWidth -gt $narrowPathWidth+100) 'Cleanup paths do not grow when the window is stretched.' }
+                          if ($width -eq 960) { $narrowPathWidth=$grid.Columns[2].ActualWidth }
+                      }
+                  }
+                  $vC=$grid.Columns[2]
+                  $header=@(Find-VisualsOfType $grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $_.Column -eq $vC })[0]
+                  $handle=$header.Template.FindName('PART_RightHeaderGripper',$header)
+                  $handle.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                  $handle.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(650,0))
+                  $handle.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(650,0,$false))
+                  Measure-Window $d 960 500
+                  $manualWidth=$vC.ActualWidth
+                  Assert ($manualWidth -gt $narrowPathWidth+600) 'Automatically filling cleanup columns cannot be expanded manually.'
+                  Measure-Window $d 760 500
+                  Assert ([Math]::Abs($vC.ActualWidth-$manualWidth) -lt 1 -and $viewer.ScrollableWidth -gt 0) 'Shrinking the window constrains the manually widened cleanup path.'
+                  Measure-Window $d 1900 500
+                  $total=($grid.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ([Math]::Abs($vC.ActualWidth-$manualWidth) -lt 1 -and [Math]::Abs($total-$viewer.ViewportWidth) -le 2) 'Automatic columns do not absorb new space around a manually resized column.'
+                  $grid.ItemsSource=@($rows[0])
+                  Measure-Window $d 1900 500
+                  $total=($grid.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ([Math]::Abs($total-$viewer.ViewportWidth) -le 2 -and $viewer.ComputedVerticalScrollBarVisibility -eq 'Collapsed') 'Cleanup widths do not account for a disappearing vertical scrollbar.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Cleanup preview has no outer inset or extra header and retains freely draggable columns' {
+              $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-WmtCleanupPreviewWpf'},$true)
+              $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$cleanupPreviewXaml'},$true)
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $cleanupPreviewXaml -NoOwner
+              try {
+                  $grid=$d.FindName('dgPreview')
+                  $grid.ItemsSource=@([pscustomobject]@{RuleName='Temporary files';Protection='';FilePath='C:\Users\Example\AppData\Local\Temp\Folder\example.tmp';SizeText='1 KB';Size=1024})
+                  $grid.SelectedIndex=0
+                  Measure-Window $d 960 500
+                  $position=$grid.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
+                  Assert ($d.Content.Margin -eq [Windows.Thickness]::new(0) -and $position.X -eq 0 -and $position.Y -eq 0 -and [Math]::Abs($grid.ActualWidth-$d.Content.ActualWidth) -lt 1) 'Cleanup preview still has outer padding around the table.'
+                  Assert ($grid.Columns.Count -eq 4) 'Cleanup preview contains an extra data column.'
+                  $filler=@(Find-VisualsOfType $grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $null -eq $_.Column })[0]
+                  $fillerBorder=$filler.Template.FindName('HeaderBorder',$filler)
+                  Assert ($fillerBorder.Background.Color.A -eq 0 -and -not $filler.IsHitTestVisible) 'Cleanup preview still displays a blank trailing column header.'
+                  foreach ($column in $grid.Columns) {
+                      $header=@(Find-VisualsOfType $grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $_.Column -eq $column })[0]
+                      $gripper=$header.Template.FindName('PART_RightHeaderGripper',$header)
+                      $oldWidth=$column.ActualWidth
+                      $gripper.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                      $gripper.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(650,0))
+                      $gripper.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(650,0,$false))
+                      Measure-Window $d 960 500
+                      Assert ($column.ActualWidth -ge $oldWidth+600) "The $($column.Header) column is constrained to a fraction of the viewport."
+                      $draggedWidth=$column.ActualWidth
+                      foreach ($width in @(760,1200,960)) {
+                          Measure-Window $d $width 500
+                          Assert ([Math]::Abs($column.ActualWidth-$draggedWidth) -lt 1) "Resizing the window resets the $($column.Header) column."
+                      }
+                      $column.Width=[Windows.Controls.DataGridLength]::new($oldWidth)
+                      Measure-Window $d 960 500
+                  }
+                  $grid.Columns[2].Width=[Windows.Controls.DataGridLength]::new(1200)
+                  Measure-Window $d 760 500
+                  $viewer=Get-WmtVisualDescendant -Element $grid -DescendantType ([Windows.Controls.ScrollViewer])
+                  Assert ($viewer.ScrollableWidth -gt 0 -and $viewer.ComputedHorizontalScrollBarVisibility -eq 'Visible') 'Expanded analysis columns cannot scroll horizontally.'
+                  Assert ($grid.SelectedIndex -eq 0 -and $grid.Items.Count -eq 1) 'Column resizing changes analysis rows or selection.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'GridView and DataGrid columns share header spacing, typography, and themed dividers' {
+              $d=Arrange-Window '<Grid><Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions><ListView Name="list"><ListView.View><GridView><GridViewColumn Header="Name" Width="220" DisplayMemberBinding="{Binding Name}"/></GridView></ListView.View></ListView><DataGrid Name="grid" Grid.Row="1" ColumnWidth="SizeToHeader" IsReadOnly="True"><DataGrid.Columns><DataGridTextColumn Header="Name" Width="220" Binding="{Binding Name}"/></DataGrid.Columns></DataGrid></Grid>'
+              try {
+                  $list=$d.FindName('list'); $grid=$d.FindName('grid')
+                  $rows=@([pscustomobject]@{Name='Example'})
+                  $list.ItemsSource=$rows; $grid.ItemsSource=$rows
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $d
+                      $listHeader=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Role -eq 'Normal' })[0]
+                      $gridHeader=@(Find-VisualsOfType $grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $null -ne $_.Column })[0]
+                      Assert ($listHeader.Padding -eq $gridHeader.Padding -and $listHeader.FontWeight -eq $gridHeader.FontWeight -and $listHeader.FontSize -eq $gridHeader.FontSize) 'The two table types use different column header spacing or typography.'
+                      $sharedHeader=$d.TryFindResource('WmtColumnHeaderStyle')
+                      Assert ($null -ne $sharedHeader -and $listHeader.Style.BasedOn -eq $sharedHeader -and $gridHeader.Style.BasedOn -eq $sharedHeader) 'Column headers duplicate their common styling.'
+                      foreach ($header in @($listHeader,$gridHeader)) {
+                          Assert ($header.Background.Color -eq $d.Resources['BgPanel'].Color -and $header.Foreground.Color -eq $d.Resources['TextSecondary'].Color) "$theme column headers ignore shared theme colors."
+                          Assert ($header.Template.FindName('HeaderBorder',$header).Background.Color -eq $d.Resources['BgPanel'].Color) "$theme normal column headers render with the filler background."
+                      }
+                      $listHandle=$listHeader.Template.FindName('PART_HeaderGripper',$listHeader)
+                      $gridHandle=$gridHeader.Template.FindName('PART_RightHeaderGripper',$gridHeader)
+                      $sharedHandle=$d.TryFindResource('WmtColumnHeaderGripperStyle')
+                      Assert ($null -ne $sharedHandle -and $listHandle.Style -eq $sharedHandle -and $gridHandle.Style -eq $sharedHandle) 'Column dividers have separate styling between table types.'
+                      foreach ($handle in @($listHandle,$gridHandle)) {
+                          $separator=$handle.Template.FindName('HeaderSeparator',$handle)
+                          Assert ($separator.BorderBrush.Color -eq $d.Resources['BorderBrush'].Color) "$theme column divider is unthemed."
+                      }
+                      $filler=@(Find-VisualsOfType $grid ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $null -eq $_.Column })[0]
+                      Assert ($filler.Template.FindName('HeaderBorder',$filler).Background.Color.A -eq 0 -and -not $filler.IsHitTestVisible) 'DataGrid filler still looks or acts like another column.'
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Every dialog table inherits shared column headers and fills its resized viewport' {
+              foreach ($functionName in @('Show-WmtScheduledTasksDialog','Show-WmtCustomUpdateCommandManager','Show-WmtCleanupPreviewWpf','Show-RegistryCleaner','Show-BrokenShortcuts','Invoke-ExportDrivers','Show-GhostDevicesDialog','Show-DriverCleanupDialog','Show-SystemRestoreManager','Show-WmtCompactManager')) {
+                  $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $functionName},$true)
+                  $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Right.Extent.Text -match '<DataGrid[ >]|<ListView[ >]'},$true)
+                  Invoke-Expression $assignment.Extent.Text
+                  $markup=(Get-Variable -Name ($assignment.Left.Extent.Text -replace '^\[xml\]','' -replace '^\$','') -ValueOnly).ToString()
+                  $d=if ($markup -match '<Window\s') { New-WmtWindowFromFullXaml -Xaml $markup -NoOwner } else { Arrange-Window $markup }
+                  try {
+                      foreach ($match in [regex]::Matches($markup,'(?s)<(?:DataGrid|ListView)\s[^>]*?(?:Name|x:Name)="([^"]+)"')) {
+                          $table=$d.FindName($match.Groups[1].Value)
+                          $parent=$table
+                          while ($parent -and $parent -ne $d) {
+                              if ($parent -is [Windows.UIElement]) { $parent.Visibility='Visible' }
+                              $parent=[Windows.LogicalTreeHelper]::GetParent($parent)
+                          }
+                          if ($table -is [Windows.Controls.DataGrid] -and $table.Columns.Count -eq 0) { Set-WmtDataGridColumns -DataGrid $table -Columns @('Name','State') }
+                          $table.ItemsSource=@([pscustomobject]@{Name='Example';State='Enabled';Check=$false})
+                          foreach ($theme in @('dark','light')) {
+                              Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                              Measure-Window $d 1000 680
+                              $headers=if ($table -is [Windows.Controls.DataGrid]) { @(Find-VisualsOfType $table ([Windows.Controls.Primitives.DataGridColumnHeader]) | Where-Object { $null -ne $_.Column }) } else { @(Find-VisualsOfType $table ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Role -eq 'Normal' }) }
+                              Assert ($headers.Count -gt 0) "$functionName did not render column headers."
+                              foreach ($header in $headers) {
+                                  Assert ($header.Style.BasedOn -eq $d.TryFindResource('WmtColumnHeaderStyle') -and $null -ne $header.Style.BasedOn) "$functionName bypasses the shared column header styling."
+                                  Assert ($header.Background.Color -eq $d.Resources['BgPanel'].Color -and $header.Foreground.Color -eq $d.Resources['TextSecondary'].Color) "$functionName has unthemed $theme column headers."
+                                  Assert ($header.Template.FindName('HeaderBorder',$header).Background.Color -eq $d.Resources['BgPanel'].Color) "$functionName renders normal headers with the filler background."
+                                  $part=if ($table -is [Windows.Controls.DataGrid]) { 'PART_RightHeaderGripper' } else { 'PART_HeaderGripper' }
+                                  Assert ($header.Template.FindName($part,$header).Style -eq $d.TryFindResource('WmtColumnHeaderGripperStyle')) "$functionName bypasses shared column divider styling."
+                              }
+                              Measure-Window $d 1900 680
+                              $viewer=Get-WmtVisualDescendant -Element $table -DescendantType ([Windows.Controls.ScrollViewer])
+                              $columns=if ($table -is [Windows.Controls.DataGrid]) { $table.Columns | Where-Object Visibility -eq 'Visible' } else { $table.View.Columns }
+                              $inset=if ($table -is [Windows.Controls.DataGrid]) { 0 } else { 6 }
+                              $total=($columns | Measure-Object -Property ActualWidth -Sum).Sum
+                              Assert ([Math]::Abs($total-($viewer.ViewportWidth-$inset)) -le 1 -and $viewer.ScrollableWidth -eq 0) "$functionName does not use shared viewport filling after resizing."
+                          }
+                      }
+                  } finally { $d.Close() }
+              }
+          }
+          function Arrange-RegistryResults {
+              $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-RegistryCleaner'},$true)
+              foreach ($name in @('Get-WmtVisualParentOfType','Select-WmtRegistryGridRowFromOriginalSource','Set-WmtRegistryHighlightedRowsChecked','ConvertTo-WmtRegistryResultClipboardText','Connect-WmtRegistryResultSorting','Connect-WmtRegistryResultClipboard')) {
+                  $helper=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -replace '^script:','' -eq $name},$true)
+                  if ($helper) { Invoke-Expression $helper.Extent.Text }
+              }
+              $assignment=$fn.Body.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$registryCleanerXaml'},$true)
+              Invoke-Expression $assignment.Extent.Text
+              New-WmtWindowFromFullXaml -Xaml $registryCleanerXaml -NoOwner
+          }
+          Test-Case 'Registry results fill the viewport on resize while retaining manually dragged widths' {
+              $d=Arrange-RegistryResults
+              try {
+                  $list=$d.FindName('dgRegistry')
+                  $list.ItemsSource=@(1..60 | ForEach-Object { [pscustomobject]@{Check=$false;Problem="Finding $_";FullPath='HKLM:\SOFTWARE\Example';Details='Review finding'} })
+                  $list.SelectedIndex=0
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $d 1280 680
+                      $pathWidth=$list.View.Columns[10].ActualWidth
+                      foreach ($width in @(1780,1280)) {
+                          Measure-Window $d $width 680
+                          $viewer=Get-WmtVisualDescendant -Element $list -DescendantType ([Windows.Controls.ScrollViewer])
+                          $total=($list.View.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                          Assert ([Math]::Abs($total-($viewer.ViewportWidth-6)) -le 1 -and $viewer.ScrollableWidth -eq 0) "Registry results do not fill the window at width $width."
+                          if ($width -eq 1780) { Assert ($list.View.Columns[10].ActualWidth -gt $pathWidth+30) 'Registry path column does not grow with the window.' }
+                      }
+                  }
+                  $vC=$list.View.Columns[10]
+                  $header=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Column -eq $vC })[0]
+                  $handle=$header.Template.FindName('PART_HeaderGripper',$header)
+                  $handle.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                  $handle.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(650,0))
+                  $handle.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(650,0,$false))
+                  $manualWidth=$vC.Width
+                  Measure-Window $d 980 680
+                  Assert ([Math]::Abs($vC.ActualWidth-$manualWidth) -lt 1 -and $viewer.ScrollableWidth -gt 0) 'Narrowing registry results overrides a dragged column instead of scrolling.'
+                  Measure-Window $d 2280 680
+                  $total=($list.View.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ([Math]::Abs($vC.ActualWidth-$manualWidth) -lt 1 -and [Math]::Abs($total-($viewer.ViewportWidth-6)) -le 1) 'Untouched registry columns do not fill around a manually resized column.'
+                  Assert ($list.SelectedIndex -eq 0 -and $list.Items.Count -eq 60) 'Registry resizing changes findings or selection.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Registry results use the Updates GridView and every text column can expand beyond the viewport' {
+              $d=Arrange-RegistryResults
+              try {
+                  $list=$d.FindName('dgRegistry')
+                  Assert ($list -is [Windows.Controls.ListView] -and $list.View -is [Windows.Controls.GridView]) 'Registry results still use a separate table implementation.'
+                  $list.ItemsSource=@([pscustomobject]@{Check=$false;Problem='Missing Uninstaller';FixAction='Delete key';Risk='Review';Confidence='Medium';DefaultAction='Review';Type='Key';ValueName='';Data='C:\ProgramData\Example';Key='Example publisher';FullPath='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Very Long Publisher And Product Entry\UninstallString';Details='Review only; not selected by default. Missing uninstaller requires manual review of the original installation.'})
+                  $list.SelectedIndex=0
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $d 1280 680
+                      $position=$list.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
+                      Assert ($d.Content.Margin -eq [Windows.Thickness]::new(0) -and $position.X -eq 0 -and [Math]::Abs($list.ActualWidth-$d.Content.ActualWidth) -lt 1) 'Registry results still sit inside an outer horizontal inset.'
+                      $row=$list.ItemContainerGenerator.ContainerFromIndex(0)
+                      Assert ($row.Style -eq $d.TryFindResource('WmtListViewItemStyle')) 'Registry rows do not use the shared Updates style.'
+                      Assert ($row.ActualHeight -le 34) 'Long registry paths wrap and add extra lines to the results.'
+                      foreach ($text in @(Find-TextBlocks $row)) {
+                          Assert ($text.Foreground.Color -eq $d.Resources['AccentText'].Color) "$theme registry text ignores the shared selection color."
+                      }
+                  }
+                  for ($i=1; $i -lt $list.View.Columns.Count; $i++) {
+                      $vC=$list.View.Columns[$i]
+                      $header=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Column -eq $vC })[0]
+                      $gripper=$header.Template.FindName('PART_HeaderGripper',$header)
+                      $oldWidth=$vC.ActualWidth
+                      $gripper.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                      $gripper.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(650,0))
+                      $gripper.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(650,0,$false))
+                      Measure-Window $d 1280 680
+                      Assert ($vC.ActualWidth -ge $oldWidth+600) "Registry column '$($vC.Header)' cannot expand freely."
+                      $draggedWidth=$vC.ActualWidth
+                      Measure-Window $d 980 680
+                      Measure-Window $d 1480 680
+                      Assert ([Math]::Abs($vC.ActualWidth-$draggedWidth) -lt 1) "Registry column '$($vC.Header)' loses its manual width."
+                      $vC.Width=$oldWidth
+                      Measure-Window $d 1280 680
+                  }
+                  $viewer=Get-WmtVisualDescendant -Element $list -DescendantType ([Windows.Controls.ScrollViewer])
+                  $list.View.Columns[10].Width=1500
+                  Measure-Window $d 980 680
+                  Assert ($viewer.ScrollableWidth -gt 0 -and $viewer.ComputedHorizontalScrollBarVisibility -eq 'Visible') 'Wide registry paths cannot scroll horizontally.'
+                  Assert ($list.SelectedIndex -eq 0 -and $list.Items.Count -eq 1) 'Column resizing changes the registry results or selection.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Registry Ctrl+C is available only for highlighted findings and retains complete details' {
+              $d=Arrange-RegistryResults
+              try {
+                  $list=$d.FindName('dgRegistry')
+                  $rows=@([pscustomobject]@{Check=$true;Problem='Hidden checked finding';FullPath='HKLM:\SOFTWARE\Hidden'},[pscustomobject]@{Check=$false;Problem='Highlighted finding';FullPath='HKLM:\SOFTWARE\Selected';Details='Keep these complete details'})
+                  $list.ItemsSource=$rows
+                  Connect-WmtRegistryResultClipboard -ListView $list
+                  Measure-Window $d 1280 680
+                  $copy=[Windows.Input.ApplicationCommands]::Copy
+                  Assert (-not $copy.CanExecute($null,$list)) 'Registry Ctrl+C is enabled without highlighted rows.'
+                  $list.SelectedIndex=1
+                  Assert ($copy.CanExecute($null,$list)) 'Registry Ctrl+C no longer copies highlighted findings.'
+                  $text=ConvertTo-WmtRegistryResultClipboardText -Rows @($list.SelectedItems)
+                  Assert ($text.Contains('HKLM:\SOFTWARE\Selected') -and $text.Contains('Keep these complete details') -and -not $text.Contains('HKLM:\SOFTWARE\Hidden')) 'Registry copy loses full details or includes unselected findings.'
+                  $list.SelectedItems.Clear()
+                  Assert (-not $copy.CanExecute($null,$list)) 'Registry Ctrl+C remains enabled after clearing selection.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Registry GridView retains two-way checks, highlighted-row actions, and protected filtering' {
+              $dialog=Arrange-RegistryResults
+              try {
+                  $dg=$dialog.FindName('dgRegistry')
+                  Assert ($dg -is [Windows.Controls.ListView]) 'Registry checkbox test requires the shared list.'
+                  $registryRows=@([pscustomobject]@{Check=$false;Problem='Review first';IsProtected=$false},[pscustomobject]@{Check=$false;Problem='Review second';IsProtected=$false},[pscustomobject]@{Check=$false;Problem='Protected COM';IsProtected=$true})
+                  $registryRowsFiltered=@($registryRows | Where-Object { -not $_.IsProtected })
+                  $protectedCount=1
+                  $lblStatus=$dialog.FindName('lblStatus'); $chkShowProtected=$dialog.FindName('chkShowProtected')
+                  $dg.ItemsSource=$registryRowsFiltered
+                  Measure-Window $dialog 1280 680
+                  $row=$dg.ItemContainerGenerator.ContainerFromIndex(0)
+                  $checkbox=@(Find-VisualsOfType $row ([Windows.Controls.CheckBox]))[0]
+                  $checkbox.IsChecked=$true
+                  Assert ($registryRows[0].Check) 'Clicking a registry checkbox does not update its finding.'
+                  $checkbox.IsChecked=$false
+                  $dg.SelectedItems.Add($registryRows[0]); $dg.SelectedItems.Add($registryRows[1])
+                  $row=$dg.ItemContainerGenerator.ContainerFromIndex(1)
+                  Assert (Select-WmtRegistryGridRowFromOriginalSource -Grid $dg -OriginalSource @((Find-TextBlocks $row))[0]) 'Right-click cannot identify the registry finding.'
+                  Assert ($dg.SelectedItems.Count -eq 2) 'Right-clicking a highlighted row loses the other highlighted rows.'
+                  Assert ((Set-WmtRegistryHighlightedRowsChecked -Grid $dg) -eq 2) 'The highlighted-row action misses selected findings.'
+                  Assert ($registryRows[0].Check -and $registryRows[1].Check -and -not $registryRows[2].Check) 'Checking highlighted rows also checks a hidden protected finding.'
+                  $registryFn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-RegistryCleaner'},$true)
+                  $filterHandler=$registryFn.Body.Find({param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Extent.Text.StartsWith('$chkShowProtected.Add_Click(')},$true)
+                  Invoke-Expression $filterHandler.Extent.Text
+                  $chkShowProtected.IsChecked=$true
+                  $chkShowProtected.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($dg.Items.Count -eq 3 -and -not $registryRows[2].Check) 'Showing protected findings changes their check state.'
+                  $chkShowProtected.IsChecked=$false
+                  $chkShowProtected.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($dg.Items.Count -eq 2 -and $registryRows[0].Check -and $registryRows[1].Check) 'Hiding protected findings loses the checked selections.'
+                  $dg.SelectedItems.Clear()
+                  Assert ((Set-WmtRegistryHighlightedRowsChecked -Grid $dg) -eq 0) 'The check action changes findings without a selection.'
+              } finally { $dialog.Close() }
+          }
+          Test-Case 'Registry headers retain the shared sort actions without changing checked findings' {
+              $d=Arrange-RegistryResults
+              try {
+                  $list=$d.FindName('dgRegistry')
+                  Assert ($list -is [Windows.Controls.ListView]) 'Registry sort test requires the shared list.'
+                  foreach ($key in @('$script:GridSortAscendingGlyph','$script:GridSortDescendingGlyph')) {
+                      $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $key},$true)
+                      Invoke-Expression $assignment.Extent.Text
+                  }
+                  $rows=@([pscustomobject]@{Check=$true;Problem='Zebra';FixAction='Delete key'},[pscustomobject]@{Check=$false;Problem='Alpha';FixAction='Delete value'})
+                  $list.ItemsSource=$rows
+                  Connect-WmtRegistryResultSorting -ListView $list
+                  Measure-Window $d 1280 680
+                  $header=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object Content -eq 'Problem')[0]
+                  $header.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($list.Items[0].Problem -eq 'Alpha') 'Registry header sorting does not sort ascending.'
+                  Measure-Window $d 1280 680
+                  $header.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($list.Items[0].Problem -eq 'Zebra') 'Registry header sorting does not reverse direction.'
+                  Assert ($rows[0].Check -and -not $rows[1].Check) 'Sorting changes which registry findings are checked.'
+                  Measure-Window $d 1280 680
+                  $header=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object Content -eq 'Action')[0]
+                  $header.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($list.Items[0].FixAction -eq 'Delete key') 'Action header sorts by its label instead of FixAction.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Main window loads with shared styles and preserves driver-specific tinting' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+              try {
+                  Assert ($null -ne $d.FindName('lstWinget')) 'Main window controls were lost.'
+                  $driverStyle=$d.Resources['DrvItem']
+                  Assert ($driverStyle.BasedOn -eq $d.TryFindResource('WmtListViewItemStyle')) 'Driver style no longer extends shared rows.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Active update status and progress use full rows below search in narrow windows' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+              try {
+                  $d.FindName('lblWingetStatus').Text='Update 2/5: Spotify (01:10)'
+                  $progress=$d.FindName('pbWingetProgress')
+                  $progress.Minimum=0; $progress.Maximum=5; $progress.Value=1
+                  $summary=$d.FindName('lblWingetProgress')
+                  $summary.Text='1/5 done | 1 success | 0 skipped | 0 failed | running 2/5'
+                  $last=$d.FindName('lblWingetLastResult')
+                  $last.Text='Last: [SUCCESS] 1/5 - Comfy Desktop 1.1.3'
+                  foreach ($control in @($progress,$summary,$last)) { $control.Visibility='Visible' }
+                  foreach ($width in @(950,1050,1400,950)) {
+                      Measure-Window $d $width 900
+                      $search=$d.FindName('txtWingetSearch')
+                      $searchBottom=$search.TranslatePoint([Windows.Point]::new(0,$search.ActualHeight),$d.Content).Y
+                      $card=Get-WmtVisualAncestor -Element $summary -AncestorType ([Windows.Controls.Border])
+                      $contentWidth=$card.ActualWidth-$card.Padding.Left-$card.Padding.Right
+                      foreach ($name in @('lblWingetStatus','pbWingetProgress','lblWingetProgress','lblWingetLastResult')) {
+                          $control=$d.FindName($name)
+                          $position=$control.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
+                          Assert ($position.Y -ge $searchBottom) "$name shares the search row at window width $width."
+                          Assert ($control.ActualWidth -ge $contentWidth-1) "$name is squeezed into a narrow title column at window width $width."
+                      }
+                      Assert ($card.ActualHeight -lt 200) "Update progress makes the header excessively tall at window width $width."
+                      Assert ($d.FindName('lstWinget').ActualHeight -gt 250) 'Update progress consumes the package list area.'
+                      $barBottom=$progress.TranslatePoint([Windows.Point]::new(0,$progress.ActualHeight),$d.Content).Y
+                      Assert ($summary.TranslatePoint([Windows.Point]::new(0,0),$d.Content).Y -ge $barBottom) 'The progress label competes with the bar for horizontal space.'
+                  }
+                  $progress.Visibility='Collapsed'; $summary.Visibility='Collapsed'; $last.Visibility='Collapsed'
+                  Measure-Window $d 950 900
+                  Assert ($card.ActualHeight -lt 120) 'The idle update header retains empty progress rows.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Driver status and legend span the header below search' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+              try {
+                  $d.FindName('pnlUpdates').Visibility='Collapsed'
+                  $d.FindName('pnlDrivers').Visibility='Visible'
+                  $status=$d.FindName('lblDrvStatus')
+                  $status.Text='Loaded 123 driver packages: 64 in use, 18 old, 26 unattached, and 15 inactive.'
+                  foreach ($width in @(950,1050,1400,950)) {
+                      Measure-Window $d $width 900
+                      $search=$d.FindName('txtDrvSearch')
+                      $searchBottom=$search.TranslatePoint([Windows.Point]::new(0,$search.ActualHeight),$d.Content).Y
+                      $card=Get-WmtVisualAncestor -Element $status -AncestorType ([Windows.Controls.Border])
+                      $legend=@(Find-TextBlocks $card | Where-Object {
+                          $_.Inlines.FirstInline -is [Windows.Documents.Run] -and $_.Inlines.FirstInline.Text.StartsWith('Highlighting:')
+                      })[0]
+                      Assert ($null -ne $legend) 'The driver status legend was lost.'
+                      foreach ($control in @($status,$legend)) {
+                          $position=$control.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
+                          Assert ($position.Y -ge $searchBottom) 'Driver status or legend shares the search row.'
+                          Assert ($control.ActualWidth -ge $card.ActualWidth-$card.Padding.Left-$card.Padding.Right-1) 'Driver text is squeezed beside search.'
+                      }
+                      Assert ($card.ActualHeight -lt 200) 'Driver status makes the header excessively tall.'
+                      Assert ($d.FindName('lstDrivers').ActualHeight -gt 250) 'Driver status consumes the driver list area.'
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Driver cells align with their headers and counts stay inside Devices' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+              try {
+                  $d.FindName('pnlUpdates').Visibility='Collapsed'
+                  $d.FindName('pnlDrivers').Visibility='Visible'
+                  $list=$d.FindName('lstDrivers')
+                  # Allow the native margins and the presenter's two-pixel trailing padding.
+                  # Row padding must not shift the right-aligned count past its header.
+                  $list.Width=($list.View.Columns | Measure-Object -Property Width -Sum).Sum + 6
+                  foreach ($count in @('0','1','12')) {
+                      $list.Items.Clear()
+                      [void]$list.Items.Add([pscustomobject]@{
+                          Status='Unattached'; Class='System'; Provider='Test'; OriginalName='driver.inf'
+                          PublishedName='oem1.inf'; DisplayVer='1.2.3.4'; DisplayDate='2026-10-01'; DevicesText=$count
+                      })
+                      Measure-Window $d 1400 900
+                      $row=$list.ItemContainerGenerator.ContainerFromIndex(0)
+                      $headers=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Role -eq 'Normal' })
+                      foreach ($pair in @(@('Status','Unattached'),@('Class','System'),@('Provider','Test'),@('Driver','driver.inf'),@('Store File','oem1.inf'),@('Version','1.2.3.4'),@('Date','2026-10-01'))) {
+                          $header=@($headers | Where-Object { $_.Content -eq $pair[0] })[0]
+                          $headerLabel=@(Find-TextBlocks $header)[0]
+                          $cellLabel=@(Find-TextBlocks $row | Where-Object { $_.Text -eq $pair[1] })[0]
+                          $headerX=$headerLabel.TranslatePoint([Windows.Point]::new(0,0),$list).X
+                          $cellX=$cellLabel.TranslatePoint([Windows.Point]::new(0,0),$list).X
+                          Assert ([Math]::Abs($headerX-$cellX) -lt 0.5) "$($pair[0]) header and cell are misaligned."
+                      }
+                      $label=@(Find-TextBlocks $row | Where-Object { $_.Text -eq $count })[0]
+                      Assert ($null -ne $label) "Device count $count was not rendered."
+                      $position=$label.TranslatePoint([Windows.Point]::new(0,0),$list)
+                      Assert ($position.X -ge 0 -and $position.X+$label.ActualWidth -le $list.ActualWidth) "Device count $count extends outside the viewport despite its header fitting."
+                      $devices=@($headers | Where-Object { $_.Content -eq 'Devices' })[0]
+                      $columnX=$devices.TranslatePoint([Windows.Point]::new(0,0),$list).X
+                      Assert ($columnX+$devices.ActualWidth -le $list.ActualWidth) 'The Devices header does not fit in the test viewport.'
+                      Assert ($position.X -ge $columnX -and $position.X+$label.ActualWidth -le $columnX+$devices.ActualWidth) "Device count $count spills into the empty header area."
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'GridView header filler has no resize handle and column dividers follow the theme' {
+              $d=Arrange-Window '<ListView Name="list"><ListView.View><GridView><GridViewColumn Header="Name" Width="800" DisplayMemberBinding="{Binding Name}"/></GridView></ListView.View></ListView>'
+              try {
+                  $list=$d.FindName('list')
+                  $list.ItemsSource=@([pscustomobject]@{Name='Example'})
+                  foreach ($theme in @('dark','light')) {
+                      Set-WmtThemeResources -Element $d -Palette $script:ThemePalettes[$theme]
+                      Measure-Window $d
+                      $headers=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]))
+                      $filler=@($headers | Where-Object { $_.Role -eq 'Padding' })[0]
+                      $handle=$filler.Template.FindName('PART_HeaderGripper',$filler)
+                      Assert ($handle.Visibility -eq 'Collapsed') 'Unused header space displays an extra column resize handle.'
+                      Assert (-not $filler.IsHitTestVisible) 'Unused header space behaves like a column header.'
+                      $normal=@($headers | Where-Object { $_.Role -eq 'Normal' })[0]
+                      $handle=$normal.Template.FindName('PART_HeaderGripper',$normal)
+                      Assert ($handle.Visibility -eq 'Visible') 'Real columns lost their resize handle.'
+                      $separator=$handle.Template.FindName('HeaderSeparator',$handle)
+                      Assert ($null -ne $separator) 'The column resize handle uses native unthemed chrome.'
+                      Assert ($separator.BorderBrush.Color -eq $d.Resources['BorderBrush'].Color) "$theme column divider is unthemed."
+                      $previousWidth=$normal.Column.Width
+                      $drag=[Windows.Controls.Primitives.DragDeltaEventArgs]::new(24,0)
+                      $drag.RoutedEvent=[Windows.Controls.Primitives.Thumb]::DragDeltaEvent
+                      $handle.RaiseEvent($drag)
+                      Assert ($normal.Column.Width -eq $previousWidth+24) 'The themed handle no longer resizes its column.'
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'All main GridView tables fill their viewport when growing and shrinking' {
+              $assignment=$ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '[xml]$xaml'},$true)
+              $AppVersion='test'
+              Invoke-Expression $assignment.Extent.Text
+              $d=New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
+              try {
+                  foreach ($name in @('lstDrivers','lstFirewall','lstWinget','lstCatalog','lstLibrary','lstAppxPackages')) {
+                      $list=$d.FindName($name)
+                      $parent=$list
+                      while ($parent -and $parent -ne $d) {
+                          if ($parent -is [Windows.UIElement]) { $parent.Visibility='Visible' }
+                          $parent=[Windows.LogicalTreeHelper]::GetParent($parent)
+                      }
+                      [void]$list.Items.Add([pscustomobject]@{Name='Example'; DevicesText='1'; Status='InUse'})
+                      $list.SelectedIndex=0
+                      $narrowViewport=0
+                      $narrowTotal=0
+                      foreach ($width in @(1400,1900,1400)) {
+                          Measure-Window $d $width 900
+                          foreach ($header in @(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Role -eq 'Normal' })) {
+                              Assert ($header.Style.BasedOn -eq $d.TryFindResource('WmtColumnHeaderStyle') -and $null -ne $header.Style.BasedOn) "$name bypasses shared column header styling."
+                          }
+                          $viewer=Get-WmtVisualDescendant -Element $list -DescendantType ([Windows.Controls.ScrollViewer])
+                          $total=($list.View.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                          Assert ([Math]::Abs($total-($viewer.ViewportWidth-6)) -lt 1) "$name leaves unused width or extends past its viewport at window width $width."
+                          Assert ($viewer.ScrollableWidth -eq 0 -and $viewer.ComputedHorizontalScrollBarVisibility -eq 'Collapsed') "$name shows a horizontal scrollbar although its columns fit at window width $width."
+                          if ($width -eq 1900 -and $viewer.ViewportWidth -gt $narrowViewport+10) {
+                              Assert ($total -gt $narrowTotal+10) "$name columns did not grow with their viewport."
+                          }
+                          elseif ($width -eq 1400) { $narrowTotal=$total; $narrowViewport=$viewer.ViewportWidth }
+                          Assert ($list.SelectedIndex -eq 0 -and $list.Items.Count -eq 1) "$name resizing changed the rows or selection."
+                      }
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'GridView sizing accounts for scrollbars and preserves columns after reordering' {
+              $d=Arrange-Window '<ListView Name="list"><ListView.View><GridView><GridViewColumn Header="Name" Width="240" DisplayMemberBinding="{Binding Name}"/><GridViewColumn Header="State" Width="100" DisplayMemberBinding="{Binding State}"/></GridView></ListView.View></ListView>'
+              try {
+                  $list=$d.FindName('list')
+                  foreach ($i in 1..100) { [void]$list.Items.Add([pscustomobject]@{Name="Item $i"; State='Ready'}) }
+                  Measure-Window $d 600 180
+                  $viewer=Get-WmtVisualDescendant -Element $list -DescendantType ([Windows.Controls.ScrollViewer])
+                  Assert ($viewer.ComputedVerticalScrollBarVisibility -eq 'Visible') 'The test did not create a vertical scrollbar.'
+                  $total=($list.View.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ([Math]::Abs($total-($viewer.ViewportWidth-6)) -lt 1) 'Columns do not fill the reduced viewport beside the vertical scrollbar.'
+                  Assert ($viewer.ScrollableWidth -eq 0 -and $viewer.ComputedHorizontalScrollBarVisibility -eq 'Collapsed') 'A table with a vertical scrollbar also shows an unnecessary horizontal scrollbar.'
+                  $nameColumn=$list.View.Columns[0]
+                  $stateColumn=$list.View.Columns[1]
+                  $list.View.Columns.Move(0,1)
+                  Measure-Window $d 900 180
+                  Assert ($list.View.Columns[1] -eq $nameColumn -and $nameColumn.ActualWidth -gt $stateColumn.ActualWidth) 'Reordering assigned widths to the wrong columns.'
+                  Assert ($viewer.ScrollableWidth -eq 0 -and $viewer.ComputedHorizontalScrollBarVisibility -eq 'Collapsed') 'Reordering or growing the table introduced a horizontal scrollbar.'
+                  Measure-Window $d 120 180
+                  Assert ($viewer.ScrollableWidth -gt 0) 'Narrow windows crush columns instead of allowing horizontal scrolling.'
+                  Assert ($viewer.ComputedHorizontalScrollBarVisibility -eq 'Visible') 'Required horizontal scrolling was hidden in a narrow window.'
+                  Assert ($nameColumn.ActualWidth -ge 60 -and $stateColumn.ActualWidth -ge 60) 'A narrow window made a column unreadable.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'DataGrid pixel columns stretch while checkbox and hidden columns retain their roles' {
+              $d=Arrange-Window '<DataGrid Name="grid" AutoGenerateColumns="False"><DataGrid.Columns><DataGridCheckBoxColumn Header="Pick" Width="36" Binding="{Binding Pick}"/><DataGridTextColumn Header="Name" Width="180" Binding="{Binding Name}"/><DataGridTextColumn Header="State" Width="90" Binding="{Binding State}"/><DataGridTextColumn Header="Internal" Width="500" Visibility="Collapsed" Binding="{Binding Internal}"/></DataGrid.Columns></DataGrid>'
+              try {
+                  $grid=$d.FindName('grid')
+                  $grid.ItemsSource=@([pscustomobject]@{Pick=$true; Name='Example'; State='Ready'; Internal='Hidden'})
+                  Measure-Window $d 600 250
+                  $nameWidth=$grid.Columns[1].ActualWidth
+                  $stateWidth=$grid.Columns[2].ActualWidth
+                  Measure-Window $d 900 250
+                  Assert ($grid.Columns[1].ActualWidth -gt $nameWidth+100 -and $grid.Columns[2].ActualWidth -gt $stateWidth+50) 'DataGrid text columns did not grow.'
+                  Assert ($grid.Columns[0].ActualWidth -eq 36) 'The checkbox column expanded.'
+                  $total=($grid.Columns | Where-Object Visibility -eq 'Visible' | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ($total -ge 895 -and $total -le 900) 'The hidden column reserves space or visible columns do not fill the grid.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'GridView and DataGrid share automatic filling and preserve manual widths after viewport changes' {
+              foreach ($kind in @('GridView','DataGrid')) {
+                  $markup=if ($kind -eq 'GridView') {
+                      '<ListView Name="table"><ListView.View><GridView><GridViewColumn Header="Name" Width="180" DisplayMemberBinding="{Binding Name}"/><GridViewColumn Header="State" Width="90" DisplayMemberBinding="{Binding State}"/></GridView></ListView.View></ListView>'
+                  } else {
+                      '<DataGrid Name="table" AutoGenerateColumns="False"><DataGrid.Columns><DataGridTextColumn Header="Name" Width="180" Binding="{Binding Name}"/><DataGridTextColumn Header="State" Width="90" Binding="{Binding State}"/></DataGrid.Columns></DataGrid>'
+                  }
+                  $d=Arrange-Window $markup
+                  try {
+                      $table=$d.FindName('table')
+                      $table.ItemsSource=@(1..50 | ForEach-Object { [pscustomobject]@{Name="Item $_";State='Ready'} })
+                      $table.SelectedIndex=0
+                      $columns=if ($kind -eq 'GridView') { $table.View.Columns } else { $table.Columns }
+                      Measure-Window $d 600 250
+                      $vC=$columns[0]
+                      $oldWidth=$vC.ActualWidth
+                      $headerType=if ($kind -eq 'GridView') { [Windows.Controls.GridViewColumnHeader] } else { [Windows.Controls.Primitives.DataGridColumnHeader] }
+                      $part=if ($kind -eq 'GridView') { 'PART_HeaderGripper' } else { 'PART_RightHeaderGripper' }
+                      $header=@(Find-VisualsOfType $table $headerType | Where-Object { $_.Column -eq $vC })[0]
+                      $handle=$header.Template.FindName($part,$header)
+                      $handle.RaiseEvent([Windows.Controls.Primitives.DragStartedEventArgs]::new(0,0))
+                      $handle.RaiseEvent([Windows.Controls.Primitives.DragDeltaEventArgs]::new(750,0))
+                      $handle.RaiseEvent([Windows.Controls.Primitives.DragCompletedEventArgs]::new(750,0,$false))
+                      $manualWidth=$vC.ActualWidth
+                      Assert ($manualWidth -gt $oldWidth+700) "$kind constrains a dragged column to its window."
+                      foreach ($width in @(400,1600,600)) {
+                          Measure-Window $d $width 250
+                          $viewer=Get-WmtVisualDescendant -Element $table -DescendantType ([Windows.Controls.ScrollViewer])
+                          Assert ([Math]::Abs($vC.ActualWidth-$manualWidth) -lt 1) "$kind discards manual column widths when the viewport changes."
+                          if ($width -eq 1600) {
+                              $inset=if ($kind -eq 'GridView') { 6 } else { 0 }
+                              $total=($columns | Measure-Object -Property ActualWidth -Sum).Sum
+                              Assert ([Math]::Abs($total-($viewer.ViewportWidth-$inset)) -le 1 -and $viewer.ScrollableWidth -eq 0) "$kind does not fill spare space around manual widths."
+                          } else { Assert ($viewer.ScrollableWidth -gt 0) "$kind clips wide columns instead of allowing horizontal scrolling." }
+                      }
+                      # Native auto-sizing resets the manually chosen width.
+                      $vC.Width=if ($kind -eq 'GridView') { [double]::NaN } else { [Windows.Controls.DataGridLength]::Auto }
+                      Measure-Window $d 600 250
+                      $total=($columns | Measure-Object -Property ActualWidth -Sum).Sum
+                      $inset=if ($kind -eq 'GridView') { 6 } else { 0 }
+                      Assert ($vC.ActualWidth -lt $manualWidth-500 -and $viewer.ScrollableWidth -eq 0 -and [Math]::Abs($total-($viewer.ViewportWidth-$inset)) -le 1) "$kind cannot resume automatic filling after a column width reset."
+                      Assert ($table.SelectedIndex -eq 0 -and $table.Items.Count -eq 50) "$kind sizing changes rows or selection."
+                  } finally { $d.Close() }
+              }
+          }
+          Test-Case 'Shared sizing respects DataGrid width bounds, star ratios, and hidden columns' {
+              $d=Arrange-Window '<DataGrid Name="grid" AutoGenerateColumns="False"><DataGrid.Columns><DataGridTextColumn Header="ID" Width="100" MaxWidth="100" Binding="{Binding ID}"/><DataGridTextColumn Header="Name" Width="2*" Binding="{Binding Name}"/><DataGridTextColumn Header="State" Width="*" Binding="{Binding State}"/><DataGridTextColumn Header="Internal" Width="500" Visibility="Collapsed" Binding="{Binding Internal}"/></DataGrid.Columns></DataGrid>'
+              try {
+                  $grid=$d.FindName('grid')
+                  $grid.ItemsSource=@([pscustomobject]@{ID='1';Name='Example';State='Ready';Internal='Hidden'})
+                  Measure-Window $d 600 250
+                  $nameWidth=$grid.Columns[1].ActualWidth
+                  $stateWidth=$grid.Columns[2].ActualWidth
+                  Measure-Window $d 900 250
+                  $nameGrowth=$grid.Columns[1].ActualWidth-$nameWidth
+                  $stateGrowth=$grid.Columns[2].ActualWidth-$stateWidth
+                  Assert ($grid.Columns[0].ActualWidth -le 100 -and [Math]::Abs($nameGrowth-2*$stateGrowth) -le 3) 'Capped columns consume spare space or declared star ratios are lost.'
+                  $viewer=Get-WmtVisualDescendant -Element $grid -DescendantType ([Windows.Controls.ScrollViewer])
+                  $total=($grid.Columns | Where-Object Visibility -eq 'Visible' | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ([Math]::Abs($total-$viewer.ViewportWidth) -le 1 -and $viewer.ScrollableWidth -eq 0) 'Width limits or hidden columns leave unused viewport space.'
+                  $grid.Columns[3].Visibility='Visible'
+                  Measure-Window $d 1200 250
+                  $total=($grid.Columns | Measure-Object -Property ActualWidth -Sum).Sum
+                  Assert ([Math]::Abs($total-$viewer.ViewportWidth) -le 1) 'A newly visible column does not participate in shared sizing.'
+                  $grid.Columns[1].MinWidth=200
+                  $grid.Columns.RemoveAt(2)
+                  Measure-Window $d 500 250
+                  Assert ($grid.Columns[1].ActualWidth -ge 200) 'Narrowing the window ignores a declared column minimum.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Compact GridView selection columns keep their header readable' {
+              $d=Arrange-Window '<ListView Name="list"><ListView.View><GridView><GridViewColumn Header="Select" Width="36"/><GridViewColumn Header="Name" Width="180" DisplayMemberBinding="{Binding Name}"/></GridView></ListView.View></ListView>'
+              try {
+                  $list=$d.FindName('list')
+                  Measure-Window $d 600 250
+                  $header=@(Find-VisualsOfType $list ([Windows.Controls.GridViewColumnHeader]) | Where-Object { $_.Role -eq 'Normal' -and $_.Content -eq 'Select' })[0]
+                  $label=@(Find-TextBlocks $header)[0]
+                  $labelX=$label.TranslatePoint([Windows.Point]::new(0,0),$header).X
+                  Assert ($labelX+$label.ActualWidth -le $header.ActualWidth-$header.Padding.Right) 'The compact column clips the Select label.'
+                  $list.View.Columns[0].Header='Select ' + [char]0x25B2
+                  Measure-Window $d 600 250
+                  $label=@(Find-TextBlocks $header)[0]
+                  Assert ($labelX+$label.ActualWidth -le $header.ActualWidth-$header.Padding.Right) 'Sorting clips the compact column header.'
+                  $compactWidth=$list.View.Columns[0].Width
+                  Measure-Window $d 900 250
+                  Assert ($list.View.Columns[0].Width -eq $compactWidth -and $compactWidth -le 64) 'The selection column absorbs extra window width.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Responsive sizing accepts an ordinary Window owner and clears removed columns' {
+              $d=[Windows.Window]::new()
+              try {
+                  $list=[Windows.Controls.ListView]::new()
+                  $list.View=[Windows.Controls.GridView]::new()
+                  $column=[Windows.Controls.GridViewColumn]::new()
+                  $column.Header='Name'; $column.Width=180
+                  [void]$list.View.Columns.Add($column)
+                  $d.Content=$list
+                  Connect-WmtResponsiveColumns -Table $list -Owner $d
+                  Measure-Window $d 600 250
+                  $state=$list.Resources['__WmtResponsiveColumns']
+                  Assert ($state.Columns.Count -eq 1) 'The column was not connected.'
+                  $list.View.Columns.Clear()
+                  Measure-Window $d 600 250
+                  Assert ($state.Columns.Count -eq 0) 'Clearing columns retained their layout state.'
+                  $column.Width=[double]::NaN
+                  Assert ($null -eq $state.Operation) 'A removed column still queues width-reset work for its former table.'
+                  Request-WmtResponsiveColumnResize -Table $list
+                  $pending=$state.Operation
+                  $d.Close()
+                  Assert ($pending.Status -eq 'Aborted') 'An ordinary owner did not cancel pending sizing.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Closing a window cancels pending column sizing and ignores late column changes' {
+              $d=Arrange-Window '<ListView Name="list"><ListView.View><GridView><GridViewColumn Header="Name" Width="180"/></GridView></ListView.View></ListView>'
+              $list=$d.FindName('list')
+              $state=$list.Resources['__WmtResponsiveColumns']
+              $pending=$state.Operation
+              Assert ($pending.Status -eq 'Pending') 'There is no queued resize to test.'
+              $d.Close()
+              Assert ($pending.Status -eq 'Aborted' -and $null -eq $state.Operation) 'The closed window retained queued sizing.'
+              [void]$list.View.Columns.Add([Windows.Controls.GridViewColumn]::new())
+              Assert ($null -eq $state.Operation) 'A late column change queued work for the closed window.'
+          }
+          Test-Case 'Dynamically added and auto-generated DataGrids inherit responsive sizing' {
+              $d=Arrange-Window '<ContentControl Name="host"/>'
+              try {
+                  $grid=[Windows.Controls.DataGrid]::new()
+                  $d.FindName('host').Content=$grid
+                  Set-WmtDataGridColumns -DataGrid $grid -Columns @('Name','State') -Widths @{Name=180; State=90}
+                  $grid.ItemsSource=@([pscustomobject]@{Name='Example'; State='Ready'})
+                  Measure-Window $d 600 250
+                  $nameWidth=$grid.Columns[0].ActualWidth
+                  Measure-Window $d 900 250
+                  Assert ($grid.Columns[0].ActualWidth -gt $nameWidth+100) 'A dynamically added grid retained fixed columns.'
+                  $auto=Arrange-Window '<DataGrid Name="grid" AutoGenerateColumns="True"/>'
+                  try {
+                      $autoGrid=$auto.FindName('grid')
+                      $autoGrid.ItemsSource=@([pscustomobject]@{Name='Example'; State='Ready'})
+                      Measure-Window $auto 600 250
+                      $firstWidth=$autoGrid.Columns[0].ActualWidth
+                      Measure-Window $auto 900 250
+                      Assert ($autoGrid.Columns[0].ActualWidth -gt $firstWidth+100) 'Auto-generated columns do not resize.'
+                  } finally { $auto.Close() }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Grids populated before attachment register their owner when loaded' {
+              $d=Arrange-Window '<ContentControl Name="host"/>'
+              try {
+                  $grid=[Windows.Controls.DataGrid]::new()
+                  Set-WmtDataGridColumns -DataGrid $grid -Columns @('Name','State') -Widths @{Name=180; State=90}
+                  $d.FindName('host').Content=$grid
+                  $grid.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.FrameworkElement]::LoadedEvent,$grid))
+                  Measure-Window $d 600 250
+                  $state=$grid.Resources['__WmtResponsiveColumns']
+                  $d.Close()
+                  [void]$grid.Columns.Add([Windows.Controls.DataGridTextColumn]::new())
+                  Assert ($state.Closed -and $null -eq $state.Operation) 'A detached grid missed owner cleanup after attachment.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Provider completion uses the timer sender to refresh status and release its monitor' {
+              $tickRegistration = $ast.Find({ param($n)
+                  $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                  $n.Member.Value -eq 'Add_Tick' -and $n.Extent.Text -match 'Provider completion monitor failed:'
+              }, $true)
+              Assert ($null -ne $tickRegistration) 'Provider completion callback was not found.'
+              $callback = Invoke-Expression $tickRegistration.Arguments[0].Extent.Text
+              foreach ($exitCode in @(0, 1)) {
+                  $timer = [Windows.Threading.DispatcherTimer]::new()
+                  $timer.Interval = [TimeSpan]::FromHours(1)
+                  $tempScriptPath = [IO.Path]::GetTempFileName()
+                  $status = @{ Refreshed = $false }
+                  $monitors = @{}
+                  $monitor = [pscustomobject]@{
+                      Key = 'ProviderTest'; Process = [pscustomobject]@{ HasExited = $false; ExitCode = $exitCode }
+                      TempScriptPath = $tempScriptPath; ProviderName = 'Test provider'; Action = 'Install'
+                      Monitors = $monitors; UpdateStatuses = { $status.Refreshed = $true }.GetNewClosure()
+                  }
+                  $monitors[$monitor.Key] = $monitor
+                  $timer.Tag = $monitor
+                  $timer.Start()
+                  try {
+                      & $callback $timer ([EventArgs]::Empty)
+                      Assert ($timer.IsEnabled -and $monitors.ContainsKey($monitor.Key)) 'A running provider lost its completion monitor.'
+                      Assert ((Test-Path -LiteralPath $tempScriptPath) -and -not $status.Refreshed) 'A running provider was cleaned up early.'
+                      $monitor.Process.HasExited = $true
+                      & $callback $timer ([EventArgs]::Empty)
+                      Assert (-not $timer.IsEnabled) 'The completed provider timer was not stopped.'
+                      Assert (-not $monitors.ContainsKey($monitor.Key)) 'The completed provider monitor was retained.'
+                      Assert (-not (Test-Path -LiteralPath $tempScriptPath)) 'The completed provider script was retained.'
+                      Assert ($status.Refreshed) 'Provider status was not refreshed after completion.'
+                  }
+                  finally {
+                      $timer.Stop()
+                      Remove-Item -LiteralPath $tempScriptPath -Force -ErrorAction SilentlyContinue
+                  }
+              }
+          }
+          Test-Case 'Both provider option forms load in the common installer shell' {
+              foreach ($provider in @('Legendary','Gogdl')) {
+                  $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq "Show-Wmt${provider}InstallOptions"},$true)
+                  $assignment=$fn.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$contentXaml'},$true)
+                  Invoke-Expression $assignment.Extent.Text
+                  $d=New-WmtInstallerDialog -Title $provider -OptionsXaml $contentXaml
+                  try {
+                      Measure-Window $d 600 400
+                      foreach ($name in @('txtRoot','btnBrowse','cboWorkers','lstDlcs','lblMetadata','lblError','btnInstall','btnCancel','chkKeepOpen','chkDesktopShortcut','chkStartMenuShortcut')) {
+                          Assert ($null -ne $d.FindName($name)) "$provider is missing $name."
+                      }
+                      $dlcs=$d.FindName('lstDlcs'); [void]$dlcs.Items.Add('Selected DLC'); $dlcs.SelectedIndex=0
+                      Measure-Window $d 600 400
+                      $row=$dlcs.ItemContainerGenerator.ContainerFromIndex(0)
+                      Assert ($row.Foreground.Color -eq $d.Resources['AccentText'].Color) "$provider DLC text is unreadable."
+                  } finally { $d.Close() }
+              }
+          }
+          Test-Case 'Installer footer stays within a short narrow window while options scroll' {
+              $options = '<StackPanel><TextBlock Name="providerOption" Text="Provider options"/><Border Height="1500"/></StackPanel>'
+              $d = New-WmtInstallerDialog -Title 'Test installer' -Description 'Description' -OptionsXaml $options
+              try {
+                  Measure-Window $d 420 280
+                  $b = $d.FindName('btnInstall')
+                  $p = $b.TranslatePoint([Windows.Point]::new(0,0), $d.Content)
+                  Assert ($p.Y -ge 0 -and $p.Y + $b.ActualHeight -le 280) 'Install button is outside the window.'
+                  $scroll = $d.FindName('InstallerScroll')
+                  Assert ($scroll.ScrollableHeight -gt 0) 'Provider options do not scroll.'
+                  Assert ($null -ne $d.FindName('providerOption')) 'Provider option names are unavailable.'
+                  Assert ($null -ne $d.FindName('chkDesktopShortcut')) 'Common shortcut options are missing.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Footer wraps several long actions without clipping buttons' {
+              $d = Arrange-Window '<ContentControl Name="host"/>'
+              try {
+                  $d.Content.Content = New-WmtActionButtonPanel -Owner $d -Buttons @(
+                      @{ Name='first'; Content='First very long action' }, @{ Name='second'; Content='Second very long action' }, @{ Name='close'; Content='Close'; IsCancel=$true })
+                  Measure-Window $d 260 200
+                  foreach ($name in @('first','second','close')) {
+                      $b = $d.FindName($name); $p = $b.TranslatePoint([Windows.Point]::new(0,0), $d.Content)
+                      Assert ($p.X -ge 0 -and $p.X + $b.ActualWidth -le 260) "$name is clipped horizontally."
+                  }
+                  Assert ($d.FindName('second').TranslatePoint([Windows.Point]::new(0,0), $d.Content).Y -gt $d.FindName('first').TranslatePoint([Windows.Point]::new(0,0), $d.Content).Y) 'Actions did not wrap.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Long installer validation errors keep the install action visible' {
+              $d=New-WmtInstallerDialog -Title 'Validation' -OptionsXaml '<Border Height="1000"/>'
+              try {
+                  $d.FindName('lblError').Text=('Long validation error. ' * 150)
+                  Measure-Window $d 420 280
+                  $button=$d.FindName('btnInstall')
+                  $position=$button.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
+                  Assert ($position.Y -ge 0 -and $position.Y+$button.ActualHeight -le 280) 'Long validation text pushed actions outside the window.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Long worker errors keep the progress close button visible' {
+              $d=Arrange-Window '<ContentControl/>'
+              try {
+                  $p=New-WmtAsyncProgress -Owner $d
+                  $d.Content.Content=$p.View
+                  Set-WmtAsyncProgressState -Progress $p -State Failed -Message ('Long worker error. ' * 150)
+                  Measure-Window $d 420 160
+                  $position=$p.CancelButton.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
+                  Assert ($position.Y -ge 0 -and $position.Y+$p.CancelButton.ActualHeight -le 160) 'Long worker error pushed the close button outside the window.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Installer option labels wrap inside the narrow scroll viewport' {
+              $d=New-WmtInstallerDialog -Title 'Narrow installer' -OptionsXaml '<Border/>'
+              try {
+                  Measure-Window $d 420 280
+                  $scroll=$d.FindName('InstallerScroll')
+                  foreach ($name in @('chkKeepOpen','chkDesktopShortcut','chkStartMenuShortcut')) {
+                      foreach ($label in @(Find-TextBlocks $d.FindName($name))) {
+                          $position=$label.TranslatePoint([Windows.Point]::new(0,0),$scroll)
+                          Assert ($position.X+$label.ActualWidth -le $scroll.ActualWidth) "$name label extends outside the scroll viewport."
+                      }
+                  }
+              } finally { $d.Close() }
+          }
+          Test-Case 'Checkable menu actions show a visible indicator only when checked' {
+              $d=Arrange-Window '<ContentControl/>'
+              try {
+                  $menu=New-WmtContextMenu -Items @(@{Header='Toggle option'; IsCheckable=$true; IsChecked=$false})
+                  $item=$menu.Items[0]
+                  $d.Content.Content=$item
+                  Measure-Window $d
+                  [void]$item.ApplyTemplate()
+                  $mark=$item.Template.FindName('CheckMark',$item)
+                  Assert ($null -ne $mark) 'Checkable menu item has no check indicator.'
+                  Assert ($mark.Visibility -eq [Windows.Visibility]::Visible -and $mark.Opacity -eq 0) 'Unchecked item shows a check.'
+                  $item.IsChecked=$true
+                  Assert ($mark.Opacity -eq 1) 'Checked item has no visible check.'
+              } finally { $d.Close() }
+          }
+          Test-Case 'Path picker uses an existing ancestor and preserves text on cancellation' {
+              $d = Arrange-Window '<ContentControl/>'
+              try {
+                  $d.Content.Content = New-WmtPathPicker -Owner $d -TextBoxName 'path' -BrowseButtonName 'browse'
+                  $text = $d.FindName('path'); $button = $d.FindName('browse')
+                  $testPath = Join-Path $repoRoot 'Missing [game]\Deep\Folder'
+                  $text.Text = $testPath
+                  $script:PickedInitial = $null
+                  function global:Select-WmtExplorerFolder { param($Description, $InitialDirectory, $Owner) $script:PickedInitial = $InitialDirectory; return $null }
+                  $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($text.Text -eq $testPath) 'Cancelling changed the typed path.'
+                  Assert ($script:PickedInitial -eq $repoRoot) 'Picker did not find the nearest existing parent.'
+                  function global:Select-WmtExplorerFolder { param($Description, $InitialDirectory, $Owner) return 'C:\Games [new]' }
+                  $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                  Assert ($text.Text -eq 'C:\Games [new]') 'Accepted folder was not applied.'
+              } finally { Remove-Item Function:\global:Select-WmtExplorerFolder -ErrorAction SilentlyContinue; $d.Close() }
+          }
+          Test-Case 'Menu builder preserves distinct callbacks and button enablement' {
+              $state = @{ First=0; Second=0 }
+              $firstAction = { $state.First++ }.GetNewClosure()
+              $secondAction = { $state.Second++ }.GetNewClosure()
+              $menu = New-WmtContextMenu -Items @(@{Header='First'; Action=$firstAction}, @{Separator=$true}, @{Header='Second'; Action=$secondAction})
+              $menu.Items[0].RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.MenuItem]::ClickEvent))
+              $menu.Items[2].RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.MenuItem]::ClickEvent))
+              Assert ($state.First -eq 1 -and $state.Second -eq 1) 'Menu actions captured the wrong descriptor.'
+              $button = [Windows.Controls.Button]::new(); $button.Content = 'Action'; $button.IsEnabled = $false
+              $tab = @{ Grid=[Windows.Controls.DataGrid]::new() }
+              Add-GridContextMenu -TabObj $tab -Buttons @($button)
+              Assert (-not $tab.Grid.ContextMenu.Items[0].IsEnabled) 'Disabled action is enabled in the menu.'
+              $button.IsEnabled = $true
+              Assert ($tab.Grid.ContextMenu.Items[0].IsEnabled) 'Menu enablement did not follow the button.'
+          }
+          Test-Case 'Async progress completes real work and restores original control states' {
+              $enabled = [Windows.Controls.Button]::new(); $disabled = [Windows.Controls.Button]::new(); $disabled.IsEnabled=$false
+              $p = New-WmtAsyncProgress -BusyControls @($enabled,$disabled)
+              $state = @{Result=$null}
+              $callback = { param($r) $state.Result = $r[0] }.GetNewClosure()
+              $job = Invoke-WmtUiBackgroundCommand -Name 'ComponentSuccess' -Sb { 'worker result' } -Progress $p -OnComplete $callback
+              Assert (-not $enabled.IsEnabled) 'Busy controls were not disabled.'
+              Wait-Progress $p
+              Assert ($p.State -eq 'Succeeded' -and $state.Result -eq 'worker result') 'Completion/result was lost.'
+              Assert ($enabled.IsEnabled -and -not $disabled.IsEnabled) 'Original control enablement was not restored.'
+              Assert (-not $script:WmtUiBackgroundCommands.ContainsKey('ComponentSuccess')) 'Completed job was retained.'
+          }
+          Test-Case 'Async progress surfaces worker failure and removes its monitor' {
+              $p = New-WmtAsyncProgress
+              [void](Invoke-WmtUiBackgroundCommand -Name 'ComponentFailure' -Sb { Write-Error 'worker failed' } -Progress $p)
+              Wait-Progress $p
+              Assert ($p.State -eq 'Failed' -and $p.Status.Text -match 'worker failed') 'Worker error was presented as success.'
+              Assert (-not (Test-WmtUiPollOperation 'UiCommand:ComponentFailure')) 'Failed worker monitor was retained.'
+          }
+          Test-Case 'Async cancellation restores controls and unregisters the monitor' {
+              $b = [Windows.Controls.Button]::new(); $p = New-WmtAsyncProgress -BusyControls @($b)
+              [void](Invoke-WmtUiBackgroundCommand -Name 'ComponentCancel' -Sb { Start-Sleep -Seconds 30 } -Progress $p)
+              Stop-WmtUiBackgroundCommand -Name 'ComponentCancel'
+              Assert ($p.State -eq 'Cancelled' -and $b.IsEnabled) 'Cancellation did not finish progress.'
+              Assert (-not (Test-WmtUiPollOperation 'UiCommand:ComponentCancel')) 'Cancelled worker monitor was retained.'
+          }
+          Test-Case 'Async timeout reports failure and restores controls' {
+              $b = [Windows.Controls.Button]::new(); $p = New-WmtAsyncProgress -BusyControls @($b)
+              [void](Invoke-WmtUiBackgroundCommand -Name 'ComponentTimeout' -Sb { Start-Sleep -Seconds 30 } -TimeoutMs 60 -Progress $p)
+              Wait-Progress $p
+              Assert ($p.State -eq 'Failed' -and $p.Status.Text -match 'timed out' -and $b.IsEnabled) 'Timeout did not finalize progress.'
+          }
+          Test-Case 'Closing the owning window cancels the worker and restores controls' {
+              $d=Arrange-Window '<ContentControl/>'
+              $b=[Windows.Controls.Button]::new()
+              $p=New-WmtAsyncProgress -Owner $d -BusyControls @($b)
+              $d.Content.Content=$p.View
+              [void](Invoke-WmtUiBackgroundCommand -Name 'ComponentOwnerClose' -Sb { Start-Sleep -Seconds 30 } -Progress $p)
+              $d.Close()
+              Assert ($p.State -eq 'Cancelled' -and $b.IsEnabled) 'Closing the owner left a running worker.'
+              Assert (-not (Test-WmtUiPollOperation 'UiCommand:ComponentOwnerClose')) 'Owner closure retained the monitor.'
+          }
+          # Cancellation finalizes workers asynchronously. Let the real stop collectors
+          # release their PowerShell instances before stopping the shared dispatcher timer.
+          $cleanupWatch=[Diagnostics.Stopwatch]::StartNew()
+          while ($script:WmtUiPollOperations.Count -and $cleanupWatch.ElapsedMilliseconds -lt 5000) {
+              Invoke-WmtDispatcherPump
+              Start-Sleep -Milliseconds 20
+          }
+          Assert ($script:WmtUiPollOperations.Count -eq 0) 'Background cleanup monitors did not drain.'
+          Stop-WmtUiPoller
+          if ($failures.Count) { throw ($failures -join "`n") }
+          Write-Host 'All WPF component tests passed.'
+
       - name: Test Legendary library recovery
         shell: powershell
         run: |

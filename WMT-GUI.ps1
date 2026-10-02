@@ -282,7 +282,9 @@ param(
     [int]$TimeoutMs = 0,
     [scriptblock]$OnComplete,
     [scriptblock]$OnError,
-    [switch]$SuppressResultLog
+    [switch]$SuppressResultLog,
+    $Progress,
+    [switch]$ShowProgress
 )
 
 if (-not $script:WmtUiBackgroundCommands) { $script:WmtUiBackgroundCommands = @{} }
@@ -300,9 +302,20 @@ if ($jobTable.ContainsKey($Name)) {
     Write-GuiLog "Background operation '$Name' is already running."
     return $null
 }
+if ($Progress -and $Progress.State -eq 'Running') {
+    Write-GuiLog "This progress component already has a running operation."
+    return $null
+}
 
-$ps = New-WmtPooledPowerShell -PoolKind Background
+$ps = $null
+$async = $null
 try {
+    if ($ShowProgress -and -not $Progress) { $Progress = New-WmtAsyncProgressDialog -Title $Msg }
+    if ($Progress) {
+        $Progress.Name = $Name
+        Set-WmtAsyncProgressState -Progress $Progress -State Running -Message $Msg
+    }
+    $ps = New-WmtPooledPowerShell -PoolKind Background
     [void]$ps.AddScript($Sb.ToString())
     foreach ($arg in @($ArgumentList)) { [void]$ps.AddArgument($arg) }
     Write-GuiLog $Msg
@@ -314,6 +327,7 @@ try {
         OnComplete        = $OnComplete
         OnError           = $OnError
         SuppressResultLog = [bool]$SuppressResultLog
+        Progress          = $Progress
     }
     $jobTable[$Name] = $job
 
@@ -329,6 +343,7 @@ try {
         if (-not $current) { return }
         try {
             $results = @($current.PowerShell.EndInvoke($current.Async))
+            if ($current.PowerShell.HadErrors) { throw (($current.PowerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join "`n") }
             if (-not $current.SuppressResultLog) {
                 $wroteOutput = $false
                 foreach ($item in $results) {
@@ -345,9 +360,11 @@ try {
                 Write-GuiLog "Done."
             }
             if ($current.OnComplete) { & $current.OnComplete $results }
+            if ($current.Progress) { Set-WmtAsyncProgressState -Progress $current.Progress -State Succeeded -Message 'Done.' -Percent 100 }
         }
         catch {
             Write-GuiLog "ERROR: $($_.Exception.Message)"
+            if ($current.Progress) { Set-WmtAsyncProgressState -Progress $current.Progress -State Failed -Message $_.Exception.Message }
             if ($current.OnError) { try { & $current.OnError $_ } catch {} }
         }
         finally {
@@ -361,6 +378,7 @@ try {
         $current = $jobTable[$Name]
         if (-not $current) { return }
         Write-GuiLog "ERROR: Background operation '$Name' timed out."
+        if ($current.Progress) { Set-WmtAsyncProgressState -Progress $current.Progress -State Failed -Message "Background operation '$Name' timed out." }
         if ($current.OnError) { try { & $current.OnError ([System.TimeoutException]::new("Background operation '$Name' timed out.")) } catch {} }
         try {
             Stop-WmtPowerShellInvocationAsync -PowerShell $current.PowerShell -Invocation $current.Async -Name "Background operation '$Name'"
@@ -375,6 +393,7 @@ try {
         param($Operation, $ErrorRecord)
         $current = $jobTable[$Name]
         if ($current) {
+            if ($current.Progress) { Set-WmtAsyncProgressState -Progress $current.Progress -State Failed -Message ([string]$ErrorRecord) }
             try {
                 Stop-WmtPowerShellInvocationAsync -PowerShell $current.PowerShell -Invocation $current.Async -Name "Background operation '$Name'"
             }
@@ -390,9 +409,15 @@ try {
     return $job
 }
 catch {
-    try { $ps.Dispose() } catch {}
-    Write-GuiLog "ERROR: $($_.Exception.Message)"
-    if ($OnError) { try { & $OnError $_ } catch {} }
+    $startupError = $_
+    if ($async) {
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $ps -Invocation $async -Name "Background startup '$Name'" } catch { try { $ps.Dispose() } catch {} }
+    }
+    elseif ($ps) { try { $ps.Dispose() } catch {} }
+    [void]$jobTable.Remove($Name)
+    if ($Progress) { Set-WmtAsyncProgressState -Progress $Progress -State Failed -Message $startupError.Exception.Message }
+    Write-GuiLog "ERROR: $($startupError.Exception.Message)"
+    if ($OnError) { try { & $OnError $startupError } catch {} }
     return $null
 }
 }
@@ -3352,6 +3377,8 @@ $Element.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = $Element.
 $Element.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $Element.Resources["AccentText"]
 $Element.Resources[[System.Windows.SystemColors]::InactiveSelectionHighlightBrushKey] = $Element.Resources["Accent"]
 $Element.Resources[[System.Windows.SystemColors]::InactiveSelectionHighlightTextBrushKey] = $Element.Resources["AccentText"]
+# Native ScrollViewer corners must follow the panel rather than system chrome.
+$Element.Resources[[System.Windows.SystemColors]::ControlBrushKey] = $Element.Resources["BgPanel"]
 Add-WmtListSelectionResources -Element $Element
 }
 
@@ -3438,23 +3465,43 @@ try {
 catch {}
 }
 
-function Add-WmtWpfRuntimeResources {
-param([System.Windows.FrameworkElement]$Element)
-
-if (-not $Element) { return }
-try {
-    if ($Element.Resources.Contains("__WmtRuntimeResourcesApplied")) { return }
-    if ($Element.Resources.Contains("TransparentScrollRepeatButton")) {
-        $Element.Resources["__WmtRuntimeResourcesApplied"] = $true
-        return
-    }
-
-    [xml]$runtimeResourcesXaml = @'
+function Get-WmtWpfResourceXaml {
+# One embedded dictionary keeps direct launches and PS2EXE builds identical.
+[xml]$runtimeResourcesXaml = @'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 <Style TargetType="{x:Type TextBlock}">
     <!-- Inherit the containing control's foreground, including selected rows. -->
     <Setter Property="TextWrapping" Value="Wrap"/>
+</Style>
+
+<!-- Empty status text must not reserve a line or its margin. -->
+<Style x:Key="WmtOptionalTextStyle" TargetType="{x:Type TextBlock}" BasedOn="{StaticResource {x:Type TextBlock}}">
+    <Style.Triggers>
+        <Trigger Property="Text" Value=""><Setter Property="Visibility" Value="Collapsed"/></Trigger>
+    </Style.Triggers>
+</Style>
+
+<!-- Title/search content stays above status content, which always spans the card. -->
+<Style x:Key="WmtPageHeaderStyle" TargetType="{x:Type HeaderedContentControl}">
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    <Setter Property="VerticalContentAlignment" Value="Top"/>
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type HeaderedContentControl}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <ContentPresenter ContentSource="Header" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
+                    <ContentPresenter Grid.Row="1" ContentSource="Content" Margin="0,8,0,0"
+                                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                </Grid>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
 </Style>
 
 <Style TargetType="{x:Type Button}">
@@ -3509,12 +3556,13 @@ try {
     </Style.Triggers>
 </Style>
 
-<Style TargetType="{x:Type ComboBox}">
+<Style x:Key="WmtComboBoxStyle" TargetType="{x:Type ComboBox}">
+    <Setter Property="MinHeight" Value="32"/>
     <Setter Property="Background" Value="{DynamicResource BgDark}"/>
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
     <Setter Property="BorderThickness" Value="1"/>
-    <Setter Property="Padding" Value="10,0,8,0"/>
+    <Setter Property="Padding" Value="10,0,32,0"/>
     <Setter Property="VerticalContentAlignment" Value="Center"/>
     <Setter Property="SnapsToDevicePixels" Value="True"/>
     <!-- The default Aero ComboBox template paints the closed selection box
@@ -3530,7 +3578,7 @@ try {
                 <Grid x:Name="templateRoot" SnapsToDevicePixels="True">
                     <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="4">
                         <Grid>
-                            <ContentPresenter x:Name="contentPresenter" Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}" Margin="{TemplateBinding Padding}" HorizontalAlignment="Left" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" IsHitTestVisible="False"/>
+                            <ContentPresenter x:Name="contentPresenter" Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}" Margin="{TemplateBinding Padding}" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" TextElement.Foreground="{TemplateBinding Foreground}" IsHitTestVisible="False"/>
                             <TextBox x:Name="PART_EditableTextBox"
                                      Text="{Binding Text, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                      Background="Transparent" Foreground="{TemplateBinding Foreground}"
@@ -3595,6 +3643,7 @@ try {
         </Setter.Value>
     </Setter>
 </Style>
+<Style TargetType="{x:Type ComboBox}" BasedOn="{StaticResource WmtComboBoxStyle}"/>
 
 <!-- The default ComboBoxItem template paints SystemColors.Window (white) and
      generated items inherit the combo's light foreground - light-on-white,
@@ -3633,6 +3682,14 @@ try {
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Setter Property="VerticalAlignment" Value="Center"/>
 </Style>
+<Style x:Key="WmtWrappingCheckBoxStyle" TargetType="{x:Type CheckBox}" BasedOn="{StaticResource {x:Type CheckBox}}">
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    <Setter Property="ContentTemplate">
+        <Setter.Value>
+            <DataTemplate><TextBlock Text="{Binding}" TextWrapping="Wrap"/></DataTemplate>
+        </Setter.Value>
+    </Setter>
+</Style>
 
 <Style TargetType="{x:Type RadioButton}">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
@@ -3650,13 +3707,16 @@ try {
         <Setter.Value>
             <ControlTemplate TargetType="{x:Type MenuItem}">
                 <Border x:Name="Bd" Background="{TemplateBinding Background}" SnapsToDevicePixels="True">
-                    <ContentPresenter ContentSource="Header"
-                                      RecognizesAccessKey="True"
-                                      Margin="{TemplateBinding Padding}"
-                                      VerticalAlignment="Center"
-                                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
+                    <Grid Margin="{TemplateBinding Padding}">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                        <TextBlock x:Name="CheckMark" Text="&#x2713;" Width="18" Visibility="Collapsed" Opacity="0" VerticalAlignment="Center"/>
+                        <ContentPresenter Grid.Column="1" ContentSource="Header" RecognizesAccessKey="True"
+                                          VerticalAlignment="Center" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
+                    </Grid>
                 </Border>
                 <ControlTemplate.Triggers>
+                    <Trigger Property="IsCheckable" Value="True"><Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/></Trigger>
+                    <Trigger Property="IsChecked" Value="True"><Setter TargetName="CheckMark" Property="Opacity" Value="1"/></Trigger>
                     <Trigger Property="IsHighlighted" Value="True">
                         <Setter TargetName="Bd" Property="Background" Value="{DynamicResource BgHover}"/>
                     </Trigger>
@@ -3713,6 +3773,136 @@ try {
     <Setter Property="Background" Value="{DynamicResource BgDark}"/>
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type ListBox}">
+                <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+                    <ScrollViewer Focusable="False" CanContentScroll="True"
+                                  HorizontalScrollBarVisibility="{TemplateBinding ScrollViewer.HorizontalScrollBarVisibility}"
+                                  VerticalScrollBarVisibility="{TemplateBinding ScrollViewer.VerticalScrollBarVisibility}">
+                        <ItemsPresenter/>
+                    </ScrollViewer>
+                </Border>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
+</Style>
+
+<Style x:Key="WmtListViewItemStyle" TargetType="{x:Type ListViewItem}">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <!-- GridView already lays out cells within the declared column widths.
+         Extra horizontal row padding shifts the last cell past its header. -->
+    <Setter Property="Padding" Value="0,6"/>
+    <Setter Property="Margin" Value="2,1"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    <Setter Property="SnapsToDevicePixels" Value="True"/>
+    <Setter Property="UseLayoutRounding" Value="True"/>
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type ListViewItem}">
+                <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"
+                        BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+                    <Grid>
+                        <GridViewRowPresenter x:Name="GridRow" Content="{TemplateBinding Content}"
+                            Columns="{Binding View.Columns, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}"
+                            VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                        <ContentPresenter x:Name="PlainRow" Visibility="Collapsed"
+                            HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                            VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                    </Grid>
+                </Border>
+                <ControlTemplate.Triggers>
+                    <DataTrigger Binding="{Binding View, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}" Value="{x:Null}">
+                        <Setter TargetName="GridRow" Property="Visibility" Value="Collapsed"/>
+                        <Setter TargetName="PlainRow" Property="Visibility" Value="Visible"/>
+                    </DataTrigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+        <DataTrigger Binding="{Binding View, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}" Value="{x:Null}">
+            <Setter Property="Padding" Value="12,6"/>
+        </DataTrigger>
+        <Trigger Property="ItemsControl.AlternationIndex" Value="0"><Setter Property="Background" Value="{DynamicResource BgPanel}"/></Trigger>
+        <Trigger Property="ItemsControl.AlternationIndex" Value="1"><Setter Property="Background" Value="{DynamicResource BgDark}"/></Trigger>
+        <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="{DynamicResource BgHover}"/></Trigger>
+        <Trigger Property="IsSelected" Value="True">
+            <Setter Property="Background" Value="{DynamicResource Accent}"/>
+            <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
+        </Trigger>
+        <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.55"/></Trigger>
+    </Style.Triggers>
+</Style>
+<Style TargetType="{x:Type ListViewItem}" BasedOn="{StaticResource WmtListViewItemStyle}"/>
+<Style x:Key="WmtListViewStyle" TargetType="{x:Type ListView}">
+    <Setter Property="Background" Value="{DynamicResource BgDark}"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+    <Setter Property="Padding" Value="0"/>
+    <Setter Property="AlternationCount" Value="2"/>
+    <Setter Property="ItemContainerStyle" Value="{StaticResource WmtListViewItemStyle}"/>
+    <Setter Property="ScrollViewer.CanContentScroll" Value="True"/>
+    <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True"/>
+    <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
+</Style>
+<Style TargetType="{x:Type ListView}" BasedOn="{StaticResource WmtListViewStyle}"/>
+<!-- Both table types share column chrome; templates only supply native WPF parts. -->
+<Style x:Key="WmtColumnHeaderStyle" TargetType="{x:Type Control}">
+    <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextSecondary}"/>
+    <!-- GridViewRowPresenter supplies six pixels of horizontal cell spacing. -->
+    <Setter Property="Padding" Value="6,8"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="FontWeight" Value="Normal"/>
+    <Setter Property="HorizontalContentAlignment" Value="Left"/>
+    <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+            <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+        </Trigger>
+    </Style.Triggers>
+</Style>
+<Style x:Key="WmtColumnHeaderGripperStyle" TargetType="{x:Type Thumb}">
+    <Setter Property="Width" Value="5"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+    <Setter Property="Cursor" Value="SizeWE"/>
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type Thumb}">
+                <Border x:Name="HeaderSeparator" Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="0,0,0.5,0"
+                        Opacity="0.5" UseLayoutRounding="False" SnapsToDevicePixels="False"/>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
+</Style>
+<Style TargetType="{x:Type GridViewColumnHeader}" BasedOn="{StaticResource WmtColumnHeaderStyle}">
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type GridViewColumnHeader}">
+                <Grid>
+                    <Border x:Name="HeaderBorder" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                        <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+                    </Border>
+                    <Thumb x:Name="PART_HeaderGripper" HorizontalAlignment="Right" Style="{StaticResource WmtColumnHeaderGripperStyle}"/>
+                </Grid>
+                <ControlTemplate.Triggers>
+                    <!-- WPF adds a filler header after the real columns. It has
+                         no data column and must not look or act like one. -->
+                    <Trigger Property="Role" Value="Padding">
+                        <Setter TargetName="PART_HeaderGripper" Property="Visibility" Value="Collapsed"/>
+                        <Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>
+                        <Setter Property="IsHitTestVisible" Value="False"/>
+                    </Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
 </Style>
 
 <Style TargetType="{x:Type ProgressBar}">
@@ -3723,33 +3913,85 @@ try {
     <Setter Property="BorderThickness" Value="1"/>
 </Style>
 
-<Style TargetType="{x:Type DataGrid}">
+<Style x:Key="WmtDataGridStyle" TargetType="{x:Type DataGrid}">
     <Setter Property="Background" Value="{DynamicResource BgDark}"/>
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-    <Setter Property="GridLinesVisibility" Value="Horizontal"/>
-    <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource BorderBrush}"/>
-    <Setter Property="VerticalGridLinesBrush" Value="{DynamicResource BorderBrush}"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="GridLinesVisibility" Value="None"/>
+    <Setter Property="MinRowHeight" Value="30"/>
+    <Setter Property="SnapsToDevicePixels" Value="True"/>
+    <Setter Property="UseLayoutRounding" Value="True"/>
     <Setter Property="RowBackground" Value="{DynamicResource BgDark}"/>
     <Setter Property="AlternatingRowBackground" Value="{DynamicResource BgPanel}"/>
     <Setter Property="HeadersVisibility" Value="Column"/>
     <Setter Property="SelectionMode" Value="Extended"/>
     <Setter Property="SelectionUnit" Value="FullRow"/>
     <Setter Property="AutoGenerateColumns" Value="False"/>
+    <Setter Property="ColumnWidth" Value="*"/>
+    <Setter Property="CanUserAddRows" Value="False"/>
+    <Setter Property="CanUserDeleteRows" Value="False"/>
+    <Setter Property="ClipboardCopyMode" Value="IncludeHeader"/>
+    <Setter Property="AlternationCount" Value="2"/>
 </Style>
+<Style TargetType="{x:Type DataGrid}" BasedOn="{StaticResource WmtDataGridStyle}"/>
 
-<Style TargetType="{x:Type DataGridColumnHeader}">
-    <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
-    <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-    <Setter Property="BorderThickness" Value="0,0,1,1"/>
-    <Setter Property="Padding" Value="8,6"/>
-    <Setter Property="FontWeight" Value="SemiBold"/>
+<Style TargetType="{x:Type DataGridColumnHeader}" BasedOn="{StaticResource WmtColumnHeaderStyle}">
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type DataGridColumnHeader}">
+                <Grid>
+                    <Border x:Name="HeaderBorder" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+                            <Path x:Name="SortIndicator" Grid.Column="1" Width="8" Height="4" Margin="6,0,0,0"
+                                  VerticalAlignment="Center" Fill="{DynamicResource TextSecondary}" Visibility="Collapsed"/>
+                        </Grid>
+                    </Border>
+                    <Thumb x:Name="PART_LeftHeaderGripper" HorizontalAlignment="Left" BorderBrush="Transparent" Style="{StaticResource WmtColumnHeaderGripperStyle}"/>
+                    <Thumb x:Name="PART_RightHeaderGripper" HorizontalAlignment="Right" Style="{StaticResource WmtColumnHeaderGripperStyle}"/>
+                </Grid>
+                <ControlTemplate.Triggers>
+                    <Trigger Property="SortDirection" Value="Ascending">
+                        <Setter TargetName="SortIndicator" Property="Visibility" Value="Visible"/>
+                        <Setter TargetName="SortIndicator" Property="Data" Value="M0,4 L4,0 L8,4 Z"/>
+                    </Trigger>
+                    <Trigger Property="SortDirection" Value="Descending">
+                        <Setter TargetName="SortIndicator" Property="Visibility" Value="Visible"/>
+                        <Setter TargetName="SortIndicator" Property="Data" Value="M0,0 L8,0 L4,4 Z"/>
+                    </Trigger>
+                    <!-- Column is assigned after template creation and does not
+                         notify bindings; identify WPF's filler by its part name. -->
+                    <Trigger Property="Name" Value="PART_FillerColumnHeader">
+                        <Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>
+                        <Setter TargetName="PART_LeftHeaderGripper" Property="Visibility" Value="Collapsed"/>
+                        <Setter TargetName="PART_RightHeaderGripper" Property="Visibility" Value="Collapsed"/>
+                        <Setter Property="IsHitTestVisible" Value="False"/>
+                    </Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
 </Style>
 
 <Style TargetType="{x:Type DataGridCell}">
+    <Setter Property="Background" Value="Transparent"/>
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Padding" Value="6,6"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type DataGridCell}">
+                <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+                    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                </Border>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
     <Style.Triggers>
         <Trigger Property="IsSelected" Value="True">
             <Setter Property="Background" Value="{DynamicResource Accent}"/>
@@ -3761,6 +4003,7 @@ try {
 <Style TargetType="{x:Type DataGridRow}">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
     <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="{DynamicResource BgHover}"/></Trigger>
         <Trigger Property="IsSelected" Value="True">
             <Setter Property="Background" Value="{DynamicResource Accent}"/>
             <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
@@ -3781,9 +4024,9 @@ try {
     </Setter>
 </Style>
 
-<Style TargetType="{x:Type ScrollBar}">
-    <Setter Property="Width" Value="10"/>
-    <Setter Property="MinWidth" Value="10"/>
+<Style x:Key="WmtScrollBarStyle" TargetType="{x:Type ScrollBar}">
+    <Setter Property="Width" Value="12"/>
+    <Setter Property="MinWidth" Value="12"/>
     <Setter Property="Background" Value="Transparent"/>
     <Setter Property="Template">
         <Setter.Value>
@@ -3794,10 +4037,10 @@ try {
                             <RepeatButton x:Name="PageDecreaseButton" Command="{x:Static ScrollBar.PageUpCommand}" Style="{StaticResource TransparentScrollRepeatButton}"/>
                         </Track.DecreaseRepeatButton>
                         <Track.Thumb>
-                            <Thumb x:Name="ScrollThumb" MinHeight="34" Background="{DynamicResource BorderBrush}">
+                            <Thumb x:Name="ScrollThumb" MinHeight="28" Background="{DynamicResource TextMuted}">
                                 <Thumb.Template>
                                     <ControlTemplate TargetType="{x:Type Thumb}">
-                                        <Border Background="{TemplateBinding Background}" CornerRadius="5" Margin="2"/>
+                                        <Border Background="{TemplateBinding Background}" CornerRadius="4" Margin="2"/>
                                     </ControlTemplate>
                                 </Thumb.Template>
                             </Thumb>
@@ -3811,10 +4054,10 @@ try {
                     <Trigger Property="Orientation" Value="Horizontal">
                         <Setter Property="Width" Value="Auto"/>
                         <Setter Property="MinWidth" Value="0"/>
-                        <Setter Property="Height" Value="10"/>
-                        <Setter Property="MinHeight" Value="10"/>
+                        <Setter Property="Height" Value="12"/>
+                        <Setter Property="MinHeight" Value="12"/>
                         <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False"/>
-                        <Setter TargetName="ScrollThumb" Property="MinWidth" Value="34"/>
+                        <Setter TargetName="ScrollThumb" Property="MinWidth" Value="28"/>
                         <Setter TargetName="ScrollThumb" Property="MinHeight" Value="0"/>
                         <Setter TargetName="PageDecreaseButton" Property="Command" Value="{x:Static ScrollBar.PageLeftCommand}"/>
                         <Setter TargetName="PageIncreaseButton" Property="Command" Value="{x:Static ScrollBar.PageRightCommand}"/>
@@ -3833,6 +4076,7 @@ try {
         </Setter.Value>
     </Setter>
 </Style>
+<Style TargetType="{x:Type ScrollBar}" BasedOn="{StaticResource WmtScrollBarStyle}"/>
 
 <Style x:Key="ModernSearchBoxStyle" TargetType="Border">
     <Setter Property="Background" Value="{DynamicResource BgDark}"/>
@@ -3877,17 +4121,18 @@ try {
 </Style>
 </ResourceDictionary>
 '@
-    $reader = [System.Xml.XmlNodeReader]::new($runtimeResourcesXaml)
-    $runtimeResources = [Windows.Markup.XamlReader]::Load($reader)
-    [void]$Element.Resources.MergedDictionaries.Add($runtimeResources)
-    $Element.Resources["__WmtRuntimeResourcesApplied"] = $true
-}
-catch {}
+return ,$runtimeResourcesXaml
 }
 
-function Add-WmtWpfScrollResources {
+function Add-WmtWpfRuntimeResources {
 param([System.Windows.FrameworkElement]$Element)
-Add-WmtWpfRuntimeResources -Element $Element
+if (-not $Element -or $Element.Resources.Contains("__WmtRuntimeResourcesApplied")) { return }
+    $runtimeResourcesXaml = Get-WmtWpfResourceXaml
+    $reader = [System.Xml.XmlNodeReader]::new($runtimeResourcesXaml)
+    try { $runtimeResources = [Windows.Markup.XamlReader]::Load($reader) }
+    finally { $reader.Close() }
+    [void]$Element.Resources.MergedDictionaries.Add($runtimeResources)
+    $Element.Resources["__WmtRuntimeResourcesApplied"] = $true
 }
 
 function Add-WmtThemeResources {
@@ -4032,11 +4277,231 @@ $ContentXaml
 </Window>
 "@
 
-$reader = [System.Xml.XmlNodeReader]::new($windowXaml)
-$dialog = [Windows.Markup.XamlReader]::Load($reader)
-Add-WmtThemeResources -Element $dialog
-if (-not $NoOwner) { Set-WmtWindowOwner -Child $dialog }
-return $dialog
+return New-WmtWindowFromFullXaml -Xaml $windowXaml -NoOwner:$NoOwner
+}
+
+function Get-WmtColumnMinimumWidth {
+param([System.Windows.Controls.Control]$Table, [object]$Header, [switch]$Compact)
+
+$text = if ($Header -is [System.Windows.Controls.ContentControl]) { [string]$Header.Content } else { [string]$Header }
+$text = [regex]::Replace($text, '\s+[\u25B2\u25BC]$', '')
+$typeface = [System.Windows.Media.Typeface]::new($Table.FontFamily, $Table.FontStyle, $Table.FontWeight, $Table.FontStretch)
+$formatted = [System.Windows.Media.FormattedText]::new($text, [Globalization.CultureInfo]::CurrentCulture,
+    $Table.FlowDirection, $typeface, $Table.FontSize, [System.Windows.Media.Brushes]::Black)
+# Reserve cell spacing and sorting, without the text-column floor for selectors.
+$spacing = 28.0
+$minimum = if ($Compact) { 0.0 } else { 64.0 }
+return [Math]::Max($minimum, [Math]::Ceiling($formatted.WidthIncludingTrailingWhitespace + $spacing))
+}
+
+function Set-WmtResponsiveColumnWidths {
+param([System.Windows.Controls.Control]$Table)
+
+if (-not $Table -or $Table.ActualWidth -le 0) { return }
+$state = $Table.Resources['__WmtResponsiveColumns']
+if (-not $state) { return }
+$isDataGrid = $Table -is [System.Windows.Controls.DataGrid]
+if (-not $isDataGrid -and -not ($Table.View -is [System.Windows.Controls.GridView])) { return }
+$columns = if ($isDataGrid) { ,$Table.Columns } else { ,$Table.View.Columns }
+foreach ($vC in @($state.Columns.Keys)) {
+    if (-not $columns.Contains($vC)) { $state.Columns.Remove($vC) }
+}
+if ($columns.Count -eq 0) { return }
+if (-not $state.Viewer) {
+    $state.Viewer = Get-WmtVisualDescendant -Element $Table -DescendantType ([System.Windows.Controls.ScrollViewer])
+}
+$viewer = $state.Viewer
+if (-not $viewer -or $viewer.ViewportWidth -le 0) { return }
+$inset = 0.0
+if (-not $isDataGrid) {
+    $header = Get-WmtVisualDescendant -Element $Table -DescendantType ([System.Windows.Controls.GridViewHeaderRowPresenter])
+    # GridView presenters add two pixels beyond the declared columns.
+    $inset = 2.0 + $(if ($header) { $header.Margin.Left + $header.Margin.Right } else { 4.0 })
+}
+$available = [Math]::Max(0.0, [Math]::Floor($viewer.ViewportWidth - $inset))
+$total = 0.0
+$elastic = [System.Collections.Generic.List[object]]::new()
+foreach ($vC in $columns) {
+    if ($isDataGrid -and $vC.Visibility -ne [System.Windows.Visibility]::Visible) { continue }
+    $auto = if ($isDataGrid) { -not $vC.Width.IsAbsolute } else { [double]::IsNaN($vC.Width) }
+    $current = if ($isDataGrid) { $vC.Width.Value } else { $vC.Width }
+    if (-not $state.Columns.ContainsKey($vC)) {
+        $initial = if ($auto) { [Math]::Max(140.0, $vC.ActualWidth) } else { $current }
+        $fixed = -not $auto -and $initial -le 48
+        $minimum = if ($fixed) {
+            if ($isDataGrid -or $initial -eq 0) { $initial } else { [Math]::Max($initial, (Get-WmtColumnMinimumWidth -Table $Table -Header $vC.Header -Compact)) }
+        } else { Get-WmtColumnMinimumWidth -Table $Table -Header $vC.Header }
+        $weight = if ($isDataGrid -and $vC.Width.IsStar) { $vC.Width.Value * 100.0 } else { [Math]::Max(1.0, $initial - $minimum) }
+        $state.Columns[$vC] = @{
+            Minimum = $minimum; Fixed = $fixed
+            Weight = $weight; LastWidth = $null; ManualWidth = $null
+        }
+    }
+    $spec = $state.Columns[$vC]
+    $maximum = if ($isDataGrid) { $vC.MaxWidth } else { [double]::PositiveInfinity }
+    $nativeMinimum = if ($isDataGrid) { $vC.MinWidth } else { 0.0 }
+    $minimum = if ($spec.Fixed) { $spec.Minimum } else { Get-WmtColumnMinimumWidth -Table $Table -Header $vC.Header }
+    $spec.Maximum = $maximum
+    $spec.Minimum = [Math]::Min($maximum, [Math]::Max($nativeMinimum, $minimum))
+    # Native pixel widths permit drags beyond the viewport. Detect changes from
+    # our last allocation so manually resized columns survive window resizing.
+    if ($auto) {
+        $spec.ManualWidth = $null
+    } elseif ($null -ne $spec.LastWidth -and [Math]::Abs($current - $spec.LastWidth) -gt 0.1) {
+        $spec.ManualWidth = $current
+    }
+    $spec.AllocatedWidth = if ($null -ne $spec.ManualWidth) {
+        [Math]::Min($maximum, [Math]::Max($nativeMinimum, $spec.ManualWidth))
+    } else { $spec.Minimum }
+    $total += $spec.AllocatedWidth
+    if (-not $spec.Fixed -and $null -eq $spec.ManualWidth -and $spec.AllocatedWidth -lt $maximum) { $elastic.Add($vC) }
+}
+$remaining = [Math]::Max(0.0, $available - $total)
+while ($remaining -ge 1 -and $elastic.Count -gt 0) {
+    $weightTotal = 0.0
+    foreach ($vC in $elastic) { $weightTotal += $state.Columns[$vC].Weight }
+    $allocated = 0.0
+    foreach ($vC in @($elastic)) {
+        $spec = $state.Columns[$vC]
+        $share = [Math]::Min($spec.Maximum - $spec.AllocatedWidth, [Math]::Floor($remaining * $spec.Weight / $weightTotal))
+        $spec.AllocatedWidth += $share
+        $allocated += $share
+        if ($spec.AllocatedWidth -ge $spec.Maximum) { [void]$elastic.Remove($vC) }
+    }
+    $remaining -= $allocated
+    if ($allocated -lt 1 -and $elastic.Count -gt 0) {
+        # Assign rounding remainder to real columns instead of a blank filler.
+        $vC = $elastic[$elastic.Count - 1]
+        $spec = $state.Columns[$vC]
+        $share = [Math]::Min($remaining, $spec.Maximum - $spec.AllocatedWidth)
+        $spec.AllocatedWidth += $share
+        $remaining -= $share
+        [void]$elastic.Remove($vC)
+    }
+}
+foreach ($vC in $columns) {
+    if ($isDataGrid -and $vC.Visibility -ne [System.Windows.Visibility]::Visible) { continue }
+    $spec = $state.Columns[$vC]
+    $width = $spec.AllocatedWidth
+    $spec.LastWidth = $width
+    if ($isDataGrid) {
+        if (-not $vC.Width.IsAbsolute -or [Math]::Abs($vC.Width.Value - $width) -gt 0.1) {
+            $vC.Width = [System.Windows.Controls.DataGridLength]::new($width)
+        }
+    } elseif ([double]::IsNaN($vC.Width) -or [Math]::Abs($vC.Width - $width) -gt 0.1) { $vC.Width = $width }
+}
+}
+
+function Request-WmtResponsiveColumnResize {
+param([System.Windows.Controls.Control]$Table)
+
+$state = $Table.Resources['__WmtResponsiveColumns']
+if (-not $state -or $state.Closed -or $state.Operation) { return }
+# Coalesce table, column, and viewport notifications after layout has settled.
+$state.Operation = $Table.Dispatcher.BeginInvoke([Action]{
+    $state.Operation = $null
+    Set-WmtResponsiveColumnWidths -Table $Table
+}.GetNewClosure(), [System.Windows.Threading.DispatcherPriority]::Loaded)
+}
+
+function Connect-WmtColumnWidthResets {
+param([System.Windows.Controls.Control]$Table)
+
+$state = $Table.Resources['__WmtResponsiveColumns']
+if (-not $state -or $state.Closed) { return }
+$isDataGrid = $Table -is [System.Windows.Controls.DataGrid]
+$columns = if ($isDataGrid) { ,$Table.Columns } else { ,$Table.View.Columns }
+foreach ($vC in @($state.WidthResetHandlers.Keys)) {
+    if (-not $columns.Contains($vC)) {
+        $watch = $state.WidthResetHandlers[$vC]
+        $watch.Descriptor.RemoveValueChanged($vC, $watch.Handler)
+        $state.WidthResetHandlers.Remove($vC)
+    }
+}
+$widthProperty = if ($isDataGrid) { [System.Windows.Controls.DataGridColumn]::WidthProperty } else { [System.Windows.Controls.GridViewColumn]::WidthProperty }
+$columnType = if ($isDataGrid) { [System.Windows.Controls.DataGridColumn] } else { [System.Windows.Controls.GridViewColumn] }
+$descriptor = [System.ComponentModel.DependencyPropertyDescriptor]::FromProperty($widthProperty, $columnType)
+foreach ($vC in $columns) {
+    if ($state.WidthResetHandlers.ContainsKey($vC)) { continue }
+    $handler = [System.EventHandler]{
+        param($s)
+        $auto = if ($s -is [System.Windows.Controls.DataGridColumn]) { -not $s.Width.IsAbsolute } else { [double]::IsNaN($s.Width) }
+        # Header auto-sizing must resume filling without a window resize.
+        # Our pixel allocations do not queue another sizing operation.
+        if ($auto) { Request-WmtResponsiveColumnResize -Table $Table }
+    }.GetNewClosure()
+    $descriptor.AddValueChanged($vC, $handler)
+    $state.WidthResetHandlers[$vC] = @{ Descriptor = $descriptor; Handler = $handler }
+}
+}
+
+function Connect-WmtResponsiveColumns {
+param([System.Windows.Controls.Control]$Table, [System.Windows.Window]$Owner)
+
+if (-not ($Table -is [System.Windows.Controls.DataGrid]) -and
+    -not ($Table -is [System.Windows.Controls.ListView] -and $Table.View -is [System.Windows.Controls.GridView])) { return }
+if ($Owner -and -not $Owner.Resources.Contains('__WmtResponsiveTables')) {
+    $Owner.Resources['__WmtResponsiveTables'] = [System.Collections.ArrayList]::new()
+    $Owner.Add_Closed({
+        foreach ($table in $Owner.Resources['__WmtResponsiveTables']) {
+            $state = $table.Resources['__WmtResponsiveColumns']
+            $state.Closed = $true
+            if ($state.Operation) { [void]$state.Operation.Abort(); $state.Operation = $null }
+            foreach ($vC in @($state.WidthResetHandlers.Keys)) {
+                $watch = $state.WidthResetHandlers[$vC]
+                $watch.Descriptor.RemoveValueChanged($vC, $watch.Handler)
+            }
+            $state.WidthResetHandlers.Clear()
+        }
+    }.GetNewClosure())
+}
+if ($Table.Resources.Contains('__WmtResponsiveColumns')) {
+    if ($Owner -and -not $Owner.Resources['__WmtResponsiveTables'].Contains($Table)) {
+        [void]$Owner.Resources['__WmtResponsiveTables'].Add($Table)
+    }
+    return
+}
+$state = @{ Columns = @{}; WidthResetHandlers = @{}; Viewer = $null; Operation = $null; Closed = $false }
+$Table.Resources['__WmtResponsiveColumns'] = $state
+if ($Owner) { [void]$Owner.Resources['__WmtResponsiveTables'].Add($Table) }
+$Table.Add_SizeChanged({
+    param($s, $eA)
+    if ($eA.WidthChanged) { Request-WmtResponsiveColumnResize -Table $s }
+}.GetNewClosure())
+$Table.Add_Loaded({
+    # A grid may be populated while detached, then inserted into a loaded window.
+    Connect-WmtResponsiveColumns -Table $Table -Owner ([System.Windows.Window]::GetWindow($Table))
+    Request-WmtResponsiveColumnResize -Table $Table
+}.GetNewClosure())
+$Table.Add_Unloaded({
+    if ($state.Operation) { [void]$state.Operation.Abort(); $state.Operation = $null }
+}.GetNewClosure())
+$Table.AddHandler([System.Windows.Controls.ScrollViewer]::ScrollChangedEvent,
+    [System.Windows.Controls.ScrollChangedEventHandler]{
+        param($s, $eA)
+        if ($eA.ViewportWidthChange -ne 0) { Request-WmtResponsiveColumnResize -Table $s }
+    }.GetNewClosure())
+$columns = if ($Table -is [System.Windows.Controls.DataGrid]) { ,$Table.Columns } else { ,$Table.View.Columns }
+([System.Collections.Specialized.INotifyCollectionChanged]$columns).Add_CollectionChanged({
+    Connect-WmtColumnWidthResets -Table $Table
+    Request-WmtResponsiveColumnResize -Table $Table
+}.GetNewClosure())
+Connect-WmtColumnWidthResets -Table $Table
+Request-WmtResponsiveColumnResize -Table $Table
+}
+
+function Connect-WmtResponsiveTables {
+param([System.Windows.DependencyObject]$Element, [System.Windows.Window]$Owner)
+
+if ($Element -is [System.Windows.Window] -and -not $Owner) {
+    $Owner = $Element
+    # Also cover controls constructed between window creation and its first load.
+    $Owner.Add_Loaded({ Connect-WmtResponsiveTables -Element $Owner -Owner $Owner }.GetNewClosure())
+}
+if ($Element -is [System.Windows.Controls.Control]) { Connect-WmtResponsiveColumns -Table $Element -Owner $Owner }
+foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($Element)) {
+    if ($child -is [System.Windows.DependencyObject]) { Connect-WmtResponsiveTables -Element $child -Owner $Owner }
+}
 }
 
 function New-WmtWindowFromFullXaml {
@@ -4045,12 +4510,315 @@ param(
     [switch]$NoOwner
 )
 
-$xamlDoc = if ($Xaml -is [System.Xml.XmlDocument]) { $Xaml } else { [xml]([string]$Xaml) }
+$xamlDoc = if ($Xaml -is [System.Xml.XmlDocument]) { $Xaml.Clone() } else { [xml]([string]$Xaml) }
+# Merge before Load: StaticResource references in the window must be resolvable
+# during construction, including styles based on shared control styles.
+$ns = 'http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+$root = $xamlDoc.DocumentElement
+$resources = $root.SelectSingleNode("*[local-name()='Window.Resources']")
+if (-not $resources) {
+    $resources = $xamlDoc.CreateElement('Window.Resources', $ns)
+    [void]$root.PrependChild($resources)
+}
+$dictionary = $resources.SelectSingleNode("*[local-name()='ResourceDictionary']")
+if (-not $dictionary) {
+    $dictionary = $xamlDoc.CreateElement('ResourceDictionary', $ns)
+    foreach ($node in @($resources.ChildNodes)) { [void]$dictionary.AppendChild($node) }
+    [void]$resources.AppendChild($dictionary)
+}
+$merged = $dictionary.SelectSingleNode("*[local-name()='ResourceDictionary.MergedDictionaries']")
+if (-not $merged) {
+    $merged = $xamlDoc.CreateElement('ResourceDictionary.MergedDictionaries', $ns)
+    [void]$dictionary.PrependChild($merged)
+}
+$shared = Get-WmtWpfResourceXaml
+[void]$merged.PrependChild($xamlDoc.ImportNode($shared.DocumentElement, $true))
 $reader = [System.Xml.XmlNodeReader]::new($xamlDoc)
-$dialog = [Windows.Markup.XamlReader]::Load($reader)
+try { $dialog = [Windows.Markup.XamlReader]::Load($reader) }
+finally { $reader.Close() }
+$dialog.Resources['__WmtRuntimeResourcesApplied'] = $true
 Add-WmtThemeResources -Element $dialog
+Connect-WmtResponsiveTables -Element $dialog
 if (-not $NoOwner) { Set-WmtWindowOwner -Child $dialog }
 return $dialog
+}
+
+function Connect-WmtPathPicker {
+param(
+    [Parameter(Mandatory = $true)][System.Windows.Controls.TextBox]$TextBox,
+    [Parameter(Mandatory = $true)][System.Windows.Controls.Button]$BrowseButton,
+    [string]$Description = 'Select folder',
+    [System.Windows.Window]$Owner
+)
+$BrowseButton.Add_Click({
+    $initial = ([string]$TextBox.Text).Trim()
+    # A destination may not exist yet. Walk to its nearest existing ancestor,
+    # using literal paths so brackets and other wildcard characters are safe.
+    while (-not [string]::IsNullOrWhiteSpace($initial) -and -not (Test-Path -LiteralPath $initial -PathType Container)) {
+        try { $parent = [System.IO.Path]::GetDirectoryName($initial) } catch { $parent = '' }
+        if ($parent -eq $initial) { break }
+        $initial = $parent
+    }
+    if ([string]::IsNullOrWhiteSpace($initial)) { $initial = $env:USERPROFILE }
+    $pickerOwner = if ($Owner) { $Owner } else { [System.Windows.Window]::GetWindow($TextBox) }
+    $selected = Select-WmtExplorerFolder -Description $Description -InitialDirectory $initial -Owner $pickerOwner
+    if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $TextBox.Text = [string]$selected }
+}.GetNewClosure())
+}
+
+function New-WmtPathPicker {
+param(
+    [System.Windows.Window]$Owner,
+    [string]$TextBoxName = '',
+    [string]$BrowseButtonName = '',
+    [string]$Label = '',
+    [string]$Description = 'Select folder',
+    [string]$InitialPath = '',
+    [double]$LabelWidth = 150
+)
+$grid = [System.Windows.Controls.Grid]::new()
+$fieldColumn = [System.Windows.Controls.ColumnDefinition]::new()
+$fieldColumn.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+if ($Label) {
+    $labelColumn = [System.Windows.Controls.ColumnDefinition]::new()
+    $labelColumn.Width = [System.Windows.GridLength]::new($LabelWidth)
+    [void]$grid.ColumnDefinitions.Add($labelColumn)
+    $caption = [System.Windows.Controls.TextBlock]::new()
+    $caption.Text = $Label
+    $caption.TextWrapping = 'Wrap'
+    $caption.VerticalAlignment = 'Center'
+    $caption.Margin = '0,0,8,0'
+    $caption.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, 'TextSecondary')
+    [void]$grid.Children.Add($caption)
+}
+[void]$grid.ColumnDefinitions.Add($fieldColumn)
+$browseColumn = [System.Windows.Controls.ColumnDefinition]::new()
+$browseColumn.Width = [System.Windows.GridLength]::Auto
+[void]$grid.ColumnDefinitions.Add($browseColumn)
+$text = [System.Windows.Controls.TextBox]::new()
+$text.Text = $InitialPath
+$text.MinHeight = 34
+$text.VerticalContentAlignment = 'Center'
+$text.Margin = '0,0,8,0'
+$text.ToolTip = $Description
+[System.Windows.Controls.Grid]::SetColumn($text, $grid.ColumnDefinitions.Count - 2)
+[void]$grid.Children.Add($text)
+$browse = [System.Windows.Controls.Button]::new()
+$browse.Content = 'Browse...'
+$browse.MinWidth = 92
+[System.Windows.Controls.Grid]::SetColumn($browse, $grid.ColumnDefinitions.Count - 1)
+[void]$grid.Children.Add($browse)
+if ($TextBoxName) { $text.Name = $TextBoxName; if ($Owner) { $Owner.RegisterName($TextBoxName, $text) } }
+if ($BrowseButtonName) { $browse.Name = $BrowseButtonName; if ($Owner) { $Owner.RegisterName($BrowseButtonName, $browse) } }
+Connect-WmtPathPicker -TextBox $text -BrowseButton $browse -Description $Description -Owner $Owner
+return $grid
+}
+
+function New-WmtActionButtonPanel {
+param(
+    [System.Windows.Window]$Owner,
+    [Parameter(Mandatory = $true)][hashtable[]]$Buttons
+)
+$border = [System.Windows.Controls.Border]::new()
+$border.Padding = '0,8,0,0'
+$panel = [System.Windows.Controls.WrapPanel]::new()
+$panel.HorizontalAlignment = 'Right'
+$border.Child = $panel
+foreach ($spec in $Buttons) {
+    $button = [System.Windows.Controls.Button]::new()
+    $button.Content = $spec.Content
+    $button.MinHeight = 34
+    $button.Padding = '14,4'
+    $button.Margin = '8,4,0,4'
+    if ($spec.Name) { $button.Name = $spec.Name; if ($Owner) { $Owner.RegisterName($spec.Name, $button) } }
+    if ($spec.ContainsKey('IsDefault')) { $button.IsDefault = [bool]$spec.IsDefault }
+    if ($spec.ContainsKey('IsCancel')) { $button.IsCancel = [bool]$spec.IsCancel }
+    if ($spec.ContainsKey('IsEnabled')) { $button.IsEnabled = [bool]$spec.IsEnabled }
+    if ($spec.Background) { $button.SetResourceReference([System.Windows.Controls.Control]::BackgroundProperty, $spec.Background) }
+    if ($spec.Foreground) { $button.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, $spec.Foreground) }
+    if ($spec.ToolTip) { $button.ToolTip = $spec.ToolTip }
+    if ($spec.Action) { $button.Add_Click($spec.Action) }
+    [void]$panel.Children.Add($button)
+}
+return $border
+}
+
+function New-WmtInstallerDialog {
+param(
+    [Parameter(Mandatory = $true)][string]$Title,
+    [string]$Description = '',
+    [Parameter(Mandatory = $true)][string]$OptionsXaml,
+    [string]$PathLabel = 'Install root',
+    [string]$PathDescription = 'Choose game library folder',
+    [double]$Width = 700,
+    [double]$Height = 700
+)
+$content = @"
+<Grid Margin="16">
+    <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <ScrollViewer Name="InstallerScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="0,0,8,0">
+            <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold"/>
+            <TextBlock Name="lblDescription" Margin="0,5,0,0" Foreground="{DynamicResource TextSecondary}"/>
+            <TextBlock Name="lblMetadata" Margin="0,5,0,12" Foreground="{DynamicResource Warning}"/>
+            <ContentControl Name="InstallerPathHost" Margin="0,0,0,10"/>
+            $OptionsXaml
+            <StackPanel Margin="150,8,0,0">
+                <CheckBox Name="chkKeepOpen" Style="{StaticResource WmtWrappingCheckBoxStyle}" Margin="0,0,0,5" Content="Keep console open after a successful download" ToolTip="Failures always pause so the final error stays visible."/>
+                <CheckBox Name="chkDesktopShortcut" Style="{StaticResource WmtWrappingCheckBoxStyle}" Margin="0,0,0,5" Content="Create a desktop shortcut after install"/>
+                <CheckBox Name="chkStartMenuShortcut" Style="{StaticResource WmtWrappingCheckBoxStyle}" Content="Create a Start menu entry after install" ToolTip="Creates an entry under Start menu &gt; Programs &gt; WMT Games after a successful install."/>
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+    <StackPanel Grid.Row="1">
+        <ScrollViewer MaxHeight="72" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <TextBlock Name="lblError" Margin="0,8,0,0" Foreground="{DynamicResource Danger}"/>
+        </ScrollViewer>
+        <ContentControl Name="InstallerActionsHost"/>
+    </StackPanel>
+</Grid>
+"@
+$workArea = [System.Windows.SystemParameters]::WorkArea
+$dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml $content `
+    -Width ([Math]::Min($Width, $workArea.Width)) -Height ([Math]::Min($Height, $workArea.Height)) `
+    -MinWidth ([Math]::Min(420, $workArea.Width)) -MinHeight ([Math]::Min(280, $workArea.Height))
+$dialog.FindName('lblDescription').Text = $Description
+$dialog.FindName('InstallerPathHost').Content = New-WmtPathPicker -Owner $dialog -TextBoxName 'txtRoot' -BrowseButtonName 'btnBrowse' -Label $PathLabel -Description $PathDescription
+$dialog.FindName('InstallerActionsHost').Content = New-WmtActionButtonPanel -Owner $dialog -Buttons @(
+    @{ Name='btnCancel'; Content='Cancel'; IsCancel=$true },
+    @{ Name='btnInstall'; Content='Install'; IsDefault=$true; Background='Accent'; Foreground='AccentText' })
+Set-WmtNativeWindowTheme -Window $dialog
+$dialog.Add_ContentRendered({
+    $field = $dialog.FindName('txtRoot'); [void]$field.Focus(); $field.SelectAll()
+}.GetNewClosure())
+return $dialog
+}
+
+function New-WmtContextMenu {
+param(
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Items,
+    [System.Windows.Controls.Control]$Target
+)
+$menu = [System.Windows.Controls.ContextMenu]::new()
+Set-WmtContextMenuChrome -ContextMenu $menu
+foreach ($spec in $Items) {
+    if ($spec -is [System.Windows.Controls.MenuItem] -or $spec -is [System.Windows.Controls.Separator]) {
+        [void]$menu.Items.Add($spec)
+        continue
+    }
+    if ($spec.Separator) { [void]$menu.Items.Add([System.Windows.Controls.Separator]::new()); continue }
+    $item = [System.Windows.Controls.MenuItem]::new()
+    $item.Header = $spec.Header
+    $item.Tag = $spec.Tag
+    if ($spec.ContainsKey('IsEnabled')) { $item.IsEnabled = [bool]$spec.IsEnabled }
+    if ($spec.ContainsKey('IsCheckable')) { $item.IsCheckable = [bool]$spec.IsCheckable }
+    if ($spec.ContainsKey('IsChecked')) { $item.IsChecked = [bool]$spec.IsChecked }
+    if ($spec.Action) { $item.Add_Click($spec.Action) }
+    [void]$menu.Items.Add($item)
+}
+if ($Target) { $Target.ContextMenu = $menu }
+return $menu
+}
+
+function New-WmtAsyncProgress {
+param(
+    [System.Windows.Window]$Owner,
+    [System.Windows.Controls.Control[]]$BusyControls = @()
+)
+$view = [System.Windows.Controls.Grid]::new()
+[void]$view.RowDefinitions.Add([System.Windows.Controls.RowDefinition]::new())
+foreach ($unused in 1..2) {
+    $row = [System.Windows.Controls.RowDefinition]::new()
+    $row.Height = [System.Windows.GridLength]::Auto
+    [void]$view.RowDefinitions.Add($row)
+}
+$status = [System.Windows.Controls.TextBlock]::new()
+$status.TextWrapping = 'Wrap'
+$status.Margin = '0,0,0,8'
+$statusScroll = [System.Windows.Controls.ScrollViewer]::new()
+$statusScroll.VerticalScrollBarVisibility = 'Auto'
+$statusScroll.HorizontalScrollBarVisibility = 'Disabled'
+$statusScroll.Content = $status
+$bar = [System.Windows.Controls.ProgressBar]::new()
+$bar.Minimum = 0
+$bar.Maximum = 100
+$bar.MinHeight = 10
+$cancel = [System.Windows.Controls.Button]::new()
+$cancel.Content = 'Cancel'
+$cancel.HorizontalAlignment = 'Right'
+$cancel.Margin = '0,12,0,0'
+$cancel.IsEnabled = $false
+[System.Windows.Controls.Grid]::SetRow($bar, 1)
+[System.Windows.Controls.Grid]::SetRow($cancel, 2)
+[void]$view.Children.Add($statusScroll)
+[void]$view.Children.Add($bar)
+[void]$view.Children.Add($cancel)
+$progress = [PSCustomObject]@{
+    View=$view; Status=$status; Bar=$bar; CancelButton=$cancel
+    State='Idle'; Name=''; Owner=$Owner; OwnsWindow=$false
+    BusyControls=@($BusyControls); SavedStates=@(); ClosedHandler=$null
+}
+$cancel.Add_Click({
+    if ($progress.State -eq 'Running') { Stop-WmtUiBackgroundCommand -Name $progress.Name }
+    elseif ($progress.OwnsWindow -and $progress.Owner) { $progress.Owner.Close() }
+}.GetNewClosure())
+return $progress
+}
+
+function New-WmtAsyncProgressDialog {
+param([string]$Title = 'Processing...')
+$dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml '<ContentControl Name="ProgressHost" Margin="20"/>' -Width 540 -Height 210 -MinWidth 420 -MinHeight 190
+$progress = New-WmtAsyncProgress -Owner $dialog
+$progress.OwnsWindow = $true
+$dialog.FindName('ProgressHost').Content = $progress.View
+Set-WmtNativeWindowTheme -Window $dialog
+$dialog.Show()
+return $progress
+}
+
+function Set-WmtAsyncProgressState {
+param(
+    [Parameter(Mandatory = $true)]$Progress,
+    [Parameter(Mandatory = $true)][ValidateSet('Idle','Running','Succeeded','Failed','Cancelled')][string]$State,
+    [string]$Message = '',
+    [double]$Percent = [double]::NaN
+)
+if ($State -eq 'Running' -and $Progress.State -ne 'Running') {
+    $Progress.SavedStates = @(foreach ($control in $Progress.BusyControls) {
+        [PSCustomObject]@{ Control=$control; IsEnabled=$control.IsEnabled }
+        $control.SetCurrentValue([System.Windows.UIElement]::IsEnabledProperty, $false)
+    })
+    if ($Progress.Owner) {
+        $component = $Progress
+        $Progress.ClosedHandler = [System.EventHandler]{
+            if ($component.State -eq 'Running') { Stop-WmtUiBackgroundCommand -Name $component.Name }
+        }.GetNewClosure()
+        $Progress.Owner.Add_Closed($Progress.ClosedHandler)
+    }
+}
+$Progress.State = $State
+$Progress.Status.Text = $Message
+$Progress.Status.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, $(if ($State -eq 'Failed') { 'Danger' } else { 'TextSecondary' }))
+$Progress.Bar.IsIndeterminate = ($State -eq 'Running' -and [double]::IsNaN($Percent))
+if (-not [double]::IsNaN($Percent)) { $Progress.Bar.Value = [Math]::Max(0, [Math]::Min(100, $Percent)) }
+$Progress.CancelButton.IsEnabled = ($State -eq 'Running' -or $Progress.OwnsWindow)
+$Progress.CancelButton.Content = if ($State -eq 'Running') { 'Cancel' } else { 'Close' }
+if ($State -ne 'Running') {
+    foreach ($saved in $Progress.SavedStates) { $saved.Control.SetCurrentValue([System.Windows.UIElement]::IsEnabledProperty, $saved.IsEnabled) }
+    $Progress.SavedStates = @()
+    if ($Progress.Owner -and $Progress.ClosedHandler) { $Progress.Owner.Remove_Closed($Progress.ClosedHandler); $Progress.ClosedHandler = $null }
+    if ($State -eq 'Succeeded' -and $Progress.OwnsWindow -and $Progress.Owner) { $Progress.Owner.Close() }
+}
+}
+
+function Stop-WmtUiBackgroundCommand {
+param([Parameter(Mandatory = $true)][string]$Name)
+if (-not $script:WmtUiBackgroundCommands -or -not $script:WmtUiBackgroundCommands.ContainsKey($Name)) { return }
+$job = $script:WmtUiBackgroundCommands[$Name]
+Unregister-WmtUiPollOperation -Name ("UiCommand:" + $Name)
+[void]$script:WmtUiBackgroundCommands.Remove($Name)
+if ($job.Progress) { Set-WmtAsyncProgressState -Progress $job.Progress -State Cancelled -Message 'Cancelled.' }
+Stop-WmtPowerShellInvocationAsync -PowerShell $job.PowerShell -Invocation $job.Async -Name "Background operation '$Name'"
 }
 
 function Show-WmtInputDialog {
@@ -4070,13 +4838,13 @@ $content = @'
     </Grid.RowDefinitions>
     <TextBlock Name="lblPrompt" TextWrapping="Wrap" Margin="0,0,0,10"/>
     <TextBox Name="txtValue" Grid.Row="1" Height="34" VerticalContentAlignment="Center"/>
-    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
-        <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
-        <Button Name="btnOk" Content="OK" Width="94" IsDefault="True" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
-    </StackPanel>
+    <ContentControl Name="InputActionsHost" Grid.Row="2"/>
 </Grid>
 '@
 $dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml $content -Width 460 -Height 190 -MinWidth 380 -MinHeight 170 -NoResize
+$dialog.FindName('InputActionsHost').Content = New-WmtActionButtonPanel -Owner $dialog -Buttons @(
+    @{Name='btnCancel'; Content='Cancel'; IsCancel=$true},
+    @{Name='btnOk'; Content='OK'; IsDefault=$true; Background='Accent'; Foreground='AccentText'})
 $lblPrompt = $dialog.FindName("lblPrompt")
 $txtValue = $dialog.FindName("txtValue")
 $btnOk = $dialog.FindName("btnOk")
@@ -4421,6 +5189,16 @@ Add-WmtStatusTextTriggers -Style $style -BindingPath $BindingPath -ColorKey "War
     "Paused", "Starting", "Stopping", "Partially Enabled"
 )
 
+# Selection takes precedence over semantic status colors on either theme.
+$selectionTrigger = [System.Windows.DataTrigger]::new()
+$selectionTrigger.Binding = [System.Windows.Data.Binding]::new('IsSelected')
+$selectionTrigger.Binding.RelativeSource = [System.Windows.Data.RelativeSource]::new(
+    [System.Windows.Data.RelativeSourceMode]::FindAncestor, [System.Windows.Controls.DataGridRow], 1)
+$selectionTrigger.Value = $true
+[void]$selectionTrigger.Setters.Add([System.Windows.Setter]::new(
+    [System.Windows.Controls.TextBlock]::ForegroundProperty, [System.Windows.DynamicResourceExtension]::new('AccentText')))
+[void]$style.Triggers.Add($selectionTrigger)
+
 return $style
 }
 
@@ -4457,6 +5235,8 @@ foreach ($column in $Columns) {
     [void]$DataGrid.Columns.Add($col)
     if ($Hidden -contains $column) { $col.Visibility = [System.Windows.Visibility]::Collapsed }
 }
+# My Device and other grids add their columns after window construction.
+Connect-WmtResponsiveColumns -Table $DataGrid -Owner ([System.Windows.Window]::GetWindow($DataGrid))
 }
 
 # --- SCHEDULED TASKS ENGINE (native Task Scheduler COM API) ---
@@ -4914,16 +5694,16 @@ $content = @'
     </Grid.RowDefinitions>
     <DataGrid Name="dgTasks" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
     <TextBlock Name="lblStatus" Grid.Row="1" Foreground="{DynamicResource TextSecondary}" Margin="0,10,0,0"/>
-    <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,12,0,0">
-        <Button Name="btnOpenScheduler" Content="Open Task Scheduler" MinWidth="128" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextPrimary}" Margin="0,0,8,8"/>
-        <Button Name="btnRefresh" Content="Refresh" MinWidth="92" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}" Margin="0,0,8,8"/>
-        <Button Name="btnEnable" Content="Enable" MinWidth="92" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,8"/>
-        <Button Name="btnDisable" Content="Disable" MinWidth="92" Background="{DynamicResource Warning}" Foreground="{DynamicResource WarningText}" Margin="0,0,8,8"/>
-        <Button Name="btnClose" Content="Close" Width="92" IsCancel="True" Margin="0,0,8,8"/>
-    </WrapPanel>
+    <ContentControl Name="TaskActionsHost" Grid.Row="2"/>
 </Grid>
 '@
 $dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml $content -Width 960 -Height 560 -MinWidth 760 -MinHeight 420
+$dialog.FindName('TaskActionsHost').Content = New-WmtActionButtonPanel -Owner $dialog -Buttons @(
+    @{Name='btnOpenScheduler'; Content='Open Task Scheduler'},
+    @{Name='btnRefresh'; Content='Refresh'; Background='Accent'; Foreground='AccentText'},
+    @{Name='btnEnable'; Content='Enable'; Background='Success'; Foreground='SuccessText'},
+    @{Name='btnDisable'; Content='Disable'; Background='Warning'; Foreground='WarningText'},
+    @{Name='btnClose'; Content='Close'; IsCancel=$true})
 $dg = $dialog.FindName("dgTasks")
 $lblStatus = $dialog.FindName("lblStatus")
 $btnOpenScheduler = $dialog.FindName("btnOpenScheduler")
@@ -12787,22 +13567,6 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
     Title="Advanced Cleanup Selection" Width="920" Height="840" MinWidth="760" MinHeight="560"
     WindowStartupLocation="CenterOwner" Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
     FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13">
-<Window.Resources>
-    <Style x:Key="ModernSearchBoxStyle" TargetType="Border">
-        <Setter Property="Background" Value="{DynamicResource BgDark}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-        <Setter Property="BorderThickness" Value="1"/>
-        <Setter Property="CornerRadius" Value="8"/>
-        <Setter Property="Height" Value="40"/>
-        <Setter Property="SnapsToDevicePixels" Value="True"/>
-        <Setter Property="UseLayoutRounding" Value="True"/>
-        <Style.Triggers>
-            <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="BorderBrush" Value="{DynamicResource TextMuted}"/>
-            </Trigger>
-        </Style.Triggers>
-    </Style>
-</Window.Resources>
 <Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
@@ -12810,50 +13574,48 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="12,10">
+    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="12,8,12,4">
         <StackPanel>
-            <DockPanel>
-                <Border Style="{StaticResource ModernSearchBoxStyle}" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0" Width="220">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <Path Grid.Column="0" Data="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"
-                              Fill="{DynamicResource TextMuted}" Stretch="Uniform" Height="14" Width="14"
-                              VerticalAlignment="Center" Margin="12,0,6,0"/>
-                        <TextBox Name="txtSearch" Grid.Column="1" Height="38"
-                                 VerticalContentAlignment="Center" Text="Search rules..."
-                                 Background="Transparent" BorderThickness="0"
-                                 Padding="0,0,0,0" Margin="0"
-                                 FontSize="14"
-                                 Foreground="{DynamicResource TextMuted}"
-                                 CaretBrush="{DynamicResource TextPrimary}"
-                                 SelectionBrush="{DynamicResource Accent}"/>
-                        <Button Name="btnClearSearch" Grid.Column="2" Content="X"
-                                Width="28" Height="28" Margin="0,0,6,0"
-                                VerticalAlignment="Center" HorizontalAlignment="Center"
-                                Visibility="Collapsed" Cursor="Hand"
-                                ToolTip="Clear search"
-                                Background="Transparent" Foreground="{DynamicResource TextMuted}" BorderThickness="0" FontWeight="Bold" FontSize="14"/>
-                    </Grid>
-                </Border>
-                <WrapPanel VerticalAlignment="Center">
-                    <Button Name="chkToggleWinapp2" Content="Winapp2.ini" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" Height="34" Margin="4" FontSize="12" ToolTip="Load rules from Winapp2.ini community database"/>
-                    <Button Name="chkToggleWinapp3" Content="Winapp3.ini" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Experimental rules from the Winapp3 beta INI"/>
-                    <Button Name="chkToggleCleanerML" Content="CleanerML" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" Height="34" Margin="4" FontSize="12" ToolTip="Load rules from BleachBit CleanerML definitions"/>
-                    <Button Name="chkToggleCleanerMLPending" Content="Pending (Beta)" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Unverified CleanerML rules from the pending folder"/>
-                    <Button Name="chkSkipDownloads" Content="Skip Downloads" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Don't download or update rule files. Use only what's cached locally."/>
-                    <Button Name="chkCacheOnly" Content="Cache Only" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Skip cache validation and parsing. Instantly load from existing cache file."/>
-                    <Button Name="btnShowEnabled" Content="Show Enabled" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="34" Margin="4" FontSize="11" ToolTip="Show only checked/enabled cleaner rules. This is a view filter and does not change selections."/>
-                </WrapPanel>
-            </DockPanel>
-            <WrapPanel Margin="4,6,0,0" VerticalAlignment="Center">
-                <TextBlock Text="Local cache refresh:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
+            <Border Style="{StaticResource ModernSearchBoxStyle}" Height="32" Margin="0,0,0,6">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Path Grid.Column="0" Data="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"
+                          Fill="{DynamicResource TextMuted}" Stretch="Uniform" Height="14" Width="14"
+                          VerticalAlignment="Center" Margin="12,0,6,0"/>
+                    <TextBox Name="txtSearch" Grid.Column="1" Height="30"
+                             VerticalContentAlignment="Center" Text="Search rules..."
+                             Background="Transparent" BorderThickness="0"
+                             Padding="0,0,0,0" Margin="0"
+                             FontSize="14"
+                             Foreground="{DynamicResource TextMuted}"
+                             CaretBrush="{DynamicResource TextPrimary}"
+                             SelectionBrush="{DynamicResource Accent}"/>
+                    <Button Name="btnClearSearch" Grid.Column="2" Content="X"
+                            Width="28" Height="28" Margin="0,0,6,0"
+                            VerticalAlignment="Center" HorizontalAlignment="Center"
+                            Visibility="Collapsed" Cursor="Hand"
+                            ToolTip="Clear search"
+                            Background="Transparent" Foreground="{DynamicResource TextMuted}" BorderThickness="0" FontWeight="Bold" FontSize="14"/>
+                </Grid>
+            </Border>
+            <WrapPanel VerticalAlignment="Center">
+                <Button Name="chkToggleWinapp2" Content="Winapp2.ini" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="12" ToolTip="Load rules from Winapp2.ini community database"/>
+                <Button Name="chkToggleWinapp3" Content="Winapp3.ini" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="11" ToolTip="Experimental rules from the Winapp3 beta INI"/>
+                <Button Name="chkToggleCleanerML" Content="CleanerML" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="12" ToolTip="Load rules from BleachBit CleanerML definitions"/>
+                <Button Name="chkToggleCleanerMLPending" Content="Pending (Beta)" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="11" ToolTip="Unverified CleanerML rules from the pending folder"/>
+                <Button Name="chkSkipDownloads" Content="Skip Downloads" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="11" ToolTip="Don't download or update rule files. Use only what's cached locally."/>
+                <Button Name="chkCacheOnly" Content="Cache Only" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="11" ToolTip="Skip cache validation and parsing. Instantly load from existing cache file."/>
+                <Button Name="btnShowEnabled" Content="Show Enabled" Background="{DynamicResource BgElevated}" Foreground="{DynamicResource TextSecondary}" BorderThickness="0" Height="30" Margin="0,0,6,4" FontSize="11" ToolTip="Show only checked/enabled cleaner rules. This is a view filter and does not change selections."/>
+            </WrapPanel>
+            <WrapPanel Margin="0,2,0,0" VerticalAlignment="Center" TextElement.FontSize="11">
+                <TextBlock Text="Local refresh:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
                 <TextBox Name="txtCleanerLocalRefresh" Width="58" Height="28" VerticalContentAlignment="Center" ToolTip="Minutes between validation/rebuilds of parsed local cleaner caches. Minimum 1 minute."/>
                 <TextBlock Text="min" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="4,0,14,0"/>
-                <TextBlock Text="List update check:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <TextBlock Text="List updates:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
                 <TextBox Name="txtCleanerRemoteRefresh" Width="64" Height="28" VerticalContentAlignment="Center" ToolTip="Minutes between conditional upstream checks. Use 0 to disable automatic list update checks."/>
                 <TextBlock Text="min" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" Margin="4,0,14,0"/>
                 <TextBlock Text="Auto clean:" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,5,0"/>
@@ -12862,8 +13624,8 @@ $isCacheOnly = [bool]$currentSettings.CacheOnly
                 <Button Name="btnApplyCleanerIntervals" Content="Apply" Height="30" MinWidth="70" Margin="4,0"/>
                 <Button Name="btnRefreshCleanerSources" Content="Refresh Lists" Height="30" MinWidth="100" Margin="4,0"/>
             </WrapPanel>
-            <TextBlock Name="lblCleanerFreshness" Foreground="{DynamicResource TextMuted}" FontSize="11" Margin="4,5,0,0" TextTrimming="CharacterEllipsis"/>
-            <TextBlock Name="lblStatus" Foreground="{DynamicResource Warning}" FontSize="12" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Name="lblCleanerFreshness" Style="{StaticResource WmtOptionalTextStyle}" Foreground="{DynamicResource TextMuted}" FontSize="11" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Name="lblStatus" Style="{StaticResource WmtOptionalTextStyle}" Foreground="{DynamicResource Warning}" FontSize="12" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
         </StackPanel>
     </Border>
 
@@ -13800,17 +14562,17 @@ $formatPreviewBytes = {
     Width="960" Height="680" MinWidth="760" MinHeight="500" WindowStartupLocation="CenterOwner"
     Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
     FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13">
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <DataGrid Name="dgPreview" Grid.Row="0" AlternationCount="2" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False">
+    <DataGrid Name="dgPreview" Grid.Row="0" MinColumnWidth="64" CanUserResizeColumns="True" AlternationCount="2" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False">
         <DataGrid.Columns>
             <DataGridTextColumn Header="RuleName" Binding="{Binding RuleName}" Width="180" IsReadOnly="True"/>
             <DataGridTextColumn Header="Status" Binding="{Binding Protection}" Width="160" IsReadOnly="True"/>
-            <DataGridTextColumn Header="FilePath" Binding="{Binding FilePath}" Width="*" IsReadOnly="True"/>
+            <DataGridTextColumn Header="FilePath" Binding="{Binding FilePath}" Width="440" IsReadOnly="True"/>
             <DataGridTextColumn Header="Size" Binding="{Binding SizeText}" SortMemberPath="Size" Width="96" IsReadOnly="True"/>
         </DataGrid.Columns>
     </DataGrid>
@@ -13865,8 +14627,7 @@ foreach ($item in @($PreviewList)) {
 $previewRows = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $dg.ItemsSource = $previewRows
 
-$ctxMenu = [System.Windows.Controls.ContextMenu]::new()
-Set-WmtContextMenuChrome -ContextMenu $ctxMenu
+$ctxMenu = New-WmtContextMenu -Items @()
 $menuOpen = [System.Windows.Controls.MenuItem]::new()
 $menuOpen.Header = "Go to file [Open folder]"
 $menuDelete = [System.Windows.Controls.MenuItem]::new()
@@ -15995,7 +16756,7 @@ foreach ($savedKey in @($savedStates.Keys)) {
         <TextBlock Text="Checked targets are saved for future registry scans." Margin="0,4,0,0" Foreground="{DynamicResource TextSecondary}"/>
     </StackPanel>
 
-    <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderThickness="0" CornerRadius="4" Padding="14">
+    <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderThickness="0" CornerRadius="4" Padding="14,14,0,14" Margin="0,0,-18,0">
         <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
             <UniformGrid Name="pnlChecks" Columns="2"/>
         </ScrollViewer>
@@ -16188,14 +16949,14 @@ function script:Get-WmtVisualParentOfType {
 
 function script:Select-WmtRegistryGridRowFromOriginalSource {
     param(
-        [System.Windows.Controls.DataGrid]$Grid,
+        [System.Windows.Controls.ListView]$Grid,
         [object]$OriginalSource
     )
 
     if ($null -eq $Grid -or $null -eq $OriginalSource) { return $false }
 
     try {
-        $rowElement = Get-WmtVisualParentOfType -Source $OriginalSource -TargetType ([System.Windows.Controls.DataGridRow])
+        $rowElement = Get-WmtVisualParentOfType -Source $OriginalSource -TargetType ([System.Windows.Controls.ListViewItem])
         if ($null -eq $rowElement) { return $false }
 
         if (-not $rowElement.IsSelected) {
@@ -16203,8 +16964,7 @@ function script:Select-WmtRegistryGridRowFromOriginalSource {
             try { $rowElement.IsSelected = $true } catch {}
         }
 
-        try { $Grid.SelectedItem = $rowElement.Item } catch {}
-        try { $Grid.CurrentItem = $rowElement.Item } catch {}
+        try { [void]$Grid.Items.MoveCurrentTo($rowElement.Content) } catch {}
         try { [void]$rowElement.Focus() } catch {}
         return $true
     }
@@ -16212,6 +16972,47 @@ function script:Select-WmtRegistryGridRowFromOriginalSource {
         try { Write-GuiLog "Registry result right-click row selection failed: $($_.Exception.Message)" } catch {}
         return $false
     }
+}
+
+function script:Connect-WmtRegistryResultSorting {
+    param([System.Windows.Controls.ListView]$ListView)
+
+    $chain = [System.Collections.ArrayList]::new()
+    $ListView.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent,
+        [System.Windows.RoutedEventHandler]{
+            param($s, $eA)
+            $header = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
+            if (-not $header -or -not $header.Column) { return }
+            $vC = $header.Column
+            $property = if ($vC.DisplayMemberBinding) { $vC.DisplayMemberBinding.Path.Path } else { 'Check' }
+            $isAscending = Set-SortChainPrimary -Chain $chain -PropertyName $property
+            Update-GridViewHeaders -ListView $s -ActiveHeader (Get-CleanHeader $vC.Header) -Ascending:$isAscending
+            Set-ListViewSort -ListView $s -Chain $chain
+        }.GetNewClosure(), $true)
+}
+
+function script:Connect-WmtRegistryResultClipboard {
+    param([System.Windows.Controls.ListView]$ListView)
+
+    $copyBinding = [System.Windows.Input.CommandBinding]::new([System.Windows.Input.ApplicationCommands]::Copy)
+    $copyBinding.Add_CanExecute({
+        param($s, $eA)
+        $eA.CanExecute = ($s.SelectedItems.Count -gt 0)
+        $eA.Handled = $true
+    })
+    $copyBinding.Add_Executed({
+        param($s, $eA)
+        $rowsToCopy = @($s.SelectedItems)
+        if ($rowsToCopy.Count -eq 0) { return }
+        try {
+            [System.Windows.Clipboard]::SetText((ConvertTo-WmtRegistryResultClipboardText -Rows $rowsToCopy))
+            $eA.Handled = $true
+        }
+        catch {
+            try { Write-GuiLog "Registry result clipboard copy failed: $($_.Exception.Message)" } catch {}
+        }
+    })
+    [void]$ListView.CommandBindings.Add($copyBinding)
 }
 
 function Test-WmtRegistryFindingAutoSelected {
@@ -16284,113 +17085,61 @@ function Test-WmtRegistryFindingAutoSelected {
     Title="Deep Registry Cleaner" Width="1280" Height="680" MinWidth="980" MinHeight="560"
     WindowStartupLocation="CenterOwner" Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
     FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13">
-<Window.Resources>
-    <Style TargetType="Button">
-        <Setter Property="Height" Value="34"/>
-        <Setter Property="MinWidth" Value="104"/>
-        <Setter Property="Margin" Value="6,0,0,0"/>
-        <Setter Property="Padding" Value="14,0"/>
-        <Setter Property="Background" Value="{DynamicResource BgElevated}"/>
-        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-        <Setter Property="BorderThickness" Value="1"/>
-    </Style>
-    <Style TargetType="DataGrid">
-        <Setter Property="Background" Value="{DynamicResource BgDark}"/>
-        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-        <Setter Property="GridLinesVisibility" Value="Horizontal"/>
-        <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource BorderBrush}"/>
-        <Setter Property="VerticalGridLinesBrush" Value="{DynamicResource BorderBrush}"/>
-        <Setter Property="RowBackground" Value="{DynamicResource BgDark}"/>
-        <Setter Property="AlternatingRowBackground" Value="{DynamicResource BgPanel}"/>
-        <Setter Property="CanUserAddRows" Value="False"/>
-        <Setter Property="CanUserDeleteRows" Value="False"/>
-        <Setter Property="HeadersVisibility" Value="Column"/>
-        <Setter Property="SelectionMode" Value="Extended"/>
-        <Setter Property="SelectionUnit" Value="FullRow"/>
-        <Setter Property="AutoGenerateColumns" Value="False"/>
-        <Setter Property="ClipboardCopyMode" Value="IncludeHeader"/>
-    </Style>
-    <Style TargetType="DataGridColumnHeader">
-        <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
-        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
-        <Setter Property="BorderThickness" Value="0,0,1,1"/>
-        <Setter Property="Padding" Value="8,6"/>
-        <Setter Property="FontWeight" Value="SemiBold"/>
-    </Style>
-    <Style TargetType="DataGridCell">
-        <Setter Property="Background" Value="Transparent"/>
-        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Setter Property="BorderThickness" Value="0"/>
-        <Setter Property="Padding" Value="6,3"/>
-        <Style.Triggers>
-            <Trigger Property="IsSelected" Value="True">
-                <Setter Property="Background" Value="{DynamicResource Accent}"/>
-                <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
-            </Trigger>
-        </Style.Triggers>
-    </Style>
-    <Style TargetType="DataGridRow">
-        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Style.Triggers>
-            <Trigger Property="IsSelected" Value="True">
-                <Setter Property="Background" Value="{DynamicResource Accent}"/>
-                <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
-            </Trigger>
-        </Style.Triggers>
-    </Style>
-</Window.Resources>
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" BorderThickness="0" CornerRadius="4" Padding="14" Margin="0,0,0,12">
+    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" BorderThickness="0" CornerRadius="4" Padding="14" Margin="16,16,16,12">
         <StackPanel>
             <TextBlock Name="lblStatus" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
             <TextBlock Text="Review checked findings before fixing. Missing-file COM server entries are selected by default unless WMT classifies them as protected/merged Microsoft COM registrations. Press Enter to check highlighted rows. Right-click a row to open its key in Regedit or copy details. Review-only rows are never fixed automatically." Margin="0,4,0,0" Foreground="{DynamicResource TextSecondary}"/>
         </StackPanel>
     </Border>
 
-    <DataGrid Name="dgRegistry" Grid.Row="1" AlternationCount="2">
-        <DataGrid.Columns>
-            <DataGridTemplateColumn Header=" " Width="42" SortMemberPath="Check">
-                <DataGridTemplateColumn.CellTemplate>
-                    <DataTemplate>
-                        <CheckBox IsChecked="{Binding Check, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                  HorizontalAlignment="Center"
-                                  VerticalAlignment="Center"
-                                  Focusable="False"/>
-                    </DataTemplate>
-                </DataGridTemplateColumn.CellTemplate>
-            </DataGridTemplateColumn>
-            <DataGridTextColumn Header="Problem" Binding="{Binding Problem}" Width="185" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Action" Binding="{Binding FixAction}" Width="90" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="75" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Confidence" Binding="{Binding Confidence}" Width="92" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Default" Binding="{Binding DefaultAction}" Width="82" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="80" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Value" Binding="{Binding ValueName}" Width="150" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Data (Path/Value)" Binding="{Binding Data}" Width="2*" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Display Key" Binding="{Binding Key}" Width="1.4*" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Exact Registry Path" Binding="{Binding FullPath}" Width="2*" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Why Flagged" Binding="{Binding Details}" Width="2*" IsReadOnly="True"/>
-        </DataGrid.Columns>
-    </DataGrid>
+    <ListView Name="dgRegistry" Grid.Row="1" SelectionMode="Extended" BorderThickness="0" Style="{StaticResource WmtListViewStyle}">
+        <ListView.Resources>
+            <Style TargetType="{x:Type TextBlock}" BasedOn="{StaticResource {x:Type TextBlock}}">
+                <Setter Property="TextWrapping" Value="NoWrap"/>
+                <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+            </Style>
+        </ListView.Resources>
+        <ListView.View>
+            <GridView>
+                <GridViewColumn Header="Select" Width="58">
+                    <GridViewColumn.CellTemplate>
+                        <DataTemplate>
+                            <CheckBox IsChecked="{Binding Check, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center" Focusable="False"/>
+                        </DataTemplate>
+                    </GridViewColumn.CellTemplate>
+                </GridViewColumn>
+                <GridViewColumn Header="Problem" DisplayMemberBinding="{Binding Problem}" Width="185"/>
+                <GridViewColumn Header="Action" DisplayMemberBinding="{Binding FixAction}" Width="110"/>
+                <GridViewColumn Header="Risk" DisplayMemberBinding="{Binding Risk}" Width="75"/>
+                <GridViewColumn Header="Confidence" DisplayMemberBinding="{Binding Confidence}" Width="100"/>
+                <GridViewColumn Header="Default" DisplayMemberBinding="{Binding DefaultAction}" Width="90"/>
+                <GridViewColumn Header="Type" DisplayMemberBinding="{Binding Type}" Width="80"/>
+                <GridViewColumn Header="Value" DisplayMemberBinding="{Binding ValueName}" Width="150"/>
+                <GridViewColumn Header="Data (Path/Value)" DisplayMemberBinding="{Binding Data}" Width="260"/>
+                <GridViewColumn Header="Display Key" DisplayMemberBinding="{Binding Key}" Width="200"/>
+                <GridViewColumn Header="Exact Registry Path" DisplayMemberBinding="{Binding FullPath}" Width="320"/>
+                <GridViewColumn Header="Why Flagged" DisplayMemberBinding="{Binding Details}" Width="300"/>
+            </GridView>
+        </ListView.View>
+    </ListView>
 
-    <Grid Grid.Row="2" Margin="0,12,0,0">
+    <Grid Grid.Row="2" Margin="16,12,16,16">
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
             <CheckBox Name="chkShowProtected" Content="Show Protected Entries" Margin="0,0,12,0" VerticalAlignment="Center" ToolTip="When unchecked, protected Microsoft COM registrations (e.g. CrossDevice, DAO, Oracle OLE DB) are hidden from the list. Toggle this to show/hide them."/>
-            <Button Name="btnClose" Content="Close" IsCancel="True"/>
+            <Button Name="btnClose" Margin="6,0,0,0" Content="Close" IsCancel="True"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnCopySelected" Content="Copy Selected Details" MinWidth="160"/>
-            <Button Name="btnCopyAll" Content="Copy All Details" MinWidth="140"/>
-            <Button Name="btnFix" Content="Fix Selected Issues..." MinWidth="180" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
+            <Button Name="btnCopySelected" Margin="6,0,0,0" Content="Copy Selected Details" MinWidth="160"/>
+            <Button Name="btnCopyAll" Margin="6,0,0,0" Content="Copy All Details" MinWidth="140"/>
+            <Button Name="btnFix" Margin="6,0,0,0" Content="Fix Selected Issues..." MinWidth="180" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
         </StackPanel>
     </Grid>
 </Grid>
@@ -16410,6 +17159,8 @@ $chkShowProtected = $dialog.FindName("chkShowProtected")
 # Enable row virtualization so the grid scrolls smoothly with hundreds of findings
 # instead of rendering every row at once and lagging.
 Enable-WmtWpfItemsVirtualization -Control $dg
+Connect-WmtRegistryResultSorting -ListView $dg
+Connect-WmtRegistryResultClipboard -ListView $dg
 
 # --- Protected/ReviewOnly filter ---
 # By default, protected and review-only entries are hidden from the grid.
@@ -16527,15 +17278,14 @@ $chkShowProtected.Add_Click({
     }
 })
 
-$registryContextMenu = [System.Windows.Controls.ContextMenu]::new()
-try { Set-WmtContextMenuChrome -ContextMenu $registryContextMenu } catch {}
+$registryContextMenu = New-WmtContextMenu -Items @()
 
 $mniOpenRegedit = [System.Windows.Controls.MenuItem]::new()
 $mniOpenRegedit.Header = "Open in Regedit"
 $mniOpenRegedit.Add_Click({
         try {
             $row = $dg.SelectedItem
-            if ($null -eq $row -and $dg.CurrentItem) { $row = $dg.CurrentItem }
+            if ($dg.SelectedItems.Contains($dg.Items.CurrentItem)) { $row = $dg.Items.CurrentItem }
             if ($null -eq $row) { return }
             [void](Open-WmtRegistryPathInRegedit -RegistryPath ([string]$row.FullPath))
         }
@@ -16550,7 +17300,6 @@ $mniCopyContextDetails.Header = "Copy Selected Details"
 $mniCopyContextDetails.Add_Click({
         try {
             $rowsToCopy = @($dg.SelectedItems | Where-Object { $_ })
-            if ($rowsToCopy.Count -eq 0 -and $dg.CurrentItem) { $rowsToCopy = @($dg.CurrentItem) }
             if ($rowsToCopy.Count -eq 0) { return }
             [System.Windows.Clipboard]::SetText((ConvertTo-WmtRegistryResultClipboardText -Rows $rowsToCopy))
         }
@@ -16585,11 +17334,11 @@ try { $registryContextMenu.Placement = [System.Windows.Controls.Primitives.Place
 $dg.ContextMenu = $registryContextMenu
 
 $updateRegistryContextMenuState = {
-    param([System.Windows.Controls.DataGrid]$Grid)
+    param([System.Windows.Controls.ListView]$Grid)
 
     $hasSelection = $false
     try {
-        $hasSelection = (($null -ne $Grid) -and (($Grid.SelectedItems.Count -gt 0) -or ($null -ne $Grid.CurrentItem)))
+        $hasSelection = (($null -ne $Grid) -and (($Grid.SelectedItems.Count -gt 0) -or ($null -ne $Grid.SelectedItem)))
     }
     catch {
         $hasSelection = $false
@@ -16602,16 +17351,16 @@ $updateRegistryContextMenuState = {
 }.GetNewClosure()
 
 $openRegistryContextMenu = {
-    param($gridSender, $mouseArgs)
+    param($s, $eA)
 
     try {
         if ($null -eq $dg -or $null -eq $registryContextMenu) { return }
 
         # Selection is best-effort only.  Never suppress the menu just because the
-        # click happened on a TextBlock, header, scrollbar, or empty DataGrid area.
+        # click happened on a TextBlock, header, scrollbar, or empty list area.
         try {
             $sourceObject = $null
-            if ($null -ne $mouseArgs) { $sourceObject = $mouseArgs.OriginalSource }
+            if ($null -ne $eA) { $sourceObject = $eA.OriginalSource }
             if ($null -ne $sourceObject) {
                 [void](Select-WmtRegistryGridRowFromOriginalSource -Grid $dg -OriginalSource $sourceObject)
             }
@@ -16627,7 +17376,7 @@ $openRegistryContextMenu = {
         # programmatically assigned ContextMenu reliably from ContextMenuOpening alone.
         try {
             $registryContextMenu.IsOpen = $true
-            if ($null -ne $mouseArgs) { $mouseArgs.Handled = $true }
+            if ($null -ne $eA) { $eA.Handled = $true }
         }
         catch {
             try { Write-GuiLog "Registry result context menu open failed: $($_.Exception.Message)" } catch {}
@@ -16641,7 +17390,6 @@ $openRegistryContextMenu = {
 $dg.Add_PreviewMouseRightButtonDown($openRegistryContextMenu)
 
 $dg.Add_ContextMenuOpening({
-        param($gridSender, $menuArgs)
         try {
             [void](& $updateRegistryContextMenuState -Grid $dg)
         }
@@ -16654,21 +17402,13 @@ $dg.Add_ContextMenuOpening({
 
 function script:Set-WmtRegistryHighlightedRowsChecked {
     param(
-        [System.Windows.Controls.DataGrid]$Grid,
+        [System.Windows.Controls.ListView]$Grid,
         [bool]$Checked = $true
     )
 
     if ($null -eq $Grid) { return 0 }
-    try {
-        [void]$Grid.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Cell, $true)
-        [void]$Grid.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Row, $true)
-    }
-    catch {}
 
     $selectedRows = @($Grid.SelectedItems | Where-Object { $_ })
-    if ($selectedRows.Count -eq 0 -and $Grid.CurrentItem) {
-        $selectedRows = @($Grid.CurrentItem)
-    }
     if ($selectedRows.Count -eq 0) { return 0 }
 
     $changed = 0
@@ -16684,18 +17424,18 @@ function script:Set-WmtRegistryHighlightedRowsChecked {
 }
 
 $dg.Add_PreviewKeyDown({
-        param($gridSender, $keyArgs)
+        param($s, $eA)
 
-        if ([string]$keyArgs.Key -notin @("Return", "Enter")) { return }
+        if ([string]$eA.Key -notin @("Return", "Enter")) { return }
 
-        $changed = Set-WmtRegistryHighlightedRowsChecked -Grid $gridSender -Checked $true
+        $changed = Set-WmtRegistryHighlightedRowsChecked -Grid $s -Checked $true
         if ($changed -gt 0) {
             if ($chkShowProtected.IsChecked -eq $true) {
                 $lblStatus.Text = "Scan complete. Issues found: $($registryRows.Count). Checked $changed highlighted row(s)."
             } else {
                 $lblStatus.Text = "Scan complete. Showing $($registryRowsFiltered.Count) of $($registryRows.Count) issues ($protectedCount protected hidden). Checked $changed highlighted row(s)."
             }
-            $keyArgs.Handled = $true
+            $eA.Handled = $true
         }
     })
 
@@ -16728,11 +17468,6 @@ $btnCopyAll.Add_Click({
 # --- 7. Fix Button Logic ---
 $btnFix.Add_Click({
         $toFix = [System.Collections.Generic.List[object]]::new()
-        try {
-            [void]$dg.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Cell, $true)
-            [void]$dg.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Row, $true)
-        }
-        catch {}
         foreach ($row in $registryRows) {
             if ($row.Check -eq $true) {
                 # If this row was consolidated from multiple originals, expand
@@ -18797,7 +19532,7 @@ if ($Action -eq "BackupHKLM") {
             Show-WmtMessageBox -Message "HKLM export saved to:`n$bkFile" -Title "Registry Export" -Image Information | Out-Null
         }
     }
-    Invoke-WmtUiBackgroundCommand -Name "RegistryBackupHKLM" -Msg "Exporting HKLM hive..." -SuppressResultLog -Sb {
+    Invoke-WmtUiBackgroundCommand -ShowProgress -Name "RegistryBackupHKLM" -Msg "Exporting HKLM hive..." -SuppressResultLog -Sb {
         param($BackupDirectory)
         if (-not (Test-Path -LiteralPath $BackupDirectory)) { New-Item -Path $BackupDirectory -ItemType Directory -Force | Out-Null }
         $bkFile = Join-Path $BackupDirectory ("HKLM_Backup_{0}.reg" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
@@ -18831,7 +19566,7 @@ if ($Action -eq "Restore") {
             Show-WmtMessageBox -Message "Registry backup imported from:`n$file" -Title "Registry Import" -Image Information | Out-Null
         }
     }
-    Invoke-WmtUiBackgroundCommand -Name "RegistryRestoreHKLM" -Msg "Importing registry backup..." -SuppressResultLog -Sb {
+    Invoke-WmtUiBackgroundCommand -ShowProgress -Name "RegistryRestoreHKLM" -Msg "Importing registry backup..." -SuppressResultLog -Sb {
         param($BackupFile)
         if (-not (Test-Path -LiteralPath $BackupFile)) { throw "Backup file not found: $BackupFile" }
         $out = @(& reg.exe import $BackupFile 2>&1)
@@ -25131,7 +25866,7 @@ return $false
 
 function Show-BrokenShortcuts {
 $content = @"
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <DataGrid Name="dgShortcuts" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
     <TextBlock Name="lblStatus" Grid.Row="1" Text="Ready." Foreground="{DynamicResource Warning}" Margin="0,10,0,0"/>
@@ -27499,7 +28234,7 @@ function New-StartupPage {
     param([string]$Title)
 
     $root = [System.Windows.Controls.Grid]::new()
-    $root.Background = $dialog.Resources["BgDark"]
+    Set-WmtThemedBrush -Object $root -Property ([System.Windows.Controls.Panel]::BackgroundProperty) -ColorOrKey "BgDark"
     $root.Visibility = [System.Windows.Visibility]::Collapsed
     foreach ($h in @("Auto", "*", "Auto")) {
         $row = [System.Windows.Controls.RowDefinition]::new()
@@ -27564,7 +28299,6 @@ function New-StartupPage {
     $grid.BorderThickness = [System.Windows.Thickness]::new(0)
     $grid.FocusVisualStyle = $null
     $grid.HeadersVisibility = [System.Windows.Controls.DataGridHeadersVisibility]::Column
-    $grid.GridLinesVisibility = [System.Windows.Controls.DataGridGridLinesVisibility]::Horizontal
     Set-WmtThemedBrush -Object $grid -Property ([System.Windows.Controls.Control]::BackgroundProperty) -ColorOrKey "BgDark"
     Set-WmtThemedBrush -Object $grid -Property ([System.Windows.Controls.Control]::ForegroundProperty) -ColorOrKey "TextPrimary"
     Set-WmtThemedBrush -Object $grid -Property ([System.Windows.Controls.Control]::BorderBrushProperty) -ColorOrKey "BorderBrush"
@@ -28398,20 +29132,24 @@ function Get-StartupFolderEntries {
 
 function Add-GridContextMenu {
     param($TabObj, [System.Windows.Controls.Button[]]$Buttons)
-    $menu = [System.Windows.Controls.ContextMenu]::new()
-    Set-WmtContextMenuChrome -ContextMenu $menu
-    foreach ($button in @($Buttons)) {
-        $item = [System.Windows.Controls.MenuItem]::new()
-        $item.Header = [string]$button.Content
-        $item.Tag = $button
-        $item.Add_Click({
+    $items = @(foreach ($button in @($Buttons)) {
+        @{
+            Header = [string]$button.Content
+            Tag = $button
+            Action = {
                 param($eventSource, $e)
                 $button = [System.Windows.Controls.Button]$eventSource.Tag
+                if (-not $button.IsEnabled) { return }
                 $button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $button))
-            }.GetNewClosure())
-        [void]$menu.Items.Add($item)
+            }
+        }
+    })
+    $menu = New-WmtContextMenu -Items $items -Target $TabObj.Grid
+    foreach ($item in $menu.Items) {
+        $binding = [System.Windows.Data.Binding]::new('IsEnabled')
+        $binding.Source = $item.Tag
+        [void]$item.SetBinding([System.Windows.UIElement]::IsEnabledProperty, $binding)
     }
-    $TabObj.Grid.ContextMenu = $menu
 }
 
 function Invoke-StartupWindowsLoad {
@@ -29222,103 +29960,6 @@ powercfg /S SCHEME_CURRENT | Out-Null
     <DropShadowEffect x:Key="SubtleElevation" ShadowDepth="0" BlurRadius="8" Opacity="0.25" Color="#000000"/>
 
     <!-- GridView Column Header (theme-aware, borderless) -->
-    <Style TargetType="GridViewColumnHeader">
-        <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
-        <Setter Property="Foreground" Value="{DynamicResource TextSecondary}"/>
-        <Setter Property="BorderBrush" Value="Transparent"/>
-        <Setter Property="BorderThickness" Value="0"/>
-        <Setter Property="Padding" Value="12,8"/>
-        <Setter Property="Margin" Value="0"/>
-        <Setter Property="FontSize" Value="11"/>
-        <Setter Property="FontWeight" Value="SemiBold"/>
-        <Setter Property="SnapsToDevicePixels" Value="True"/>
-        <Setter Property="UseLayoutRounding" Value="True"/>
-        <Setter Property="Template">
-            <Setter.Value>
-                <ControlTemplate TargetType="GridViewColumnHeader">
-                    <Grid>
-                        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="0" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True" UseLayoutRounding="True">
-                            <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Left" TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"/>
-                        </Border>
-                        <Thumb x:Name="PART_HeaderGripper" HorizontalAlignment="Right" Margin="0,0,-4,0" Width="8" Cursor="SizeWE" Opacity="0.4">
-                            <Thumb.Template>
-                                <ControlTemplate TargetType="Thumb">
-                                    <Border Background="Transparent"/>
-                                </ControlTemplate>
-                            </Thumb.Template>
-                        </Thumb>
-                    </Grid>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-
-    <!-- Transparent, theme-aware scrollbars for all WPF scroll viewers -->
-    <Style x:Key="TransparentScrollRepeatButton" TargetType="{x:Type RepeatButton}">
-        <Setter Property="Focusable" Value="False"/>
-        <Setter Property="Background" Value="Transparent"/>
-        <Setter Property="BorderThickness" Value="0"/>
-        <Setter Property="Template">
-            <Setter.Value>
-                <ControlTemplate TargetType="{x:Type RepeatButton}">
-                    <Border Background="Transparent"/>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-
-    <Style TargetType="{x:Type ScrollBar}">
-        <Setter Property="Width" Value="10"/>
-        <Setter Property="MinWidth" Value="10"/>
-        <Setter Property="Background" Value="Transparent"/>
-        <Setter Property="Template">
-            <Setter.Value>
-                <ControlTemplate TargetType="{x:Type ScrollBar}">
-                    <Grid Background="{TemplateBinding Background}" SnapsToDevicePixels="True">
-                        <Track x:Name="PART_Track" IsDirectionReversed="True">
-                            <Track.DecreaseRepeatButton>
-                                <RepeatButton x:Name="PageDecreaseButton" Command="{x:Static ScrollBar.PageUpCommand}" Style="{StaticResource TransparentScrollRepeatButton}"/>
-                            </Track.DecreaseRepeatButton>
-                            <Track.Thumb>
-                                <Thumb x:Name="ScrollThumb" MinHeight="34" Background="{DynamicResource BorderBrush}">
-                                    <Thumb.Template>
-                                        <ControlTemplate TargetType="{x:Type Thumb}">
-                                            <Border Background="{TemplateBinding Background}" CornerRadius="5" Margin="2"/>
-                                        </ControlTemplate>
-                                    </Thumb.Template>
-                                </Thumb>
-                            </Track.Thumb>
-                            <Track.IncreaseRepeatButton>
-                                <RepeatButton x:Name="PageIncreaseButton" Command="{x:Static ScrollBar.PageDownCommand}" Style="{StaticResource TransparentScrollRepeatButton}"/>
-                            </Track.IncreaseRepeatButton>
-                        </Track>
-                    </Grid>
-                    <ControlTemplate.Triggers>
-                        <Trigger Property="Orientation" Value="Horizontal">
-                            <Setter Property="Width" Value="Auto"/>
-                            <Setter Property="MinWidth" Value="0"/>
-                            <Setter Property="Height" Value="10"/>
-                            <Setter Property="MinHeight" Value="10"/>
-                            <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False"/>
-                            <Setter TargetName="ScrollThumb" Property="MinWidth" Value="34"/>
-                            <Setter TargetName="ScrollThumb" Property="MinHeight" Value="0"/>
-                            <Setter TargetName="PageDecreaseButton" Property="Command" Value="{x:Static ScrollBar.PageLeftCommand}"/>
-                            <Setter TargetName="PageIncreaseButton" Property="Command" Value="{x:Static ScrollBar.PageRightCommand}"/>
-                        </Trigger>
-                        <Trigger Property="IsMouseOver" Value="True">
-                            <Setter TargetName="ScrollThumb" Property="Background" Value="{DynamicResource TextSecondary}"/>
-                        </Trigger>
-                        <Trigger SourceName="ScrollThumb" Property="IsDragging" Value="True">
-                            <Setter TargetName="ScrollThumb" Property="Background" Value="{DynamicResource Accent}"/>
-                        </Trigger>
-                        <Trigger Property="IsEnabled" Value="False">
-                            <Setter Property="Opacity" Value="0.4"/>
-                        </Trigger>
-                    </ControlTemplate.Triggers>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
 
     <!-- Modern TextBox (crisp text) -->
     <Style TargetType="TextBox">
@@ -29471,52 +30112,10 @@ powercfg /S SCHEME_CURRENT | Out-Null
         </Style.Triggers>
     </Style>
 
-    <!-- Modern ListView Item (crisp text) -->
-    <Style x:Key="FwItem" TargetType="ListViewItem">
-        <Setter Property="BorderThickness" Value="0"/>
-        <Setter Property="Padding" Value="12,6"/>
-        <Setter Property="Margin" Value="2,1"/>
-        <Setter Property="Background" Value="Transparent"/>
-        <Setter Property="SnapsToDevicePixels" Value="True"/>
-        <Setter Property="UseLayoutRounding" Value="True"/>
-        <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
-        <Setter Property="TextOptions.TextRenderingMode" Value="ClearType"/>
-        <!-- Paint the row with theme brushes instead of native selection chrome. -->
-        <Setter Property="Template">
-            <Setter.Value>
-                <ControlTemplate TargetType="ListViewItem">
-                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                            BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
-                            SnapsToDevicePixels="True">
-                        <GridViewRowPresenter Content="{TemplateBinding Content}"
-                                              Columns="{Binding View.Columns, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}"
-                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-                    </Border>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-        <Style.Triggers>
-            <Trigger Property="ItemsControl.AlternationIndex" Value="0">
-                <Setter Property="Background" Value="{DynamicResource BgPanel}"/>
-            </Trigger>
-            <Trigger Property="ItemsControl.AlternationIndex" Value="1">
-                <Setter Property="Background" Value="{DynamicResource BgDark}"/>
-            </Trigger>
-            <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="Background" Value="{DynamicResource BgHover}"/>
-            </Trigger>
-            <Trigger Property="IsSelected" Value="True">
-                <Setter Property="Background" Value="{DynamicResource Accent}"/>
-                <Setter Property="Foreground" Value="{DynamicResource AccentText}"/>
-                <Setter Property="FontWeight" Value="Medium"/>
-            </Trigger>
-        </Style.Triggers>
-    </Style>
-
     <!-- Driver list row: zebra base + status tint. Hover/selection triggers are
          re-declared AFTER the status triggers so selecting or hovering a tinted
          row still wins over the tint (last active trigger in a style wins). -->
-    <Style x:Key="DrvItem" TargetType="ListViewItem" BasedOn="{StaticResource FwItem}">
+    <Style x:Key="DrvItem" TargetType="ListViewItem" BasedOn="{StaticResource WmtListViewItemStyle}">
         <Style.Triggers>
             <DataTrigger Binding="{Binding Status}" Value="In Use"><Setter Property="Background" Value="{DynamicResource DrvTintInUse}"/></DataTrigger>
             <DataTrigger Binding="{Binding Status}" Value="Old"><Setter Property="Background" Value="{DynamicResource DrvTintOld}"/></DataTrigger>
@@ -29699,31 +30298,15 @@ powercfg /S SCHEME_CURRENT | Out-Null
 
                 <!-- Header Card -->
                 <Border Grid.Row="0" Style="{StaticResource CardStyle}" Margin="0,0,0,12">
-                    <Grid>
+                    <HeaderedContentControl Style="{StaticResource WmtPageHeaderStyle}">
+                      <HeaderedContentControl.Header>
+                       <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" MinWidth="0"/>
-                            <ColumnDefinition Width="380"/>
+                            <ColumnDefinition Width="*" MaxWidth="380"/>
                         </Grid.ColumnDefinitions>
-                        <StackPanel Grid.Column="0" Margin="0,0,16,0">
-                            <TextBlock Name="lblWingetTitle" Text="Package Updates" Style="{StaticResource SectionHeader}" Margin="0"/>
-                            <TextBlock Name="lblWingetStatus" Text="Ready to scan"
-                                       Foreground="{DynamicResource TextSecondary}" FontSize="13" Visibility="Visible"
-                                       TextWrapping="Wrap"/>
-                            <Grid Margin="0,8,0,0" VerticalAlignment="Center">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="*"/>
-                                </Grid.ColumnDefinitions>
-                                <ProgressBar Name="pbWingetProgress" Grid.Column="0" Width="260" Height="8"
-                                             Minimum="0" Maximum="100" Value="0" Visibility="Collapsed"/>
-                                <TextBlock Name="lblWingetProgress" Grid.Column="1" Text="" Margin="10,0,0,0"
-                                           Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"
-                                           TextWrapping="Wrap"/>
-                            </Grid>
-                            <TextBlock Name="lblWingetLastResult" Text="" Margin="0,6,0,0"
-                                       Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"
-                                       TextWrapping="Wrap"/>
-                        </StackPanel>
+                        <TextBlock Name="lblWingetTitle" Text="Package Updates" Style="{StaticResource SectionHeader}"
+                                   Margin="0,0,16,0" VerticalAlignment="Center" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
                         <Border Grid.Column="1" Style="{StaticResource ModernSearchBoxStyle}" VerticalAlignment="Top">
                             <Grid>
                                 <Grid.ColumnDefinitions>
@@ -29752,13 +30335,28 @@ powercfg /S SCHEME_CURRENT | Out-Null
                                         Style="{StaticResource SearchClearBtnStyle}"/>
                             </Grid>
                         </Border>
-                    </Grid>
+                       </Grid>
+                      </HeaderedContentControl.Header>
+                      <StackPanel>
+                        <TextBlock Name="lblWingetStatus" Text="Ready to scan"
+                                   Foreground="{DynamicResource TextSecondary}" FontSize="13" Visibility="Visible"
+                                   TextWrapping="Wrap"/>
+                        <ProgressBar Name="pbWingetProgress" Height="8" Margin="0,8,0,0"
+                                     Minimum="0" Maximum="100" Value="0" Visibility="Collapsed"/>
+                        <TextBlock Name="lblWingetProgress" Text="" Margin="0,6,0,0"
+                                   Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"
+                                   TextWrapping="Wrap"/>
+                        <TextBlock Name="lblWingetLastResult" Text="" Margin="0,6,0,0"
+                                   Foreground="{DynamicResource TextMuted}" FontSize="12" Visibility="Collapsed"
+                                   TextWrapping="Wrap"/>
+                      </StackPanel>
+                    </HeaderedContentControl>
                 </Border>
 
                 <!-- List Card -->
                 <Border Grid.Row="1" Style="{StaticResource CardStyle}" Padding="0" Margin="0">
                     <ListView Name="lstWinget" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" 
-                              SelectionMode="Extended" AlternationCount="2" ItemContainerStyle="{StaticResource FwItem}"
+                              SelectionMode="Extended" AlternationCount="2"
                               VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                         <ListView.View>
                             <GridView>
@@ -29836,7 +30434,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                 <!-- Catalog List -->
                 <Border Name="brdCatalogList" Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0">
                     <ListView Name="lstCatalog" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" 
-                              SelectionMode="Extended" AlternationCount="2" ItemContainerStyle="{StaticResource FwItem}"
+                              SelectionMode="Extended" AlternationCount="2"
                               VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                         <ListView.View>
                             <GridView>
@@ -29881,7 +30479,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             </Grid>
                         </Border>
                         <ListView Name="lstLibrary" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0"
-                                  SelectionMode="Extended" ItemContainerStyle="{StaticResource FwItem}"
+                                  SelectionMode="Extended"
                                   VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                             <ListView.ContextMenu>
                                 <ContextMenu Name="ctxLibrary">
@@ -29935,7 +30533,8 @@ powercfg /S SCHEME_CURRENT | Out-Null
             </Grid>
 
             <!-- TWEAKS PANEL � Revamped: multi-column iconified cards (My Device pattern) -->
-    <Grid Name="grdTweaksContainer">
+    <!-- Scroll pages reach the right edge past the shared content inset. -->
+    <Grid Name="grdTweaksContainer" Margin="0,0,-20,0">
     <ScrollViewer Name="pnlTweaks" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <StackPanel>
             <WrapPanel Name="pnlTweaksCards" Margin="20" ItemWidth="350">
@@ -30015,7 +30614,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <TextBlock Text="Remove pre-installed UWP/Modern apps" FontSize="11" Foreground="{DynamicResource TextMuted}" Margin="0,2,0,8"/>
                             <TextBlock Text="Select apps to remove (use Ctrl+Click for multiple)" Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,8" FontSize="12"/>
                             <ListView Name="lstAppxPackages" Height="200" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" SelectionMode="Multiple"
-                                      AlternationCount="2" ItemContainerStyle="{StaticResource FwItem}"
+                                      AlternationCount="2"
                                       VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                                 <ListView.View>
                                     <GridView>
@@ -30695,7 +31294,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             </StackPanel>
 
                             <!-- MY DEVICE PANEL -->
-                            <ScrollViewer Name="pnlMyDevice" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <ScrollViewer Name="pnlMyDevice" Margin="0,0,-20,0" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                 <StackPanel>
                                     <WrapPanel Name="pnlMyDeviceCards" Margin="20" ItemWidth="350">
                                             <Border Background="{DynamicResource BgPanel}" CornerRadius="8" BorderThickness="0" Margin="10" Padding="15">
@@ -31083,7 +31682,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
 
                 <!-- Rules List Card -->
                 <Border Grid.Row="1" Style="{StaticResource CardStyle}" Padding="0" Margin="0">
-                    <ListView Name="lstFirewall" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" AlternationCount="2" ItemContainerStyle="{StaticResource FwItem}"
+                    <ListView Name="lstFirewall" Background="Transparent" Foreground="{DynamicResource TextPrimary}" BorderThickness="0" AlternationCount="2"
                               VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
                         <ListView.View>
                             <GridView>
@@ -31157,22 +31756,15 @@ powercfg /S SCHEME_CURRENT | Out-Null
 
                 <!-- Header Card -->
                 <Border Grid.Row="0" Style="{StaticResource CardStyle}" Margin="0,0,0,12">
-                    <Grid>
+                    <HeaderedContentControl Style="{StaticResource WmtPageHeaderStyle}">
+                      <HeaderedContentControl.Header>
+                       <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="380"/>
+                            <ColumnDefinition Width="*" MaxWidth="380"/>
                         </Grid.ColumnDefinitions>
-                        <StackPanel>
-                            <TextBlock Text="Driver Management" Style="{StaticResource SectionHeader}" Margin="0"/>
-                            <TextBlock Name="lblDrvStatus" Text="Ready — the driver store loads when you open this page" Foreground="{DynamicResource TextSecondary}" FontSize="13" TextWrapping="Wrap"/>
-                            <TextBlock FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap">
-                                <Run Text="Highlighting:  " Foreground="{DynamicResource TextMuted}"/>
-                                <Run Text="● In Use   " Foreground="{DynamicResource Success}"/>
-                                <Run Text="● Old   " Foreground="{DynamicResource Warning}"/>
-                                <Run Text="● Unattached   " Foreground="{DynamicResource Danger}"/>
-                                <Run Text="● Inactive (disabled in Device Manager)" Foreground="{DynamicResource TextSecondary}"/>
-                            </TextBlock>
-                        </StackPanel>
+                        <TextBlock Text="Driver Management" Style="{StaticResource SectionHeader}" Margin="0,0,16,0"
+                                   VerticalAlignment="Center" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
                         <Border Grid.Column="1" Style="{StaticResource ModernSearchBoxStyle}" VerticalAlignment="Top">
                             <Grid>
                                 <Grid.ColumnDefinitions>
@@ -31200,7 +31792,19 @@ powercfg /S SCHEME_CURRENT | Out-Null
                                         Style="{StaticResource SearchClearBtnStyle}"/>
                             </Grid>
                         </Border>
-                    </Grid>
+                       </Grid>
+                      </HeaderedContentControl.Header>
+                      <StackPanel>
+                        <TextBlock Name="lblDrvStatus" Text="Ready — the driver store loads when you open this page" Foreground="{DynamicResource TextSecondary}" FontSize="13" TextWrapping="Wrap"/>
+                        <TextBlock FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap">
+                            <Run Text="Highlighting:  " Foreground="{DynamicResource TextMuted}"/>
+                            <Run Text="● In Use   " Foreground="{DynamicResource Success}"/>
+                            <Run Text="● Old   " Foreground="{DynamicResource Warning}"/>
+                            <Run Text="● Unattached   " Foreground="{DynamicResource Danger}"/>
+                            <Run Text="● Inactive (disabled in Device Manager)" Foreground="{DynamicResource TextSecondary}"/>
+                        </TextBlock>
+                      </StackPanel>
+                    </HeaderedContentControl>
                 </Border>
 
                 <!-- Driver List Card -->
@@ -31340,24 +31944,22 @@ powercfg /S SCHEME_CURRENT | Out-Null
             <StackPanel Name="pnlSupport" Visibility="Collapsed">
                 <!-- Header Card -->
                 <Border Style="{StaticResource CardStyle}">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Grid.Column="0" Margin="0,0,16,0">
-                            <TextBlock Text="Support &amp; Credits" Style="{StaticResource SectionHeader}" Margin="0"/>
-                            <TextBlock Text="Windows Maintenance Tool v$AppVersion" FontSize="14" Foreground="{DynamicResource TextSecondary}" FontWeight="SemiBold"/>
-                        </StackPanel>
-                        <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
-                            <Button Name="btnStartWithWindows" Content="Start with Windows: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="170" Margin="0,0,8,0" ToolTip="WMT does not launch at logon (no startup task, or task state: Disabled). Click to set the state to On."/>
-                            <Button Name="btnLaunchMinimized" Content="Launch Minimized: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="160" Margin="0,0,8,0" ToolTip="WMT starts with a visible window. Click to start hidden in the system tray instead."/>
-                            <Button Name="btnDisableBgJobs" Content="Bg Jobs: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="130" Margin="0,0,8,0" ToolTip="Background auto-refresh ENABLED. My Device info and Tweaks states load automatically. Click to disable."/>
-                            <Button Name="btnDisableUpdateScans" Content="Update Scans: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="150" Margin="0,0,8,0" ToolTip="Disable all automatic and tray-triggered update scans. Manual scans will still work. Click to toggle."/>
-                            <Button Name="btnDebugMode" Content="Debug Logs: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="135" Margin="0,0,8,0" ToolTip="Extra internal diagnostic error logging is disabled. Click to enable additional WMT troubleshooting logs."/>
-                            <Button Name="btnToggleTheme" Content="Toggle Theme" Style="{StaticResource ActionBtn}" Height="32" MinWidth="112" ToolTip="Switch between dark and light theme"/>
-                        </StackPanel>
-                    </Grid>
+                    <HeaderedContentControl Style="{StaticResource WmtPageHeaderStyle}">
+                        <HeaderedContentControl.Header>
+                            <StackPanel>
+                                <TextBlock Text="Support &amp; Credits" Style="{StaticResource SectionHeader}" Margin="0" TextWrapping="Wrap"/>
+                                <TextBlock Text="Windows Maintenance Tool v$AppVersion" FontSize="14" Foreground="{DynamicResource TextSecondary}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </HeaderedContentControl.Header>
+                        <WrapPanel>
+                            <Button Name="btnStartWithWindows" Content="Start with Windows: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="170" Margin="0,0,8,8" ToolTip="WMT does not launch at logon (no startup task, or task state: Disabled). Click to set the state to On."/>
+                            <Button Name="btnLaunchMinimized" Content="Launch Minimized: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="160" Margin="0,0,8,8" ToolTip="WMT starts with a visible window. Click to start hidden in the system tray instead."/>
+                            <Button Name="btnDisableBgJobs" Content="Bg Jobs: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="130" Margin="0,0,8,8" ToolTip="Background auto-refresh ENABLED. My Device info and Tweaks states load automatically. Click to disable."/>
+                            <Button Name="btnDisableUpdateScans" Content="Update Scans: On" Style="{StaticResource ActionBtn}" Height="32" MinWidth="150" Margin="0,0,8,8" ToolTip="Disable all automatic and tray-triggered update scans. Manual scans will still work. Click to toggle."/>
+                            <Button Name="btnDebugMode" Content="Debug Logs: Off" Style="{StaticResource ActionBtn}" Height="32" MinWidth="135" Margin="0,0,8,8" ToolTip="Extra internal diagnostic error logging is disabled. Click to enable additional WMT troubleshooting logs."/>
+                            <Button Name="btnToggleTheme" Content="Toggle Theme" Style="{StaticResource ActionBtn}" Height="32" MinWidth="112" Margin="0,0,8,8" ToolTip="Switch between dark and light theme"/>
+                        </WrapPanel>
+                    </HeaderedContentControl>
                 </Border>
 
                 <!-- Credits Card -->
@@ -35579,8 +36181,7 @@ if ($lstSearchResults) { $lstSearchResults.Add_SelectionChanged({
 }) }
 
 # WINGET CONTEXT MENU (Right-Click)
-$ctxMenu = New-Object System.Windows.Controls.ContextMenu
-Set-WmtContextMenuChrome -ContextMenu $ctxMenu
+$ctxMenu = New-WmtContextMenu -Items @()
 
 if ($lstWinget) {
 $lstWinget.Add_PreviewMouseRightButtonDown({
@@ -36129,7 +36730,6 @@ $btnWingetClearSearch.Add_Click({
         if ($btnWingetUpdateAll) { $btnWingetUpdateAll.Visibility = "Visible" }
         if ($btnWingetUninstall) { $btnWingetUninstall.Visibility = "Visible" }
         $script:WmtPackageSearchActive = $false
-        Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
     }
     $txtWingetSearch.Focus()
 })
@@ -41668,11 +42268,11 @@ $startProviderAction = {
     }
     $timer.Tag = $monitorState
     $timer.Add_Tick({
-            param($s, $eA)
+            param($s)
 
-            $state = $sender.Tag
+            $state = $s.Tag
             if (-not $state) {
-                try { $sender.Stop() } catch {}
+                try { $s.Stop() } catch {}
                 return
             }
 
@@ -41681,7 +42281,7 @@ $startProviderAction = {
                 try { $hasExited = [bool]$state.Process.HasExited } catch { $hasExited = $true }
                 if (-not $hasExited) { return }
 
-                try { $sender.Stop() } catch {}
+                try { $s.Stop() } catch {}
                 try { $state.Monitors.Remove($state.Key) } catch {}
                 $exitCode = 1
                 try { $exitCode = [int]$state.Process.ExitCode } catch {}
@@ -41697,7 +42297,7 @@ $startProviderAction = {
                 }
             }
             catch {
-                try { $sender.Stop() } catch {}
+                try { $s.Stop() } catch {}
                 try { $state.Monitors.Remove($state.Key) } catch {}
                 try { Write-GuiLog "[$($state.ProviderName)] Provider completion monitor failed: $($_.Exception.Message)" } catch {}
                 try { & $state.UpdateStatuses } catch {}
@@ -42197,7 +42797,6 @@ if ($removed -gt 0) {
     try {
         $lstWinget.Items.Refresh()
         $lstWinget.UpdateLayout()
-        Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
     }
     catch {}
     $displayName = if ([string]::IsNullOrWhiteSpace($targetName)) { "Steam item" } else { $targetName }
@@ -42256,7 +42855,6 @@ if ($removed -gt 0) {
     try {
         $lstWinget.Items.Refresh()
         $lstWinget.UpdateLayout()
-        Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
     }
     catch {}
     $displayName = if ([string]::IsNullOrWhiteSpace($targetName) -or $RemoveAllProviderItems) { "$label item(s)" } else { $targetName }
@@ -43140,7 +43738,6 @@ $script:ScanTimer.Add_Tick({
 
             $lstWinget.Items.Refresh()
             $lstWinget.UpdateLayout()
-            Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
 
             if ($lstWinget.Items.Count -eq 0) {
                 if ($rebootPendingCount -gt 0) {
@@ -45380,192 +45977,6 @@ foreach ($item in @($Items)) {
 try { if ($lstWinget) { $lstWinget.Items.Refresh() } } catch {}
 }
 
-function Measure-WmtUpdateListTextScore {
-param([object]$Text)
-
-if ($null -eq $Text) { return 0.0 }
-$s = [string]$Text
-if ([string]::IsNullOrEmpty($s)) { return 0.0 }
-
-$score = 0.0
-foreach ($ch in $s.ToCharArray()) {
-    $c = [string]$ch
-    if ([char]::IsWhiteSpace($ch)) { $score += 0.35 }
-    elseif ("ilI1.,:;|![]()".IndexOf($c) -ge 0) { $score += 0.35 }
-    elseif ("MW@#%&".IndexOf($c) -ge 0) { $score += 1.25 }
-    elseif ($c -cmatch '[A-Z0-9]') { $score += 0.90 }
-    else { $score += 0.72 }
-}
-
-return [Math]::Min(140.0, [Math]::Ceiling($score))
-}
-
-function Get-WmtUpdateListPropertyText {
-param(
-    [object]$Item,
-    [string]$PropertyName
-)
-
-if ($null -eq $Item -or [string]::IsNullOrWhiteSpace($PropertyName)) { return "" }
-if ($Item.PSObject.Properties[$PropertyName]) { return [string]$Item.$PropertyName }
-return ""
-}
-
-function Set-WmtUpdateListSmartColumnWidths {
-param([System.Windows.Controls.ListView]$ListView = $lstWinget)
-
-if (-not $ListView -or -not $ListView.View -or -not ($ListView.View -is [System.Windows.Controls.GridView])) { return }
-$grid = [System.Windows.Controls.GridView]$ListView.View
-if (-not $grid.Columns -or $grid.Columns.Count -lt 6) { return }
-
-# There should only be six real update columns. If a stale/extra GridViewColumn ever survives
-# a patch merge, collapse it so it cannot look like an unused seventh column.
-if ($grid.Columns.Count -gt 6) {
-    for ($i = 6; $i -lt $grid.Columns.Count; $i++) {
-        try { $grid.Columns[$i].Width = 0.0 } catch {}
-    }
-}
-
-$available = 0.0
-try {
-    # Use cached ScrollViewer if available; otherwise walk the visual tree once and cache it.
-    if (-not $script:WmtUpdateListCachedScrollViewer -or $script:WmtUpdateListCachedScrollViewerTag -ne $ListView) {
-        $script:WmtUpdateListCachedScrollViewer = Get-WmtVisualDescendant -Element $ListView -DescendantType ([System.Windows.Controls.ScrollViewer])
-        $script:WmtUpdateListCachedScrollViewerTag = $ListView
-    }
-    $viewer = $script:WmtUpdateListCachedScrollViewer
-    if ($viewer -and -not [double]::IsNaN([double]$viewer.ViewportWidth) -and [double]$viewer.ViewportWidth -gt 150) {
-        # ViewportWidth already excludes the vertical scrollbar, so using it prevents the
-        # right-side blank GridView filler from being mistaken for another column.
-        $available = [double]$viewer.ViewportWidth
-    }
-}
-catch {}
-
-if ($available -le 150) {
-    try { $available = [double]$ListView.ActualWidth - 4.0 } catch {}
-}
-if ($available -le 150) {
-    try { $available = [double]$ListView.RenderSize.Width - 4.0 } catch {}
-}
-if ($available -le 150) { return }
-$available = [Math]::Max(420.0, [Math]::Floor($available) - 2.0)
-
-$specs = @(
-    [PSCustomObject]@{ Index = 0; Header = "Select"; Property = "IsChecked"; Min = 64.0; Char = 0.0; Grow = 0.0; Fixed = $true },
-    [PSCustomObject]@{ Index = 1; Header = "Source"; Property = "Source"; Min = 82.0; Char = 7.0; Grow = 0.35; Fixed = $false },
-    [PSCustomObject]@{ Index = 2; Header = "Package Name"; Property = "Name"; Min = 210.0; Char = 7.0; Grow = 5.00; Fixed = $false },
-    [PSCustomObject]@{ Index = 3; Header = "ID"; Property = "Id"; Min = 170.0; Char = 6.7; Grow = 3.50; Fixed = $false },
-    [PSCustomObject]@{ Index = 4; Header = "Installed"; Property = "Version"; Min = 100.0; Char = 6.8; Grow = 0.85; Fixed = $false },
-    [PSCustomObject]@{ Index = 5; Header = "Latest"; Property = "Available"; Min = 100.0; Char = 6.8; Grow = 0.85; Fixed = $false }
-)
-
-$scores = @{}
-foreach ($spec in $specs) {
-    $scores[[int]$spec.Index] = Measure-WmtUpdateListTextScore $spec.Header
-}
-
-$sampled = 0
-foreach ($item in @($ListView.Items)) {
-    if ($sampled -ge 600) { break }
-    $sampled++
-    foreach ($spec in $specs) {
-        if ([bool]$spec.Fixed) { continue }
-        $score = Measure-WmtUpdateListTextScore (Get-WmtUpdateListPropertyText -Item $item -PropertyName $spec.Property)
-        if ($score -gt $scores[[int]$spec.Index]) { $scores[[int]$spec.Index] = $score }
-    }
-}
-
-$widths = @{}
-foreach ($spec in $specs) {
-    if ([bool]$spec.Fixed) {
-        $widths[[int]$spec.Index] = [double]$spec.Min
-        continue
-    }
-    $desired = ([double]$scores[[int]$spec.Index] * [double]$spec.Char) + 30.0
-    $widths[[int]$spec.Index] = [Math]::Max([double]$spec.Min, [Math]::Ceiling($desired))
-}
-
-$total = 0.0
-foreach ($spec in $specs) { $total += [double]$widths[[int]$spec.Index] }
-
-if ($total -lt $available) {
-    $extra = $available - $total
-    $growTotal = 0.0
-    foreach ($spec in $specs) { if (-not [bool]$spec.Fixed) { $growTotal += [double]$spec.Grow } }
-    if ($growTotal -gt 0) {
-        foreach ($spec in $specs) {
-            if ([bool]$spec.Fixed) { continue }
-            $widths[[int]$spec.Index] = [double]$widths[[int]$spec.Index] + ($extra * ([double]$spec.Grow / $growTotal))
-        }
-    }
-}
-elseif ($total -gt $available) {
-    $overflow = $total - $available
-    $shrinkRoom = 0.0
-    foreach ($spec in $specs) {
-        if ([bool]$spec.Fixed) { continue }
-        $shrinkRoom += [Math]::Max(0.0, ([double]$widths[[int]$spec.Index] - [double]$spec.Min))
-    }
-    if ($shrinkRoom -gt 0) {
-        foreach ($spec in $specs) {
-            if ([bool]$spec.Fixed) { continue }
-            $room = [Math]::Max(0.0, ([double]$widths[[int]$spec.Index] - [double]$spec.Min))
-            $reduce = [Math]::Min($room, $overflow * ($room / $shrinkRoom))
-            $widths[[int]$spec.Index] = [double]$widths[[int]$spec.Index] - $reduce
-        }
-    }
-}
-
-$roundedTotal = 0.0
-foreach ($spec in $specs) {
-    $idx = [int]$spec.Index
-    $newWidth = [Math]::Max([double]$spec.Min, [Math]::Floor([double]$widths[$idx]))
-    $grid.Columns[$idx].Width = $newWidth
-    $roundedTotal += $newWidth
-}
-
-$remainder = [Math]::Floor($available - $roundedTotal)
-if ($remainder -gt 0 -and $grid.Columns.Count -gt 2) {
-    # Use the name column as the final elastic column so the GridView fills the card cleanly
-    # instead of leaving a blank right-side filler that looks like an unused column.
-    $grid.Columns[2].Width = [double]$grid.Columns[2].Width + $remainder
-}
-elseif ($remainder -lt -1 -and $grid.Columns.Count -gt 2) {
-    # Last-pixel correction for DPI/rounding: trim the elastic name column before WPF creates
-    # a horizontal scroll area or visually separates a phantom filler column.
-    $trim = [Math]::Min([Math]::Abs($remainder), [Math]::Max(0.0, [double]$grid.Columns[2].Width - 210.0))
-    if ($trim -gt 0) { $grid.Columns[2].Width = [double]$grid.Columns[2].Width - $trim }
-}
-}
-
-function Request-WmtUpdateListSmartColumnResize {
-param([System.Windows.Controls.ListView]$ListView = $lstWinget)
-
-if (-not $ListView) { return }
-$targetListView = $ListView
-try {
-    # Cancel any pending resize to avoid piling up Background operations
-    if ($script:WmtColumnResizeTimer) {
-        try { $script:WmtColumnResizeTimer.Stop() } catch {}
-    }
-    if (-not $script:WmtColumnResizeTimer) {
-        $script:WmtColumnResizeTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $script:WmtColumnResizeTimer.Interval = [TimeSpan]::FromMilliseconds(80)
-        $script:WmtColumnResizeTimer.Add_Tick({
-            try { $script:WmtColumnResizeTimer.Stop() } catch {}
-            if ($script:WmtColumnResizeTimerTag) {
-                Set-WmtUpdateListSmartColumnWidths -ListView $script:WmtColumnResizeTimerTag
-            }
-        })
-    }
-    $script:WmtColumnResizeTimerTag = $targetListView
-    try { $script:WmtColumnResizeTimer.Start() } catch {}
-}
-catch {
-    try { Set-WmtUpdateListSmartColumnWidths -ListView $targetListView } catch {}
-}
-}
 
 $script:WingetSortChain = New-Object System.Collections.ArrayList
 $script:GridSortAscendingGlyph = [string][char]0x25B2
@@ -45728,8 +46139,8 @@ switch ($Header) {
 
 if ($lstWinget) {
 $wingetSortHandler = [System.Windows.RoutedEventHandler] {
-    param($src, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
+    param($s, $eA)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -45738,13 +46149,10 @@ $wingetSortHandler = [System.Windows.RoutedEventHandler] {
     if ([string]::IsNullOrWhiteSpace($propName)) { return }
 
     $isAscending = Set-SortChainPrimary -Chain $script:WingetSortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $lstWinget -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $lstWinget -Chain $script:WingetSortChain
+    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
+    Set-ListViewSort -ListView $s -Chain $script:WingetSortChain
 }
 $lstWinget.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $wingetSortHandler, $true)
-$lstWinget.Add_Loaded({ Request-WmtUpdateListSmartColumnResize -ListView $lstWinget })
-$lstWinget.Add_SizeChanged({ Request-WmtUpdateListSmartColumnResize -ListView $lstWinget })
-Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
 }
 
 # --- Library list column sorting ---
@@ -45764,8 +46172,8 @@ switch ($Header) {
 
 if ($lstLibrary) {
 $librarySortHandler = [System.Windows.RoutedEventHandler] {
-    param($src, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
+    param($s, $eA)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -45774,8 +46182,8 @@ $librarySortHandler = [System.Windows.RoutedEventHandler] {
     if ([string]::IsNullOrWhiteSpace($propName)) { return }
 
     $isAscending = Set-SortChainPrimary -Chain $script:LibrarySortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $lstLibrary -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $lstLibrary -Chain $script:LibrarySortChain
+    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
+    Set-ListViewSort -ListView $s -Chain $script:LibrarySortChain
 }
 $lstLibrary.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $librarySortHandler, $true)
 }
@@ -45816,7 +46224,6 @@ $script:SearchTimer.Add_Tick({
         $lblWingetStatus.Visibility = "Visible"
         $txtWingetSearch.IsEnabled = $true
         $txtWingetSearch.ToolTip = ""
-        if ($lstWinget.Items.Count -gt 0) { Request-WmtUpdateListSmartColumnResize -ListView $lstWinget }
         $script:AsyncSearch = $null
         $script:AsyncPowerShell = $null
         $script:SearchOutput = $null
@@ -45926,7 +46333,6 @@ $script:SearchTimer.Add_Tick({
         }
         else {
             $lblWingetStatus.Visibility = "Hidden"
-            Request-WmtUpdateListSmartColumnResize -ListView $lstWinget
             Write-GuiLog "Search Complete. Found $($lstWinget.Items.Count) results."
         }
         $script:AsyncSearch = $null
@@ -47022,7 +47428,6 @@ $script:InvokeWingetSearch = {
                                 $instVer = ""
                                 try { if ($game.PSObject.Properties["InstalledVersion"]) { $instVer = [string]$game.InstalledVersion } } catch {}
                                 $latestVer = [string]$game.Version
-                                $verCol = if ($isInst -and -not [string]::IsNullOrWhiteSpace($instVer)) { $instVer } else { "-" }
                                 $availCol = if (-not [string]::IsNullOrWhiteSpace($latestVer)) { $latestVer } else { "-" }
                                 New-WmtPackageSearchResult -Source "legendary" -Name $title -Id ([string]$game.Id) -RemoteVersion $availCol -InstalledState $isInst -InstalledVersion $instVer
                         $script:provCount++
@@ -47569,8 +47974,7 @@ if ($lstFw) { $lstFw.Add_MouseDoubleClick({
     }
 })
 # --- FIREWALL CONTEXT MENU ---
-$fwCtxMenu = New-Object System.Windows.Controls.ContextMenu
-Set-WmtContextMenuChrome -ContextMenu $fwCtxMenu
+$fwCtxMenu = New-WmtContextMenu -Items @()
 
 # 1. Option: Copy Rule Name
 $mniCopyName = New-Object System.Windows.Controls.MenuItem
@@ -48141,8 +48545,8 @@ switch ($Header) {
 
 if ($lstFw) {
 $fwSortHandler = [System.Windows.RoutedEventHandler] {
-    param($src, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
+    param($s, $eA)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -48151,8 +48555,8 @@ $fwSortHandler = [System.Windows.RoutedEventHandler] {
     if ([string]::IsNullOrWhiteSpace($propName)) { return }
 
     $isAscending = Set-SortChainPrimary -Chain $script:FirewallSortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $lstFw -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $lstFw -Chain $script:FirewallSortChain
+    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
+    Set-ListViewSort -ListView $s -Chain $script:FirewallSortChain
 }
 $lstFw.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $fwSortHandler, $true)
 }
@@ -49273,8 +49677,8 @@ switch ($Header) {
 
 if ($lstDrivers) {
 $drvSortHandler = [System.Windows.RoutedEventHandler] {
-    param($src, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
+    param($s, $eA)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -49283,8 +49687,8 @@ $drvSortHandler = [System.Windows.RoutedEventHandler] {
     if ([string]::IsNullOrWhiteSpace($propName)) { return }
 
     $isAscending = Set-SortChainPrimary -Chain $script:DriverSortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $lstDrivers -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $lstDrivers -Chain $script:DriverSortChain
+    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
+    Set-ListViewSort -ListView $s -Chain $script:DriverSortChain
 }
 $lstDrivers.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $drvSortHandler, $true)
 
@@ -49318,8 +49722,7 @@ $lstDrivers.Add_PreviewKeyDown({
 
 # --- DRIVER LIST CONTEXT MENU ---
 if ($lstDrivers) {
-$drvCtxMenu = New-Object System.Windows.Controls.ContextMenu
-Set-WmtContextMenuChrome -ContextMenu $drvCtxMenu
+$drvCtxMenu = New-WmtContextMenu -Items @()
 
 $miDrvDetails = New-Object System.Windows.Controls.MenuItem
 $miDrvDetails.Header = "Driver Details"
@@ -51231,11 +51634,7 @@ function Show-WmtCompactManager {
     $rbFolder.Add_Checked($setTargetMode)
     $rbDrive.Add_Checked($setTargetMode)
 
-    $btnBrowse.Add_Click({
-        $initial = [string]$txtFolder.Text
-        $picked = Select-WmtExplorerFolder -Description "Select folder to compress or decompress" -InitialDirectory $initial -OwnerWindow $dialog
-        if (-not [string]::IsNullOrWhiteSpace($picked)) { $txtFolder.Text = $picked }
-    }.GetNewClosure())
+    Connect-WmtPathPicker -TextBox $txtFolder -BrowseButton $btnBrowse -Description "Select folder to compress or decompress" -Owner $dialog
 
     $runOperation = {
         param([string]$Mode)
@@ -54154,136 +54553,83 @@ param(
 )
 
 $contentXaml = @'
-<Grid Margin="14">
-    <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
-
-    <StackPanel Grid.Row="0" Margin="0,0,0,12">
-        <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-        <TextBlock Text="Choose where this game should be installed. Pick the parent game-library folder below; the final game directory is shown separately."
-                   Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBlock Name="lblMetadata" Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Warning}"/>
+<Grid Margin="0" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+  </Grid.RowDefinitions>
+  <Grid Grid.Row="0" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Game subfolder (optional)" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <TextBox Name="txtGameFolder" Grid.Column="1" Height="34" VerticalContentAlignment="Center" ToolTip="Optional final folder name inside the game library folder. Leave blank (recommended) to let Legendary/Epic choose the normal game folder name." />
+  </Grid>
+  <Grid Grid.Row="1" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Final destination" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <TextBox Name="txtDestinationPreview" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center" ToolTip="Shows the exact final path when you provide a custom game subfolder. If blank, Legendary chooses the final folder from Epic metadata." />
+  </Grid>
+  <Grid Grid.Row="2" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Platform" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboPlatform" Grid.Column="1" Height="34" ToolTip="Platforms reported by Legendary for this title. Windows is preferred on Windows." />
+  </Grid>
+  <Grid Grid.Row="3" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Version / size" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <TextBox Name="txtVersion" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center" />
+  </Grid>
+  <Grid Grid.Row="4" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboWorkers" Grid.Column="1" Height="34" ToolTip="Higher values may improve throughput but increase CPU, memory, network, and disk pressure." />
+  </Grid>
+  <Grid Grid.Row="5" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Shared memory" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboSharedMemory" Grid.Column="1" Height="34" ToolTip="Legendary download-manager shared memory limit in MiB." />
+  </Grid>
+  <Grid Grid.Row="6" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}" />
+      <TextBlock Text="Ctrl/Shift-select specific installable DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}" />
     </StackPanel>
-
-    <Grid Grid.Row="1" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Game library folder" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"
-                 ToolTip="Parent folder that contains your Epic games, for example D:\Games\Epic."/>
-        <Button Name="btnBrowse" Grid.Column="2" Content="Browse..." MinWidth="92"/>
-    </Grid>
-
-    <Grid Grid.Row="2" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Game subfolder (optional)" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtGameFolder" Grid.Column="1" Height="34" VerticalContentAlignment="Center"
-                 ToolTip="Optional final folder name inside the game library folder. Leave blank (recommended) to let Legendary/Epic choose the normal game folder name."/>
-    </Grid>
-
-    <Grid Grid.Row="3" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Final destination" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtDestinationPreview" Grid.Column="1" Height="34" IsReadOnly="True"
-                 VerticalContentAlignment="Center"
-                 ToolTip="Shows the exact final path when you provide a custom game subfolder. If blank, Legendary chooses the final folder from Epic metadata."/>
-    </Grid>
-
-    <Grid Grid.Row="4" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Platform" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <ComboBox Name="cboPlatform" Grid.Column="1" Height="34"
-                  ToolTip="Platforms reported by Legendary for this title. Windows is preferred on Windows."/>
-    </Grid>
-
-    <Grid Grid.Row="5" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Version / size" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtVersion" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center"/>
-    </Grid>
-
-    <Grid Grid.Row="6" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <ComboBox Name="cboWorkers" Grid.Column="1" Height="34"
-                  ToolTip="Higher values may improve throughput but increase CPU, memory, network, and disk pressure."/>
-    </Grid>
-
-    <Grid Grid.Row="7" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Shared memory" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <ComboBox Name="cboSharedMemory" Grid.Column="1" Height="34"
-                  ToolTip="Legendary download-manager shared memory limit in MiB."/>
-    </Grid>
-
-    <Grid Grid.Row="8" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <StackPanel>
-            <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}"/>
-            <TextBlock Text="Ctrl/Shift-select specific installable DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
-        </StackPanel>
-        <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended"
-                 Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}"
-                 BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
-                 ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2">
-            <ListBox.Template>
-                <ControlTemplate TargetType="{x:Type ListBox}">
-                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                            BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
-                            SnapsToDevicePixels="True">
-                        <ScrollViewer Focusable="False" HorizontalScrollBarVisibility="Disabled"
-                                      VerticalScrollBarVisibility="Auto" CanContentScroll="True">
-                            <ItemsPresenter/>
-                        </ScrollViewer>
-                    </Border>
-                </ControlTemplate>
-            </ListBox.Template>
-        </ListBox>
-    </Grid>
-
-    <CheckBox Name="chkReorder" Grid.Row="9" Margin="150,0,0,5"
-              Content="Enable download reordering (lower RAM usage)"
-              ToolTip="Passes Legendary --enable-reordering. Legendary notes this can have adverse results for some titles."/>
-    <StackPanel Grid.Row="10" Margin="150,0,0,8">
-        <CheckBox Name="chkKeepOpen" Margin="0,0,0,5"
-                  Content="Keep console open after a successful download"
-                  ToolTip="Failures always pause so the final Legendary error stays visible."/>
-        <CheckBox Name="chkDesktopShortcut" Margin="0,0,0,5"
-                  Content="Create a desktop shortcut after install"
-                  ToolTip="Creates the shortcut only after Legendary finishes successfully."/>
-        <CheckBox Name="chkStartMenuShortcut"
-                  Content="Create a Start menu entry after install"
-                  ToolTip="Creates an entry under Start menu > Programs > WMT Games only after a successful install."/>
-    </StackPanel>
-
-    <TextBlock Grid.Row="11" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}"
-               Text="Legendary installs resumably. WMT tracks the running install, selected DLCs, and final install path when Legendary reports it."/>
-    <TextBlock Name="lblError" Grid.Row="12" Margin="0,8,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Danger}"/>
-
-    <StackPanel Grid.Row="13" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,2">
-        <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
-        <Button Name="btnInstall" Content="Install" Width="104" IsDefault="True"
-                Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
-    </StackPanel>
+    <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended" Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2"></ListBox>
+  </Grid>
+  <CheckBox Name="chkReorder" Style="{StaticResource WmtWrappingCheckBoxStyle}" Grid.Row="7" Margin="150,0,0,5" Content="Enable download reordering (lower RAM usage)" ToolTip="Passes Legendary --enable-reordering. Legendary notes this can have adverse results for some titles." />
+  <TextBlock Grid.Row="8" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}" Text="Legendary installs resumably. WMT tracks the running install, selected DLCs, and final install path when Legendary reports it." />
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "Legendary Install Options" -ContentXaml $contentXaml -Width 700 -Height 770 -MinWidth 600 -MinHeight 730 -NoResize
-Add-WmtListSelectionResources -Element $dialog
-Set-WmtNativeWindowTheme -Window $dialog
+$dialog = New-WmtInstallerDialog -Title 'Legendary Install Options' -Description 'Choose where this game should be installed. Pick the parent game-library folder below; the final game directory is shown separately.' -OptionsXaml $contentXaml -PathLabel 'Game library folder' -PathDescription 'Choose the parent folder that should contain your Epic games' -Width 700 -Height 770
 
 $lblTitle = $dialog.FindName("lblTitle")
 $lblMetadata = $dialog.FindName("lblMetadata")
@@ -54300,18 +54646,9 @@ $chkKeepOpen = $dialog.FindName("chkKeepOpen")
 $chkDesktopShortcut = $dialog.FindName("chkDesktopShortcut")
 $chkStartMenuShortcut = $dialog.FindName("chkStartMenuShortcut")
 $lblError = $dialog.FindName("lblError")
-$btnBrowse = $dialog.FindName("btnBrowse")
 $btnInstall = $dialog.FindName("btnInstall")
 $btnCancel = $dialog.FindName("btnCancel")
 
-if ($lstDlcs) {
-    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowBrushKey] = New-WmtBrush "BgPanel"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowTextBrushKey] = New-WmtBrush "TextPrimary"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlBrushKey] = New-WmtBrush "BgPanel"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlTextBrushKey] = New-WmtBrush "TextPrimary"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = New-WmtBrush "Accent"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = New-WmtBrush "AccentText"
-}
 
 $lblTitle.Text = "Install $GameName"
 $txtRoot.Text = $DefaultRoot
@@ -54412,19 +54749,6 @@ $lblMetadata.Text = $metadataNotes -join [Environment]::NewLine
 
 $result = @{ Value = $null }
 
-$btnBrowse.Add_Click({
-        $initial = ([string]$txtRoot.Text).Trim()
-        if (-not (Test-Path -LiteralPath $initial -PathType Container)) {
-            try {
-                $parent = Split-Path -Parent $initial
-                if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) { $initial = $parent }
-                elseif ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) { $initial = $env:USERPROFILE }
-            }
-            catch {}
-        }
-        $selected = Select-WmtExplorerFolder -Description "Choose the parent folder that should contain your Epic games" -InitialDirectory $initial -Owner $dialog
-        if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $txtRoot.Text = [string]$selected }
-    }.GetNewClosure())
 
 $btnInstall.Add_Click({
         $root = ([string]$txtRoot.Text).Trim()
@@ -54489,7 +54813,6 @@ $btnInstall.Add_Click({
     }.GetNewClosure())
 
 $btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
-$dialog.Add_ContentRendered({ $txtRoot.Focus() | Out-Null; $txtRoot.SelectAll() }.GetNewClosure())
 [void]$dialog.ShowDialog()
 return $result.Value
 }
@@ -54842,120 +55165,57 @@ param(
 )
 
 $contentXaml = @'
-<Grid Margin="14">
-    <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
-
-    <StackPanel Grid.Row="0" Margin="0,0,0,12">
-        <TextBlock Name="lblTitle" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-        <TextBlock Text="Choose how GOGDL should install this game. The selected path is a library/root folder; GOGDL creates the game's own folder inside it."
-                   Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBlock Name="lblMetadata" Margin="0,5,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Warning}"/>
+<Grid Margin="0" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+  </Grid.RowDefinitions>
+  <Grid Grid.Row="0" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Language" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboLanguage" Grid.Column="1" Height="34" IsEditable="True" ToolTip="Languages reported by GOGDL. You can also type a language code manually." />
+  </Grid>
+  <Grid Grid.Row="1" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Build / version" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboBuild" Grid.Column="1" Height="34" ToolTip="Choose a GOG build/version, or leave the GOGDL stable/default build selected." />
+  </Grid>
+  <Grid Grid.Row="2" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboWorkers" Grid.Column="1" Height="34" ToolTip="1 is lowest-memory. More workers can improve throughput but create more GOGDL worker processes." />
+  </Grid>
+  <Grid Grid.Row="3" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}" />
+      <TextBlock Text="Ctrl/Shift-select specific DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}" />
     </StackPanel>
-
-    <Grid Grid.Row="1" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="150"/>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        <TextBlock Text="Install root" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtRoot" Grid.Column="1" Height="34" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
-        <Button Name="btnBrowse" Grid.Column="2" Content="Browse..." MinWidth="92"/>
-    </Grid>
-
-    <Grid Grid.Row="2" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Language" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <ComboBox Name="cboLanguage" Grid.Column="1" Height="34" IsEditable="True"
-                  ToolTip="Languages reported by GOGDL. You can also type a language code manually."/>
-    </Grid>
-
-    <Grid Grid.Row="3" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Build / version" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <ComboBox Name="cboBuild" Grid.Column="1" Height="34"
-                  ToolTip="Choose a GOG build/version, or leave the GOGDL stable/default build selected."/>
-    </Grid>
-
-    <Grid Grid.Row="4" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}"/>
-        <ComboBox Name="cboWorkers" Grid.Column="1" Height="34"
-                  ToolTip="1 is lowest-memory. More workers can improve throughput but create more GOGDL worker processes."/>
-    </Grid>
-
-    <Grid Grid.Row="5" Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <StackPanel>
-            <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}"/>
-            <TextBlock Text="Ctrl/Shift-select specific DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
-        </StackPanel>
-        <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended"
-                 Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}"
-                 BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
-                 ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2">
-            <ListBox.Template>
-                <ControlTemplate TargetType="{x:Type ListBox}">
-                    <Border Background="{TemplateBinding Background}"
-                            BorderBrush="{TemplateBinding BorderBrush}"
-                            BorderThickness="{TemplateBinding BorderThickness}"
-                            Padding="{TemplateBinding Padding}"
-                            SnapsToDevicePixels="True">
-                        <ScrollViewer Focusable="False"
-                                      HorizontalScrollBarVisibility="Disabled"
-                                      VerticalScrollBarVisibility="Auto"
-                                      CanContentScroll="True">
-                            <ItemsPresenter/>
-                        </ScrollViewer>
-                    </Border>
-                </ControlTemplate>
-            </ListBox.Template>
-        </ListBox>
-    </Grid>
-
-    <StackPanel Grid.Row="6" Margin="150,0,0,8">
-        <CheckBox Name="chkKeepOpen" Margin="0,0,0,5"
-                  Content="Keep console open after a successful download"
-                  ToolTip="Failures always pause so the final GOGDL error stays visible."/>
-        <CheckBox Name="chkDesktopShortcut" Margin="0,0,0,5"
-                  Content="Create a desktop shortcut after install"
-                  ToolTip="Creates the shortcut only after GOGDL finishes successfully."/>
-        <CheckBox Name="chkStartMenuShortcut"
-                  Content="Create a Start menu entry after install"
-                  ToolTip="Creates an entry under Start menu > Programs > WMT Games only after a successful install."/>
-    </StackPanel>
-
-    <TextBlock Grid.Row="7" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Warning}"
-               Text="Low-memory note: current GOGDL reserves a 1 GiB shared-memory block and maps it into its worker/writer processes. WMT defaults to 1 worker so Task Manager does not multiply those mappings as aggressively."/>
-
-    <TextBlock Name="lblError" Grid.Row="8" Margin="0,8,0,0" TextWrapping="Wrap"
-               Foreground="{DynamicResource Danger}"/>
-
-    <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,2">
-        <Button Name="btnCancel" Content="Cancel" Width="94" IsCancel="True" Margin="0,0,8,0"/>
-        <Button Name="btnInstall" Content="Install" Width="104" IsDefault="True"
-                Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
-    </StackPanel>
+    <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended" Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2"></ListBox>
+  </Grid>
+  <TextBlock Grid.Row="4" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Warning}" Text="Low-memory note: current GOGDL reserves a 1 GiB shared-memory block and maps it into its worker/writer processes. WMT defaults to 1 worker so Task Manager does not multiply those mappings as aggressively." />
 </Grid>
 '@
 
-$dialog = New-WmtWindowFromXaml -Title "GOGDL Install Options" -ContentXaml $contentXaml -Width 700 -Height 660 -MinWidth 600 -MinHeight 620 -NoResize
+$dialog = New-WmtInstallerDialog -Title 'GOGDL Install Options' -Description 'Choose how GOGDL should install this game. The selected path is a library/root folder; GOGDL creates the game''s own folder inside it.' -OptionsXaml $contentXaml -PathLabel 'Install root' -PathDescription 'Choose GOG game library folder' -Width 700 -Height 660
 # The generic runtime resources theme the controls; add the selection template
 # as well so DLC rows never fall back to Aero/SystemColors, and theme the
 # native title bar to match the current WMT palette.
-Add-WmtListSelectionResources -Element $dialog
-Set-WmtNativeWindowTheme -Window $dialog
 
 $lblTitle = $dialog.FindName("lblTitle")
 $lblMetadata = $dialog.FindName("lblMetadata")
@@ -54964,19 +55224,10 @@ $cboLanguage = $dialog.FindName("cboLanguage")
 $cboBuild = $dialog.FindName("cboBuild")
 $cboWorkers = $dialog.FindName("cboWorkers")
 $lstDlcs = $dialog.FindName("lstDlcs")
-if ($lstDlcs) {
-    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowBrushKey] = New-WmtBrush "BgPanel"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::WindowTextBrushKey] = New-WmtBrush "TextPrimary"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlBrushKey] = New-WmtBrush "BgPanel"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::ControlTextBrushKey] = New-WmtBrush "TextPrimary"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = New-WmtBrush "Accent"
-    $lstDlcs.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = New-WmtBrush "AccentText"
-}
 $chkKeepOpen = $dialog.FindName("chkKeepOpen")
 $chkDesktopShortcut = $dialog.FindName("chkDesktopShortcut")
 $chkStartMenuShortcut = $dialog.FindName("chkStartMenuShortcut")
 $lblError = $dialog.FindName("lblError")
-$btnBrowse = $dialog.FindName("btnBrowse")
 $btnInstall = $dialog.FindName("btnInstall")
 $btnCancel = $dialog.FindName("btnCancel")
 
@@ -55053,19 +55304,6 @@ if ($dlcItems.Count -eq 0) { $lstDlcs.IsEnabled = $false }
 
 $result = @{ Value = $null }
 
-$btnBrowse.Add_Click({
-        $initial = ([string]$txtRoot.Text).Trim()
-        if (-not (Test-Path -LiteralPath $initial -PathType Container)) {
-            try {
-                $parent = Split-Path -Parent $initial
-                if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) { $initial = $parent }
-                elseif ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) { $initial = $env:USERPROFILE }
-            }
-            catch {}
-        }
-        $selected = Select-WmtExplorerFolder -Description "Choose GOG game library folder" -InitialDirectory $initial -Owner $dialog
-        if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $txtRoot.Text = [string]$selected }
-    }.GetNewClosure())
 
 $btnInstall.Add_Click({
         $root = ([string]$txtRoot.Text).Trim()
@@ -55133,7 +55371,6 @@ $btnInstall.Add_Click({
     }.GetNewClosure())
 
 $btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
-$dialog.Add_ContentRendered({ $txtRoot.Focus() | Out-Null; $txtRoot.SelectAll() }.GetNewClosure())
 [void]$dialog.ShowDialog()
 return $result.Value
 }
