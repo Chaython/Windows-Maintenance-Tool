@@ -9181,12 +9181,13 @@ if (-not $script:FirewallLoadInProgress) {
 }
 
 if (-not $script:DriverLoadInProgress) {
-    $script:DriverPackages = @()
+    try { if ($script:DriverPackages -and $script:DriverPackages.PSObject.Methods["Clear"]) { $script:DriverPackages.Clear() } } catch {}
     $script:DriverDeviceMap = @{}
     $script:DriverServiceMap = $null
     $script:DriverUsageLoaded = $false
     $script:DriverCacheLoaded = $false
-    try { if ($lstDrivers) { $lstDrivers.Items.Clear() } } catch {}
+    $script:DriverCacheLoadedAt = [DateTime]::MinValue
+    try { if ($script:DriverCollectionView) { $script:DriverCollectionView.Refresh() } } catch {}
 }
 
 if (-not $script:WmtLibraryScanRunspace) {
@@ -26389,9 +26390,11 @@ $content = @"
     <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <DataGrid Name="dgGhost" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
-    <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+    <TextBlock Name="txtGhostStatus" Grid.Row="1" Margin="0,10,0,0" Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Text="Ready"/>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
         <Button Name="btnRefresh" Content="Refresh" Width="104" Margin="0,0,8,0" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
         <Button Name="btnRemoveSel" Content="Remove Selected" MinWidth="132" Margin="0,0,8,0" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
         <Button Name="btnRemoveAll" Content="Remove All" Width="108" Margin="0,0,8,0" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
@@ -26401,6 +26404,7 @@ $content = @"
 "@
 $dialog = New-WmtWindowFromXaml -Title "Ghost Devices" -ContentXaml $content -Width 840 -Height 520 -MinWidth 680 -MinHeight 420
 $dg = $dialog.FindName("dgGhost")
+$txtStatus = $dialog.FindName("txtGhostStatus")
 $btnRefresh = $dialog.FindName("btnRefresh")
 $btnRemoveSel = $dialog.FindName("btnRemoveSel")
 $btnRemoveAll = $dialog.FindName("btnRemoveAll")
@@ -26410,37 +26414,138 @@ $items = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $dg.ItemsSource = $items
 Set-WmtDataGridColumns -DataGrid $dg -Columns @("InstanceId", "Class", "FriendlyName") -Widths @{ InstanceId = "*"; Class = 120; FriendlyName = 260 }
 
+# Keep cache invalidation working even though the callbacks below use
+# GetNewClosure() (where $script: would otherwise point at the closure module).
+$driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script -ErrorAction SilentlyContinue
+$driverCacheLoadedAtState = Get-Variable -Name DriverCacheLoadedAt -Scope Script -ErrorAction SilentlyContinue
+$state = @{ Busy = $false; Generation = 0 }
+
+$setBusy = {
+    param([bool]$Busy, [string]$Message)
+    $state.Busy = $Busy
+    if ($txtStatus) { $txtStatus.Text = $Message }
+    if ($btnRefresh) { $btnRefresh.IsEnabled = -not $Busy }
+    if ($btnRemoveSel) { $btnRemoveSel.IsEnabled = -not $Busy }
+    if ($btnRemoveAll) { $btnRemoveAll.IsEnabled = -not $Busy }
+}.GetNewClosure()
+
+$load = $null
 $load = {
-    $items.Clear()
-    Set-WmtBusyCursor -Busy
-    try {
-        foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Unknown' })) {
-            [void]$items.Add([PSCustomObject]@{
-                    InstanceId   = [string]$d.InstanceId
-                    Class        = [string]$d.Class
-                    FriendlyName = [string]$d.FriendlyName
-                })
+    if ($state.Busy) { return }
+    $state.Generation++
+    $generation = [int]$state.Generation
+    & $setBusy $true "Scanning disconnected devices in background..."
+
+    $done = {
+        param($results)
+        if ($generation -ne [int]$state.Generation) { return }
+        try {
+            $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["Items"] } | Select-Object -Last 1)[0]
+            $items.Clear()
+            if ($payload) {
+                foreach ($d in @($payload.Items)) {
+                    if (-not $d -or [string]::IsNullOrWhiteSpace([string]$d.InstanceId)) { continue }
+                    [void]$items.Add([PSCustomObject]@{
+                        InstanceId   = [string]$d.InstanceId
+                        Class        = [string]$d.Class
+                        FriendlyName = [string]$d.FriendlyName
+                    })
+                }
+            }
+            if ($items.Count -eq 0) { & $setBusy $false "No disconnected/ghost devices found." }
+            else { & $setBusy $false ("Found {0} disconnected/ghost device(s)." -f $items.Count) }
         }
-        if ($items.Count -eq 0) {
-            Show-WmtMessageBox -Owner $dialog -Message "No hidden/ghost devices found." -Title "Ghost Devices" -Image Information | Out-Null
+        catch {
+            & $setBusy $false "Ghost-device scan failed."
+            Write-GuiLog "[Drivers] Ghost-device scan UI update failed: $($_.Exception.Message)"
         }
-    }
-    finally { Set-WmtBusyCursor }
+    }.GetNewClosure()
+
+    $failed = {
+        param($err)
+        if ($generation -ne [int]$state.Generation) { return }
+        & $setBusy $false "Ghost-device scan failed or timed out."
+        $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+        Write-GuiLog "[Drivers] Ghost-device scan failed: $msg"
+    }.GetNewClosure()
+
+    Invoke-WmtUiBackgroundCommand -Name ("GhostDeviceScan_" + [guid]::NewGuid().ToString("N")) -Msg "Scanning disconnected devices..." -SuppressResultLog -TimeoutMs 60000 -Sb {
+        # Get-PnpDevice without -PresentOnly includes non-present devnodes. Build
+        # a present-ID set and return only devices that are actually absent,
+        # instead of treating Status=Unknown as synonymous with disconnected.
+        $presentIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)) {
+            if ($p.InstanceId) { [void]$presentIds.Add([string]$p.InstanceId) }
+        }
+
+        $ghosts = [System.Collections.Generic.List[object]]::new()
+        foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue)) {
+            $id = [string]$d.InstanceId
+            if ([string]::IsNullOrWhiteSpace($id) -or $presentIds.Contains($id)) { continue }
+            [void]$ghosts.Add([PSCustomObject]@{
+                InstanceId   = $id
+                Class        = [string]$d.Class
+                FriendlyName = [string]$d.FriendlyName
+            })
+        }
+        [PSCustomObject]@{ Items = $ghosts.ToArray() }
+    } -OnComplete $done -OnError $failed | Out-Null
 }.GetNewClosure()
 
 $removeRows = {
     param([object[]]$Rows)
-    foreach ($row in @($Rows)) {
-        $id = [string]$row.InstanceId
-        if (-not [string]::IsNullOrWhiteSpace($id)) { pnputil /remove-device $id | Out-Null }
-    }
-    & $load
+    if ($state.Busy) { return }
+    $ids = @($Rows | ForEach-Object { [string]$_.InstanceId } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($ids.Count -eq 0) { return }
+
+    $state.Generation++
+    $generation = [int]$state.Generation
+    & $setBusy $true ("Removing {0} disconnected device(s) in background..." -f $ids.Count)
+
+    $done = {
+        param($results)
+        if ($generation -ne [int]$state.Generation) { return }
+        $records = @($results | Where-Object { $_ -and $_.PSObject.Properties["InstanceId"] })
+        $removed = @($records | Where-Object { $_.Success }).Count
+        $failedRows = @($records | Where-Object { -not $_.Success })
+        foreach ($failure in $failedRows) {
+            Write-GuiLog "[Drivers] Could not remove ghost device $($failure.InstanceId): exit $($failure.ExitCode) $($failure.Output)"
+        }
+        if ($removed -gt 0) {
+            if ($driverCacheLoadedState) { $driverCacheLoadedState.Value = $false }
+            if ($driverCacheLoadedAtState) { $driverCacheLoadedAtState.Value = [DateTime]::MinValue }
+        }
+        & $setBusy $false ("Removed {0} device(s); rescanning..." -f $removed)
+        & $load
+    }.GetNewClosure()
+
+    $failed = {
+        param($err)
+        if ($generation -ne [int]$state.Generation) { return }
+        & $setBusy $false "Ghost-device removal failed or timed out."
+        $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+        Write-GuiLog "[Drivers] Ghost-device removal failed: $msg"
+    }.GetNewClosure()
+
+    Invoke-WmtUiBackgroundCommand -Name ("GhostDeviceRemove_" + [guid]::NewGuid().ToString("N")) -Msg "Removing disconnected devices..." -SuppressResultLog -TimeoutMs 120000 -Sb {
+        param($InstanceIds)
+        foreach ($id in @($InstanceIds)) {
+            $out = @(& pnputil.exe /remove-device $id 2>&1)
+            $exit = $LASTEXITCODE
+            [PSCustomObject]@{
+                InstanceId = [string]$id
+                Success = ($exit -eq 0 -or $exit -eq 3010)
+                ExitCode = $exit
+                Output = ((@($out) | ForEach-Object { [string]$_ }) -join "`n")
+            }
+        }
+    } -ArgumentList (, $ids) -OnComplete $done -OnError $failed | Out-Null
 }.GetNewClosure()
 
 $btnRefresh.Add_Click({ & $load }.GetNewClosure())
 $btnRemoveSel.Add_Click({ & $removeRows -Rows @($dg.SelectedItems) }.GetNewClosure())
 $btnRemoveAll.Add_Click({ & $removeRows -Rows @($items) }.GetNewClosure())
-$btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
+$btnClose.Add_Click({ $state.Generation++; $dialog.Close() }.GetNewClosure())
 $dialog.Add_ContentRendered({ & $load }.GetNewClosure())
 $dialog.ShowDialog() | Out-Null
 }
@@ -26714,7 +26819,7 @@ if ($null -eq $DriverOutput) {
         $inUse = @()
         try {
             $inUse = @(
-                Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                Get-CimInstance -ClassName Win32_PnPSignedDriver -Property InfName -ErrorAction Stop |
                 Where-Object { $_.InfName -match '^oem\d+\.inf$' } |
                 Select-Object -ExpandProperty InfName -Unique
             )
@@ -27142,6 +27247,7 @@ if (-not $selectedPath) {
 }
 
 $driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script
+$driverCacheLoadedAtState = Get-Variable -Name DriverCacheLoadedAt -Scope Script -ErrorAction SilentlyContinue
 $driverPackagesState = Get-Variable -Name DriverPackages -Scope Script
 $restoreDone = {
     param($results)
@@ -27150,6 +27256,7 @@ $restoreDone = {
     if ($result.Output) { Write-GuiLog ([string]$result.Output) }
     if ($result.Status -eq "Success") {
         $driverCacheLoadedState.Value = $false
+        if ($driverCacheLoadedAtState) { $driverCacheLoadedAtState.Value = [DateTime]::MinValue }
         Show-WmtMessageBox -Message "Drivers restored from:`n$($result.Path)" -Title "Restore Drivers" -Image Information | Out-Null
         if ($driverPackagesState.Value -and $driverPackagesState.Value.Count -gt 0) { Start-DriverListLoad -Force }
     }
@@ -34642,9 +34749,9 @@ $tabButton.Add_Click({
         $s.FontWeight = "SemiBold"
         $s.Tag = "Visible"  # Show indicator
         if ($s.Name -eq "btnTabFirewall") { Start-FirewallRuleLoad }
-        # Cached list: only the first visit enumerates the driver store;
-        # later visits keep the loaded rows (Refresh button forces a recheck).
-        if ($s.Name -eq "btnTabDrivers" -and -not $script:DriverCacheLoaded) { Start-DriverListLoad }
+        # Drivers cache has a TTL; Start-DriverListLoad returns immediately while
+        # it is fresh and transparently refreshes stale data in the background.
+        if ($s.Name -eq "btnTabDrivers") { Start-DriverListLoad }
         if ($s.Name -eq "btnTabUpdates") {
             if ($lstWinget.Items.Count -eq 0 -and -not (Get-WmtUpdateScansDisabled)) {
                 $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
@@ -49001,20 +49108,25 @@ $btnToggleDrvMeta.Add_Click({
 # Windows' registered/running driver services — filter and service drivers
 # (antivirus, audio effects, bus drivers) never bind to a single device, so
 # without this they would all be mislabeled "Unattached".
-# The loaded list is CACHED: re-opening the Drivers tab shows the cached rows
-# instead of re-running the whole enumeration, removals update the cache in
+# The loaded list is cached for 10 minutes: re-opening the Drivers tab within
+# that window shows the cached rows, while older data refreshes in background.
+# Removals update the cache in
 # place (only rows pnputil actually deleted disappear), device enable/disable
 # toggles update the cached device state the same way, and the Refresh
 # button / menu item force a full recheck at any time.
-$script:DriverPackages = @()
+$script:DriverPackages = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $script:DriverDeviceMap = @{}
 $script:DriverServiceMap = $null
 $script:DriverUsageLoaded = $false
 $script:DriverCacheLoaded = $false
+$script:DriverCacheLoadedAt = [DateTime]::MinValue
+$script:DriverCacheTtlSeconds = 600
 $script:DriverLoadInProgress = $false
+$script:DriverLoadPhase = ""
 $script:DriverLoadRunspace = $null
 $script:DriverLoadAsyncResult = $null
 $script:DriverLoadTimer = $null
+$script:DriverCollectionView = $null
 # Status quick-filter set by the legend chips ("" = show all). Survives
 # reloads so a Refresh keeps the current view focused.
 $script:DriverStatusFilter = ""
@@ -49028,6 +49140,67 @@ $txtDrvSearch = Get-Ctrl "txtDrvSearch"
 $lblDrvStatus = Get-Ctrl "lblDrvStatus"
 $btnDrvReload = Get-Ctrl "btnDrvReload"
 $lblDrvLegend = Get-Ctrl "lblDrvLegend"
+
+function Set-DriverPackageRows {
+param([object[]]$Rows)
+# Do not mutate an ObservableCollection while its CollectionView is inside
+# DeferRefresh(): WPF throws "Cannot change or check the contents or Current
+# position of CollectionView while Refresh is being deferred." Build the
+# replacement collection while it is detached from WPF, then swap ItemsSource
+# once. This is both safe and much cheaper than hundreds of CollectionChanged
+# notifications during the package phase.
+$newRows = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+foreach ($row in @($Rows)) {
+    if ($row) { [void]$newRows.Add($row) }
+}
+$script:DriverPackages = $newRows
+
+if ($lstDrivers) {
+    $lstDrivers.ItemsSource = $script:DriverPackages
+    $script:DriverCollectionView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:DriverPackages)
+    if ($script:DriverCollectionView) {
+        $script:DriverCollectionView.Filter = [System.Predicate[object]]{
+            param($row)
+            if (-not $row) { return $false }
+            $query = if ($txtDrvSearch) { [string]$txtDrvSearch.Text } else { "" }
+            if (-not (Test-DriverSearchIsBlank $query)) {
+                if (-not (Test-DriverRowMatchesQuery -Row $row -Query $query.Trim())) { return $false }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($script:DriverStatusFilter) -and [string]$row.Status -ne $script:DriverStatusFilter) { return $false }
+            return $true
+        }
+    }
+}
+}
+
+function Invalidate-DriverCache {
+param([switch]$KeepRows)
+$script:DriverCacheLoaded = $false
+$script:DriverCacheLoadedAt = [DateTime]::MinValue
+if (-not $KeepRows) {
+    Set-DriverPackageRows -Rows @()
+    $script:DriverDeviceMap = @{}
+    $script:DriverServiceMap = $null
+    $script:DriverUsageLoaded = $false
+}
+}
+
+if ($lstDrivers) {
+    $script:DriverCollectionView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:DriverPackages)
+    if ($script:DriverCollectionView) {
+        $script:DriverCollectionView.Filter = [System.Predicate[object]]{
+            param($row)
+            if (-not $row) { return $false }
+            $query = if ($txtDrvSearch) { [string]$txtDrvSearch.Text } else { "" }
+            if (-not (Test-DriverSearchIsBlank $query)) {
+                if (-not (Test-DriverRowMatchesQuery -Row $row -Query $query.Trim())) { return $false }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($script:DriverStatusFilter) -and [string]$row.Status -ne $script:DriverStatusFilter) { return $false }
+            return $true
+        }
+    }
+    $lstDrivers.ItemsSource = $script:DriverPackages
+}
 
 function Set-DriverStatus {
 param([string]$Text, [bool]$Visible = $true)
@@ -49154,29 +49327,13 @@ foreach ($selectedRow in @($lstDrivers.SelectedItems)) {
         [void]$selectedInfs.Add([string]$selectedRow.PublishedName)
     }
 }
-$query = if ($txtDrvSearch) { [string]$txtDrvSearch.Text } else { "" }
-$rows = $script:DriverPackages
 
-if (-not (Test-DriverSearchIsBlank $query)) {
-    $query = $query.Trim()
-    $filtered = [System.Collections.Generic.List[object]]::new()
-    foreach ($row in $rows) {
-        if (Test-DriverRowMatchesQuery -Row $row -Query $query) { [void]$filtered.Add($row) }
-    }
-    $rows = $filtered
+if (-not $script:DriverCollectionView) {
+    $script:DriverCollectionView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:DriverPackages)
+    $lstDrivers.ItemsSource = $script:DriverPackages
 }
+try { $script:DriverCollectionView.Refresh() } catch {}
 
-# Legend quick-filter (AND-combined with the search text).
-if (-not [string]::IsNullOrWhiteSpace($script:DriverStatusFilter)) {
-    $statusFiltered = [System.Collections.Generic.List[object]]::new()
-    foreach ($row in $rows) {
-        if ([string]$row.Status -eq $script:DriverStatusFilter) { [void]$statusFiltered.Add($row) }
-    }
-    $rows = $statusFiltered
-}
-
-$lstDrivers.Items.Clear()
-foreach ($row in $rows) { [void]$lstDrivers.Items.Add($row) }
 if ($script:DriverSortChain -and $script:DriverSortChain.Count -gt 0) {
     Set-ListViewSort -ListView $lstDrivers -Chain $script:DriverSortChain
 }
@@ -49259,7 +49416,7 @@ foreach ($row in $script:DriverPackages) {
 
     if ($row.Status -eq "Old") {
         Set-DriverRowProperty -Row $row -Name "DevicesText" -Value "0"
-        Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value "0"
+        Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value 0
         Set-DriverRowProperty -Row $row -Name "DevicesTooltip" -Value "No present device uses this package."
         continue
     }
@@ -49268,7 +49425,7 @@ foreach ($row in $script:DriverPackages) {
         $okCount = @($devices | Where-Object { $_.State -eq "OK" }).Count
         $names = @(Get-DriverDeviceListText -Devices $devices)
         Set-DriverRowProperty -Row $row -Name "DevicesText" -Value ([string]$devices.Count)
-        Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value ([string]$devices.Count)
+        Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value ([int]$devices.Count)
         Set-DriverRowProperty -Row $row -Name "DevicesTooltip" -Value ("Devices using this package:`n" + ($names -join "`n"))
         if ($okCount -gt 0) {
             Set-DriverRowProperty -Row $row -Name "Status" -Value "In Use"
@@ -49294,7 +49451,7 @@ foreach ($row in $script:DriverPackages) {
             Set-DriverRowProperty -Row $row -Name "Status" -Value "In Use"
             Set-DriverRowProperty -Row $row -Name "StatusSort" -Value "0"
             Set-DriverRowProperty -Row $row -Name "DevicesText" -Value "0"
-            Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value "0"
+            Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value 0
             if ($runningCount -gt 0) {
                 Set-DriverRowProperty -Row $row -Name "StatusTooltip" -Value ("In use as a Windows driver service: {0} ({1} running). Filter/service drivers don't bind to a single device, so no device is listed — this package is NOT safe to remove." -f $svcNames, $runningCount)
             }
@@ -49313,7 +49470,7 @@ foreach ($row in $script:DriverPackages) {
             Set-DriverRowProperty -Row $row -Name "StatusSort" -Value "3"
             Set-DriverRowProperty -Row $row -Name "StatusTooltip" -Value "No device is currently attached to this package, and none of the services it installs are registered in Windows. This does NOT mean it is safe to remove: hardware that is switched off, disabled or disconnected can still need it (a camera that is off, an iGPU idle while the laptop runs on the dGPU, antivirus features toggled off, printers/USB gear that connects occasionally). Right-click and use 'Find Devices Using This Driver' to re-check live."
             Set-DriverRowProperty -Row $row -Name "DevicesText" -Value "0"
-            Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value "0"
+            Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value 0
             Set-DriverRowProperty -Row $row -Name "DevicesTooltip" -Value "No device is currently attached to this package."
         }
     }
@@ -49321,17 +49478,18 @@ foreach ($row in $script:DriverPackages) {
 }
 
 function Stop-DriverLoad {
+try { Unregister-WmtUiPollOperation -Name "DriverPackageLoad" } catch {}
 try { Unregister-WmtUiPollOperation -Name "DriverUsageLoad" } catch {}
 $script:DriverLoadTimer = $null
 
-# Never call PowerShell.Stop() on the WPF thread: stopping a worker that is
-# blocked in pnputil/CIM can itself wait and freeze the window. Detach the
-# invocation from page state immediately and let the shared async-stop monitor
-# finish cancellation/disposal without blocking the dispatcher.
+# Never call PowerShell.Stop() on the WPF thread: stopping pnputil/CIM can
+# itself block. Detach page state immediately and let BeginStop finish through
+# the shared async-stop monitor.
 $driverPs = $script:DriverLoadRunspace
 $driverAsync = $script:DriverLoadAsyncResult
 $script:DriverLoadRunspace = $null
 $script:DriverLoadAsyncResult = $null
+$script:DriverLoadPhase = ""
 
 if ($driverPs) {
     if ($driverAsync -and -not $driverAsync.IsCompleted) {
@@ -49344,43 +49502,255 @@ if ($driverPs) {
 }
 
 $script:DriverLoadInProgress = $false
-$script:DriverServiceMap = $null
 if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
 }
+
+function Complete-DriverLoadState {
+$script:DriverLoadRunspace = $null
+$script:DriverLoadAsyncResult = $null
+$script:DriverLoadTimer = $null
+$script:DriverLoadPhase = ""
+$script:DriverLoadInProgress = $false
+if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
+}
+
+function Test-DriverResultShouldBeDiscarded {
+try { return [bool](Test-WmtAggressiveTrayMemoryMode) } catch { return $false }
+}
+
+function Start-DriverUsageLoad {
+param([string[]]$Infs)
+if (-not $script:DriverLoadInProgress) { return }
+$script:DriverLoadPhase = "Usage"
+Set-DriverStatus "Driver packages loaded — checking device/service usage in background..." -Visible $true
+
+$usageWorker = @'
+param($infs, $infSvcCache)
+$result = [PSCustomObject]@{ Success = $false; Usage = $null; Services = $null; InfServiceCache = $null; Error = "" }
+try {
+    $entityState = @{}
+    foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -Property DeviceID,Name,Status,ConfigManagerErrorCode -ErrorAction SilentlyContinue)) {
+        if (-not $e.DeviceID) { continue }
+        $code = -1
+        try { $code = [int]$e.ConfigManagerErrorCode } catch {}
+        $entityState[[string]$e.DeviceID] = @{ Name = [string]$e.Name; Status = [string]$e.Status; Code = $code }
+    }
+
+    $map = @{}
+    foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -Property InfName,DeviceID,DeviceName -ErrorAction SilentlyContinue)) {
+        $inf = ([string]$d.InfName).ToLowerInvariant()
+        if ($inf -notmatch '^oem\d+\.inf$') { continue }
+        if (-not $map.ContainsKey($inf)) { $map[$inf] = [System.Collections.Generic.List[object]]::new() }
+        $devId = [string]$d.DeviceID
+        $ent = if ($entityState.ContainsKey($devId)) { $entityState[$devId] } else { $null }
+        $state = if (-not $ent) { "Unknown" } elseif ($ent.Code -eq 0 -and $ent.Status -eq "OK") { "OK" } else { "Problem" }
+        $name = [string]$d.DeviceName
+        if ([string]::IsNullOrWhiteSpace($name) -and $ent) { $name = [string]$ent.Name }
+        [void]$map[$inf].Add([PSCustomObject]@{
+            DeviceId = $devId
+            Name = $name
+            State = $state
+            Code = if ($ent) { [int]$ent.Code } else { -1 }
+        })
+    }
+
+    # A package can be in use without a PnP binding (filter/audio/AV/bus
+    # drivers). Cache only AddService parsing; service state is always fresh.
+    $svcState = @{}
+    foreach ($s in @(Get-CimInstance -ClassName Win32_SystemDriver -Property Name,State -ErrorAction SilentlyContinue)) {
+        if ($s.Name) { $svcState[[string]$s.Name] = [string]$s.State }
+    }
+    foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Property Name,State -ErrorAction SilentlyContinue)) {
+        if ($s.Name) { $svcState[[string]$s.Name] = [string]$s.State }
+    }
+
+    $svcInfo = @{}
+    $svcCache = if ($infSvcCache) { $infSvcCache } else { @{} }
+    $newSvcCache = @{}
+    foreach ($infName in @($infs)) {
+        if ([string]::IsNullOrWhiteSpace([string]$infName)) { continue }
+        $infPath = Join-Path $env:SystemRoot ("INF\" + $infName)
+        if (-not (Test-Path -LiteralPath $infPath)) { continue }
+        $infLower = [string]$infName.ToLowerInvariant()
+        $stamp = ""
+        try { $stamp = (Get-Item -LiteralPath $infPath -ErrorAction Stop).LastWriteTimeUtc.Ticks.ToString() } catch {}
+
+        $svcNames = $null
+        if ($stamp -and $svcCache.ContainsKey($infLower) -and $svcCache[$infLower].Stamp -eq $stamp) {
+            $svcNames = @($svcCache[$infLower].Names)
+        }
+        if ($null -eq $svcNames) {
+            $svcNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            try {
+                foreach ($line in @(Get-Content -LiteralPath $infPath -ErrorAction Stop)) {
+                    if ($line -match '(?i)^\s*AddService\s*=\s*"?([A-Za-z0-9_\.\-]+)"?\s*(,|$)') {
+                        [void]$svcNames.Add($matches[1])
+                    }
+                }
+            }
+            catch {}
+        }
+        if ($stamp) { $newSvcCache[$infLower] = @{ Stamp = $stamp; Names = @($svcNames) } }
+        if (@($svcNames).Count -eq 0) { continue }
+
+        $present = @()
+        foreach ($svcName in @($svcNames)) {
+            $installed = $svcState.ContainsKey($svcName) -or (Test-Path -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svcName))
+            if (-not $installed) { continue }
+            $isRunning = ($svcState.ContainsKey($svcName) -and $svcState[$svcName] -eq "Running")
+            $present += [PSCustomObject]@{ Name = $svcName; Running = $isRunning }
+        }
+        if ($present.Count -gt 0) { $svcInfo[$infLower] = $present }
+    }
+
+    $result = [PSCustomObject]@{ Success = $true; Usage = $map; Services = $svcInfo; InfServiceCache = $newSvcCache; Error = "" }
+}
+catch {
+    $result = [PSCustomObject]@{ Success = $false; Usage = $null; Services = $null; InfServiceCache = $null; Error = $_.Exception.Message }
+}
+return $result
+'@
+
+try {
+    if (-not $script:DriverInfServiceCache) { $script:DriverInfServiceCache = @{} }
+    $script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript($usageWorker).AddArgument(@($Infs)).AddArgument($script:DriverInfServiceCache)
+    $script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
+}
+catch {
+    Set-DriverStatus "Driver usage scan failed to start — package list remains available" -Visible $true
+    Write-GuiLog "[Drivers] Device/service usage scan failed to start: $($_.Exception.Message)"
+    Complete-DriverLoadState
+    return
+}
+
+Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 200 -TimeoutMs 120000 -TestComplete {
+    return [bool]($script:DriverLoadAsyncResult -and $script:DriverLoadAsyncResult.IsCompleted)
+} -OnComplete {
+    $ps = $script:DriverLoadRunspace
+    $async = $script:DriverLoadAsyncResult
+    try {
+        $result = $ps.EndInvoke($async)
+        if ($result -and $result.Count -eq 1) { $result = $result[0] }
+
+        if (Test-DriverResultShouldBeDiscarded) {
+            Set-DriverPackageRows -Rows @()
+            $script:DriverDeviceMap = @{}
+            $script:DriverServiceMap = $null
+            $script:DriverUsageLoaded = $false
+            $script:DriverCacheLoaded = $false
+            $script:DriverCacheLoadedAt = [DateTime]::MinValue
+            try { $script:DriverCollectionView.Refresh() } catch {}
+            Write-GuiLog "[Drivers] Discarded completed driver scan while aggressive tray-memory mode was active."
+            return
+        }
+
+        if (-not $result -or -not $result.Success) {
+            $err = if ($result -and $result.Error) { [string]$result.Error } else { "Unknown error" }
+            $script:DriverDeviceMap = @{}
+            $script:DriverServiceMap = $null
+            $script:DriverUsageLoaded = $false
+            $script:DriverCacheLoaded = $true
+            $script:DriverCacheLoadedAt = Get-Date
+            Set-DriverStatus "Driver packages loaded, but device/service usage check failed — click Reload to retry" -Visible $true
+            Write-GuiLog "[Drivers] Device/service usage scan failed: $err"
+            return
+        }
+
+        $script:DriverDeviceMap = if ($result.Usage) { $result.Usage } else { @{} }
+        $script:DriverServiceMap = if ($result.Services) { $result.Services } else { @{} }
+        if ($result.InfServiceCache) { $script:DriverInfServiceCache = $result.InfServiceCache }
+        $script:DriverUsageLoaded = $true
+        $script:DriverCacheLoaded = $true
+        $script:DriverCacheLoadedAt = Get-Date
+        Set-DriverStatusFlags
+        Update-DriverListView
+        Update-DriverStatusLabel
+        Write-GuiLog "[Drivers] Device/service usage scan completed for $($script:DriverPackages.Count) driver package(s)."
+    }
+    catch {
+        $script:DriverUsageLoaded = $false
+        $script:DriverCacheLoaded = $true
+        $script:DriverCacheLoadedAt = Get-Date
+        Set-DriverStatus "Driver packages loaded, but device/service usage check failed — click Reload to retry" -Visible $true
+        Write-GuiLog "[Drivers] Device/service usage completion failed: $($_.Exception.Message)"
+    }
+    finally {
+        try { if ($ps) { $ps.Dispose() } } catch {}
+        Complete-DriverLoadState
+    }
+} -OnTimeout {
+    $ps = $script:DriverLoadRunspace
+    $async = $script:DriverLoadAsyncResult
+    $script:DriverLoadRunspace = $null
+    $script:DriverLoadAsyncResult = $null
+    $script:DriverUsageLoaded = $false
+    $script:DriverCacheLoaded = ($script:DriverPackages.Count -gt 0)
+    if ($script:DriverCacheLoaded) { $script:DriverCacheLoadedAt = Get-Date }
+    Set-DriverStatus "Driver usage scan timed out after 120 seconds — package list is available; click Reload to retry" -Visible $true
+    Write-GuiLog "[Drivers] Device/service usage scan timed out after 120 seconds."
+    if ($ps) {
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $ps -Invocation $async -Name "Driver usage scan" } catch { try { $ps.Dispose() } catch {} }
+    }
+    Complete-DriverLoadState
+} -OnError {
+    param($Operation, $ErrorRecord)
+    $ps = $script:DriverLoadRunspace
+    $async = $script:DriverLoadAsyncResult
+    $script:DriverLoadRunspace = $null
+    $script:DriverLoadAsyncResult = $null
+    if ($ps) {
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $ps -Invocation $async -Name "Driver usage scan" } catch { try { $ps.Dispose() } catch {} }
+    }
+    $script:DriverUsageLoaded = $false
+    $script:DriverCacheLoaded = ($script:DriverPackages.Count -gt 0)
+    Set-DriverStatus "Driver usage monitor failed — package list is available; click Reload to retry" -Visible $true
+    Write-GuiLog "[Drivers] Usage monitor failed: $($ErrorRecord.Exception.Message)"
+    Complete-DriverLoadState
+} | Out-Null
+}
+
 function Start-DriverListLoad {
 param([switch]$Force)
 if (-not $lstDrivers) { return }
+
 if ($script:DriverLoadInProgress) {
     if (-not $Force) { return }
     Stop-DriverLoad
 }
+
 if ($script:DriverCacheLoaded -and -not $Force) {
-    Update-DriverListView
-    Update-DriverStatusLabel
-    return
+    $cacheFresh = $false
+    try {
+        $cacheFresh = ($script:DriverCacheLoadedAt -and $script:DriverCacheLoadedAt -ne [DateTime]::MinValue -and (((Get-Date) - $script:DriverCacheLoadedAt).TotalSeconds -lt $script:DriverCacheTtlSeconds))
+    }
+    catch {}
+    if ($cacheFresh) {
+        Update-DriverListView
+        Update-DriverStatusLabel
+        return
+    }
+    Write-GuiLog "[Drivers] Cached driver data expired; refreshing in background."
 }
 
 $script:DriverLoadInProgress = $true
+$script:DriverLoadPhase = "Packages"
 $script:DriverUsageLoaded = $false
 $script:DriverCacheLoaded = $false
-$script:DriverDeviceMap = $null
+$script:DriverCacheLoadedAt = [DateTime]::MinValue
+$script:DriverDeviceMap = @{}
 $script:DriverServiceMap = $null
 if ($btnDrvReload) { $btnDrvReload.IsEnabled = $false }
-if ($lstDrivers) { $lstDrivers.Items.Clear() }
+Set-DriverPackageRows -Rows @()
+Update-DriverListView
 Set-DriverStatus "Loading driver packages in background..." -Visible $true
-Write-GuiLog "[Drivers] Loading driver store packages and device usage in background..."
+Write-GuiLog "[Drivers] Loading driver-store packages in background..."
 
-# Everything that can block (pnputil, staged-INF parsing and CIM/service scans)
-# runs in the UiSupport pool. The UI thread only converts the returned plain
-# objects into rows and updates WPF controls after the worker has completed.
-# Embed the parser helpers in the worker because pooled runspaces do not
-# inherit functions from this script's session state.
+# Phase 1: pnputil + INF metadata only. Rows become visible as soon as this
+# completes; the slower device/service scan runs as a separate phase afterward.
 $selectInfStringTableBody = ${function:Select-WmtInfStringTable}.ToString()
 $resolveInfTokenBody = ${function:Resolve-WmtInfToken}.ToString()
 $getDriverStorePackagesBody = ${function:Get-WmtDriverStorePackages}.ToString()
-$driverWorkerScript = @"
-param(`$infSvcCache)
-
+$packageWorker = @"
 function Select-WmtInfStringTable {
 $selectInfStringTableBody
 }
@@ -49390,146 +49760,53 @@ $resolveInfTokenBody
 function Get-WmtDriverStorePackages {
 $getDriverStorePackagesBody
 }
-
-`$result = [PSCustomObject]@{
-    Success = `$false
-    Packages = @()
-    Usage = `$null
-    Services = `$null
-    InfServiceCache = `$null
-    Error = ""
-}
 try {
-    `$packages = @(Get-WmtDriverStorePackages)
-    `$infs = @(`$packages | ForEach-Object { [string]`$_.PublishedName } | Where-Object { -not [string]::IsNullOrWhiteSpace(`$_) })
-
-    `$entityState = @{}
-    foreach (`$e in @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
-        if (-not `$e.DeviceID) { continue }
-        `$code = -1
-        try { `$code = [int]`$e.ConfigManagerErrorCode } catch {}
-        `$entityState[[string]`$e.DeviceID] = @{ Name = [string]`$e.Name; Status = [string]`$e.Status; Code = `$code }
-    }
-
-    `$map = @{}
-    foreach (`$d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue)) {
-        `$inf = ([string]`$d.InfName).ToLowerInvariant()
-        if (`$inf -notmatch '^oem\d+\.inf$') { continue }
-        if (-not `$map.ContainsKey(`$inf)) { `$map[`$inf] = [System.Collections.Generic.List[object]]::new() }
-        `$devId = [string]`$d.DeviceID
-        `$ent = if (`$entityState.ContainsKey(`$devId)) { `$entityState[`$devId] } else { `$null }
-        `$state = if (-not `$ent) { "Unknown" } elseif (`$ent.Code -eq 0 -and `$ent.Status -eq "OK") { "OK" } else { "Problem" }
-        `$name = [string]`$d.DeviceName
-        if ([string]::IsNullOrWhiteSpace(`$name) -and `$ent) { `$name = [string]`$ent.Name }
-        [void]`$map[`$inf].Add([PSCustomObject]@{
-            DeviceId = `$devId
-            Name = `$name
-            State = `$state
-            Code = if (`$ent) { [int]`$ent.Code } else { -1 }
-        })
-    }
-
-    # A package can be in use without a PnP-device binding (filter drivers,
-    # audio/AV drivers and bus drivers). Cache only the expensive AddService
-    # INF parse; service presence/running state is refreshed every load.
-    `$svcState = @{}
-    foreach (`$s in @(Get-CimInstance -ClassName Win32_SystemDriver -ErrorAction SilentlyContinue)) {
-        if (`$s.Name) { `$svcState[[string]`$s.Name] = [string]`$s.State }
-    }
-    foreach (`$s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
-        if (`$s.Name) { `$svcState[[string]`$s.Name] = [string]`$s.State }
-    }
-
-    `$svcInfo = @{}
-    `$svcCache = if (`$infSvcCache) { `$infSvcCache } else { @{} }
-    `$newSvcCache = @{}
-    foreach (`$infName in @(`$infs)) {
-        `$infPath = Join-Path `$env:SystemRoot ("INF\" + `$infName)
-        if (-not (Test-Path -LiteralPath `$infPath)) { continue }
-        `$infLower = [string]`$infName.ToLowerInvariant()
-        `$stamp = ""
-        try { `$stamp = (Get-Item -LiteralPath `$infPath -ErrorAction Stop).LastWriteTimeUtc.Ticks.ToString() } catch {}
-
-        `$svcNames = `$null
-        if (`$stamp -and `$svcCache.ContainsKey(`$infLower) -and `$svcCache[`$infLower].Stamp -eq `$stamp) {
-            `$svcNames = @(`$svcCache[`$infLower].Names)
-        }
-        if (`$null -eq `$svcNames) {
-            `$svcNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            try {
-                foreach (`$line in @(Get-Content -LiteralPath `$infPath -ErrorAction Stop)) {
-                    if (`$line -match '(?i)^\s*AddService\s*=\s*"?([A-Za-z0-9_\.\-]+)"?\s*(,|$)') {
-                        [void]`$svcNames.Add(`$matches[1])
-                    }
-                }
-            }
-            catch {}
-        }
-        if (`$stamp) { `$newSvcCache[`$infLower] = @{ Stamp = `$stamp; Names = @(`$svcNames) } }
-        if (@(`$svcNames).Count -eq 0) { continue }
-
-        `$present = @()
-        foreach (`$svcName in @(`$svcNames)) {
-            `$installed = `$svcState.ContainsKey(`$svcName) -or (Test-Path -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + `$svcName))
-            if (-not `$installed) { continue }
-            `$isRunning = (`$svcState.ContainsKey(`$svcName) -and `$svcState[`$svcName] -eq "Running")
-            `$present += [PSCustomObject]@{ Name = `$svcName; Running = `$isRunning }
-        }
-        if (`$present.Count -gt 0) { `$svcInfo[`$infLower] = `$present }
-    }
-
-    `$result = [PSCustomObject]@{
-        Success = `$true
-        Packages = `$packages
-        Usage = `$map
-        Services = `$svcInfo
-        InfServiceCache = `$newSvcCache
-        Error = ""
-    }
+    [PSCustomObject]@{ Success = `$true; Packages = @(Get-WmtDriverStorePackages); Error = "" }
 }
 catch {
-    `$result = [PSCustomObject]@{
-        Success = `$false
-        Packages = @()
-        Usage = `$null
-        Services = `$null
-        InfServiceCache = `$null
-        Error = `$_.Exception.Message
-    }
+    [PSCustomObject]@{ Success = `$false; Packages = @(); Error = `$_.Exception.Message }
 }
-return `$result
 "@
 
 try {
-    if (-not $script:DriverInfServiceCache) { $script:DriverInfServiceCache = @{} }
-    $script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript($driverWorkerScript).AddArgument($script:DriverInfServiceCache)
+    $script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript($packageWorker)
     $script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
 }
 catch {
-    Set-DriverStatus "Driver load failed to start" -Visible $true
-    Write-GuiLog "[Drivers] Background load failed to start: $($_.Exception.Message)"
+    Set-DriverStatus "Driver package load failed to start" -Visible $true
+    Write-GuiLog "[Drivers] Package load failed to start: $($_.Exception.Message)"
     Stop-DriverLoad
     return
 }
 
-$script:DriverLoadTimer = $null
-Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplete { $false } -OnTick {
-    if (-not $script:DriverLoadAsyncResult -or -not $script:DriverLoadAsyncResult.IsCompleted) { return }
-
-    Unregister-WmtUiPollOperation -Name "DriverUsageLoad"
+Register-WmtUiPollOperation -Name "DriverPackageLoad" -IntervalMs 150 -TimeoutMs 60000 -TestComplete {
+    return [bool]($script:DriverLoadAsyncResult -and $script:DriverLoadAsyncResult.IsCompleted)
+} -OnComplete {
+    $ps = $script:DriverLoadRunspace
+    $async = $script:DriverLoadAsyncResult
     try {
-        $result = $script:DriverLoadRunspace.EndInvoke($script:DriverLoadAsyncResult)
+        $result = $ps.EndInvoke($async)
         if ($result -and $result.Count -eq 1) { $result = $result[0] }
+        try { if ($ps) { $ps.Dispose() } } catch {}
+        $script:DriverLoadRunspace = $null
+        $script:DriverLoadAsyncResult = $null
+
+        if (Test-DriverResultShouldBeDiscarded) {
+            Set-DriverPackageRows -Rows @()
+            $script:DriverCacheLoaded = $false
+            $script:DriverCacheLoadedAt = [DateTime]::MinValue
+            Complete-DriverLoadState
+            Write-GuiLog "[Drivers] Discarded driver-package results while aggressive tray-memory mode was active."
+            return
+        }
 
         if (-not $result -or -not $result.Success) {
             $err = if ($result -and $result.Error) { [string]$result.Error } else { "Unknown error" }
-            $script:DriverPackages = @()
-            $script:DriverDeviceMap = @{}
-            $script:DriverServiceMap = $null
-            $script:DriverUsageLoaded = $false
+            Set-DriverPackageRows -Rows @()
             $script:DriverCacheLoaded = $false
-            Set-DriverStatus "Driver list load failed" -Visible $true
-            Write-GuiLog "[Drivers] Background load failed: $err"
+            Set-DriverStatus "Driver package load failed" -Visible $true
+            Write-GuiLog "[Drivers] Package load failed: $err"
+            Complete-DriverLoadState
             return
         }
 
@@ -49549,44 +49826,69 @@ Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplet
                 DateSort       = ([DateTime]$d.SortDate).ToString("yyyyMMdd")
                 Status         = "Checking..."
                 StatusSort     = "4"
-                StatusTooltip  = "Checking which present devices use this package..."
+                StatusTooltip  = "Checking which present devices or driver services use this package..."
                 DevicesText    = "..."
-                DevicesSort    = "0"
-                DevicesTooltip = ""
+                DevicesSort    = 0
+                DevicesTooltip = "Device/service usage scan is still running."
             })
         }
 
-        $script:DriverPackages = @($rows)
-        $script:DriverDeviceMap = if ($result.Usage) { $result.Usage } else { @{} }
-        $script:DriverServiceMap = if ($result.Services) { $result.Services } else { @{} }
-        if ($result.InfServiceCache) { $script:DriverInfServiceCache = $result.InfServiceCache }
+        Set-DriverPackageRows -Rows @($rows)
         $script:DriverCacheLoaded = $true
-        $script:DriverUsageLoaded = $true
-
-        Set-DriverStatusFlags
         Update-DriverListView
         Update-DriverStatusLabel
-        Write-GuiLog "[Drivers] Loaded $($script:DriverPackages.Count) driver package(s) and device/service usage in background."
+        Write-GuiLog "[Drivers] Listed $($script:DriverPackages.Count) package(s); starting device/service usage phase."
+
+        $infs = @($script:DriverPackages | ForEach-Object { [string]$_.PublishedName } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($infs.Count -eq 0) {
+            $script:DriverUsageLoaded = $true
+            $script:DriverCacheLoaded = $true
+            $script:DriverCacheLoadedAt = Get-Date
+            Set-DriverStatus "No third-party driver packages found." -Visible $true
+            Complete-DriverLoadState
+        }
+        else {
+            Start-DriverUsageLoad -Infs $infs
+        }
     }
     catch {
-        $script:DriverPackages = @()
-        $script:DriverDeviceMap = @{}
-        $script:DriverServiceMap = $null
-        $script:DriverUsageLoaded = $false
+        try { if ($ps) { $ps.Dispose() } } catch {}
+        Set-DriverPackageRows -Rows @()
         $script:DriverCacheLoaded = $false
-        Set-DriverStatus "Driver list load failed" -Visible $true
-        Write-GuiLog "[Drivers] Background load failed: $($_.Exception.Message)"
+        Set-DriverStatus "Driver package load failed" -Visible $true
+        Write-GuiLog "[Drivers] Package completion failed: $($_.Exception.Message)"
+        Complete-DriverLoadState
     }
-    finally {
-        try { $script:DriverLoadRunspace.Dispose() } catch {}
-        $script:DriverLoadRunspace = $null
-        $script:DriverLoadAsyncResult = $null
-        $script:DriverLoadTimer = $null
-        $script:DriverLoadInProgress = $false
-        if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
+} -OnTimeout {
+    $ps = $script:DriverLoadRunspace
+    $async = $script:DriverLoadAsyncResult
+    $script:DriverLoadRunspace = $null
+    $script:DriverLoadAsyncResult = $null
+    Set-DriverPackageRows -Rows @()
+    $script:DriverCacheLoaded = $false
+    Set-DriverStatus "Driver package scan timed out after 60 seconds — click Reload to retry" -Visible $true
+    Write-GuiLog "[Drivers] Package scan timed out after 60 seconds."
+    if ($ps) {
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $ps -Invocation $async -Name "Driver package scan" } catch { try { $ps.Dispose() } catch {} }
     }
+    Complete-DriverLoadState
+} -OnError {
+    param($Operation, $ErrorRecord)
+    $ps = $script:DriverLoadRunspace
+    $async = $script:DriverLoadAsyncResult
+    $script:DriverLoadRunspace = $null
+    $script:DriverLoadAsyncResult = $null
+    if ($ps) {
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $ps -Invocation $async -Name "Driver package scan" } catch { try { $ps.Dispose() } catch {} }
+    }
+    Set-DriverPackageRows -Rows @()
+    $script:DriverCacheLoaded = $false
+    Set-DriverStatus "Driver package monitor failed — click Reload to retry" -Visible $true
+    Write-GuiLog "[Drivers] Package monitor failed: $($ErrorRecord.Exception.Message)"
+    Complete-DriverLoadState
 } | Out-Null
 }
+
 function Get-DriverPackageDetailsText {
 param($Row)
 if (-not $Row) { return "" }
@@ -49691,7 +49993,7 @@ $queryError = {
 Invoke-WmtUiBackgroundCommand -Name ("DriverUsageLive_" + [guid]::NewGuid().ToString("N")) -Msg "Checking devices using $inf..." -SuppressResultLog -Sb {
     param($inf, $provider, $originalName)
     $entityState = @{}
-    foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+    foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -Property DeviceID,Name,Status,ConfigManagerErrorCode -ErrorAction SilentlyContinue)) {
         if (-not $e.DeviceID) { continue }
         $code = -1
         try { $code = [int]$e.ConfigManagerErrorCode } catch {}
@@ -49699,7 +50001,8 @@ Invoke-WmtUiBackgroundCommand -Name ("DriverUsageLive_" + [guid]::NewGuid().ToSt
     }
 
     $devices = [System.Collections.Generic.List[object]]::new()
-    foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { ([string]$_.InfName).ToLowerInvariant() -eq $inf.ToLowerInvariant() })) {
+    $infFilter = "InfName='{0}'" -f $inf.Replace("'", "''")
+    foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -Filter $infFilter -Property InfName,DeviceID,DeviceName -ErrorAction Stop)) {
         $devId = [string]$d.DeviceID
         $ent = if ($entityState.ContainsKey($devId)) { $entityState[$devId] } else { $null }
         $code = if ($ent) { [int]$ent.Code } else { -1 }
@@ -49710,7 +50013,7 @@ Invoke-WmtUiBackgroundCommand -Name ("DriverUsageLive_" + [guid]::NewGuid().ToSt
     }
 
     [PSCustomObject]@{ Inf = $inf; Provider = $provider; OriginalName = $originalName; Devices = $devices.ToArray() }
-} -ArgumentList $inf, $provider, $originalName -OnComplete $queryDone -OnError $queryError | Out-Null
+} -ArgumentList $inf, $provider, $originalName -TimeoutMs 60000 -OnComplete $queryDone -OnError $queryError | Out-Null
 }
 
 function Copy-DriverSelectionToClipboard {
@@ -50047,7 +50350,9 @@ if ($removedCount -eq 0) {
     Write-GuiLog "[Drivers] No cached rows matched the removed package(s); list left unchanged."
     return
 }
-$script:DriverPackages = @($kept)
+Set-DriverPackageRows -Rows @($kept)
+$script:DriverCacheLoaded = $false
+$script:DriverCacheLoadedAt = [DateTime]::MinValue
 
 # Drop the packages from the cached device/service maps too, so tooltips,
 # details dialogs and live-status recomputation don't reference ghost rows.
@@ -50174,7 +50479,7 @@ switch ($Header) {
     "Provider"   { return "Provider" }
     "Driver"     { return "OriginalName" }
     "Store File" { return "PublishedName" }
-    "Version"    { return "VersionSort" }
+    "Version"    { return "Version" }
     "Date"       { return "DateSort" }
     "Devices"    { return "DevicesSort" }
     default      { return $Header }
