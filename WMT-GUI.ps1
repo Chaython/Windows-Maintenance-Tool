@@ -24,6 +24,18 @@ $script:WmtDebug = $false
 # OEM encoding is only used per-process where needed (e.g. ipconfig).
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+# Preserve the OS/.NET TLS policy when ServicePointManager is using SystemDefault.
+# On legacy explicit protocol masks, add TLS 1.2 without removing newer protocols.
+# SystemDefault is numeric zero, so OR-ing Tls12 into it would replace OS-managed
+# negotiation (including TLS 1.3) with an explicit TLS 1.2-only mask.
+try {
+    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+    if ($wmtTlsProtocols -ne [Net.SecurityProtocolType]::SystemDefault -and
+        ($wmtTlsProtocols -band [Net.SecurityProtocolType]::Tls12) -ne [Net.SecurityProtocolType]::Tls12) {
+        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+    }
+}
+catch {}
 
 function Get-WmtCurrentProcessPath {
 $proc = $null
@@ -7497,7 +7509,14 @@ if ($version -match '^\d[\w\.\-\+]*$') { $url = "$url/$version" }
 
 $tmpFile = $null
 try {
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+        if ($wmtTlsProtocols -ne [Net.SecurityProtocolType]::SystemDefault -and
+            ($wmtTlsProtocols -band [Net.SecurityProtocolType]::Tls12) -ne [Net.SecurityProtocolType]::Tls12) {
+            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+        }
+    }
+    catch {}
     $tmpFile = [System.IO.Path]::GetTempFileName()
     $oldProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
@@ -10213,7 +10232,13 @@ $runningAsExe = [bool]$script:WmtIsCompiledExe
 # 2. Start Background Thread (Runspace)
 $script:UpdateRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
         param($CurrentVer, $IsExe)
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        try {
+            $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+            if ([int]$wmtTlsProtocols -ne 0) {
+                [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+            }
+        }
+        catch {}
 
         $jobRes = @{ Status = "Failed"; RemoteVersion = "0.0"; RemoteHash = ""; RemoteLastModifiedUtc = ""; Content = ""; Error = ""; ExeDownloadUrl = ""; RemoteBytes = $null; ExeAssetName = ""; ExeSha256 = ""; ChecksumStatus = "None" }
 
@@ -12280,7 +12305,13 @@ $client = $null
 $request = $null
 $response = $null
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+        if ([int]$wmtTlsProtocols -ne 0) {
+            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+        }
+    }
+    catch {}
     Add-Type -AssemblyName System.Net.Http
     $client = [System.Net.Http.HttpClient]::new()
     $client.Timeout = [TimeSpan]::FromSeconds(30)
@@ -26132,11 +26163,51 @@ Invoke-WmtUiBackgroundCommand -Name "FirewallPurge" -Msg "Deleting all firewall 
 # --- DRIVER TOOLS ---
 function Invoke-DriverReport {
 $outfile = Join-Path (Get-DataPath) "Installed_Drivers.txt"
+$csvFile = Join-Path (Get-DataPath) "Driver_Store_Packages.csv"
+# The Drivers page cache is snapshotted here on the UI thread into plain CSV
+# text, so the background job needs no shared state. When the Drivers tab has
+# never been opened (or the cache was dropped while hidden to the tray), the
+# CSV is simply skipped and the report is driverquery-only.
+$driverCsv = ""
+try {
+    if ($script:DriverPackages -and @($script:DriverPackages).Count -gt 0) {
+        $driverCsv = (@($script:DriverPackages) | ForEach-Object {
+            [PSCustomObject]@{
+                StoreFile  = [string]$_.PublishedName
+                DriverInf  = [string]$_.OriginalName
+                Provider   = [string]$_.Provider
+                Class      = [string]$_.Class
+                Signer     = [string]$_.Signer
+                Version    = [string]$_.DisplayVer
+                DriverDate = [string]$_.DisplayDate
+                Status     = [string]$_.Status
+                Devices    = [string]$_.DevicesText
+            }
+        } | ConvertTo-Csv -NoTypeInformation) -join [Environment]::NewLine
+    }
+}
+catch { $driverCsv = "" }
+
 Invoke-WmtUiBackgroundCommand -Name "DriverReport" -Msg "Creating driver report..." -Sb {
-    param($outfile)
+    param($outfile, $csvFile, $driverCsv)
     driverquery /v > $outfile
-    Write-Output "Driver report saved to $outfile"
-} -ArgumentList $outfile | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($driverCsv)) {
+        # UTF-8 with BOM so Excel opens the file with the correct encoding.
+        [System.IO.File]::WriteAllText($csvFile, $driverCsv, (New-Object System.Text.UTF8Encoding $true))
+        Write-Output "Driver report saved to $outfile`nDriver store package list (CSV) saved to $csvFile"
+    }
+    else {
+        # Do not leave a package CSV from an earlier run beside a fresh report.
+        if (Test-Path -LiteralPath $csvFile -PathType Leaf) {
+            try { Remove-Item -LiteralPath $csvFile -Force -ErrorAction Stop }
+            catch {
+                Write-Output "Driver report saved to $outfile`nWARNING: no fresh driver-store snapshot was available and the old CSV could not be removed: $($_.Exception.Message)"
+                return
+            }
+        }
+        Write-Output "Driver report saved to $outfile (open the Drivers page first to also include the driver store package CSV)"
+    }
+} -ArgumentList $outfile, $csvFile, $driverCsv | Out-Null
 }
 
 function Invoke-ExportDrivers {
@@ -26403,6 +26474,54 @@ Invoke-UiCommand {
 # output quirks (see the notes inline below). Returns an array of
 # [PSCustomObject] with: PublishedName, OriginalName, Provider, Class, Signer,
 # Version ([Version]), DisplayVer, SortDate, DisplayDate.
+function Select-WmtInfStringTable {
+# Windows selects ONE Strings section for an INF; it does not merge localized
+# sections token-by-token. Match the documented order:
+# exact LANGID -> primary language/SUBLANG_NEUTRAL -> any same primary language
+# -> undecorated [Strings].
+param(
+    [hashtable]$Sections,
+    [string[]]$SectionOrder
+)
+if (-not $Sections -or $Sections.Count -eq 0) { return @{} }
+
+$langId = ([System.Globalization.CultureInfo]::CurrentUICulture.LCID -band 0xFFFF)
+$exactId = ("{0:X4}" -f $langId)
+if ($Sections.ContainsKey($exactId)) { return $Sections[$exactId] }
+
+# LANGID: low 10 bits are the primary language; the upper 6 are sublanguage.
+$primaryId = ($langId -band 0x03FF)
+$neutralId = ("{0:X4}" -f $primaryId)
+if ($Sections.ContainsKey($neutralId)) { return $Sections[$neutralId] }
+
+foreach ($candidate in @($SectionOrder)) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    $candidateId = 0
+    if ([int]::TryParse($candidate,
+            [System.Globalization.NumberStyles]::HexNumber,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$candidateId) -and
+        (($candidateId -band 0x03FF) -eq $primaryId)) {
+        return $Sections[$candidate]
+    }
+}
+
+if ($Sections.ContainsKey("")) { return $Sections[""] }
+return @{}
+}
+
+function Resolve-WmtInfToken {
+# Resolve against the ONE Strings table Windows would select. Each localized
+# Strings.* section is required to contain all tokens, so cross-language
+# token-by-token fallback would produce results Windows itself would not use.
+param([string]$Raw, [hashtable]$Strings)
+if ([string]::IsNullOrWhiteSpace($Raw)) { return "" }
+if ($Raw -notmatch '^%([^%]+)%$') { return $Raw }
+$token = $Matches[1]
+if ($Strings -and $Strings.ContainsKey($token)) { return [string]$Strings[$token] }
+return ""
+}
+
 function Get-WmtDriverStorePackages {
 param([object[]]$RawOutput = $null)
 $rawOutput = if ($null -ne $RawOutput) { @($RawOutput) } else { @(pnputil.exe /enum-drivers 2>&1) }
@@ -26462,30 +26581,104 @@ foreach ($line in $rawOutput) {
 if ($current) { $drivers.Add([PSCustomObject]$current) }
 
 # Fallback: pnputil's /enum-drivers text output varies between Windows builds
-# and on some systems never yields a parseable "Driver Version" line (every
-# row would show Version "Unknown" even though the INF has one). Read the
-# DriverVer directive straight from the staged INF copy in C:\Windows\INF —
-# the same source of truth tools like Driver Store Explorer use. Format:
-#   DriverVer = MM/DD/YYYY[,a.b.c.d]
+# and is LOCALIZED on non-English systems, where the English field-name matches
+# above never fire and Provider/Class degrade to "Unknown" even though the
+# data is in the INF. The staged INF copy in C:\Windows\INF is the
+# locale-independent source of truth tools like Driver Store Explorer use:
+#   [Version] DriverVer = MM/DD/YYYY[,a.b.c.d]
+#   [Version] Provider  = %Token%   (resolved through [Strings])
+#   [Version] Class      = Name|%Token%   (ClassGuid registry name as fallback)
 foreach ($d in $drivers) {
-    if ($d.DisplayVer -ne "Unknown" -and $d.DisplayVer -ne "N/A") { continue }
+    $needVer = ($d.DisplayVer -eq "Unknown" -or $d.DisplayVer -eq "N/A")
+    $needMeta = ($d.Provider -eq "Unknown" -or $d.Class -eq "Unknown")
+    if (-not ($needVer -or $needMeta)) { continue }
     if (-not $d.PublishedName) { continue }
     $infPath = Join-Path $env:SystemRoot ("INF\" + $d.PublishedName)
     if (-not (Test-Path -LiteralPath $infPath)) { continue }
     try {
-        $verLine = Select-String -LiteralPath $infPath -Pattern '^\s*DriverVer\s*=\s*(.+)$' | Select-Object -First 1
-        if (-not $verLine) { continue }
-        $raw = ($verLine.Matches[0].Groups[1].Value -split ";", 2)[0].Trim()
-        $verParts = $raw -split ",", 2
-        $datePart = $verParts[0].Trim()
-        $verPart  = if ($verParts.Count -gt 1) { $verParts[1].Trim() } else { "" }
-        if ($verPart -match '(\d+(\.\d+){1,3})') {
-            $d.DisplayVer = $Matches[1]
-            try { $d.Version = [Version]$Matches[1] } catch {}
+        $section = ""
+        $activeStrings = $null
+        $stringSections = @{}
+        $stringSectionOrder = [System.Collections.Generic.List[string]]::new()
+        $verRaw = ""; $providerRaw = ""; $classRaw = ""; $classGuidRaw = ""
+        foreach ($infLine in @(Get-Content -LiteralPath $infPath -ErrorAction Stop)) {
+            $t = $infLine.Trim()
+            if ($t.Length -eq 0 -or $t.StartsWith(";")) { continue }
+            if ($t.StartsWith("[") -and $t.EndsWith("]")) {
+                $section = $t.Trim("[", "]")
+                $activeStrings = $null
+                $stringSectionId = $null
+                if ($section -ieq "Strings") {
+                    $stringSectionId = ""
+                }
+                elseif ($section -match '(?i)^Strings\.([0-9A-F]{4})$') {
+                    $stringSectionId = $Matches[1].ToUpperInvariant()
+                }
+
+                if ($null -ne $stringSectionId) {
+                    if (-not $stringSections.ContainsKey($stringSectionId)) {
+                        $stringSections[$stringSectionId] = @{}
+                        [void]$stringSectionOrder.Add($stringSectionId)
+                    }
+                    $activeStrings = $stringSections[$stringSectionId]
+                }
+                continue
+            }
+            $eq = $t.IndexOf("=")
+            if ($eq -lt 1) { continue }
+            $k = $t.Substring(0, $eq).Trim()
+            $v = $t.Substring($eq + 1).Trim()
+            if ($null -ne $activeStrings) {
+                if (-not $activeStrings.ContainsKey($k)) { $activeStrings[$k] = $v.Trim('"') }
+            }
+            elseif ($section -like "Version*") {
+                if ($k -ieq "DriverVer") { $verRaw = $v }
+                elseif ($k -ieq "Provider") { $providerRaw = $v }
+                elseif ($k -ieq "Class") { $classRaw = $v }
+                elseif ($k -ieq "ClassGuid") { $classGuidRaw = $v }
+            }
         }
-        if ($d.DisplayDate -eq "Unknown" -and $datePart -and ($datePart -as [DateTime])) {
-            $d.DisplayDate = $datePart
-            $d.SortDate = [DateTime]$datePart
+
+        $strings = Select-WmtInfStringTable -Sections $stringSections -SectionOrder @($stringSectionOrder)
+
+        if ($needVer -and $verRaw) {
+            $raw = ($verRaw -split ";", 2)[0].Trim()
+            $verParts = $raw -split ",", 2
+            $datePart = $verParts[0].Trim()
+            $verPart = if ($verParts.Count -gt 1) { $verParts[1].Trim() } else { "" }
+            if ($verPart -match '(\d+(\.\d+){1,3})') {
+                $d.DisplayVer = $Matches[1]
+                try { $d.Version = [Version]$Matches[1] } catch {}
+            }
+            if ($d.DisplayDate -eq "Unknown" -and $datePart -and ($datePart -as [DateTime])) {
+                $d.DisplayDate = $datePart
+                $d.SortDate = [DateTime]$datePart
+            }
+        }
+
+        if ($needMeta) {
+            if ($d.Provider -eq "Unknown" -and $providerRaw) {
+                $prov = Resolve-WmtInfToken -Raw $providerRaw -Strings $strings
+                if ($prov -and $prov -notmatch '%') { $d.Provider = $prov }
+            }
+            if ($d.Class -eq "Unknown" -and ($classRaw -or $classGuidRaw)) {
+                $cls = if ($classRaw) { Resolve-WmtInfToken -Raw $classRaw -Strings $strings } else { "" }
+                if ($cls -and $cls -notmatch '%') { $d.Class = $cls }
+                elseif ($classGuidRaw -match '^\{[0-9A-Fa-f\-]+\}$') {
+                    # Last resort: the default value of the class GUID registry
+                    # key is the canonical (English) class name on every
+                    # Windows language.
+                    try {
+                        $ck = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(("SYSTEM\CurrentControlSet\Control\Class\" + $classGuidRaw))
+                        if ($ck) {
+                            $cn = [string]$ck.GetValue("")
+                            try { $ck.Close() } catch {}
+                            if ($cn) { $d.Class = $cn }
+                        }
+                    }
+                    catch {}
+                }
+            }
         }
     }
     catch {}
@@ -31835,12 +32028,16 @@ powercfg /S SCHEME_CURRENT | Out-Null
                       </HeaderedContentControl.Header>
                       <StackPanel>
                         <TextBlock Name="lblDrvStatus" Text="Ready — the driver store loads when you open this page" Foreground="{DynamicResource TextSecondary}" FontSize="13" TextWrapping="Wrap"/>
-                        <TextBlock FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap">
-                            <Run Text="Highlighting:  " Foreground="{DynamicResource TextMuted}"/>
-                            <Run Text="● In Use   " Foreground="{DynamicResource Success}"/>
-                            <Run Text="● Old   " Foreground="{DynamicResource Warning}"/>
-                            <Run Text="● Unattached   " Foreground="{DynamicResource Danger}"/>
-                            <Run Text="● Inactive (disabled in Device Manager)" Foreground="{DynamicResource TextSecondary}"/>
+                        <TextBlock Name="lblDrvLegend" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap">
+                            <Run Text="Highlighting — click to filter:  " Foreground="{DynamicResource TextMuted}"/>
+                            <Hyperlink TextDecorations="None" Cursor="Hand" Focusable="False" Foreground="{DynamicResource Success}"
+                                       ToolTip="Show only packages in use. Click again to show all."><Run Text="● In Use   "/></Hyperlink>
+                            <Hyperlink TextDecorations="None" Cursor="Hand" Focusable="False" Foreground="{DynamicResource Warning}"
+                                       ToolTip="Show only superseded duplicate copies. Click again to show all."><Run Text="● Old   "/></Hyperlink>
+                            <Hyperlink TextDecorations="None" Cursor="Hand" Focusable="False" Foreground="{DynamicResource Danger}"
+                                       ToolTip="Show only packages with no device currently attached. Click again to show all."><Run Text="● Unattached   "/></Hyperlink>
+                            <Hyperlink TextDecorations="None" Cursor="Hand" Focusable="False" Foreground="{DynamicResource TextSecondary}"
+                                       ToolTip="Show only packages whose devices are disabled in Device Manager. Click again to show all."><Run Text="● Inactive (disabled in Device Manager)"/></Hyperlink>
                         </TextBlock>
                       </StackPanel>
                     </HeaderedContentControl>
@@ -40646,7 +40843,13 @@ try {
     }
 
     $token = [string]$creds.access_token
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+        if ([int]$wmtTlsProtocols -ne 0) {
+            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+        }
+    }
+    catch {}
 
     $page = 1
     $totalPages = 1
@@ -40858,7 +41061,13 @@ if (-not $Force -and (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
 
 # Download from GitHub.
 try {
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+        if ([int]$wmtTlsProtocols -ne 0) {
+            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+        }
+    }
+    catch {}
     Write-GuiLog "Downloading Steam app ID list..."
 
     $gamesUrl = "https://raw.githubusercontent.com/jsnli/steamappidlist/master/data/games_appid.json"
@@ -40998,7 +41207,13 @@ param([string]$Query, [int]$TimeoutSeconds = 15)
 $result = New-Object System.Collections.Generic.List[object]
 if ([string]::IsNullOrWhiteSpace($Query)) { return $result.ToArray() }
 try {
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+        if ([int]$wmtTlsProtocols -ne 0) {
+            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+        }
+    }
+    catch {}
     $encoded = [Uri]::EscapeDataString($Query)
     $url = "https://store.steampowered.com/api/storesearch/?term=$encoded&l=english&cc=US"
     $resp = Invoke-RestMethod -Uri $url -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
@@ -41705,7 +41920,11 @@ $fallbackUrl = "https://github.com/legendary-gl/legendary/releases/latest/downlo
 $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
 
 try {
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+    if ($wmtTlsProtocols -ne [Net.SecurityProtocolType]::SystemDefault -and
+        ($wmtTlsProtocols -band [Net.SecurityProtocolType]::Tls12) -ne [Net.SecurityProtocolType]::Tls12) {
+        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+    }
 }
 catch {}
 
@@ -41840,7 +42059,11 @@ $fallbackUrl = "https://github.com/Heroic-Games-Launcher/heroic-gogdl/releases/l
 $headers = @{ "User-Agent" = "Windows-Maintenance-Tool" }
 
 try {
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+    if ($wmtTlsProtocols -ne [Net.SecurityProtocolType]::SystemDefault -and
+        ($wmtTlsProtocols -band [Net.SecurityProtocolType]::Tls12) -ne [Net.SecurityProtocolType]::Tls12) {
+        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+    }
 }
 catch {}
 
@@ -42001,7 +42224,10 @@ Write-Host ""
 Write-Host "Step 3: Exchanging code for tokens..." -ForegroundColor Yellow
 
 try {
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+`$wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+if ([int]`$wmtTlsProtocols -ne 0) {
+[Net.ServicePointManager]::SecurityProtocol = `$wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+}
 `$body = "client_id=`$clientId&client_secret=`$clientSecret&grant_type=authorization_code" +
          "&redirect_uri=" + [Uri]::EscapeDataString(`$redirectUri) +
          "&code="         + [Uri]::EscapeDataString(`$code)
@@ -46165,6 +46391,40 @@ foreach ($item in $sorted) {
 }
 }
 
+function Connect-WmtGridSorting {
+# Shared column-click sorting wiring for the winget / library / firewall /
+# drivers ListViews. Replaces four byte-identical copies of the same
+# RoutedEventHandler; each list passes its own sort chain (script-scoped so
+# the page's update function can re-apply it after every refresh) and its
+# header -> sort-property resolver. Both ride on the ListView's Tag so the
+# handler itself needs no closure and keeps running in the main script
+# session state (a GetNewClosure handler would lose $script: scope).
+param(
+    [System.Windows.Controls.ListView]$ListView,
+    [System.Collections.ArrayList]$Chain,
+    [scriptblock]$ResolveProperty
+)
+if (-not $ListView -or $null -eq $Chain -or -not $ResolveProperty) { return }
+$ListView.Tag = @{ Chain = $Chain; Resolve = $ResolveProperty }
+$ListView.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent,
+    [System.Windows.RoutedEventHandler]{
+        param($s, $e)
+        $cfg = $s.Tag
+        if (-not $cfg) { return }
+        $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
+        if (-not $columnHeader -or -not $columnHeader.Column) { return }
+        $header = Get-CleanHeader $columnHeader.Column.Header
+        if ([string]::IsNullOrWhiteSpace($header)) { return }
+
+        $propName = & $cfg.Resolve $header
+        if ([string]::IsNullOrWhiteSpace($propName)) { return }
+
+        $isAscending = Set-SortChainPrimary -Chain $cfg.Chain -PropertyName $propName
+        Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
+        Set-ListViewSort -ListView $s -Chain $cfg.Chain
+    }, $true)
+}
+
 function Resolve-WingetSortProperty {
 param([string]$Header)
 switch ($Header) {
@@ -46177,21 +46437,7 @@ switch ($Header) {
 }
 
 if ($lstWinget) {
-$wingetSortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
-    if (-not $columnHeader -or -not $columnHeader.Column) { return }
-    $header = Get-CleanHeader $columnHeader.Column.Header
-    if ([string]::IsNullOrWhiteSpace($header)) { return }
-
-    $propName = Resolve-WingetSortProperty $header
-    if ([string]::IsNullOrWhiteSpace($propName)) { return }
-
-    $isAscending = Set-SortChainPrimary -Chain $script:WingetSortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $s -Chain $script:WingetSortChain
-}
-$lstWinget.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $wingetSortHandler, $true)
+Connect-WmtGridSorting -ListView $lstWinget -Chain $script:WingetSortChain -ResolveProperty ${function:Resolve-WingetSortProperty}
 }
 
 # --- Library list column sorting ---
@@ -46210,21 +46456,7 @@ switch ($Header) {
 }
 
 if ($lstLibrary) {
-$librarySortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
-    if (-not $columnHeader -or -not $columnHeader.Column) { return }
-    $header = Get-CleanHeader $columnHeader.Column.Header
-    if ([string]::IsNullOrWhiteSpace($header)) { return }
-
-    $propName = Resolve-LibrarySortProperty $header
-    if ([string]::IsNullOrWhiteSpace($propName)) { return }
-
-    $isAscending = Set-SortChainPrimary -Chain $script:LibrarySortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $s -Chain $script:LibrarySortChain
-}
-$lstLibrary.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $librarySortHandler, $true)
+Connect-WmtGridSorting -ListView $lstLibrary -Chain $script:LibrarySortChain -ResolveProperty ${function:Resolve-LibrarySortProperty}
 }
 
 # ---------------------------------------------------------
@@ -46499,7 +46731,13 @@ $script:InvokeWingetSearch = {
             [void]$pypiPs.AddScript({
                     param($CacheFile)
                     try {
-                        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                        try {
+                            $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                            if ([int]$wmtTlsProtocols -ne 0) {
+                                [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                            }
+                        }
+                        catch {}
                         $headers = @{
                             "Accept"     = "application/vnd.pypi.simple.v1+json"
                             "User-Agent" = "Windows-Maintenance-Tool"
@@ -46718,7 +46956,13 @@ $script:InvokeWingetSearch = {
                             if ($clientProp) { $creds = $clientProp.Value }
                             elseif (-not [string]::IsNullOrWhiteSpace([string]$json.access_token)) { $creds = $json }
                             if ($creds -and -not [string]::IsNullOrWhiteSpace([string]$creds.access_token)) {
-                                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                                try {
+                                    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                                    if ([int]$wmtTlsProtocols -ne 0) {
+                                        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                                    }
+                                }
+                                catch {}
                                 $token = [string]$creds.access_token
                                 $headers = @{ "Authorization" = "Bearer $token"; "User-Agent" = "Windows-Maintenance-Tool" }
                                 $page = 1
@@ -47352,7 +47596,13 @@ $script:InvokeWingetSearch = {
             $script:provCount = 0
             Log "Searching Steam Store..."
             try {
-                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                try {
+                    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                    if ([int]$wmtTlsProtocols -ne 0) {
+                        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                    }
+                }
+                catch {}
                 $encoded = [Uri]::EscapeDataString($Query)
                 $url = "https://store.steampowered.com/api/storesearch/?term=$encoded&l=english&cc=US"
                 $resp = Invoke-RestMethod -Uri $url -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
@@ -48627,21 +48877,7 @@ switch ($Header) {
 }
 
 if ($lstFw) {
-$fwSortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
-    if (-not $columnHeader -or -not $columnHeader.Column) { return }
-    $header = Get-CleanHeader $columnHeader.Column.Header
-    if ([string]::IsNullOrWhiteSpace($header)) { return }
-
-    $propName = Resolve-FirewallSortProperty $header
-    if ([string]::IsNullOrWhiteSpace($propName)) { return }
-
-    $isAscending = Set-SortChainPrimary -Chain $script:FirewallSortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $s -Chain $script:FirewallSortChain
-}
-$lstFw.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $fwSortHandler, $true)
+Connect-WmtGridSorting -ListView $lstFw -Chain $script:FirewallSortChain -ResolveProperty ${function:Resolve-FirewallSortProperty}
 }
 
 $btnFwClearSearch = Get-Ctrl "btnFwClearSearch"
@@ -48779,11 +49015,19 @@ $script:DriverLoadInProgress = $false
 $script:DriverLoadRunspace = $null
 $script:DriverLoadAsyncResult = $null
 $script:DriverLoadTimer = $null
+# Status quick-filter set by the legend chips ("" = show all). Survives
+# reloads so a Refresh keeps the current view focused.
+$script:DriverStatusFilter = ""
+$script:DriverLegendLinks = @{}
+# INF AddService scan cache: lowercased INF name -> @{ Stamp; Names }. Lets
+# Reload skip re-reading every staged INF that has not changed on disk.
+$script:DriverInfServiceCache = @{}
 
 $lstDrivers = Get-Ctrl "lstDrivers"
 $txtDrvSearch = Get-Ctrl "txtDrvSearch"
 $lblDrvStatus = Get-Ctrl "lblDrvStatus"
 $btnDrvReload = Get-Ctrl "btnDrvReload"
+$lblDrvLegend = Get-Ctrl "lblDrvLegend"
 
 function Set-DriverStatus {
 param([string]$Text, [bool]$Visible = $true)
@@ -48791,6 +49035,50 @@ if (-not $lblDrvStatus) { return }
 if ([string]::IsNullOrWhiteSpace($Text)) { $Text = "Ready" }
 $lblDrvStatus.Text = $Text
 $lblDrvStatus.Visibility = if ($Visible) { "Visible" } else { "Collapsed" }
+}
+
+function Set-DriverStatusFilter {
+# Quick-filter toggle behind the legend chips: clicking a chip shows only
+# that status, clicking the active chip again clears the filter. The active
+# chip is bolded/underlined so the filter state stays visible even when the
+# list is scrolled away from the status label.
+param([string]$Status)
+if ([string]::IsNullOrWhiteSpace($Status) -or $script:DriverStatusFilter -eq $Status) {
+    $script:DriverStatusFilter = ""
+}
+else { $script:DriverStatusFilter = $Status }
+foreach ($entry in @($script:DriverLegendLinks.GetEnumerator())) {
+    $link = $entry.Value
+    if (-not $link) { continue }
+    $isActive = ($entry.Key -eq $script:DriverStatusFilter)
+    try {
+        $link.FontWeight = if ($isActive) { [System.Windows.FontWeights]::Bold } else { [System.Windows.FontWeights]::Normal }
+        $link.TextDecorations = if ($isActive) { [System.Windows.TextDecorations]::Underline } else { $null }
+    }
+    catch {}
+}
+Update-DriverListView
+Update-DriverStatusLabel
+}
+
+# Wire the legend chips. They are found through the legend TextBlock's
+# Inlines (not FindName) and identified by their visible text against the
+# known status set, so the XAML namescope and the chip order stay flexible.
+if ($lblDrvLegend) {
+$knownStatuses = @("In Use", "Old", "Unattached", "Inactive", "Checking...", "Unknown")
+foreach ($inline in @($lblDrvLegend.Inlines)) {
+    if ($inline -isnot [System.Windows.Documents.Hyperlink]) { continue }
+    $chipText = ""
+    foreach ($run in @($inline.Inlines)) {
+        if ($run -is [System.Windows.Documents.Run]) { $chipText += [string]$run.Text }
+    }
+    $chipText = ($chipText.Trim() -replace '^[●\s]+', '').Trim()
+    $status = ($knownStatuses | Where-Object { $chipText.StartsWith($_) } | Select-Object -First 1)
+    if (-not $status) { continue }
+    $script:DriverLegendLinks[$status] = $inline
+    $clickStatus = $status
+    $inline.Add_Click({ param($s, $e) Set-DriverStatusFilter -Status $clickStatus }.GetNewClosure())
+}
 }
 
 function Set-DriverRowProperty {
@@ -48848,6 +49136,9 @@ if ($script:DriverUsageLoaded) {
 else {
     $summary += " · checking device usage..."
 }
+if (-not [string]::IsNullOrWhiteSpace($script:DriverStatusFilter)) {
+    $summary += " · showing only: $($script:DriverStatusFilter) (click its legend chip to clear)"
+}
 return $summary
 }
 
@@ -48873,6 +49164,15 @@ if (-not (Test-DriverSearchIsBlank $query)) {
         if (Test-DriverRowMatchesQuery -Row $row -Query $query) { [void]$filtered.Add($row) }
     }
     $rows = $filtered
+}
+
+# Legend quick-filter (AND-combined with the search text).
+if (-not [string]::IsNullOrWhiteSpace($script:DriverStatusFilter)) {
+    $statusFiltered = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in $rows) {
+        if ([string]$row.Status -eq $script:DriverStatusFilter) { [void]$statusFiltered.Add($row) }
+    }
+    $rows = $statusFiltered
 }
 
 $lstDrivers.Items.Clear()
@@ -49023,17 +49323,30 @@ foreach ($row in $script:DriverPackages) {
 function Stop-DriverLoad {
 try { Unregister-WmtUiPollOperation -Name "DriverUsageLoad" } catch {}
 $script:DriverLoadTimer = $null
-if ($script:DriverLoadRunspace) {
-    try { $script:DriverLoadRunspace.Stop() } catch {}
-    try { $script:DriverLoadRunspace.Dispose() } catch {}
-    $script:DriverLoadRunspace = $null
-}
+
+# Never call PowerShell.Stop() on the WPF thread: stopping a worker that is
+# blocked in pnputil/CIM can itself wait and freeze the window. Detach the
+# invocation from page state immediately and let the shared async-stop monitor
+# finish cancellation/disposal without blocking the dispatcher.
+$driverPs = $script:DriverLoadRunspace
+$driverAsync = $script:DriverLoadAsyncResult
+$script:DriverLoadRunspace = $null
 $script:DriverLoadAsyncResult = $null
+
+if ($driverPs) {
+    if ($driverAsync -and -not $driverAsync.IsCompleted) {
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $driverPs -Invocation $driverAsync -Name "Driver background load" } catch { try { $driverPs.Dispose() } catch {} }
+    }
+    else {
+        try { if ($driverAsync) { [void]$driverPs.EndInvoke($driverAsync) } } catch [System.Management.Automation.PipelineStoppedException] {} catch {}
+        try { $driverPs.Dispose() } catch {}
+    }
+}
+
 $script:DriverLoadInProgress = $false
 $script:DriverServiceMap = $null
 if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
 }
-
 function Start-DriverListLoad {
 param([switch]$Force)
 if (-not $lstDrivers) { return }
@@ -49041,6 +49354,12 @@ if ($script:DriverLoadInProgress) {
     if (-not $Force) { return }
     Stop-DriverLoad
 }
+if ($script:DriverCacheLoaded -and -not $Force) {
+    Update-DriverListView
+    Update-DriverStatusLabel
+    return
+}
+
 $script:DriverLoadInProgress = $true
 $script:DriverUsageLoaded = $false
 $script:DriverCacheLoaded = $false
@@ -49048,113 +49367,150 @@ $script:DriverDeviceMap = $null
 $script:DriverServiceMap = $null
 if ($btnDrvReload) { $btnDrvReload.IsEnabled = $false }
 if ($lstDrivers) { $lstDrivers.Items.Clear() }
-Set-DriverStatus "Loading driver packages..." -Visible $true
-Write-GuiLog "[Drivers] Loading driver store packages..."
+Set-DriverStatus "Loading driver packages in background..." -Visible $true
+Write-GuiLog "[Drivers] Loading driver store packages and device usage in background..."
 
-# Phase 1 (fast, inline): parse pnputil /enum-drivers and list every package.
+# Everything that can block (pnputil, staged-INF parsing and CIM/service scans)
+# runs in the UiSupport pool. The UI thread only converts the returned plain
+# objects into rows and updates WPF controls after the worker has completed.
+# Embed the parser helpers in the worker because pooled runspaces do not
+# inherit functions from this script's session state.
+$selectInfStringTableBody = ${function:Select-WmtInfStringTable}.ToString()
+$resolveInfTokenBody = ${function:Resolve-WmtInfToken}.ToString()
+$getDriverStorePackagesBody = ${function:Get-WmtDriverStorePackages}.ToString()
+$driverWorkerScript = @"
+param(`$infSvcCache)
+
+function Select-WmtInfStringTable {
+$selectInfStringTableBody
+}
+function Resolve-WmtInfToken {
+$resolveInfTokenBody
+}
+function Get-WmtDriverStorePackages {
+$getDriverStorePackagesBody
+}
+
+`$result = [PSCustomObject]@{
+    Success = `$false
+    Packages = @()
+    Usage = `$null
+    Services = `$null
+    InfServiceCache = `$null
+    Error = ""
+}
 try {
-    $parsed = Get-WmtDriverStorePackages
-    $rows = [System.Collections.Generic.List[object]]::new()
-    foreach ($d in $parsed) {
-        $rows.Add([PSCustomObject]@{
-            PublishedName  = [string]$d.PublishedName
-            OriginalName   = if ([string]::IsNullOrWhiteSpace([string]$d.OriginalName)) { "(unknown)" } else { [string]$d.OriginalName }
-            Provider       = [string]$d.Provider
-            Class          = [string]$d.Class
-            Signer         = [string]$d.Signer
-            Version        = $d.Version
-            DisplayVer     = [string]$d.DisplayVer
-            SortDate       = $d.SortDate
-            DisplayDate    = [string]$d.DisplayDate
-            DateSort       = ([DateTime]$d.SortDate).ToString("yyyyMMdd")
-            Status         = "Checking..."
-            StatusSort     = "4"
-            StatusTooltip  = "Checking which present devices use this package..."
-            DevicesText    = "..."
-            DevicesSort    = "0"
-            DevicesTooltip = ""
+    `$packages = @(Get-WmtDriverStorePackages)
+    `$infs = @(`$packages | ForEach-Object { [string]`$_.PublishedName } | Where-Object { -not [string]::IsNullOrWhiteSpace(`$_) })
+
+    `$entityState = @{}
+    foreach (`$e in @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+        if (-not `$e.DeviceID) { continue }
+        `$code = -1
+        try { `$code = [int]`$e.ConfigManagerErrorCode } catch {}
+        `$entityState[[string]`$e.DeviceID] = @{ Name = [string]`$e.Name; Status = [string]`$e.Status; Code = `$code }
+    }
+
+    `$map = @{}
+    foreach (`$d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue)) {
+        `$inf = ([string]`$d.InfName).ToLowerInvariant()
+        if (`$inf -notmatch '^oem\d+\.inf$') { continue }
+        if (-not `$map.ContainsKey(`$inf)) { `$map[`$inf] = [System.Collections.Generic.List[object]]::new() }
+        `$devId = [string]`$d.DeviceID
+        `$ent = if (`$entityState.ContainsKey(`$devId)) { `$entityState[`$devId] } else { `$null }
+        `$state = if (-not `$ent) { "Unknown" } elseif (`$ent.Code -eq 0 -and `$ent.Status -eq "OK") { "OK" } else { "Problem" }
+        `$name = [string]`$d.DeviceName
+        if ([string]::IsNullOrWhiteSpace(`$name) -and `$ent) { `$name = [string]`$ent.Name }
+        [void]`$map[`$inf].Add([PSCustomObject]@{
+            DeviceId = `$devId
+            Name = `$name
+            State = `$state
+            Code = if (`$ent) { [int]`$ent.Code } else { -1 }
         })
     }
-    $script:DriverPackages = @($rows)
-    $script:DriverCacheLoaded = $true
-    Update-DriverListView
-    Update-DriverStatusLabel
-    Write-GuiLog "[Drivers] Listed $($script:DriverPackages.Count) driver package(s) from the driver store (cached until Refresh)."
+
+    # A package can be in use without a PnP-device binding (filter drivers,
+    # audio/AV drivers and bus drivers). Cache only the expensive AddService
+    # INF parse; service presence/running state is refreshed every load.
+    `$svcState = @{}
+    foreach (`$s in @(Get-CimInstance -ClassName Win32_SystemDriver -ErrorAction SilentlyContinue)) {
+        if (`$s.Name) { `$svcState[[string]`$s.Name] = [string]`$s.State }
+    }
+    foreach (`$s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
+        if (`$s.Name) { `$svcState[[string]`$s.Name] = [string]`$s.State }
+    }
+
+    `$svcInfo = @{}
+    `$svcCache = if (`$infSvcCache) { `$infSvcCache } else { @{} }
+    `$newSvcCache = @{}
+    foreach (`$infName in @(`$infs)) {
+        `$infPath = Join-Path `$env:SystemRoot ("INF\" + `$infName)
+        if (-not (Test-Path -LiteralPath `$infPath)) { continue }
+        `$infLower = [string]`$infName.ToLowerInvariant()
+        `$stamp = ""
+        try { `$stamp = (Get-Item -LiteralPath `$infPath -ErrorAction Stop).LastWriteTimeUtc.Ticks.ToString() } catch {}
+
+        `$svcNames = `$null
+        if (`$stamp -and `$svcCache.ContainsKey(`$infLower) -and `$svcCache[`$infLower].Stamp -eq `$stamp) {
+            `$svcNames = @(`$svcCache[`$infLower].Names)
+        }
+        if (`$null -eq `$svcNames) {
+            `$svcNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            try {
+                foreach (`$line in @(Get-Content -LiteralPath `$infPath -ErrorAction Stop)) {
+                    if (`$line -match '(?i)^\s*AddService\s*=\s*"?([A-Za-z0-9_\.\-]+)"?\s*(,|$)') {
+                        [void]`$svcNames.Add(`$matches[1])
+                    }
+                }
+            }
+            catch {}
+        }
+        if (`$stamp) { `$newSvcCache[`$infLower] = @{ Stamp = `$stamp; Names = @(`$svcNames) } }
+        if (@(`$svcNames).Count -eq 0) { continue }
+
+        `$present = @()
+        foreach (`$svcName in @(`$svcNames)) {
+            `$installed = `$svcState.ContainsKey(`$svcName) -or (Test-Path -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + `$svcName))
+            if (-not `$installed) { continue }
+            `$isRunning = (`$svcState.ContainsKey(`$svcName) -and `$svcState[`$svcName] -eq "Running")
+            `$present += [PSCustomObject]@{ Name = `$svcName; Running = `$isRunning }
+        }
+        if (`$present.Count -gt 0) { `$svcInfo[`$infLower] = `$present }
+    }
+
+    `$result = [PSCustomObject]@{
+        Success = `$true
+        Packages = `$packages
+        Usage = `$map
+        Services = `$svcInfo
+        InfServiceCache = `$newSvcCache
+        Error = ""
+    }
 }
 catch {
-    Set-DriverStatus "Driver list load failed" -Visible $true
-    Write-GuiLog "[Drivers] Failed to parse driver store packages: $($_.Exception.Message)"
+    `$result = [PSCustomObject]@{
+        Success = `$false
+        Packages = @()
+        Usage = `$null
+        Services = `$null
+        InfServiceCache = `$null
+        Error = `$_.Exception.Message
+    }
+}
+return `$result
+"@
+
+try {
+    if (-not $script:DriverInfServiceCache) { $script:DriverInfServiceCache = @{} }
+    $script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript($driverWorkerScript).AddArgument($script:DriverInfServiceCache)
+    $script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
+}
+catch {
+    Set-DriverStatus "Driver load failed to start" -Visible $true
+    Write-GuiLog "[Drivers] Background load failed to start: $($_.Exception.Message)"
     Stop-DriverLoad
     return
 }
-
-# Phase 2 (slow, background): which present devices use each package, plus
-# which of each package's INF services exist / run in Windows.
-$drvInfList = @($script:DriverPackages | ForEach-Object { [string]$_.PublishedName })
-$script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript({
-    param([string[]]$infs)
-    $result = [PSCustomObject]@{ Success = $false; Usage = $null; Services = $null; Error = "" }
-    try {
-        $entityState = @{}
-        foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
-            if (-not $e.DeviceID) { continue }
-            $code = -1
-            try { $code = [int]$e.ConfigManagerErrorCode } catch {}
-            $entityState[[string]$e.DeviceID] = @{ Name = [string]$e.Name; Status = [string]$e.Status; Code = $code }
-        }
-        $map = @{}
-        foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue)) {
-            $inf = ([string]$d.InfName).ToLowerInvariant()
-            if ($inf -notmatch '^oem\d+\.inf$') { continue }
-            if (-not $map.ContainsKey($inf)) { $map[$inf] = [System.Collections.Generic.List[object]]::new() }
-            $devId = [string]$d.DeviceID
-            $ent = if ($entityState.ContainsKey($devId)) { $entityState[$devId] } else { $null }
-            $state = if (-not $ent) { "Unknown" } elseif ($ent.Code -eq 0 -and $ent.Status -eq "OK") { "OK" } else { "Problem" }
-            $name = [string]$d.DeviceName
-            if ([string]::IsNullOrWhiteSpace($name) -and $ent) { $name = [string]$ent.Name }
-            [void]$map[$inf].Add([PSCustomObject]@{ DeviceId = $devId; Name = $name; State = $state; Code = if ($ent) { [int]$ent.Code } else { -1 } })
-        }
-        # Service detection: a package can be "in use" without binding to any
-        # device (filter drivers, audio/AV drivers, bus drivers). Parse the
-        # staged INF for AddService entries and check each name against the
-        # registered driver/Win32 services and their running state.
-        $svcState = @{}
-        foreach ($s in @(Get-CimInstance -ClassName Win32_SystemDriver -ErrorAction SilentlyContinue)) {
-            if (-not $s.Name) { continue }
-            $svcState[[string]$s.Name] = [string]$s.State
-        }
-        foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
-            if (-not $s.Name) { continue }
-            $svcState[[string]$s.Name] = [string]$s.State
-        }
-        $svcInfo = @{}
-        foreach ($infName in @($infs)) {
-            if (-not $infName) { continue }
-            $infPath = Join-Path $env:SystemRoot ("INF\" + $infName)
-            if (-not (Test-Path -LiteralPath $infPath)) { continue }
-            try { $infLines = @(Get-Content -LiteralPath $infPath -ErrorAction Stop) } catch { continue }
-            $svcNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            foreach ($line in $infLines) {
-                if ($line -match '(?i)^\s*AddService\s*=\s*"?([A-Za-z0-9_\.\-]+)"?\s*(,|$)') { [void]$svcNames.Add($matches[1]) }
-            }
-            if ($svcNames.Count -eq 0) { continue }
-            $present = @()
-            foreach ($svcName in $svcNames) {
-                $installed = $svcState.ContainsKey($svcName) -or (Test-Path -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svcName))
-                if (-not $installed) { continue }
-                $isRunning = ($svcState.ContainsKey($svcName) -and $svcState[$svcName] -eq "Running")
-                $present += [PSCustomObject]@{ Name = $svcName; Running = $isRunning }
-            }
-            if ($present.Count -gt 0) { $svcInfo[[string]$infName.ToLowerInvariant()] = $present }
-        }
-        $result = [PSCustomObject]@{ Success = $true; Usage = $map; Services = $svcInfo; Error = "" }
-    }
-    catch {
-        $result = [PSCustomObject]@{ Success = $false; Usage = $null; Services = $null; Error = $_.Exception.Message }
-    }
-    return $result
-}).AddArgument($drvInfList)
-$script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
 
 $script:DriverLoadTimer = $null
 Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplete { $false } -OnTick {
@@ -49165,43 +49521,61 @@ Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplet
         $result = $script:DriverLoadRunspace.EndInvoke($script:DriverLoadAsyncResult)
         if ($result -and $result.Count -eq 1) { $result = $result[0] }
 
-        if ($result -and $result.Success) {
-            $script:DriverDeviceMap = $result.Usage
-            $script:DriverServiceMap = $result.Services
-            $script:DriverUsageLoaded = $true
-            Set-DriverStatusFlags
-            Update-DriverListView
-            Update-DriverStatusLabel
-            Write-GuiLog "[Drivers] Device usage loaded: $(Get-DriverStatusCounts)"
+        if (-not $result -or -not $result.Success) {
+            $err = if ($result -and $result.Error) { [string]$result.Error } else { "Unknown error" }
+            $script:DriverPackages = @()
+            $script:DriverDeviceMap = @{}
+            $script:DriverServiceMap = $null
+            $script:DriverUsageLoaded = $false
+            $script:DriverCacheLoaded = $false
+            Set-DriverStatus "Driver list load failed" -Visible $true
+            Write-GuiLog "[Drivers] Background load failed: $err"
+            return
         }
-        else {
-            $err = if ($result -and $result.Error) { $result.Error } else { "Unknown error" }
-            # Without the usage map the rows can stay in "Checking..." forever —
-            # move them to a muted "Unknown" state instead.
-            foreach ($row in $script:DriverPackages) {
-                if ($row.Status -eq "Checking...") {
-                    Set-DriverRowProperty -Row $row -Name "Status" -Value "Unknown"
-                    Set-DriverRowProperty -Row $row -Name "StatusSort" -Value "5"
-                    Set-DriverRowProperty -Row $row -Name "StatusTooltip" -Value "Device usage could not be determined (Win32_PnPSignedDriver query failed). Right-click and use 'Find Devices Using This Driver' to query live."
-                }
-            }
-            Update-DriverListView
-            Set-DriverStatus "Driver packages loaded — device usage unavailable" -Visible $true
-            Write-GuiLog "[Drivers] Device usage load failed: $err"
+
+        $rows = [System.Collections.Generic.List[object]]::new()
+        foreach ($d in @($result.Packages)) {
+            if (-not $d) { continue }
+            [void]$rows.Add([PSCustomObject]@{
+                PublishedName  = [string]$d.PublishedName
+                OriginalName   = if ([string]::IsNullOrWhiteSpace([string]$d.OriginalName)) { "(unknown)" } else { [string]$d.OriginalName }
+                Provider       = [string]$d.Provider
+                Class          = [string]$d.Class
+                Signer         = [string]$d.Signer
+                Version        = $d.Version
+                DisplayVer     = [string]$d.DisplayVer
+                SortDate       = $d.SortDate
+                DisplayDate    = [string]$d.DisplayDate
+                DateSort       = ([DateTime]$d.SortDate).ToString("yyyyMMdd")
+                Status         = "Checking..."
+                StatusSort     = "4"
+                StatusTooltip  = "Checking which present devices use this package..."
+                DevicesText    = "..."
+                DevicesSort    = "0"
+                DevicesTooltip = ""
+            })
         }
+
+        $script:DriverPackages = @($rows)
+        $script:DriverDeviceMap = if ($result.Usage) { $result.Usage } else { @{} }
+        $script:DriverServiceMap = if ($result.Services) { $result.Services } else { @{} }
+        if ($result.InfServiceCache) { $script:DriverInfServiceCache = $result.InfServiceCache }
+        $script:DriverCacheLoaded = $true
+        $script:DriverUsageLoaded = $true
+
+        Set-DriverStatusFlags
+        Update-DriverListView
+        Update-DriverStatusLabel
+        Write-GuiLog "[Drivers] Loaded $($script:DriverPackages.Count) driver package(s) and device/service usage in background."
     }
     catch {
-        $err = $_.Exception.Message
-        foreach ($row in $script:DriverPackages) {
-            if ($row.Status -eq "Checking...") {
-                Set-DriverRowProperty -Row $row -Name "Status" -Value "Unknown"
-                Set-DriverRowProperty -Row $row -Name "StatusSort" -Value "5"
-                Set-DriverRowProperty -Row $row -Name "StatusTooltip" -Value "Device usage could not be determined because the background usage query failed. Right-click and use 'Find Devices Using This Driver' to query live."
-            }
-        }
-        Update-DriverListView
-        Set-DriverStatus "Driver packages loaded — device usage unavailable" -Visible $true
-        Write-GuiLog "[Drivers] Device usage load failed: $err"
+        $script:DriverPackages = @()
+        $script:DriverDeviceMap = @{}
+        $script:DriverServiceMap = $null
+        $script:DriverUsageLoaded = $false
+        $script:DriverCacheLoaded = $false
+        Set-DriverStatus "Driver list load failed" -Visible $true
+        Write-GuiLog "[Drivers] Background load failed: $($_.Exception.Message)"
     }
     finally {
         try { $script:DriverLoadRunspace.Dispose() } catch {}
@@ -49211,9 +49585,8 @@ Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplet
         $script:DriverLoadInProgress = $false
         if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
     }
-    } | Out-Null
+} | Out-Null
 }
-
 function Get-DriverPackageDetailsText {
 param($Row)
 if (-not $Row) { return "" }
@@ -49254,41 +49627,6 @@ function Show-DriverPackageDetails {
 param($Row)
 if (-not $Row) { return }
 Show-TextDialog -Title "Driver Details - $($Row.PublishedName)" -Text (Get-DriverPackageDetailsText -Row $Row)
-}
-
-function Get-DriverDeviceUsageLive {
-param([string]$Inf)
-# Live single-package query. Used when the background usage map has no entry
-# for the package (still loading, or load failed).
-$devices = [System.Collections.Generic.List[object]]::new()
-try {
-    $signed = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
-        Where-Object { ([string]$_.InfName).ToLowerInvariant() -eq $Inf.ToLowerInvariant() })
-    foreach ($d in $signed) {
-        $state = "Unknown"
-        $entName = ""
-        $code = -1
-        try {
-            $ent = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop |
-                Where-Object { [string]$_.DeviceID -eq [string]$d.DeviceID } |
-                Select-Object -First 1
-            if ($ent) {
-                $entName = [string]$ent.Name
-                $code = -1
-                try { $code = [int]$ent.ConfigManagerErrorCode } catch {}
-                $state = if ($code -eq 0 -and [string]$ent.Status -eq "OK") { "OK" } else { "Problem" }
-            }
-        }
-        catch {}
-        $name = [string]$d.DeviceName
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = $entName }
-        [void]$devices.Add([PSCustomObject]@{ DeviceId = [string]$d.DeviceID; Name = $name; State = $state; Code = $code })
-    }
-}
-catch {
-    Write-GuiLog "[Drivers] Live device query failed for ${Inf}: $($_.Exception.Message)"
-}
-return @($devices)
 }
 
 function Show-DriverDeviceUsageResult {
@@ -49844,21 +50182,7 @@ switch ($Header) {
 }
 
 if ($lstDrivers) {
-$drvSortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $e)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
-    if (-not $columnHeader -or -not $columnHeader.Column) { return }
-    $header = Get-CleanHeader $columnHeader.Column.Header
-    if ([string]::IsNullOrWhiteSpace($header)) { return }
-
-    $propName = Resolve-DriverSortProperty $header
-    if ([string]::IsNullOrWhiteSpace($propName)) { return }
-
-    $isAscending = Set-SortChainPrimary -Chain $script:DriverSortChain -PropertyName $propName
-    Update-GridViewHeaders -ListView $s -ActiveHeader $header -Ascending:$isAscending
-    Set-ListViewSort -ListView $s -Chain $script:DriverSortChain
-}
-$lstDrivers.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $drvSortHandler, $true)
+Connect-WmtGridSorting -ListView $lstDrivers -Chain $script:DriverSortChain -ResolveProperty ${function:Resolve-DriverSortProperty}
 
 # Prevent context menu from opening when right-clicking empty space, headers,
 # or scrollbars; instead select the row under the cursor first.
@@ -58445,7 +58769,13 @@ try {
                         if ($clientProp) { $creds = $clientProp.Value }
                         elseif (-not [string]::IsNullOrWhiteSpace([string]$json.access_token)) { $creds = $json }
                         if ($creds -and -not [string]::IsNullOrWhiteSpace([string]$creds.access_token)) {
-                            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                            try {
+                                $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                                if ([int]$wmtTlsProtocols -ne 0) {
+                                    [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                                }
+                            }
+                            catch {}
                             $token = [string]$creds.access_token
                             $headers = @{
                                 "Authorization" = "Bearer $token"
@@ -58495,7 +58825,13 @@ try {
             if ($DoPypi) {
                 try {
                     Write-Output "LOG:Fetching PyPI package index..."
-                    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                    try {
+                        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                        if ([int]$wmtTlsProtocols -ne 0) {
+                            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                        }
+                    }
+                    catch {}
                     $headers = @{
                         "Accept"     = "application/vnd.pypi.simple.v1+json"
                         "User-Agent" = "Windows-Maintenance-Tool"
@@ -58552,7 +58888,13 @@ try {
 
                         if ($needAppList) {
                             try {
-                                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                                try {
+                                    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                                    if ([int]$wmtTlsProtocols -ne 0) {
+                                        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                                    }
+                                }
+                                catch {}
                                 Write-Output "LOG:Downloading Steam app ID list..."
 
                                 # Download games list.
