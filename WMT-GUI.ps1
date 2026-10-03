@@ -49652,12 +49652,18 @@ $applyResultsState = @{ Callback = $null }
 $applyResults = {
     param($results, [bool]$AllowForce)
     $records = @($results | Where-Object { $_ -and $_.PSObject.Properties["Inf"] })
-    $removed = @($records | Where-Object { [bool]$_.Success } | ForEach-Object { [string]$_.Inf })
+    # ERROR_SUCCESS_REBOOT_REQUIRED (3010) means the delete was accepted but
+    # its changes are not effective until reboot. Keep those packages visible
+    # in the cached view so WMT does not imply they are already gone.
+    $removed = @($records | Where-Object { [bool]$_.Success -and [int]$_.ExitCode -eq 0 } | ForEach-Object { [string]$_.Inf })
+    $pendingReboot = @($records | Where-Object { [bool]$_.Success -and [int]$_.ExitCode -eq 3010 } | ForEach-Object { [string]$_.Inf })
     $failed = @($records | Where-Object { -not [bool]$_.Success })
 
     foreach ($item in $records) {
         if ([bool]$item.Success) {
-            if ([int]$item.ExitCode -eq 3010) { Write-GuiLog "[Drivers] Removed $($item.Inf) (reboot required to finish the removal)." }
+            if ([int]$item.ExitCode -eq 3010) {
+                Write-GuiLog "[Drivers] Removal accepted for $($item.Inf), but Windows requires a reboot before the change is effective; keeping the cached row visible."
+            }
             else { Write-GuiLog "[Drivers] Removed $($item.Inf)." }
         }
         else {
@@ -49666,6 +49672,10 @@ $applyResults = {
     }
 
     if ($removed.Count -gt 0) { Remove-DriverRowsFromCache -RemovedInfs $removed }
+    if ($pendingReboot.Count -gt 0) {
+        $pendingText = (@($pendingReboot) -join "`n")
+        Show-WmtMessageBox -Message "Windows accepted removal of the following driver package(s), but a reboot is required before the change is effective:`n`n$pendingText`n`nThey will remain visible in the Drivers list until Windows actually removes them. Reboot, then use Reload." -Title "Driver Removal Pending Reboot" -Image Information | Out-Null
+    }
 
     if ($AllowForce -and $failed.Count -gt 0) {
         $failText = (@($failed) | ForEach-Object { "$($_.Inf) (exit $($_.ExitCode)):`n$($_.Output)" }) -join "`n`n"
