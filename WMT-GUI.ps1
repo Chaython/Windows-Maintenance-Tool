@@ -13996,8 +13996,11 @@ $applyCleanerSearch = {
     }
 }.GetNewClosure()
 
-$RenderAllRules = {
-    param($allRules)
+$1
+    # Child handlers are another GetNewClosure() layer; capture through locals.
+    $applyCleanerSearchRef = $applyCleanerSearch
+    $showEnabledStateRef = $showEnabledState
+    $txtSearchRef = $txtSearch
 
     $prevStates = @{}
     foreach ($k in $cleanupCheckboxes.Keys) {
@@ -14117,10 +14120,10 @@ $RenderAllRules = {
             if ($item.Desc) { $chk.ToolTip = [string]$item.Desc }
 
             $chk.Add_Checked({
-                    if ($showEnabledState.Enabled) { & $applyCleanerSearch }
+                    if ($showEnabledStateRef.Enabled) { & $applyCleanerSearchRef }
                 }.GetNewClosure())
             $chk.Add_Unchecked({
-                    if ($showEnabledState.Enabled) { & $applyCleanerSearch }
+                    if ($showEnabledStateRef.Enabled) { & $applyCleanerSearchRef }
                 }.GetNewClosure())
 
             [void]$flow.Children.Add($chk)
@@ -14131,18 +14134,18 @@ $RenderAllRules = {
         $secChk.IsChecked = $isSecChecked
         $secChk.Add_Checked({
                 param($s, $e)
-                $searchText = [string]$txtSearch.Text
+                $searchText = [string]$txtSearchRef.Text
                 if ($searchText -eq "Search rules...") { $searchText = "" }
-                $filterActive = (-not [string]::IsNullOrWhiteSpace($searchText)) -or [bool]$showEnabledState.Enabled
+                $filterActive = (-not [string]::IsNullOrWhiteSpace($searchText)) -or [bool]$showEnabledStateRef.Enabled
                 foreach ($c in $childChecks) {
                     if (-not $filterActive -or $c.Visibility -eq [System.Windows.Visibility]::Visible) { $c.IsChecked = $true }
                 }
             }.GetNewClosure())
         $secChk.Add_Unchecked({
                 param($s, $e)
-                $searchText = [string]$txtSearch.Text
+                $searchText = [string]$txtSearchRef.Text
                 if ($searchText -eq "Search rules...") { $searchText = "" }
-                $filterActive = (-not [string]::IsNullOrWhiteSpace($searchText)) -or [bool]$showEnabledState.Enabled
+                $filterActive = (-not [string]::IsNullOrWhiteSpace($searchText)) -or [bool]$showEnabledStateRef.Enabled
                 foreach ($c in $childChecks) {
                     if (-not $filterActive -or $c.Visibility -eq [System.Windows.Visibility]::Visible) { $c.IsChecked = $false }
                 }
@@ -14153,7 +14156,7 @@ $RenderAllRules = {
         [void]$sectionEntries.Add([PSCustomObject]@{ Header = $header; Flow = $flow; HeaderCheck = $secChk; Children = $childChecks })
     }
 
-    & $applyCleanerSearch
+    & $applyCleanerSearchRef
 }.GetNewClosure()
 
 $externalRuleState = @{
@@ -26200,8 +26203,8 @@ $rebuildClasses = {
     $lstClasses.SelectedIndex = 0
 }.GetNewClosure()
 
-$exportDrivers = {
-    param([object[]]$DriversToExport)
+$1    $exportDialogRef = $dialog
+    $exportStatusRef = $lblStatus
     $targets = @($DriversToExport | Where-Object { $_ })
     if ($targets.Count -eq 0) {
         Show-WmtMessageBox -Owner $dialog -Message "Please select at least one driver to export." -Title "Driver Export Tool" -Image Warning | Out-Null
@@ -26216,25 +26219,25 @@ $exportDrivers = {
 
     $complete = {
         param($results)
-        if (-not $dialog.IsLoaded) { return }
-        $dialog.IsEnabled = $true
+        if (-not $exportDialogRef.IsLoaded) { return }
+        $exportDialogRef.IsEnabled = $true
         $summary = @($results | Where-Object { $_ -and $_.PSObject.Properties["ExportPath"] } | Select-Object -Last 1)[0]
         if ($summary) {
             $failedCount = @($summary.Failed).Count
-            $lblStatus.Text = if ($failedCount -gt 0) { "Completed with $failedCount failure(s)" } else { "Done" }
+            $exportStatusRef.Text = if ($failedCount -gt 0) { "Completed with $failedCount failure(s)" } else { "Done" }
             $message = if ($failedCount -gt 0) { "Driver export completed with $failedCount failure(s). Saved to: $($summary.ExportPath)" } else { "Export Complete. Saved to: $($summary.ExportPath)" }
             $image = if ($failedCount -gt 0) { "Warning" } else { "Information" }
-            Show-WmtMessageBox -Owner $dialog -Message $message -Title "Driver Export" -Image $image | Out-Null
+            Show-WmtMessageBox -Owner $exportDialogRef -Message $message -Title "Driver Export" -Image $image | Out-Null
         }
     }.GetNewClosure()
 
     $failed = {
         param($errorRecord)
-        if (-not $dialog.IsLoaded) { return }
-        $dialog.IsEnabled = $true
-        $lblStatus.Text = "Error"
+        if (-not $exportDialogRef.IsLoaded) { return }
+        $exportDialogRef.IsEnabled = $true
+        $exportStatusRef.Text = "Error"
         $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
-        Show-WmtMessageBox -Owner $dialog -Message "An error occurred during export: $message" -Title "Error" -Image Error | Out-Null
+        Show-WmtMessageBox -Owner $exportDialogRef -Message "An error occurred during export: $message" -Title "Error" -Image Error | Out-Null
     }.GetNewClosure()
 
     Invoke-WmtUiBackgroundCommand -Msg "Exporting $($targets.Count) driver package(s)..." -SuppressResultLog -Sb {
@@ -26646,8 +26649,13 @@ $chooseCleanupMode = {
     return $state.Result
 }.GetNewClosure()
 
-$doRemove = {
-    param([object[]]$Items, [bool]$CloseWindow)
+$1    # Re-home outer captures before creating nested completion/error closures.
+    $cleanupDialogRef = $dialog
+    $cleanupCurrentListRef = $currentList
+    $cleanupLoadGridRef = $loadGrid
+    $cleanupRemoveAllRef = $btnRemoveAll
+    $cleanupRemoveSelectedRef = $btnRemoveSel
+    $cleanupCloseRef = $btnClose
     $itemsToRemove = @($Items | ForEach-Object { if ($_.PSObject.Properties["Source"]) { $_.Source } else { $_ } })
     if ($itemsToRemove.Count -eq 0) { return }
 
@@ -26688,12 +26696,12 @@ $doRemove = {
         }
 
         if ($removedSet.Count -gt 0) {
-            for ($idx = $currentList.Count - 1; $idx -ge 0; $idx--) {
-                if ($removedSet.Contains([string]$currentList[$idx].PublishedName)) {
-                    $currentList.RemoveAt($idx)
+            for ($idx = $cleanupCurrentListRef.Count - 1; $idx -ge 0; $idx--) {
+                if ($removedSet.Contains([string]$cleanupCurrentListRef[$idx].PublishedName)) {
+                    $cleanupCurrentListRef.RemoveAt($idx)
                 }
             }
-            & $loadGrid
+            & $cleanupLoadGridRef
             Remove-DriverRowsFromCache -RemovedInfs @($removedSet)
         }
 
@@ -26701,14 +26709,14 @@ $doRemove = {
         if ($mode -eq "Backup") {
             $resMsg += "`nBackups: $BackupCount`nPath: $BackupPath"
         }
-        Show-WmtMessageBox -Owner $dialog -Message $resMsg -Title "Result" -Image Information | Out-Null
+        Show-WmtMessageBox -Owner $cleanupDialogRef -Message $resMsg -Title "Result" -Image Information | Out-Null
 
-        $dialog.Title = "Clean Old Drivers"
-        $btnRemoveAll.IsEnabled = $true
-        $btnRemoveSel.IsEnabled = $true
-        $btnClose.IsEnabled = $true
+        $cleanupDialogRef.Title = "Clean Old Drivers"
+        $cleanupRemoveAllRef.IsEnabled = $true
+        $cleanupRemoveSelectedRef.IsEnabled = $true
+        $cleanupCloseRef.IsEnabled = $true
         Set-WmtBusyCursor
-        if ($CloseWindow) { $dialog.Close() }
+        if ($CloseWindow) { $cleanupDialogRef.Close() }
     }.GetNewClosure()
 
     # GetNewClosure() creates a dynamic module. Capture the finalizer in this
@@ -26739,7 +26747,7 @@ $doRemove = {
                 $detail = ($detail + "`nDriver removal timed out.").Trim()
             }
             $warnMsg = "Driver: $($failure.OriginalName) ($($failure.PublishedName))`n`nError:`n$detail`n`nForce delete?"
-            if ((Show-WmtMessageBox -Owner $dialog -Message $warnMsg -Title "Deletion Failed" -Button YesNo -Image Error) -eq [System.Windows.MessageBoxResult]::Yes) {
+            if ((Show-WmtMessageBox -Owner $cleanupDialogRef -Message $warnMsg -Title "Deletion Failed" -Button YesNo -Image Error) -eq [System.Windows.MessageBoxResult]::Yes) {
                 [void]$forceItems.Add($failure)
             }
         }
@@ -26806,13 +26814,13 @@ $doRemove = {
 
     $firstPassError = {
         param($err)
-        $dialog.Title = "Clean Old Drivers"
-        $btnRemoveAll.IsEnabled = $true
-        $btnRemoveSel.IsEnabled = $true
-        $btnClose.IsEnabled = $true
+        $cleanupDialogRef.Title = "Clean Old Drivers"
+        $cleanupRemoveAllRef.IsEnabled = $true
+        $cleanupRemoveSelectedRef.IsEnabled = $true
+        $cleanupCloseRef.IsEnabled = $true
         Set-WmtBusyCursor
         $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
-        Show-WmtMessageBox -Owner $dialog -Message ("Driver cleanup failed: " + $message) -Title "Clean Old Drivers" -Image Error | Out-Null
+        Show-WmtMessageBox -Owner $cleanupDialogRef -Message ("Driver cleanup failed: " + $message) -Title "Clean Old Drivers" -Image Error | Out-Null
     }.GetNewClosure()
 
     $workerArgs = [object[]]@((, @($workItems)), $mode, $mainBkPath)
@@ -27609,8 +27617,10 @@ $restorePointCreateActiveState = Get-Variable -Name WmtRestorePointCreateActive 
 $restorePointCreateTimerState = Get-Variable -Name WmtRestorePointCreateTimer -Scope Script
 $restorePointCreateProcessState = Get-Variable -Name WmtRestorePointCreateProcess -Scope Script
 
-$startRestorePointCreate = {
-    param([string]$Description)
+$1
+    $restorePointCreateActiveStateRef = $restorePointCreateActiveState
+    $restorePointCreateTimerStateRef = $restorePointCreateTimerState
+    $restorePointCreateProcessStateRef = $restorePointCreateProcessState
 
     $descriptionText = & $toRestoreCellText $Description
     if ([string]::IsNullOrWhiteSpace($descriptionText)) { return }
@@ -27631,13 +27641,13 @@ $startRestorePointCreate = {
     }
     catch {}
 
-    if ($restorePointCreateActiveState.Value) {
+    if ($restorePointCreateActiveStateRef.Value) {
         Show-WmtMessageBox -Owner $restoreDialog -Message "A restore point is already being created. Please wait for it to finish." -Title "System Restore Manager" -Image Information | Out-Null
         return
     }
 
     if ($descriptionText.Length -gt 256) { $descriptionText = $descriptionText.Substring(0, 256) }
-    $restorePointCreateActiveState.Value = $true
+    $restorePointCreateActiveStateRef.Value = $true
     if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $false }
     if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Creating restore point..." }
 
@@ -27660,7 +27670,7 @@ $startRestorePointCreate = {
         $progressWindow = New-WmtWindowFromXaml -Title "Create Restore Point" -ContentXaml $progressContent -Width 560 -Height 205 -MinWidth 520 -MinHeight 190 -NoResize
     }
     catch {
-        $restorePointCreateActiveState.Value = $false
+        $restorePointCreateActiveStateRef.Value = $false
         if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
         if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Restore point creation failed to start." }
         Show-WmtMessageBox -Owner $restoreDialog -Message "Could not open the restore point progress window.`n$($_.Exception.Message)" -Title "System Restore Manager" -Image Error | Out-Null
@@ -27816,7 +27826,7 @@ exit 1
         try { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue } catch {}
         try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
         try { $progressWindow.Close() } catch {}
-        $restorePointCreateActiveState.Value = $false
+        $restorePointCreateActiveStateRef.Value = $false
         if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
         if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Restore point creation failed to start." }
         Show-WmtMessageBox -Owner $restoreDialog -Message "Failed to start restore point creation.`n$($_.Exception.Message)" -Title "System Restore Manager" -Image Error | Out-Null
@@ -27851,9 +27861,9 @@ exit 1
                 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
                 try { if ($progressWindow) { $progressWindow.Close() } } catch {}
 
-                $restorePointCreateActiveState.Value = $false
-                if ([object]::ReferenceEquals($restorePointCreateTimerState.Value, $timer)) { $restorePointCreateTimerState.Value = $null }
-                if ([object]::ReferenceEquals($restorePointCreateProcessState.Value, $process)) { $restorePointCreateProcessState.Value = $null }
+                $restorePointCreateActiveStateRef.Value = $false
+                if ([object]::ReferenceEquals($restorePointCreateTimerStateRef.Value, $timer)) { $restorePointCreateTimerStateRef.Value = $null }
+                if ([object]::ReferenceEquals($restorePointCreateProcessStateRef.Value, $process)) { $restorePointCreateProcessStateRef.Value = $null }
                 if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
 
                 $messageOwner = $null
@@ -27898,9 +27908,9 @@ exit 1
                 try { if ($process) { $process.Dispose() } } catch {}
                 try { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue } catch {}
                 try { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue } catch {}
-                $restorePointCreateActiveState.Value = $false
-                if ([object]::ReferenceEquals($restorePointCreateTimerState.Value, $timer)) { $restorePointCreateTimerState.Value = $null }
-                if ([object]::ReferenceEquals($restorePointCreateProcessState.Value, $process)) { $restorePointCreateProcessState.Value = $null }
+                $restorePointCreateActiveStateRef.Value = $false
+                if ([object]::ReferenceEquals($restorePointCreateTimerStateRef.Value, $timer)) { $restorePointCreateTimerStateRef.Value = $null }
+                if ([object]::ReferenceEquals($restorePointCreateProcessStateRef.Value, $process)) { $restorePointCreateProcessStateRef.Value = $null }
                 if ($null -ne $restoreCreateButton) { $restoreCreateButton.IsEnabled = $true }
                 try {
                     if ($null -ne $restoreStatusLabel) { $restoreStatusLabel.Text = "Restore point creation failed." }
@@ -27914,8 +27924,8 @@ exit 1
         }.GetNewClosure())
 
     [void]$progressWindow.Show()
-    $restorePointCreateTimerState.Value = $timer
-    $restorePointCreateProcessState.Value = $process
+    $restorePointCreateTimerStateRef.Value = $timer
+    $restorePointCreateProcessStateRef.Value = $process
     $timer.Start()
 }.GetNewClosure()
 
@@ -27995,10 +28005,15 @@ $loadRestorePoints = {
 }.GetNewClosure()
 
 $refreshRestorePointsAfterCreate = {
+    $restoreRefreshStateRef = $restoreRefreshState
+    $restoreDialogRef = $dialog
+    $restoreStatusRef = $lblStatus
+    $restoreRefreshButtonRef = $btnRefresh
+    $loadRestorePointsRef = $loadRestorePoints
     try {
-        if ($restoreRefreshState.Timer) {
-            $restoreRefreshState.Timer.Stop()
-            $restoreRefreshState.Timer = $null
+        if ($restoreRefreshStateRef.Timer) {
+            $restoreRefreshStateRef.Timer.Stop()
+            $restoreRefreshStateRef.Timer = $null
         }
     }
     catch {}
@@ -28007,26 +28022,26 @@ $refreshRestorePointsAfterCreate = {
     $invokeRestoreRefresh = {
         param([switch]$ShowError)
 
-        if (-not $dialog) { return $false }
+        if (-not $restoreDialogRef) { return $false }
         $refreshState.Attempt = [int]$refreshState.Attempt + 1
         if ([int]$refreshState.Attempt -eq 1) {
-            $lblStatus.Text = "Restore point created. Refreshing list..."
+            $restoreStatusRef.Text = "Restore point created. Refreshing list..."
         }
         else {
-            $lblStatus.Text = "Refreshing restore points... ($($refreshState.Attempt)/$($refreshState.MaxAttempts))"
+            $restoreStatusRef.Text = "Refreshing restore points... ($($refreshState.Attempt)/$($refreshState.MaxAttempts))"
         }
 
-        if ($btnRefresh) {
+        if ($restoreRefreshButtonRef) {
             try {
-                $btnRefresh.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+                $restoreRefreshButtonRef.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
             }
             catch {
                 Write-GuiLog "Restore point Refresh button click failed: $($_.Exception.Message)"
-                & $loadRestorePoints -ShowError:$ShowError
+                & $loadRestorePointsRef -ShowError:$ShowError
             }
         }
         else {
-            & $loadRestorePoints -ShowError:$ShowError
+            & $loadRestorePointsRef -ShowError:$ShowError
         }
         return $true
     }.GetNewClosure()
@@ -28040,21 +28055,21 @@ $refreshRestorePointsAfterCreate = {
             try {
                 if ([int]$refreshState.Attempt -ge [int]$refreshState.MaxAttempts) {
                     $refreshTimer.Stop()
-                    if ([object]::ReferenceEquals($restoreRefreshState.Timer, $refreshTimer)) { $restoreRefreshState.Timer = $null }
+                    if ([object]::ReferenceEquals($restoreRefreshStateRef.Timer, $refreshTimer)) { $restoreRefreshStateRef.Timer = $null }
                     return
                 }
                 if (-not (& $invokeRestoreRefresh)) {
                     $refreshTimer.Stop()
-                    if ([object]::ReferenceEquals($restoreRefreshState.Timer, $refreshTimer)) { $restoreRefreshState.Timer = $null }
+                    if ([object]::ReferenceEquals($restoreRefreshStateRef.Timer, $refreshTimer)) { $restoreRefreshStateRef.Timer = $null }
                 }
             }
             catch {
                 $refreshTimer.Stop()
-                if ([object]::ReferenceEquals($restoreRefreshState.Timer, $refreshTimer)) { $restoreRefreshState.Timer = $null }
+                if ([object]::ReferenceEquals($restoreRefreshStateRef.Timer, $refreshTimer)) { $restoreRefreshStateRef.Timer = $null }
                 Write-GuiLog "Delayed restore point refresh failed: $($_.Exception.Message)"
             }
         }.GetNewClosure())
-    $restoreRefreshState.Timer = $refreshTimer
+    $restoreRefreshStateRef.Timer = $refreshTimer
     $refreshTimer.Start()
 }.GetNewClosure()
 $restoreRefreshState.Handler = $refreshRestorePointsAfterCreate
@@ -49605,6 +49620,7 @@ if ($choice -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
 $targetInfs = @($targets | ForEach-Object { [string]$_.PublishedName })
 
+$applyResultsState = @{ Callback = $null }
 $applyResults = {
     param($results, [bool]$AllowForce)
     $records = @($results | Where-Object { $_ -and $_.PSObject.Properties["Inf"] })
@@ -49626,12 +49642,11 @@ $applyResults = {
     if ($AllowForce -and $failed.Count -gt 0) {
         $failText = (@($failed) | ForEach-Object { "$($_.Inf) (exit $($_.ExitCode)):`n$($_.Output)" }) -join "`n`n"
         $force = Show-WmtMessageBox -Message "Failed to remove $($failed.Count) package(s):`n`n$failText`n`nForce delete? This also removes packages Windows considers in use." -Title "Force Delete Driver Packages" -Button YesNo -Image Error
-        if ($force -eq [System.Windows.MessageBoxResult]::Yes) {
-            $failedInfs = @($failed | ForEach-Object { [string]$_.Inf })
-            $forceDone = {
-                param($forceResults)
-                & $applyResults $forceResults $false
-            }.GetNewClosure()
+        if ($force -eq [System.Windows.MessageBoxResult]::Yes) {$1$2$applyResultsCallback = $applyResultsState.Callback
+$2$forceDone = {
+$2    param($forceResults)
+$2    & $applyResultsCallback $forceResults $false
+$2}.GetNewClosure()
             Invoke-WmtUiBackgroundCommand -Name ("ForceDeleteDrivers_" + [guid]::NewGuid().ToString("N")) -Msg "Force-deleting $($failedInfs.Count) driver package(s)..." -SuppressResultLog -Sb {
                 param($infs)
                 foreach ($inf in @($infs)) {
@@ -49648,6 +49663,7 @@ $applyResults = {
         }
     }
 }.GetNewClosure()
+$applyResultsState.Callback = $applyResults
 
 $done = {
     param($results)
