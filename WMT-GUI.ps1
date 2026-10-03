@@ -26829,7 +26829,9 @@ $doRemove = {
         Show-WmtMessageBox -Owner $cleanupDialogRef -Message ("Driver cleanup failed: " + $message) -Title "Clean Old Drivers" -Image Error | Out-Null
     }.GetNewClosure()
 
-    $workerArgs = [object[]]@((, @($workItems)), $mode, $mainBkPath)
+    # The outer argument list already keeps the batch as its first element.
+    # Another unary comma nests the batch and joins all INF names into one target.
+    $workerArgs = [object[]]@($workItems, $mode, $mainBkPath)
     Invoke-WmtUiBackgroundCommand -Name ("DriverCleanup_" + [guid]::NewGuid().ToString("N")) -Msg "Cleaning old driver packages..." -TimeoutMs ([Math]::Max(120000, 125000 * $workItems.Count)) -SuppressResultLog -Sb {
         param(
             $Items,
@@ -48057,23 +48059,67 @@ $mniCopyAll.Add_Click({
     }
 })
 
-# Add items to the menu
+# Reuse the toolbar handlers so confirmations, errors and refresh behavior match.
+$fwMenuActions = @(
+    @{ Header = "Modify"; Button = $btnFwEdit; RequiresRule = $true },
+    @{ Header = "Enable"; Button = $btnFwEnable; RequiresRule = $true; RuleState = "False" },
+    @{ Header = "Disable"; Button = $btnFwDisable; RequiresRule = $true; RuleState = "True" },
+    @{ Header = "Delete"; Button = $btnFwDelete; RequiresRule = $true },
+    @{ Separator = $true },
+    @{ Header = "Reload"; Button = $btnFwRefresh },
+    @{ Header = "Add Rule"; Button = $btnFwAdd },
+    @{ Header = "Export"; Button = $btnFwExport },
+    @{ Header = "Import"; Button = $btnFwImport },
+    @{ Separator = $true },
+    @{ Header = "Restore Defaults"; Button = $btnFwDefaults },
+    @{ Header = "Delete All"; Button = $btnFwPurge }
+)
+foreach ($action in $fwMenuActions) {
+    if ($action.Separator) {
+        [void]$fwCtxMenu.Items.Add([System.Windows.Controls.Separator]::new())
+        continue
+    }
+    $item = [System.Windows.Controls.MenuItem]::new()
+    $item.Header = $action.Header
+    $item.Tag = $action
+    $item.Add_Click({
+        param($s, $eA)
+        $button = $s.Tag.Button
+        if ($button -and $button.IsEnabled -and $s.IsEnabled -and $s.Visibility -eq 'Visible') {
+            $button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        }
+    })
+    [void]$fwCtxMenu.Items.Add($item)
+}
+
+[void]$fwCtxMenu.Items.Add([System.Windows.Controls.Separator]::new())
 [void]$fwCtxMenu.Items.Add($mniCopyName)
 [void]$fwCtxMenu.Items.Add($mniCopyPort)
 [void]$fwCtxMenu.Items.Add((New-Object System.Windows.Controls.Separator))
 [void]$fwCtxMenu.Items.Add($mniCopyAll)
 
-# Attach to the ListView
-# Prevent context menu from opening when right-clicking empty space, headers, or scrollbars
+$fwCtxMenu.Add_Opened({
+    param($s, $eA)
+    $rule = $lstFw.SelectedItem
+    $hasRule = ($null -ne $rule)
+    foreach ($item in $s.Items) {
+        if ($item -isnot [System.Windows.Controls.MenuItem] -or -not $item.Tag) { continue }
+        $action = $item.Tag
+        $item.IsEnabled = ($null -ne $action.Button -and $action.Button.IsEnabled -and (-not $action.RequiresRule -or $hasRule))
+        if ($action.RuleState) {
+            $item.Visibility = if ($hasRule -and [string]$rule.Enabled -eq $action.RuleState) { 'Visible' } else { 'Collapsed' }
+        }
+    }
+    $mniCopyName.IsEnabled = $hasRule
+    $mniCopyPort.IsEnabled = $hasRule
+    $mniCopyAll.IsEnabled = $hasRule
+})
+
+# Select the clicked row; global actions remain available on empty space.
 $lstFw.Add_PreviewMouseRightButtonDown({
     param($s, $e)
     try { Set-WmtListViewRightClickSelection -ListView $s -OriginalSource $e.OriginalSource } catch {}
 })
-$lstFw.Add_ContextMenuOpening({
-    param($s, $e)
-    if (@($s.SelectedItems).Count -eq 0) { $e.Handled = $true }
-})
-
 # Attach to the ListView
 $lstFw.ContextMenu = $fwCtxMenu
 }
