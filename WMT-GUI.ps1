@@ -49172,8 +49172,9 @@ function Get-DriverPackageDetailsText {
 param($Row)
 if (-not $Row) { return "" }
 $inf = [string]$Row.PublishedName
+$usageKnown = [bool]$script:DriverUsageLoaded
 $devices = @()
-if ($script:DriverDeviceMap -and $script:DriverDeviceMap.ContainsKey($inf.ToLowerInvariant())) { $devices = @($script:DriverDeviceMap[$inf.ToLowerInvariant()]) }
+if ($usageKnown -and $script:DriverDeviceMap -and $script:DriverDeviceMap.ContainsKey($inf.ToLowerInvariant())) { $devices = @($script:DriverDeviceMap[$inf.ToLowerInvariant()]) }
 
 $lines = [System.Collections.Generic.List[string]]::new()
 [void]$lines.Add("Store File:    $inf")
@@ -49192,8 +49193,11 @@ if ($devices.Count -gt 0) {
     [void]$lines.Add("Devices using this package ($($devices.Count)):")
     foreach ($line in (Get-DriverDeviceListText -Devices $devices)) { [void]$lines.Add("  $line") }
 }
-else {
+elseif ($usageKnown) {
     [void]$lines.Add("No device is currently attached to this package.")
+}
+else {
+    [void]$lines.Add("Device usage has not been determined yet. The background usage scan may still be running or may have failed; use 'Find Devices Using This Driver' for a live query.")
 }
 [void]$lines.Add("")
 [void]$lines.Add("Remove (dangerous):  pnputil /delete-driver $inf /uninstall")
