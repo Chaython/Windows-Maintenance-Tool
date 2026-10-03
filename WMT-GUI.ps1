@@ -49173,18 +49173,6 @@ if ($lstDrivers) {
 }
 }
 
-function Invalidate-DriverCache {
-param([switch]$KeepRows)
-$script:DriverCacheLoaded = $false
-$script:DriverCacheLoadedAt = [DateTime]::MinValue
-if (-not $KeepRows) {
-    Set-DriverPackageRows -Rows @()
-    $script:DriverDeviceMap = @{}
-    $script:DriverServiceMap = $null
-    $script:DriverUsageLoaded = $false
-}
-}
-
 if ($lstDrivers) {
     $script:DriverCollectionView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:DriverPackages)
     if ($script:DriverCollectionView) {
