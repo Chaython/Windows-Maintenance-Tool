@@ -13996,7 +13996,9 @@ $applyCleanerSearch = {
     }
 }.GetNewClosure()
 
-$1
+$RenderAllRules = {
+    param($allRules)
+
     # Child handlers are another GetNewClosure() layer; capture through locals.
     $applyCleanerSearchRef = $applyCleanerSearch
     $showEnabledStateRef = $showEnabledState
@@ -26203,7 +26205,9 @@ $rebuildClasses = {
     $lstClasses.SelectedIndex = 0
 }.GetNewClosure()
 
-$1    $exportDialogRef = $dialog
+$exportDrivers = {
+    param([object[]]$DriversToExport)
+    $exportDialogRef = $dialog
     $exportStatusRef = $lblStatus
     $targets = @($DriversToExport | Where-Object { $_ })
     if ($targets.Count -eq 0) {
@@ -26649,7 +26653,9 @@ $chooseCleanupMode = {
     return $state.Result
 }.GetNewClosure()
 
-$1    # Re-home outer captures before creating nested completion/error closures.
+$doRemove = {
+    param([object[]]$Items, [bool]$CloseWindow)
+    # Re-home outer captures before creating nested completion/error closures.
     $cleanupDialogRef = $dialog
     $cleanupCurrentListRef = $currentList
     $cleanupLoadGridRef = $loadGrid
@@ -27617,7 +27623,9 @@ $restorePointCreateActiveState = Get-Variable -Name WmtRestorePointCreateActive 
 $restorePointCreateTimerState = Get-Variable -Name WmtRestorePointCreateTimer -Scope Script
 $restorePointCreateProcessState = Get-Variable -Name WmtRestorePointCreateProcess -Scope Script
 
-$1
+$startRestorePointCreate = {
+    param([string]$Description)
+
     $restorePointCreateActiveStateRef = $restorePointCreateActiveState
     $restorePointCreateTimerStateRef = $restorePointCreateTimerState
     $restorePointCreateProcessStateRef = $restorePointCreateProcessState
@@ -49642,11 +49650,13 @@ $applyResults = {
     if ($AllowForce -and $failed.Count -gt 0) {
         $failText = (@($failed) | ForEach-Object { "$($_.Inf) (exit $($_.ExitCode)):`n$($_.Output)" }) -join "`n`n"
         $force = Show-WmtMessageBox -Message "Failed to remove $($failed.Count) package(s):`n`n$failText`n`nForce delete? This also removes packages Windows considers in use." -Title "Force Delete Driver Packages" -Button YesNo -Image Error
-        if ($force -eq [System.Windows.MessageBoxResult]::Yes) {$1$2$applyResultsCallback = $applyResultsState.Callback
-$2$forceDone = {
-$2    param($forceResults)
-$2    & $applyResultsCallback $forceResults $false
-$2}.GetNewClosure()
+        if ($force -eq [System.Windows.MessageBoxResult]::Yes) {
+            $failedInfs = @($failed | ForEach-Object { [string]$_.Inf })
+            $applyResultsCallback = $applyResultsState.Callback
+            $forceDone = {
+                param($forceResults)
+                & $applyResultsCallback $forceResults $false
+            }.GetNewClosure()
             Invoke-WmtUiBackgroundCommand -Name ("ForceDeleteDrivers_" + [guid]::NewGuid().ToString("N")) -Msg "Force-deleting $($failedInfs.Count) driver package(s)..." -SuppressResultLog -Sb {
                 param($infs)
                 foreach ($inf in @($infs)) {
