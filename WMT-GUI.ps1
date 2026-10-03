@@ -4160,9 +4160,9 @@ if (-not $alreadyTracked) {
     [void]$script:WmtThemedElements.Add($Element)
     if ($Element -is [System.Windows.Window]) {
         $Element.Add_Closed({
-                param($closedWindow, $closedEventArgs)
-                $null = $closedEventArgs
-                try { [void]$script:WmtThemedElements.Remove($closedWindow) } catch {}
+                param($s, $e)
+                $null = $e
+                try { [void]$script:WmtThemedElements.Remove($s) } catch {}
             })
     }
 }
@@ -4465,8 +4465,8 @@ $state = @{ Columns = @{}; WidthResetHandlers = @{}; Viewer = $null; Operation =
 $Table.Resources['__WmtResponsiveColumns'] = $state
 if ($Owner) { [void]$Owner.Resources['__WmtResponsiveTables'].Add($Table) }
 $Table.Add_SizeChanged({
-    param($s, $eA)
-    if ($eA.WidthChanged) { Request-WmtResponsiveColumnResize -Table $s }
+    param($s, $e)
+    if ($e.WidthChanged) { Request-WmtResponsiveColumnResize -Table $s }
 }.GetNewClosure())
 $Table.Add_Loaded({
     # A grid may be populated while detached, then inserted into a loaded window.
@@ -4478,8 +4478,8 @@ $Table.Add_Unloaded({
 }.GetNewClosure())
 $Table.AddHandler([System.Windows.Controls.ScrollViewer]::ScrollChangedEvent,
     [System.Windows.Controls.ScrollChangedEventHandler]{
-        param($s, $eA)
-        if ($eA.ViewportWidthChange -ne 0) { Request-WmtResponsiveColumnResize -Table $s }
+        param($s, $e)
+        if ($e.ViewportWidthChange -ne 0) { Request-WmtResponsiveColumnResize -Table $s }
     }.GetNewClosure())
 $columns = if ($Table -is [System.Windows.Controls.DataGrid]) { ,$Table.Columns } else { ,$Table.View.Columns }
 ([System.Collections.Specialized.INotifyCollectionChanged]$columns).Add_CollectionChanged({
@@ -5085,7 +5085,7 @@ namespace Wmt.Native
 
     $useDark = ([string]$script:CurrentTheme -ne "light")
     $applyNativeTheme = {
-        param($s, $eA)
+        param($s, $e)
         try {
             $handle = [System.Windows.Interop.WindowInteropHelper]::new($Window).Handle
             [Wmt.Native.DwmTheme]::SetDarkMode($handle, $useDark)
@@ -9967,9 +9967,9 @@ try {
     $notifyIcon.Add_DoubleClick({ Show-WmtMainWindowFromTray }.GetNewClosure())
     $notifyIcon.Add_MouseDoubleClick({ Show-WmtMainWindowFromTray }.GetNewClosure())
     $notifyIcon.Add_MouseClick({
-            param($traySender, $mouseArgs)
+            param($s, $e)
             try {
-                if ($mouseArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+                if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
                     Show-WmtMainWindowFromTray
                 }
             }
@@ -11661,21 +11661,21 @@ $btnSave.Add_Click({
 $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
 
 $dialog.Add_KeyDown({
-        param($src, $e)
+        param($s, $e)
         if ($e.Key -eq [System.Windows.Input.Key]::S -and (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq [System.Windows.Input.ModifierKeys]::Control)) {
             $e.Handled = $true
-            $null = & $SaveAction -DialogObj $src -TextBox $txtHosts -FilePath $hostsPath
+            $null = & $SaveAction -DialogObj $s -TextBox $txtHosts -FilePath $hostsPath
         }
     }.GetNewClosure())
 
 $dialog.Add_Closing({
-        param($src, $e)
+        param($s, $e)
 
         if ($state.Dirty -eq $true) {
-            $res = Show-WmtMessageBox -Owner $src -Message "You have unsaved changes. Save now?" -Title "Confirm" -Button YesNoCancel -Image Warning
+            $res = Show-WmtMessageBox -Owner $s -Message "You have unsaved changes. Save now?" -Title "Confirm" -Button YesNoCancel -Image Warning
 
             if ($res -eq [System.Windows.MessageBoxResult]::Yes) {
-                $success = & $SaveAction -DialogObj $src -TextBox $txtHosts -FilePath $hostsPath
+                $success = & $SaveAction -DialogObj $s -TextBox $txtHosts -FilePath $hostsPath
                 if (-not $success) {
                     $e.Cancel = $true
                 }
@@ -16985,8 +16985,8 @@ function script:Connect-WmtRegistryResultSorting {
     $chain = [System.Collections.ArrayList]::new()
     $ListView.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent,
         [System.Windows.RoutedEventHandler]{
-            param($s, $eA)
-            $header = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
+            param($s, $e)
+            $header = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
             if (-not $header -or -not $header.Column) { return }
             $vC = $header.Column
             $property = if ($vC.DisplayMemberBinding) { $vC.DisplayMemberBinding.Path.Path } else { 'Check' }
@@ -17001,17 +17001,17 @@ function script:Connect-WmtRegistryResultClipboard {
 
     $copyBinding = [System.Windows.Input.CommandBinding]::new([System.Windows.Input.ApplicationCommands]::Copy)
     $copyBinding.Add_CanExecute({
-        param($s, $eA)
-        $eA.CanExecute = ($s.SelectedItems.Count -gt 0)
-        $eA.Handled = $true
+        param($s, $e)
+        $e.CanExecute = ($s.SelectedItems.Count -gt 0)
+        $e.Handled = $true
     })
     $copyBinding.Add_Executed({
-        param($s, $eA)
+        param($s, $e)
         $rowsToCopy = @($s.SelectedItems)
         if ($rowsToCopy.Count -eq 0) { return }
         try {
             [System.Windows.Clipboard]::SetText((ConvertTo-WmtRegistryResultClipboardText -Rows $rowsToCopy))
-            $eA.Handled = $true
+            $e.Handled = $true
         }
         catch {
             try { Write-GuiLog "Registry result clipboard copy failed: $($_.Exception.Message)" } catch {}
@@ -17356,7 +17356,7 @@ $updateRegistryContextMenuState = {
 }.GetNewClosure()
 
 $openRegistryContextMenu = {
-    param($s, $eA)
+    param($s, $e)
 
     try {
         if ($null -eq $dg -or $null -eq $registryContextMenu) { return }
@@ -17365,7 +17365,7 @@ $openRegistryContextMenu = {
         # click happened on a TextBlock, header, scrollbar, or empty list area.
         try {
             $sourceObject = $null
-            if ($null -ne $eA) { $sourceObject = $eA.OriginalSource }
+            if ($null -ne $e) { $sourceObject = $e.OriginalSource }
             if ($null -ne $sourceObject) {
                 [void](Select-WmtRegistryGridRowFromOriginalSource -Grid $dg -OriginalSource $sourceObject)
             }
@@ -17381,7 +17381,7 @@ $openRegistryContextMenu = {
         # programmatically assigned ContextMenu reliably from ContextMenuOpening alone.
         try {
             $registryContextMenu.IsOpen = $true
-            if ($null -ne $eA) { $eA.Handled = $true }
+            if ($null -ne $e) { $e.Handled = $true }
         }
         catch {
             try { Write-GuiLog "Registry result context menu open failed: $($_.Exception.Message)" } catch {}
@@ -17429,9 +17429,9 @@ function script:Set-WmtRegistryHighlightedRowsChecked {
 }
 
 $dg.Add_PreviewKeyDown({
-        param($s, $eA)
+        param($s, $e)
 
-        if ([string]$eA.Key -notin @("Return", "Enter")) { return }
+        if ([string]$e.Key -notin @("Return", "Enter")) { return }
 
         $changed = Set-WmtRegistryHighlightedRowsChecked -Grid $s -Checked $true
         if ($changed -gt 0) {
@@ -17440,7 +17440,7 @@ $dg.Add_PreviewKeyDown({
             } else {
                 $lblStatus.Text = "Scan complete. Showing $($registryRowsFiltered.Count) of $($registryRows.Count) issues ($protectedCount protected hidden). Checked $changed highlighted row(s)."
             }
-            $eA.Handled = $true
+            $e.Handled = $true
         }
     })
 
@@ -28356,11 +28356,11 @@ function New-StartupPage {
     [void]$root.Children.Add($bottomBorder)
 
     $grid.Add_PreviewMouseRightButtonDown({
-            param($eventSource, $e)
+            param($s, $e)
             $row = Get-WmtVisualAncestor -Element $e.OriginalSource -AncestorType ([System.Windows.Controls.DataGridRow])
             if ($row) {
                 if (-not $row.IsSelected) {
-                    $eventSource.SelectedItems.Clear()
+                    $s.SelectedItems.Clear()
                     $row.IsSelected = $true
                 }
                 try { $row.Focus() | Out-Null } catch {}
@@ -29176,8 +29176,8 @@ function Add-GridContextMenu {
             Header = [string]$button.Content
             Tag = $button
             Action = {
-                param($eventSource, $e)
-                $button = [System.Windows.Controls.Button]$eventSource.Tag
+                param($s, $e)
+                $button = [System.Windows.Controls.Button]$s.Tag
                 if (-not $button.IsEnabled) { return }
                 $button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $button))
             }
@@ -29393,16 +29393,16 @@ foreach ($t in @($winTab, $taskTab, $ctxTab, $svcTab)) {
     $t.Grid.Tag = $t
     $t.ClearButton.Tag = $t
     $t.SearchBox.Add_TextChanged({
-            param($eventSource, $e)
-            & $fnUpdateStartupTabFilter $eventSource.Tag
+            param($s, $e)
+            & $fnUpdateStartupTabFilter $s.Tag
         }.GetNewClosure())
     $t.ClearButton.Add_Click({
-            param($eventSource, $e)
-            $eventSource.Tag.SearchBox.Text = ""
+            param($s, $e)
+            $s.Tag.SearchBox.Text = ""
         }.GetNewClosure())
     $t.Grid.Add_MouseDoubleClick({
-            param($eventSource, $e)
-            & $fnShowStartupRowDetails $eventSource.Tag "$($eventSource.Tag.Header) Details"
+            param($s, $e)
+            & $fnShowStartupRowDetails $s.Tag "$($s.Tag.Header) Details"
         }.GetNewClosure())
 }
 
@@ -43136,7 +43136,7 @@ if (-not $minutes -or $minutes -lt 1) { $minutes = 1 }
 $script:WmtCleanerDefinitionRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:WmtCleanerDefinitionRefreshTimer.Interval = [TimeSpan]::FromMinutes([double]$minutes)
 $script:WmtCleanerDefinitionRefreshTimerTickHandler = [System.EventHandler] {
-    param($s, $eventArg)
+    param($s, $e)
     Invoke-WmtCleanerDefinitionRefresh
 }
 $script:WmtCleanerDefinitionRefreshTimer.Add_Tick($script:WmtCleanerDefinitionRefreshTimerTickHandler)
@@ -43300,7 +43300,7 @@ if ($minutes -le 0) { return }
 $script:WmtCleanerAutoCleanTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:WmtCleanerAutoCleanTimer.Interval = [TimeSpan]::FromMinutes([double]$minutes)
 $script:WmtCleanerAutoCleanTimerTickHandler = [System.EventHandler] {
-    param($s, $eventArg)
+    param($s, $e)
     Invoke-WmtCleanerAutoClean
 }
 $script:WmtCleanerAutoCleanTimer.Add_Tick($script:WmtCleanerAutoCleanTimerTickHandler)
@@ -43388,7 +43388,7 @@ if ($ResetNextRun -or -not $script:WmtUpdateAutoScanLastRun) {
 $script:WmtUpdateAutoScanTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:WmtUpdateAutoScanTimer.Interval = [TimeSpan]::FromMinutes($minutes)
 $script:WmtUpdateAutoScanTimerTickHandler = [System.EventHandler] {
-    param($s, $eventArg)
+    param($s, $e)
     Invoke-WmtUpdateAutoScan
 }
 $script:WmtUpdateAutoScanTimer.Add_Tick($script:WmtUpdateAutoScanTimerTickHandler)
@@ -46178,8 +46178,8 @@ switch ($Header) {
 
 if ($lstWinget) {
 $wingetSortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $eA)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
+    param($s, $e)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -46211,8 +46211,8 @@ switch ($Header) {
 
 if ($lstLibrary) {
 $librarySortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $eA)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
+    param($s, $e)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -48083,7 +48083,7 @@ foreach ($action in $fwMenuActions) {
     $item.Header = $action.Header
     $item.Tag = $action
     $item.Add_Click({
-        param($s, $eA)
+        param($s, $e)
         $button = $s.Tag.Button
         if ($button -and $button.IsEnabled -and $s.IsEnabled -and $s.Visibility -eq 'Visible') {
             $button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
@@ -48099,7 +48099,7 @@ foreach ($action in $fwMenuActions) {
 [void]$fwCtxMenu.Items.Add($mniCopyAll)
 
 $fwCtxMenu.Add_Opened({
-    param($s, $eA)
+    param($s, $e)
     $rule = $lstFw.SelectedItem
     $hasRule = ($null -ne $rule)
     foreach ($item in $s.Items) {
@@ -48628,8 +48628,8 @@ switch ($Header) {
 
 if ($lstFw) {
 $fwSortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $eA)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
+    param($s, $e)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -49845,8 +49845,8 @@ switch ($Header) {
 
 if ($lstDrivers) {
 $drvSortHandler = [System.Windows.RoutedEventHandler] {
-    param($s, $eA)
-    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $eA.OriginalSource
+    param($s, $e)
+    $columnHeader = Get-GridViewColumnHeaderFromSource -OriginalSource $e.OriginalSource
     if (-not $columnHeader -or -not $columnHeader.Column) { return }
     $header = Get-CleanHeader $columnHeader.Column.Header
     if ([string]::IsNullOrWhiteSpace($header)) { return }
@@ -50159,9 +50159,9 @@ $drvCtxMenu.Add_Opened({
             $tItem.Tag = [PSCustomObject]@{ Inf = $tInf; Dev = $tDev }
             if ($tStyle) { try { $tItem.Style = $tStyle } catch {} }
             $tItem.Add_Click({
-                param($cSrc, $cE)
+                param($s, $e)
                 try {
-                    $tag = $cSrc.Tag
+                    $tag = $s.Tag
                     if ($tag) { [void](Invoke-DriverDeviceToggle -Inf ([string]$tag.Inf) -Device $tag.Dev) }
                 }
                 catch {
@@ -58714,12 +58714,12 @@ $script:bootCacheTimer.Add_Tick({
 $script:bootCacheTimer.Start()
 
 $onMainWindowClosing = {
-param($windowSender, $closeArgs)
+param($s, $e)
 
 if (-not $script:WmtAllowFinalClose -and (Get-WmtRunInTrayOnClose)) {
     try {
         if (Initialize-WmtTrayIcon -Window $window) {
-            if ($closeArgs) { $closeArgs.Cancel = $true }
+            if ($e) { $e.Cancel = $true }
             $script:WmtHiddenToTray = $true
             $window.ShowInTaskbar = $false
             $window.Hide()
@@ -58907,13 +58907,13 @@ if ($script:WmtDispatcherUnhandledHandler) {
     try { $script:WmtApplication.remove_DispatcherUnhandledException($script:WmtDispatcherUnhandledHandler) } catch {}
 }
 $script:WmtDispatcherUnhandledHandler = [System.Windows.Threading.DispatcherUnhandledExceptionEventHandler] {
-    param($s, $eA)
+    param($s, $e)
 
-    try { $eA.Handled = $true } catch {}
+    try { $e.Handled = $true } catch {}
     try {
-        Write-WmtLastCrash -Context "Unhandled WPF dispatcher exception" -Exception $eA.Exception
+        Write-WmtLastCrash -Context "Unhandled WPF dispatcher exception" -Exception $e.Exception
         if ($script:WingetJob -or $script:WingetActiveAction) {
-            Reset-WmtUpdateUiAfterMonitorError -Context "Unhandled WPF dispatcher exception" -Exception $eA.Exception -SkipCrashWrite
+            Reset-WmtUpdateUiAfterMonitorError -Context "Unhandled WPF dispatcher exception" -Exception $e.Exception -SkipCrashWrite
         }
     }
     catch {}
