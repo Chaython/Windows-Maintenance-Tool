@@ -48811,7 +48811,12 @@ Set-DriverStatus (Get-DriverStatusCounts) -Visible $true
 
 function Update-DriverListView {
 if (-not $lstDrivers) { return }
-$selectedInf = if ($lstDrivers.SelectedItem) { [string]$lstDrivers.SelectedItem.PublishedName } else { $null }
+$selectedInfs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($selectedRow in @($lstDrivers.SelectedItems)) {
+    if ($selectedRow -and -not [string]::IsNullOrWhiteSpace([string]$selectedRow.PublishedName)) {
+        [void]$selectedInfs.Add([string]$selectedRow.PublishedName)
+    }
+}
 $query = if ($txtDrvSearch) { [string]$txtDrvSearch.Text } else { "" }
 $rows = $script:DriverPackages
 
@@ -48829,11 +48834,10 @@ foreach ($row in $rows) { [void]$lstDrivers.Items.Add($row) }
 if ($script:DriverSortChain -and $script:DriverSortChain.Count -gt 0) {
     Set-ListViewSort -ListView $lstDrivers -Chain $script:DriverSortChain
 }
-if ($selectedInf) {
+if ($selectedInfs.Count -gt 0) {
     foreach ($item in $lstDrivers.Items) {
-        if ($item.PublishedName -eq $selectedInf) {
-            $lstDrivers.SelectedItem = $item
-            break
+        if ($item.PublishedName -and $selectedInfs.Contains([string]$item.PublishedName)) {
+            [void]$lstDrivers.SelectedItems.Add($item)
         }
     }
 }
@@ -48994,6 +48998,7 @@ if ($script:DriverLoadInProgress) {
 $script:DriverLoadInProgress = $true
 $script:DriverUsageLoaded = $false
 $script:DriverCacheLoaded = $false
+$script:DriverDeviceMap = $null
 $script:DriverServiceMap = $null
 if ($btnDrvReload) { $btnDrvReload.IsEnabled = $false }
 if ($lstDrivers) { $lstDrivers.Items.Clear() }
@@ -49140,7 +49145,17 @@ Register-WmtUiPollOperation -Name "DriverUsageLoad" -IntervalMs 150 -TestComplet
         }
     }
     catch {
-        Write-GuiLog "[Drivers] Device usage load failed: $($_.Exception.Message)"
+        $err = $_.Exception.Message
+        foreach ($row in $script:DriverPackages) {
+            if ($row.Status -eq "Checking...") {
+                Set-DriverRowProperty -Row $row -Name "Status" -Value "Unknown"
+                Set-DriverRowProperty -Row $row -Name "StatusSort" -Value "5"
+                Set-DriverRowProperty -Row $row -Name "StatusTooltip" -Value "Device usage could not be determined because the background usage query failed. Right-click and use 'Find Devices Using This Driver' to query live."
+            }
+        }
+        Update-DriverListView
+        Set-DriverStatus "Driver packages loaded — device usage unavailable" -Visible $true
+        Write-GuiLog "[Drivers] Device usage load failed: $err"
     }
     finally {
         try { $script:DriverLoadRunspace.Dispose() } catch {}
@@ -49157,8 +49172,9 @@ function Get-DriverPackageDetailsText {
 param($Row)
 if (-not $Row) { return "" }
 $inf = [string]$Row.PublishedName
+$usageKnown = [bool]$script:DriverUsageLoaded
 $devices = @()
-if ($script:DriverDeviceMap -and $script:DriverDeviceMap.ContainsKey($inf.ToLowerInvariant())) { $devices = @($script:DriverDeviceMap[$inf.ToLowerInvariant()]) }
+if ($usageKnown -and $script:DriverDeviceMap -and $script:DriverDeviceMap.ContainsKey($inf.ToLowerInvariant())) { $devices = @($script:DriverDeviceMap[$inf.ToLowerInvariant()]) }
 
 $lines = [System.Collections.Generic.List[string]]::new()
 [void]$lines.Add("Store File:    $inf")
@@ -49177,8 +49193,11 @@ if ($devices.Count -gt 0) {
     [void]$lines.Add("Devices using this package ($($devices.Count)):")
     foreach ($line in (Get-DriverDeviceListText -Devices $devices)) { [void]$lines.Add("  $line") }
 }
-else {
+elseif ($usageKnown) {
     [void]$lines.Add("No device is currently attached to this package.")
+}
+else {
+    [void]$lines.Add("Device usage has not been determined yet. The background usage scan may still be running or may have failed; use 'Find Devices Using This Driver' for a live query.")
 }
 [void]$lines.Add("")
 [void]$lines.Add("Remove (dangerous):  pnputil /delete-driver $inf /uninstall")
@@ -49202,6 +49221,7 @@ try {
     foreach ($d in $signed) {
         $state = "Unknown"
         $entName = ""
+        $code = -1
         try {
             $ent = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop |
                 Where-Object { [string]$_.DeviceID -eq [string]$d.DeviceID } |
