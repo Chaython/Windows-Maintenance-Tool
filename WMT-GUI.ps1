@@ -49245,24 +49245,16 @@ catch {
 return @($devices)
 }
 
-function Show-DriverDevicesDialog {
-param($Row)
-if (-not $Row) { return }
-$inf = [string]$Row.PublishedName
-if ([string]::IsNullOrWhiteSpace($inf)) { return }
-
-$devices = @()
-if ($script:DriverUsageLoaded -and $script:DriverDeviceMap -and $script:DriverDeviceMap.ContainsKey($inf.ToLowerInvariant())) {
-    $devices = @($script:DriverDeviceMap[$inf.ToLowerInvariant()])
-}
-else {
-    Set-DriverStatus "Checking devices using $inf..." -Visible $true
-    $devices = Get-DriverDeviceUsageLive -Inf $inf
-    Set-DriverStatus "" -Visible $false
-}
-
+function Show-DriverDeviceUsageResult {
+param(
+    [string]$Inf,
+    [string]$Provider,
+    [string]$OriginalName,
+    [object[]]$Devices
+)
+$devices = @($Devices)
 $lines = [System.Collections.Generic.List[string]]::new()
-[void]$lines.Add("Driver package: $inf  ($($Row.Provider) — $($Row.OriginalName))")
+[void]$lines.Add("Driver package: $Inf  ($Provider — $OriginalName)")
 [void]$lines.Add("")
 if ($devices.Count -gt 0) {
     [void]$lines.Add("$($devices.Count) present device(s) use this package:")
@@ -49274,7 +49266,67 @@ else {
     [void]$lines.Add("")
     [void]$lines.Add("That is not proof the package is safe to remove: hardware that is switched off, disabled or disconnected can still need it — a camera that is off, an iGPU idle while the system runs on the dGPU, an antivirus module toggled off, devices that connect only occasionally (printers, USB gear, external displays). Only remove it if you are sure the device or software is gone for good.")
 }
-Show-TextDialog -Title "Devices Using $inf" -Text ($lines -join [Environment]::NewLine)
+Show-TextDialog -Title "Devices Using $Inf" -Text ($lines -join [Environment]::NewLine)
+}
+
+function Show-DriverDevicesDialog {
+param($Row)
+if (-not $Row) { return }
+$inf = [string]$Row.PublishedName
+if ([string]::IsNullOrWhiteSpace($inf)) { return }
+$provider = [string]$Row.Provider
+$originalName = [string]$Row.OriginalName
+
+if ($script:DriverUsageLoaded -and $script:DriverDeviceMap -and $script:DriverDeviceMap.ContainsKey($inf.ToLowerInvariant())) {
+    Show-DriverDeviceUsageResult -Inf $inf -Provider $provider -OriginalName $originalName -Devices @($script:DriverDeviceMap[$inf.ToLowerInvariant()])
+    return
+}
+
+# The cached usage map is unavailable or still loading. Do the live CIM query
+# off the WPF thread so opening this context-menu action cannot freeze the UI.
+Set-DriverStatus "Checking devices using $inf..." -Visible $true
+$queryDone = {
+    param($results)
+    Set-DriverStatus "" -Visible $false
+    $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["Inf"] -and $_.PSObject.Properties["Devices"] } | Select-Object -Last 1)
+    if ($payload.Count -eq 0) {
+        Write-GuiLog "[Drivers] Live device query returned no result."
+        return
+    }
+    $result = $payload[0]
+    Show-DriverDeviceUsageResult -Inf ([string]$result.Inf) -Provider ([string]$result.Provider) -OriginalName ([string]$result.OriginalName) -Devices @($result.Devices)
+}
+$queryError = {
+    param($errorRecord)
+    Set-DriverStatus "" -Visible $false
+    $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+    Write-GuiLog "[Drivers] Live device query failed for ${inf}: $message"
+    Show-WmtMessageBox -Message "Could not query devices using ${inf}:`n`n$message" -Title "Driver Device Query" -Image Warning | Out-Null
+}.GetNewClosure()
+
+Invoke-WmtUiBackgroundCommand -Name ("DriverUsageLive_" + [guid]::NewGuid().ToString("N")) -Msg "Checking devices using $inf..." -SuppressResultLog -Sb {
+    param($inf, $provider, $originalName)
+    $entityState = @{}
+    foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+        if (-not $e.DeviceID) { continue }
+        $code = -1
+        try { $code = [int]$e.ConfigManagerErrorCode } catch {}
+        $entityState[[string]$e.DeviceID] = @{ Name = [string]$e.Name; Status = [string]$e.Status; Code = $code }
+    }
+
+    $devices = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { ([string]$_.InfName).ToLowerInvariant() -eq $inf.ToLowerInvariant() })) {
+        $devId = [string]$d.DeviceID
+        $ent = if ($entityState.ContainsKey($devId)) { $entityState[$devId] } else { $null }
+        $code = if ($ent) { [int]$ent.Code } else { -1 }
+        $state = if ($ent -and $code -eq 0 -and [string]$ent.Status -eq "OK") { "OK" } elseif ($ent) { "Problem" } else { "Unknown" }
+        $name = [string]$d.DeviceName
+        if ([string]::IsNullOrWhiteSpace($name) -and $ent) { $name = [string]$ent.Name }
+        [void]$devices.Add([PSCustomObject]@{ DeviceId = $devId; Name = $name; State = $state; Code = $code })
+    }
+
+    [PSCustomObject]@{ Inf = $inf; Provider = $provider; OriginalName = $originalName; Devices = $devices.ToArray() }
+} -ArgumentList $inf, $provider, $originalName -OnComplete $queryDone -OnError $queryError | Out-Null
 }
 
 function Copy-DriverSelectionToClipboard {
