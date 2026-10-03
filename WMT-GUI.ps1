@@ -26711,6 +26711,10 @@ $doRemove = {
         if ($CloseWindow) { $dialog.Close() }
     }.GetNewClosure()
 
+    # GetNewClosure() creates a dynamic module. Capture the finalizer in this
+    # scope before creating the first-pass callback so later nested callbacks do
+    # not have to resolve it through another closure module.
+    $finalizeCleanupForFirstPass = $finalizeCleanup
     $firstPassComplete = {
         param($results)
 
@@ -26720,7 +26724,7 @@ $doRemove = {
             Select-Object -Last 1
         )
         if ($payload.Count -eq 0) {
-            & $finalizeCleanup @() $itemsToRemove.Count 0 $mainBkPath
+            & $finalizeCleanupForFirstPass @() $itemsToRemove.Count 0 $mainBkPath
             return
         }
 
@@ -26741,9 +26745,19 @@ $doRemove = {
         }
 
         if ($forceItems.Count -eq 0) {
-            & $finalizeCleanup $deleted $failures.Count ([int]$result.BackupCount) ([string]$result.BackupPath)
+            & $finalizeCleanupForFirstPass $deleted $failures.Count ([int]$result.BackupCount) ([string]$result.BackupPath)
             return
         }
+
+        # This callback is itself created inside a GetNewClosure() callback.
+        # Copy every outer value it needs into locals first; otherwise PowerShell
+        # can resolve $finalizeCleanup to $null in the second dynamic module and
+        # the call operator throws "The expression after '&' ... was not valid".
+        $finalizeCleanupCallback = $finalizeCleanupForFirstPass
+        $deletedBeforeForce = [string[]]@($deleted)
+        $forceItemCount = [int]$forceItems.Count
+        $backupCountAfterFirstPass = [int]$result.BackupCount
+        $backupPathAfterFirstPass = [string]$result.BackupPath
 
         $forceComplete = {
             param($forceResults)
@@ -26753,17 +26767,17 @@ $doRemove = {
                 Select-Object -Last 1
             )
             $forcedDeleted = @()
-            $forcedFailed = $forceItems.Count
+            $forcedFailed = $forceItemCount
             if ($forcePayload.Count -gt 0) {
                 $forcedDeleted = @($forcePayload[0].Deleted)
                 $forcedFailed = [int]$forcePayload[0].Failed
             }
-            & $finalizeCleanup @($deleted + $forcedDeleted) $forcedFailed ([int]$result.BackupCount) ([string]$result.BackupPath)
+            & $finalizeCleanupCallback @($deletedBeforeForce + $forcedDeleted) $forcedFailed $backupCountAfterFirstPass $backupPathAfterFirstPass
         }.GetNewClosure()
 
         $forceError = {
             param($err)
-            & $finalizeCleanup $deleted $forceItems.Count ([int]$result.BackupCount) ([string]$result.BackupPath)
+            & $finalizeCleanupCallback $deletedBeforeForce $forceItemCount $backupCountAfterFirstPass $backupPathAfterFirstPass
         }.GetNewClosure()
 
         $forceArgs = [object[]]@((, @($forceItems.ToArray())))
