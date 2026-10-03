@@ -1809,6 +1809,22 @@ jobs:
               }
           }
 
+          # Driver cleanup can launch a second background job from inside the
+          # first-pass GetNewClosure() callback. The nested completion/error
+          # callbacks must use locals captured in that callback rather than
+          # reaching back through another dynamic module for the finalizer.
+          $driverCleanupClosureGuards = @(
+              '$finalizeCleanupForFirstPass = $finalizeCleanup',
+              '$finalizeCleanupCallback = $finalizeCleanupForFirstPass',
+              '& $finalizeCleanupCallback @($deletedBeforeForce + $forcedDeleted)',
+              '& $finalizeCleanupCallback $deletedBeforeForce $forceItemCount'
+          )
+          foreach ($guard in $driverCleanupClosureGuards) {
+              if (-not $source.Contains($guard)) {
+                  throw "Driver cleanup nested GetNewClosure regression detected: missing $guard"
+              }
+          }
+
           # A pooled worker must never silently fall back to bare PowerShell.Create().
           if ([regex]::IsMatch($source, '(?m)return\s+\[PowerShell\]::Create\(\)')) {
               throw "Helper-less pooled PowerShell fallback detected."
