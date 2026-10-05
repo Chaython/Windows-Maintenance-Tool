@@ -846,9 +846,10 @@ jobs:
                       $search=$d.FindName('txtDrvSearch')
                       $searchBottom=$search.TranslatePoint([Windows.Point]::new(0,$search.ActualHeight),$d.Content).Y
                       $card=Get-WmtVisualAncestor -Element $status -AncestorType ([Windows.Controls.Border])
-                      $legend=@(Find-TextBlocks $card | Where-Object {
-                          $_.Inlines.FirstInline -is [Windows.Documents.Run] -and $_.Inlines.FirstInline.Text.StartsWith('Highlighting:')
-                      })[0]
+                      # Use the named legend control rather than matching its display copy.
+                      # The wording may evolve (for example, the clickable-filter hint) without
+                      # invalidating the layout regression test.
+                      $legend=$d.FindName('lblDrvLegend')
                       Assert ($null -ne $legend) 'The driver status legend was lost.'
                       foreach ($control in @($status,$legend)) {
                           $position=$control.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
