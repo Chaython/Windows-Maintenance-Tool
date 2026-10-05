@@ -237,15 +237,16 @@ param([string]$Message)
 if (-not $script:LogBox -or [string]::IsNullOrWhiteSpace($Message)) { return }
 
 try {
-    $lines = @($script:LogBox.Text -split "\r?\n" | Where-Object {
-        $_ -and $_ -notmatch ('^\[[^\]]+\]\s*' + [regex]::Escape($Message) + '\s*$')
-    })
+    $pattern = '^\[[^\]]+\]\s*' + [regex]::Escape($Message) + '\s*$'
+    $lines = @(
+        $script:LogBox.Text -split "\r?\n" |
+        Where-Object { $_ -and $_ -notmatch $pattern }
+    )
     $script:LogBox.Text = if ($lines.Count -gt 0) { ($lines -join "`n") + "`n" } else { "" }
     $script:LogBox.ScrollToEnd()
 }
 catch {}
 }
-
 function ConvertTo-WmtVersion {
 param([string]$VersionText)
 
