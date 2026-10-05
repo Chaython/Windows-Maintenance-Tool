@@ -43794,6 +43794,7 @@ $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
             # caches that are immediately rebuilt. Only drop reloadable caches when the
             # process is genuinely large; let the CLR collect them naturally.
             Optimize-WmtLogMemory -MaxLines $script:WmtMaxLogLines
+            $proc = $null
             try {
                 $proc = [System.Diagnostics.Process]::GetCurrentProcess()
                 $proc.Refresh()
@@ -43807,9 +43808,13 @@ $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
                         Write-GuiLog ("[Memory] Released reloadable caches at {0:N0} MB working set; CLR collection remains automatic." -f ($proc.WorkingSet64 / 1MB))
                     }
                 }
-                $proc.Dispose()
             }
             catch {}
+            finally {
+                if ($proc) {
+                    try { $proc.Dispose() } catch {}
+                }
+            }
         }
     }
     catch {}
