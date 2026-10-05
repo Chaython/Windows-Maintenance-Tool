@@ -10425,106 +10425,126 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                 elseif ($jobResult.ChecksumStatus -eq "Failed") { $lb.AppendText("[UPDATE] Note: release checksum file could not be downloaded - hash will be logged for manual verification.`n") }
                                 $lb.ScrollToEnd()
                             }
-                            $window.Dispatcher.Invoke([Action] {
-                                    $msg = "A new version is available!`n`nLocal Version:  v$localVerText`nRemote Version: v$remoteVerText`n`nDo you want to download and install the update now?"
-                                    $mbRes = [System.Windows.MessageBox]::Show($msg, "Update Available", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
-                                    if ($mbRes -eq [System.Windows.MessageBoxResult]::Yes) {
-                                        $tempExe = $null
-                                        $currentExe = $null
-                                        $backupExe = $null
-                                        $backupCreated = $false
-                                        $updateApplied = $false
-                                        try {
-                                            $downloadUrl = [string]$jobResult.ExeDownloadUrl
-                                            if ([string]::IsNullOrWhiteSpace($downloadUrl)) {
-                                                throw "No download URL found for EXE."
+
+                            $msg = "A new version is available!`n`nLocal Version:  v$localVerText`nRemote Version: v$remoteVerText`n`nDo you want to download and install the update now?"
+                            $mbRes = [System.Windows.MessageBox]::Show($msg, "Update Available", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                            if ($mbRes -eq [System.Windows.MessageBoxResult]::Yes) {
+                                $downloadUrl = [string]$jobResult.ExeDownloadUrl
+                                $expectedHash = [string]$jobResult.ExeSha256
+                                $checksumStatus = [string]$jobResult.ChecksumStatus
+                                $currentExe = [string]$script:WmtProcessPath
+                                $updateWindow = $window
+                                $updateLogBox = $lb
+                                $allowFinalCloseState = Get-Variable -Name WmtAllowFinalClose -Scope Script
+
+                                $updateComplete = {
+                                    param($Results)
+                                    $result = @($Results | Where-Object { $_ -and $_.PSObject.Properties["CurrentExe"] } | Select-Object -Last 1)
+                                    if ($result.Count -eq 0) { throw "The updater completed without a result." }
+                                    $result = $result[0]
+
+                                    if ($updateLogBox) {
+                                        foreach ($line in @($result.LogLines)) {
+                                            if (-not [string]::IsNullOrWhiteSpace([string]$line)) {
+                                                $updateLogBox.AppendText("[UPDATE] $line`n")
                                             }
-
-                                            if ($lb) { $lb.AppendText("[UPDATE] Downloading new EXE from: $downloadUrl`n"); $lb.ScrollToEnd() }
-
-                                            # Create temp file for download
-                                            $tempExe = "$env:TEMP\WMT-GUI-Update-$([System.Guid]::NewGuid()).exe"
-                                            Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -TimeoutSec 60 | Out-Null
-
-                                            if (-not (Test-Path $tempExe)) {
-                                                throw "Failed to download update file."
-                                            }
-
-                                            $fileSize = (Get-Item $tempExe).Length
-                                            if ($fileSize -lt 1MB) {
-                                                throw "Downloaded file is suspiciously small ($fileSize bytes). Update may have failed."
-                                            }
-
-                                            # Safety: PE header check - the download must be a Windows executable
-                                            $fsPe = [System.IO.File]::OpenRead($tempExe)
-                                            try { $peB0 = $fsPe.ReadByte(); $peB1 = $fsPe.ReadByte() } finally { $fsPe.Close() }
-                                            if ($peB0 -ne 0x4D -or $peB1 -ne 0x5A) {
-                                                throw "Downloaded file is not a Windows executable (MZ header missing). Update aborted."
-                                            }
-
-                                            # Safety: SHA256 - log the hash and verify it against the release
-                                            # checksum when the release publishes one
-                                            $downloadHash = (Get-FileHash -LiteralPath $tempExe -Algorithm SHA256).Hash.ToLowerInvariant()
-                                            if ($lb) { $lb.AppendText("[UPDATE] Downloaded EXE SHA256: $downloadHash`n"); $lb.ScrollToEnd() }
-
-                                            $expectedHash = [string]$jobResult.ExeSha256
-                                            $checksumStatus = [string]$jobResult.ChecksumStatus
-                                            if ($expectedHash) {
-                                                if ($downloadHash -ne $expectedHash.ToLowerInvariant()) {
-                                                    throw "SHA256 MISMATCH! The downloaded EXE does not match the release checksum ($expectedHash). Update aborted - nothing was replaced."
-                                                }
-                                                if ($lb) { $lb.AppendText("[UPDATE] SHA256 verified against the release checksum file.`n"); $lb.ScrollToEnd() }
-                                            }
-                                            elseif ($checksumStatus -eq "None") {
-                                                if ($lb) { $lb.AppendText("[UPDATE] Note: release publishes no SHA256 checksum file - hash logged above for manual verification.`n"); $lb.ScrollToEnd() }
-                                            }
-
-                                            if ($lb) { $lb.AppendText("[UPDATE] Download complete. Preparing update...`n"); $lb.ScrollToEnd() }
-
-                                            # Create backup of current EXE
-                                            $currentExe = [string]$script:WmtProcessPath
-                                            $backupExe = "$currentExe.backup"
-                                            Copy-Item -Path $currentExe -Destination $backupExe -Force
-                                            $backupCreated = $true
-
-                                            if ($lb) { $lb.AppendText("[UPDATE] Backup created at: $backupExe`n"); $lb.ScrollToEnd() }
-
-                                            # Replace current EXE with new one
-                                            Copy-Item -Path $tempExe -Destination $currentExe -Force
-
-                                            # Safety: the installed file must hash identical to the verified download
-                                            $installedHash = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash.ToLowerInvariant()
-                                            if ($installedHash -ne $downloadHash) {
-                                                throw "Installed EXE failed SHA256 verification (disk write did not match the download)."
-                                            }
-                                            $updateApplied = $true
-
-                                            Remove-Item -Path $tempExe -Force -ErrorAction SilentlyContinue
-                                            $tempExe = $null
-
-                                            if ($lb) { $lb.AppendText("[UPDATE] Update installed successfully. Restarting...`n"); $lb.ScrollToEnd() }
-
-                                            # Restart with new EXE
-                                            [System.Windows.MessageBox]::Show("Update installed successfully! The application will restart with the new version.", "Update Complete", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
-                                            Start-Process -FilePath $currentExe -WorkingDirectory (Split-Path -Parent $currentExe)
-                                            $script:WmtAllowFinalClose = $true
-                                            $window.Close()
                                         }
-                                        catch {
-                                            # Safety net: put the previous EXE back if anything failed before/during the swap
-                                            if (-not $updateApplied -and $backupCreated) {
-                                                Copy-Item -Path $backupExe -Destination $currentExe -Force -ErrorAction SilentlyContinue
-                                                if ($lb) { $lb.AppendText("[UPDATE] Previous EXE restored from backup.`n"); $lb.ScrollToEnd() }
+                                        $updateLogBox.ScrollToEnd()
+                                    }
+
+                                    [System.Windows.MessageBox]::Show("Update installed successfully! The application will restart with the new version.", "Update Complete", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                                    Start-Process -FilePath ([string]$result.CurrentExe) -WorkingDirectory (Split-Path -Parent ([string]$result.CurrentExe))
+                                    $allowFinalCloseState.Value = $true
+                                    $updateWindow.Close()
+                                }.GetNewClosure()
+
+                                $updateFailed = {
+                                    param($ErrorRecord)
+                                    $message = if ($ErrorRecord -is [System.Exception]) { $ErrorRecord.Message } elseif ($ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+                                    $errMsg = "Update failed: $message"
+                                    if ($updateLogBox) {
+                                        $updateLogBox.AppendText("[UPDATE] ERROR: $errMsg`n")
+                                        $updateLogBox.ScrollToEnd()
+                                    }
+                                    [System.Windows.MessageBox]::Show("$errMsg`n`nPlease download the update manually from the Releases page.", "Update Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+                                }.GetNewClosure()
+
+                                Invoke-WmtUiBackgroundCommand -Name "SelfUpdateInstallExe" -Msg "Downloading and installing update..." -SuppressResultLog -Sb {
+                                    param(
+                                        [string]$DownloadUrl,
+                                        [string]$ExpectedHash,
+                                        [string]$ChecksumStatus,
+                                        [string]$CurrentExe
+                                    )
+
+                                    $tempExe = $null
+                                    $backupExe = $null
+                                    $backupCreated = $false
+                                    $updateApplied = $false
+                                    $logLines = [System.Collections.Generic.List[string]]::new()
+
+                                    try {
+                                        if ([string]::IsNullOrWhiteSpace($DownloadUrl)) { throw "No download URL found for EXE." }
+                                        if ([string]::IsNullOrWhiteSpace($CurrentExe) -or -not (Test-Path -LiteralPath $CurrentExe)) { throw "Could not resolve the running EXE path." }
+
+                                        [void]$logLines.Add("Downloading new EXE from: $DownloadUrl")
+                                        $tempExe = Join-Path ([System.IO.Path]::GetTempPath()) ("WMT-GUI-Update-" + [System.Guid]::NewGuid().ToString("N") + ".exe")
+                                        Invoke-WebRequest -Uri $DownloadUrl -OutFile $tempExe -TimeoutSec 60 | Out-Null
+
+                                        if (-not (Test-Path -LiteralPath $tempExe)) { throw "Failed to download update file." }
+                                        $fileSize = (Get-Item -LiteralPath $tempExe).Length
+                                        if ($fileSize -lt 1MB) { throw "Downloaded file is suspiciously small ($fileSize bytes). Update may have failed." }
+
+                                        $fsPe = [System.IO.File]::OpenRead($tempExe)
+                                        try { $peB0 = $fsPe.ReadByte(); $peB1 = $fsPe.ReadByte() } finally { $fsPe.Dispose() }
+                                        if ($peB0 -ne 0x4D -or $peB1 -ne 0x5A) { throw "Downloaded file is not a Windows executable (MZ header missing). Update aborted." }
+
+                                        $downloadHash = (Get-FileHash -LiteralPath $tempExe -Algorithm SHA256).Hash.ToLowerInvariant()
+                                        [void]$logLines.Add("Downloaded EXE SHA256: $downloadHash")
+
+                                        if (-not [string]::IsNullOrWhiteSpace($ExpectedHash)) {
+                                            if ($downloadHash -ne $ExpectedHash.ToLowerInvariant()) {
+                                                throw "SHA256 MISMATCH! The downloaded EXE does not match the release checksum ($ExpectedHash). Update aborted - nothing was replaced."
                                             }
-                                            if ($tempExe -and (Test-Path $tempExe)) { Remove-Item -Path $tempExe -Force -ErrorAction SilentlyContinue }
+                                            [void]$logLines.Add("SHA256 verified against the release checksum file.")
+                                        }
+                                        elseif ($ChecksumStatus -eq "None") {
+                                            [void]$logLines.Add("Release publishes no SHA256 checksum file; downloaded hash is logged above.")
+                                        }
 
-                                            $errMsg = "Update failed: $($_.Exception.Message)"
-                                            if ($lb) { $lb.AppendText("[UPDATE] ERROR: $errMsg`n"); $lb.ScrollToEnd() }
+                                        $backupExe = "$CurrentExe.backup"
+                                        Copy-Item -LiteralPath $CurrentExe -Destination $backupExe -Force
+                                        $backupCreated = $true
+                                        [void]$logLines.Add("Backup created at: $backupExe")
 
-                                            [System.Windows.MessageBox]::Show("$errMsg`n`nPlease download the update manually from the Releases page.", "Update Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+                                        Copy-Item -LiteralPath $tempExe -Destination $CurrentExe -Force
+                                        $installedHash = (Get-FileHash -LiteralPath $CurrentExe -Algorithm SHA256).Hash.ToLowerInvariant()
+                                        if ($installedHash -ne $downloadHash) {
+                                            throw "Installed EXE failed SHA256 verification (disk write did not match the download)."
+                                        }
+                                        $updateApplied = $true
+
+                                        Remove-Item -LiteralPath $tempExe -Force -ErrorAction SilentlyContinue
+                                        $tempExe = $null
+                                        [void]$logLines.Add("Update installed and integrity verified.")
+
+                                        [PSCustomObject]@{
+                                            CurrentExe = $CurrentExe
+                                            BackupExe  = $backupExe
+                                            LogLines   = $logLines.ToArray()
                                         }
                                     }
-                                })
+                                    catch {
+                                        if (-not $updateApplied -and $backupCreated -and $backupExe -and (Test-Path -LiteralPath $backupExe)) {
+                                            Copy-Item -LiteralPath $backupExe -Destination $CurrentExe -Force -ErrorAction SilentlyContinue
+                                        }
+                                        if ($tempExe -and (Test-Path -LiteralPath $tempExe)) {
+                                            Remove-Item -LiteralPath $tempExe -Force -ErrorAction SilentlyContinue
+                                        }
+                                        throw
+                                    }
+                                } -ArgumentList @($downloadUrl, $expectedHash, $checksumStatus, $currentExe) -OnComplete $updateComplete -OnError $updateFailed | Out-Null
+                            }
                             return
                         }
 
@@ -34437,23 +34457,26 @@ $pnlCatalog = Get-Ctrl "pnlCatalog"
 $btnMyDeviceCleanRAM = Get-Ctrl "btnMyDeviceCleanRAM"
 if ($btnMyDeviceCleanRAM) {
 $btnMyDeviceCleanRAM.Add_Click({
-        Invoke-UiCommand {
+        Invoke-WmtUiBackgroundCommand -Name "TrimProcessWorkingSets" -Msg "Trimming process working sets..." -Sb {
             if (-not ([System.Management.Automation.PSTypeName]'Win32Functions.Win32EmptyWorkingSet').Type) {
                 $code = '[DllImport("psapi.dll")] public static extern int EmptyWorkingSet(IntPtr hwProc);'
                 Add-Type -MemberDefinition $code -Name "Win32EmptyWorkingSet" -Namespace Win32Functions
             }
-            $processes = Get-Process
+
             $count = 0
-            foreach ($p in $processes) {
+            foreach ($p in @(Get-Process)) {
                 try {
                     [Win32Functions.Win32EmptyWorkingSet]::EmptyWorkingSet($p.Handle) | Out-Null
                     $count++
                 }
                 catch {}
+                finally {
+                    try { $p.Dispose() } catch {}
+                }
             }
-            [GC]::Collect()
-            Write-GuiLog "Cleaned working sets for $count processes and freed RAM."
-        } "Cleaning RAM..."
+
+            Write-Output "Trimmed working sets for $count processes."
+        } | Out-Null
     })
 }
 
@@ -38429,7 +38452,7 @@ exit /b %WMT_EXIT%
 
     function Invoke-StoreCliInteractive {
         param(
-            [string]$Arguments,
+            [string[]]$ArgumentList,
             [string]$PackageName,
             [string]$TempPath,
             [string]$ActionLabel = "Update",
@@ -38896,17 +38919,18 @@ Start-Sleep -Milliseconds 700
 }
 '@
 
+        $storeArgsJson = @($ArgumentList) | ConvertTo-Json -Compress
+        $storeArgsEncoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($storeArgsJson))
         $runnerContent = @"
-`$storeArgsLine = @'
-$Arguments
-'@
+`$storeArgsJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$storeArgsEncoded'))
+`$storeArgs = @(`$storeArgsJson | ConvertFrom-Json)
 `$transcriptPath = @'
 $transcriptPath
 '@
 `$exitCode = 1
 try { Start-Transcript -Path `$transcriptPath -Force | Out-Null } catch {}
 try {
-Invoke-Expression ("store " + `$storeArgsLine)
+& store @storeArgs
 if (`$null -ne `$global:LASTEXITCODE) { `$exitCode = [int]`$global:LASTEXITCODE } else { `$exitCode = 0 }
 }
 catch {
@@ -38945,7 +38969,7 @@ exit /b %WMT_EXIT%
             Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$sendKeysPath`" -TargetPid $($cmdProc.Id) -PackageName `"$safePackageArg`" -StatusPath `"$statusPath`" -ResourcesInUsePath `"$resourcesInUsePath`" -ScreenPath `"$screenPath`" -EventPath `"$EventPath`"" -WindowStyle Hidden
             Write-Output "LOG:  [store] Progress: 5%"
 
-            $storeCliTimeoutMinutes = if (([string]$Arguments).Trim().ToLowerInvariant() -eq "updates") { 10 } else { 3 }
+            $storeCliTimeoutMinutes = if ($ArgumentList.Count -eq 1 -and ([string]$ArgumentList[0]).Trim().ToLowerInvariant() -eq "updates") { 10 } else { 3 }
             $deadline = (Get-Date).AddMinutes($storeCliTimeoutMinutes)
             $lastBeat = Get-Date
             $storeProgress = 5
@@ -39375,7 +39399,7 @@ exit /b %WMT_EXIT%
                 }
                 elseif ($act -eq "Install") {
                     if ($safeStoreId) {
-                        $storeCliArgs = "install `"$safeStoreId`""
+                        $storeCliArgs = [string[]]@("install", $safeStoreId)
                         if ($preferStoreUpdateScan) {
                             $storeFallbackUri = "ms-windows-store://downloadsandupdates"
                             $storeFallbackWebUri = "https://apps.microsoft.com/home"
@@ -39393,7 +39417,7 @@ exit /b %WMT_EXIT%
                             $skipReason = "Store CLI needs a product ID or package name, but this row has ID '$rawStoreId' and no usable name."
                         }
                         else {
-                            $storeCliArgs = "install `"$storeTarget`""
+                            $storeCliArgs = [string[]]@("install", $storeTarget)
                             $escapedStoreTarget = [System.Uri]::EscapeDataString($storeTarget)
                             if ($preferStoreUpdateScan) {
                                 $storeFallbackUri = "ms-windows-store://downloadsandupdates"
@@ -39789,7 +39813,7 @@ exit /b %WMT_EXIT%
                 $p = Invoke-WmtStoreAppUpdateScan -PackageName $name
             }
             elseif ($storeCliArgs) {
-                $p = Invoke-StoreCliInteractive -Arguments $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri
+                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri
             }
             elseif ($windowsUpdateItem) {
                 $p = Invoke-WmtWindowsUpdateInstall -Item $windowsUpdateItem
@@ -41404,10 +41428,11 @@ function Update-WmtProviderPathEnvironment {
         $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
         $pathParts = New-Object System.Collections.Generic.List[string]
+        $seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($pathValue in @($machinePath, $userPath, $env:Path)) {
             foreach ($part in @(([string]$pathValue) -split ";")) {
                 $trimmed = $part.Trim()
-                if (-not [string]::IsNullOrWhiteSpace($trimmed) -and -not $pathParts.Contains($trimmed)) {
+                if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $seenPaths.Add($trimmed)) {
                     [void]$pathParts.Add($trimmed)
                 }
             }
@@ -42467,10 +42492,11 @@ throw "Steam was not found. Opened the Steam download page."
 function Update-WmtProviderPathEnvironment {
 try {
     `$pathParts = New-Object System.Collections.Generic.List[string]
+    `$seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach (`$pathValue in @([Environment]::GetEnvironmentVariable("Path", "Machine"), [Environment]::GetEnvironmentVariable("Path", "User"), `$env:Path)) {
         foreach (`$part in @(([string]`$pathValue) -split ";")) {
             `$trimmed = `$part.Trim()
-            if (-not [string]::IsNullOrWhiteSpace(`$trimmed) -and -not `$pathParts.Contains(`$trimmed)) {
+            if (-not [string]::IsNullOrWhiteSpace(`$trimmed) -and `$seenPaths.Add(`$trimmed)) {
                 [void]`$pathParts.Add(`$trimmed)
             }
         }
@@ -43763,18 +43789,27 @@ $script:WmtPeriodicMemoryTrimTimer.Add_Tick({
             Invoke-WmtMemoryTrim -Reason "tray-periodic"
         }
         elseif (-not $scanBusy) {
-            # Release parsed cleaner rules (re-parsed on next cleaner use).
-            Clear-WmtCleanerRuleMemoryCaches
-            # Release game library caches (re-loaded on next library tab visit).
-            $script:LegendaryLibraryCache = $null
-            $script:WmtGogLibraryCache = $null
-            $script:SteamLibraryCache = $null
-            # Release firewall detail cache (re-loaded on demand).
-            $script:FirewallDetailCache = $null
+            # Keep normal visible-mode maintenance lightweight. Forced full GC/finalizer
+            # cycles on this DispatcherTimer pause the WPF UI and routinely evict useful
+            # caches that are immediately rebuilt. Only drop reloadable caches when the
+            # process is genuinely large; let the CLR collect them naturally.
             Optimize-WmtLogMemory -MaxLines $script:WmtMaxLogLines
-            [System.GC]::Collect()
-            [System.GC]::WaitForPendingFinalizers()
-            [System.GC]::Collect()
+            try {
+                $proc = [System.Diagnostics.Process]::GetCurrentProcess()
+                $proc.Refresh()
+                if ($proc.WorkingSet64 -ge 512MB) {
+                    Clear-WmtCleanerRuleMemoryCaches
+                    $script:LegendaryLibraryCache = $null
+                    $script:WmtGogLibraryCache = $null
+                    $script:SteamLibraryCache = $null
+                    $script:FirewallDetailCache = $null
+                    if ($script:WmtDebug) {
+                        Write-GuiLog ("[Memory] Released reloadable caches at {0:N0} MB working set; CLR collection remains automatic." -f ($proc.WorkingSet64 / 1MB))
+                    }
+                }
+                $proc.Dispose()
+            }
+            catch {}
         }
     }
     catch {}
