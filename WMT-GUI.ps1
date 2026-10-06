@@ -40120,10 +40120,14 @@ exit /b %WMT_EXIT%
                 }
 
                 $legendaryCommand = Get-WmtLegendaryCommandText -ForPowerShell:($act -ne "Update" -or $silentUpdateInstallEnabled)
+                # Legendary's downloader timeout does not control Epic API metadata calls.
+                # Give the API the same 30-second tolerance used by WMT's library/install paths
+                # instead of Legendary's 10-second default.
+                $legendaryGlobalArgs = "--api-timeout 30"
                 $legendaryHeadlessArgs = "--max-workers 4 --dl-timeout 30 --skip-sdl --skip-dlcs"
                 if ($act -eq "Install") { $skipReason = "Epic/Legendary installs must use WMT's interactive game installer." }
-                if ($act -eq "Update") { $cmd = "$legendaryCommand -y update `"$id`" --update-only $legendaryHeadlessArgs" }
-                if ($act -eq "Uninstall") { $cmd = "$legendaryCommand -y uninstall `"$id`"" }
+                if ($act -eq "Update") { $cmd = "$legendaryCommand $legendaryGlobalArgs -y update `"$id`" --update-only $legendaryHeadlessArgs" }
+                if ($act -eq "Uninstall") { $cmd = "$legendaryCommand $legendaryGlobalArgs -y uninstall `"$id`"" }
 
                 if ($providerLogFilesEnabled -and $act -in @("Update", "Uninstall") -and -not [string]::IsNullOrWhiteSpace($cmd)) {
                     $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
@@ -40141,7 +40145,7 @@ exit /b %WMT_EXIT%
                         $exePs = ([string]$legendaryLogExe).Replace("'", "''")
                         $idPs = ([string]$id).Replace("'", "''")
                         $logPs = ([string]$providerTranscriptPath).Replace("'", "''")
-                        $legendaryArgsText = if ($act -eq "Update") { "-y update '" + $idPs + "' --update-only " + $legendaryHeadlessArgs } else { "-y uninstall '" + $idPs + "'" }
+                        $legendaryArgsText = if ($act -eq "Update") { $legendaryGlobalArgs + " -y update '" + $idPs + "' --update-only " + $legendaryHeadlessArgs } else { $legendaryGlobalArgs + " -y uninstall '" + $idPs + "'" }
                         $loggedScript = "& '" + $exePs + "' " + $legendaryArgsText + " 2>&1 | Tee-Object -FilePath '" + $logPs + "' -Append | ForEach-Object { Write-Host `$_ }; `$wmtLegendaryExit = `$LASTEXITCODE; exit `$wmtLegendaryExit"
                         $encodedLoggedScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loggedScript))
                         $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLoggedScript"
