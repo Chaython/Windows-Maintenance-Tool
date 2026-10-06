@@ -37297,13 +37297,29 @@ $wingetWorkerScript = {
         "1602" = "Cancelled by User"
         "1618" = "Another Installation in Progress"
 
-        # Winget Specific
-        "0x8a150001" = "Invalid Argument"; "0x8a150002" = "Internal Failure"; "0x8a150003" = "Source Corrupted (Trying auto-fix...)"
-        "0x8a150004" = "Installer Failed"; "0x8a150005" = "Hash Mismatch"; "0x8a150006" = "Not Applicable"
-        "0x8a150007" = "Launch Failed"; "0x8a150008" = "Manifest Missing"; "0x8a150009" = "Invalid Manifest"
-        "0x8a15000a" = "Unsupported Type"; "0x8a15000b" = "Package Not Found"; "0x8a15000c" = "Vendor Error"
-        "0x8a15000d" = "Download Failed"; "0x8a15000e" = "Installer Hash Mismatch"; "0x8a15000f" = "Data Missing"
-        "0x8a150014" = "Network Error"
+        # WinGet-specific HRESULTs. Keep these aligned with
+        # winget error --output / AppInstallerErrors.h.
+        "0x8a150001" = "WinGet internal error"
+        "0x8a150002" = "Invalid WinGet command-line arguments"
+        "0x8a150003" = "WinGet command failed"
+        "0x8a150004" = "Opening manifest failed"
+        "0x8a150005" = "Cancellation signal received"
+        "0x8a150006" = "Running installer through ShellExecute failed"
+        "0x8a150007" = "Manifest version is newer than this WinGet client supports"
+        "0x8a150008" = "Downloading installer failed"
+        "0x8a150009" = "Cannot write to a higher-version source index"
+        "0x8a15000a" = "WinGet source index integrity is compromised"
+        "0x8a15000b" = "Configured WinGet source information is corrupt"
+        "0x8a15000c" = "WinGet source name already exists"
+        "0x8a15000d" = "Invalid WinGet source type"
+        "0x8a15000e" = "Package is a bundle rather than a package"
+        "0x8a15000f" = "Required source data is missing"
+        "0x8a150010" = "No applicable installer for this system"
+        "0x8a150011" = "Installer hash does not match the manifest"
+        "0x8a150012" = "WinGet source name does not exist"
+        "0x8a150013" = "WinGet source location is already configured"
+        "0x8a150014" = "No packages found"
+        "0x8a15008e" = "Upgrade uses a different install technology than the current installation"
         "0x80070002" = "File Not Found"; "0x80070003" = "Path Not Found"; "0x80070005" = "Access Denied"
         "0x80070490" = "Element Not Found"; "0x80072ee7" = "DNS Lookup Fail"; "0x80072f8f" = "SSL Cert Error"
         "0x80073d02" = "Resources Currently In Use"; "-2147009278" = "Resources Currently In Use"; "2147958018" = "Resources Currently In Use"
@@ -37349,6 +37365,41 @@ $wingetWorkerScript = {
         catch {}
     }
 
+    function Copy-WmtLatestWingetDiagnosticLog {
+        param(
+            [string]$DestinationPath,
+            [datetime]$Since
+        )
+
+        if ([string]::IsNullOrWhiteSpace($DestinationPath)) { return $false }
+
+        $candidateDirs = @(
+            (Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"),
+            (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Logs")
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Container) }
+
+        $cutoff = if ($Since -and $Since -ne [datetime]::MinValue) { $Since.AddSeconds(-10) } else { (Get-Date).AddMinutes(-10) }
+        $latest = $null
+        foreach ($dir in @($candidateDirs)) {
+            try {
+                $candidate = Get-ChildItem -LiteralPath $dir -File -Filter "*.log" -ErrorAction Stop |
+                    Where-Object { $_.LastWriteTime -ge $cutoff } |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1
+                if ($candidate -and (-not $latest -or $candidate.LastWriteTime -gt $latest.LastWriteTime)) {
+                    $latest = $candidate
+                }
+            }
+            catch {}
+        }
+
+        if (-not $latest) { return $false }
+        try {
+            Copy-Item -LiteralPath $latest.FullName -Destination $DestinationPath -Force -ErrorAction Stop
+            return $true
+        }
+        catch { return $false }
+    }
     function Write-WmtInstallerFailureSummary {
         param(
             [string]$LogPath,
@@ -39440,6 +39491,7 @@ exit /b %WMT_EXIT%
         $wingetTranscriptPath = ""
         $wingetInstallerLogPath = ""
         $wingetRetryInstallerLogPath = ""
+        $wingetAttemptStartedAt = [datetime]::MinValue
         $storeCliArgs = $null
         $windowsUpdateItem = $null
         $storeForceUpdateScan = $false
@@ -39887,7 +39939,7 @@ exit /b %WMT_EXIT%
 
         if ($cmd) {
             Write-Output "LOG:[$act][$index/$total] Starting: $name ($src)..."
-            $commandForLog = if (-not [string]::IsNullOrWhiteSpace($displayCmd)) { $displayCmd } else { $userCmd }
+            $commandForLog = if (-not [string]::IsNullOrWhiteSpace($displayCmd)) { $displayCmd } else { $cmd }
             Write-Output "LOG:[$act] Command: $commandForLog"
 
             # 1. RUN COMMAND (First Attempt - Admin)
@@ -39897,6 +39949,8 @@ exit /b %WMT_EXIT%
             $isChocoUpdate = (($src -eq "chocolatey" -or $src -eq "choco") -and $act -eq "Update")
             $isPythonUpdate = ($act -eq "Update" -and (([string]$id -match "(?i)\bpython([0-9\.]*)\b") -or ([string]$name -match "(?i)\bpython([0-9\.]*)\b")))
             $useVisibleWindow = ($act -eq "Update" -and -not $silentUpdateInstallEnabled -and -not ($src -eq "msstore" -and $storeCliArgs) -and -not $windowsUpdateItem)
+
+            if ($wingetArgs) { $wingetAttemptStartedAt = Get-Date }
 
             if ($useVisibleWindow) {
                 $windowTag = switch -Regex ($src) {
@@ -39946,6 +40000,15 @@ exit /b %WMT_EXIT%
                     else {
                         Write-Output "LOG:[$act] Visible window forcefully closed or interrupted."
                         $p = [PSCustomObject]@{ ExitCode = 1 }
+                    }
+                }
+
+                if ($wingetArgs -and -not [string]::IsNullOrWhiteSpace($wingetTranscriptPath)) {
+                    if (Copy-WmtLatestWingetDiagnosticLog -DestinationPath $wingetTranscriptPath -Since $wingetAttemptStartedAt) {
+                        Write-Output "LOG:[Diagnostics] Preserved WinGet verbose diagnostic log: $wingetTranscriptPath"
+                    }
+                    else {
+                        Write-Output "LOG:[Diagnostics] WinGet did not expose a verbose diagnostic file for this visible attempt."
                     }
                 }
             }
@@ -40002,7 +40065,7 @@ exit /b %WMT_EXIT%
             # diagnostics into a new install failure: if WinGet rejects the
             # logging option itself, retry once without --log while preserving
             # WinGet verbose diagnostics and the WMT transcript.
-            if ($wingetArgsWithoutInstallerLog -and $wingetInstallerLogPath -and $hex -eq "0x8a150001") {
+            if ($wingetArgsWithoutInstallerLog -and $wingetInstallerLogPath -and $hex -eq "0x8a150002") {
                 Write-Output "LOG:[Diagnostics] WinGet rejected the installer --log option for $name. Retrying without --log."
                 $wingetArgs = $wingetArgsWithoutInstallerLog
                 $cmd = "winget $wingetArgs"
@@ -40017,7 +40080,7 @@ exit /b %WMT_EXIT%
             }
 
             # --- AUTO-FIX: SOURCE CORRUPTION ---
-            if ($wingetArgs -and $hex -eq "0x8a150003") {
+            if ($wingetArgs -and $hex -eq "0x8a15000b") {
                 Write-Output "LOG:[$act] WARNING: Detected Winget Source Corruption. Auto-fixing..."
                 $fixP = $null
                 Invoke-WingetCmd -Command "winget source reset --force" -Result ([ref]$fixP)
@@ -40063,19 +40126,34 @@ exit /b %WMT_EXIT%
 
                 if ($wingetInstallerLogPath) {
                     Write-WmtInstallerFailureSummary -LogPath $wingetInstallerLogPath -PackageName $name -AttemptLabel "installer"
-                    if (-not [string]::IsNullOrWhiteSpace($wingetTranscriptPath)) {
-                        Write-Output "LOG:[Diagnostics] WinGet stdout/stderr transcript: $wingetTranscriptPath"
+                    if (-not [string]::IsNullOrWhiteSpace($wingetTranscriptPath) -and (Test-Path -LiteralPath $wingetTranscriptPath -PathType Leaf)) {
+                        Write-Output "LOG:[Diagnostics] WinGet diagnostic transcript: $wingetTranscriptPath"
                     }
                 }
 
                 # Known non-retry outcomes: avoid opening fallback user-mode consoles.
-                if ($hex -eq "0x8a150006") {
+                if ($hex -eq "0x8a150010") {
                     Write-Output "LOG:[$act][$index/$total] SKIPPED [$hex] ${errDesc} - $name"
                     Write-Output "RESULT:${index}:SKIPPED:$name"
                     continue
                 }
-                if ($hex -eq "0x8a15000b" -or $dec -eq "1618") {
-                    Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (no user-mode retry)"
+                if ($hex -eq "0x8a15000b") {
+                    Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (source reset did not recover the source; no user-mode retry)"
+                    Write-Output "RESULT:${index}:FAILED:$name"
+                    continue
+                }
+                if ($hex -eq "0x8a15008e") {
+                    $currentVersionText = ([string]$item.Version).Trim()
+                    $availableVersionText = ([string]$item.Available).Trim()
+                    $versionTransition = if ($currentVersionText -and $availableVersionText) { "$currentVersionText -> $availableVersionText" } else { "current -> available" }
+                    Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name ($versionTransition)"
+                    Write-Output "LOG:[WinGet] WinGet blocked the upgrade before launching the new installer because the installer technology changed. No MSI/installer log is expected for this attempt."
+                    Write-Output "LOG:[WinGet] Required migration: uninstall the currently installed package, then install the newer package. WMT will not auto-uninstall it because a failed reinstall could leave the application removed."
+                    Write-Output "RESULT:${index}:FAILED:$name"
+                    continue
+                }
+                if ($dec -eq "1618") {
+                    Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (another installer is already running; no user-mode retry)"
                     Write-Output "RESULT:${index}:FAILED:$name"
                     continue
                 }
@@ -40134,6 +40212,9 @@ exit /b %WMT_EXIT%
 
                 # --- RETRY AS USER (Fallback) ---
                 # Handles Scoop (needs user rights) and Spotify (hates Admin)
+                if (-not [string]::IsNullOrWhiteSpace($userCmd)) {
+                    Write-Output "LOG:[$act] User-mode retry command: $userCmd"
+                }
                 $retryResult = Invoke-WmtUserModeRetry -Command $userCmd -ActionLabel $act -PackageName $name -TempPath $temp
                 if ($retryResult.TimedOut) {
                     Write-Output "LOG:[$act][$index/$total] FAILED: $name (user-mode retry timed out and was stopped)"
