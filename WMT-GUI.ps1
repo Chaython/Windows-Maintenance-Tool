@@ -30667,9 +30667,14 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas, monospace" FontSize="12" 
                                  Background="Transparent" Foreground="{DynamicResource LogText}" BorderThickness="0" Padding="4"
                                  VerticalAlignment="Stretch" AcceptsReturn="True"
-                                 SelectionBrush="{DynamicResource Accent}" SelectionOpacity="0.48"
+                                 SelectionBrush="#FFF2C94C" SelectionOpacity="0.78"
                                  IsInactiveSelectionHighlightEnabled="True"
-                                 SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display"/>
+                                 SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display">
+                            <TextBox.Resources>
+                                <!-- WPF uses this system brush when the find box owns keyboard focus. -->
+                                <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#FFF2C94C"/>
+                            </TextBox.Resources>
+                        </TextBox>
                     </ScrollViewer>
                 </Grid>
             </Border>
