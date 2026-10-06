@@ -37387,7 +37387,7 @@ $wingetWorkerScript = {
                         ([string]$_) -match '(?i)(error\s+[0-9]{3,5}|installation failed|installer failed|fatal error|exception|customaction.+error|mainenginethread.+returning)'
                     } | Select-Object -Last 12)
                 if ($failureLines.Count -gt 0) {
-                    Write-Output "LOG:[Installer] Failure indicators found in the $AttemptLabel log for $PackageName:"
+                    Write-Output "LOG:[Installer] Failure indicators found in the $AttemptLabel log for ${PackageName}:"
                 }
             }
 
