@@ -56390,6 +56390,33 @@ $btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
 return $result.Value
 }
 
+function New-WmtLegendaryOperationLogPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$Action
+)
+
+try {
+    $settings = Get-WmtSettings
+    if (-not (Get-WmtProviderToggle -Settings $settings -ProviderKey "legendary" -ToggleName "Logs")) { return "" }
+
+    $root = Join-Path (Get-DataPath) "package-install-logs"
+    try { [void][System.IO.Directory]::CreateDirectory($root) }
+    catch {
+        $root = Join-Path $env:TEMP "WMT-PackageInstallLogs"
+        try { [void][System.IO.Directory]::CreateDirectory($root) } catch { return "" }
+    }
+
+    $safeId = ([string]$Id -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeId)) { $safeId = "package" }
+    $safeAction = ([string]$Action -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeAction)) { $safeAction = "Action" }
+    $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+    return (Join-Path $root "$stamp-$safeAction-$safeId-legendary.log")
+}
+catch { return "" }
+}
+
 function Start-WmtLegendaryLibraryInstall {
 param(
     [Parameter(Mandatory = $true)][string]$Name,
@@ -56427,9 +56454,11 @@ if (-not (Test-Path -LiteralPath $launcherDir -PathType Container)) {
     [void][System.IO.Directory]::CreateDirectory($launcherDir)
 }
 $resultPath = Join-Path $launcherDir ("legendary-result-{0}-{1}.json" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
+$logPath = New-WmtLegendaryOperationLogPath -Id $Id -Action "Install"
 
 $exeLiteral = ConvertTo-WmtLegendaryPsLiteral $LegendaryExe
 $resultLiteral = ConvertTo-WmtLegendaryPsLiteral $resultPath
+$logLiteral = ConvertTo-WmtLegendaryPsLiteral $logPath
 $appLiteral = ConvertTo-WmtLegendaryPsLiteral $Id
 $titleLiteral = ConvertTo-WmtLegendaryPsLiteral ("WMT Legendary Install - " + $Name + " [" + $Id + "]")
 $baseArgsLiteral = "@(" + (@($baseArgs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
@@ -56446,10 +56475,20 @@ try { $Host.UI.RawUI.WindowTitle = __TITLE__ } catch {}
 $exe = __EXE__
 $appId = __APP__
 $resultPath = __RESULT__
+$logPath = __LOG__
 $baseArgs = __BASEARGS__
 $dlcs = __DLCS__
 $dlcCommon = __DLCCOMMON__
-& $exe @baseArgs
+if (-not [string]::IsNullOrWhiteSpace($logPath)) {
+    try {
+        $header = "[" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") + "] COMMAND: " + $exe + " " + ($baseArgs -join " ") + [Environment]::NewLine
+        [System.IO.File]::WriteAllText($logPath, $header, [System.Text.UTF8Encoding]::new($false))
+    } catch {}
+    & $exe @baseArgs 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
+}
+else {
+    & $exe @baseArgs
+}
 $exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
 
 if ($exitCode -eq 0 -and $dlcs.Count -gt 0) {
@@ -56457,7 +56496,13 @@ if ($exitCode -eq 0 -and $dlcs.Count -gt 0) {
         Write-Host ""
         Write-Host ("[WMT] Installing selected DLC: " + $dlc)
         $dlcArgs = @("-y", "--api-timeout", "30", "install", $dlc) + $dlcCommon[4..($dlcCommon.Count - 1)]
-        & $exe @dlcArgs
+        if (-not [string]::IsNullOrWhiteSpace($logPath)) {
+            try { [System.IO.File]::AppendAllText($logPath, ("[WMT] DLC COMMAND: " + $exe + " " + ($dlcArgs -join " ") + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false)) } catch {}
+            & $exe @dlcArgs 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
+        }
+        else {
+            & $exe @dlcArgs
+        }
         $dlcExit = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
         if ($dlcExit -ne 0) {
             $exitCode = $dlcExit
@@ -56506,6 +56551,7 @@ $launcherScript = $launcherTemplate.Replace("__TITLE__", $titleLiteral).
     Replace("__EXE__", $exeLiteral).
     Replace("__APP__", $appLiteral).
     Replace("__RESULT__", $resultLiteral).
+    Replace("__LOG__", $logLiteral).
     Replace("__BASEARGS__", $baseArgsLiteral).
     Replace("__DLCS__", $dlcLiteral).
     Replace("__DLCCOMMON__", $dlcCommonLiteral).
@@ -56544,6 +56590,7 @@ if (-not [string]::IsNullOrWhiteSpace([string]$Options.GameFolder)) {
 }
 
 Write-GuiLog "Starting Legendary install for: $Name (app $Id) -> $($Options.RootPath) | platform=$($Options.Platform) | workers=$($Options.Workers) | shared-memory=$($Options.SharedMemoryMiB) MiB | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
+if (-not [string]::IsNullOrWhiteSpace($logPath)) { Write-GuiLog "[Diagnostics] Legendary install log: $logPath" }
 
 $procRef = $proc
 $resultRef = $resultPath
@@ -56552,6 +56599,7 @@ $nameRef = $Name
 $rootRef = [string]$Options.RootPath
 $expectedRef = $expectedInstallPath
 $legendaryExeRef = [string]$LegendaryExe
+$logRef = [string]$logPath
 $createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
 $createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
 $preInstallDirectoriesRef = @($preInstallDirectories)
@@ -56699,6 +56747,9 @@ $onComplete = {
     }
     else {
         Write-GuiLog ("Legendary install ended with exit code " + $exitCode + ": " + $nameRef + " (app " + $idRef + "). Partial files were kept for resume.")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($logRef) -and (Test-Path -LiteralPath $logRef -PathType Leaf)) {
+        Write-GuiLog "[Diagnostics] Legendary log saved: $logRef"
     }
 
     try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction SilentlyContinue } catch {}
