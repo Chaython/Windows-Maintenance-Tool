@@ -57886,8 +57886,34 @@ function Invoke-WmtLibraryUninstall {
                 if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
             }
             if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
-                Start-Process -FilePath $legExe -ArgumentList "-y", "uninstall", $id -WindowStyle Normal
-                Write-GuiLog "Starting Legendary uninstall for: $name (app $id)"
+                $legendaryUninstallLog = New-WmtLegendaryOperationLogPath -Id $id -Action "Uninstall"
+                if (-not [string]::IsNullOrWhiteSpace($legendaryUninstallLog)) {
+                    $exeLiteral = "'" + ([string]$legExe).Replace("'", "''") + "'"
+                    $idLiteral = "'" + ([string]$id).Replace("'", "''") + "'"
+                    $logLiteral = "'" + ([string]$legendaryUninstallLog).Replace("'", "''") + "'"
+                    $uninstallTemplate = @'
+$ErrorActionPreference = 'Continue'
+$exe = __EXE__
+$appId = __APP__
+$logPath = __LOG__
+try {
+    $header = "[" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") + "] COMMAND: " + $exe + " -y uninstall " + $appId + [Environment]::NewLine
+    [System.IO.File]::WriteAllText($logPath, $header, [System.Text.UTF8Encoding]::new($false))
+} catch {}
+& $exe -y uninstall $appId 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
+$exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+exit $exitCode
+'@
+                    $uninstallScript = $uninstallTemplate.Replace("__EXE__", $exeLiteral).Replace("__APP__", $idLiteral).Replace("__LOG__", $logLiteral)
+                    $encodedUninstall = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($uninstallScript))
+                    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedUninstall -WindowStyle Normal | Out-Null
+                    Write-GuiLog "Starting Legendary uninstall for: $name (app $id)"
+                    Write-GuiLog "[Diagnostics] Legendary uninstall log: $legendaryUninstallLog"
+                }
+                else {
+                    Start-Process -FilePath $legExe -ArgumentList "-y", "uninstall", $id -WindowStyle Normal
+                    Write-GuiLog "Starting Legendary uninstall for: $name (app $id)"
+                }
             }
             else {
                 Show-WmtMessageBox -Message "Legendary is not installed. Cannot uninstall Epic games." -Title "Uninstall Failed" -Image Warning | Out-Null
