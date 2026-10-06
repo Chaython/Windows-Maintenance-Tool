@@ -30667,6 +30667,8 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas, monospace" FontSize="12" 
                                  Background="Transparent" Foreground="{DynamicResource LogText}" BorderThickness="0" Padding="4"
                                  VerticalAlignment="Stretch" AcceptsReturn="True"
+                                 SelectionBrush="{DynamicResource Accent}" SelectionOpacity="0.48"
+                                 IsInactiveSelectionHighlightEnabled="True"
                                  SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display"/>
                     </ScrollViewer>
                 </Grid>
@@ -32578,7 +32580,12 @@ else {
     if ($index -lt 0 -and -not $Restart -and $start -gt 0) { $index = $text.IndexOf($Query, 0, $comparison) }
 }
 
-if ($index -lt 0) { return $false }
+if ($index -lt 0) {
+    # Do not leave an older match highlighted when the new query has no hits.
+    $collapseAt = [Math]::Min([Math]::Max(0, $script:LogBox.SelectionStart), $text.Length)
+    $script:LogBox.Select($collapseAt, 0)
+    return $false
+}
 $script:LogBox.Select($index, $Query.Length)
 try {
     $lineIndex = $script:LogBox.GetLineIndexFromCharacterIndex($index)
@@ -34872,7 +34879,13 @@ if ($txtLogSearch) {
         $hasQuery = (-not [string]::IsNullOrWhiteSpace($query)) -and $query -ne $script:LogSearchPlaceholder
         if ($btnLogClearSearch) { $btnLogClearSearch.Visibility = if ($hasQuery) { "Visible" } else { "Collapsed" } }
         Set-WmtLogSearchForeground -TextBox $txtLogSearch
-        if ($hasQuery) { [void](Select-WmtActivityLogMatch -Query $query -Restart) }
+        if ($hasQuery) {
+            [void](Select-WmtActivityLogMatch -Query $query -Restart)
+        }
+        elseif ($LogBox) {
+            # Clearing the query should remove the visible find highlight without hiding log lines.
+            $LogBox.Select($LogBox.SelectionStart, 0)
+        }
     })
     $txtLogSearch.Add_KeyDown({
         param($s, $e)
@@ -34882,7 +34895,8 @@ if ($txtLogSearch) {
             $e.Handled = $true
             return
         }
-        if ($e.Key -ne "Return" -or [string]::IsNullOrWhiteSpace($query) -or $query -eq $script:LogSearchPlaceholder) { return }
+        $isFindNavigationKey = ($e.Key -eq "Return" -or $e.Key -eq "F3")
+        if (-not $isFindNavigationKey -or [string]::IsNullOrWhiteSpace($query) -or $query -eq $script:LogSearchPlaceholder) { return }
         $goPrevious = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0)
         [void](Select-WmtActivityLogMatch -Query $query -Previous:$goPrevious)
         $e.Handled = $true
