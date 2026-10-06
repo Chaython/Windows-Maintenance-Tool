@@ -32649,15 +32649,10 @@ try {
     $lineIndex = $script:LogBox.GetLineIndexFromCharacterIndex($index)
     if ($lineIndex -ge 0) { $script:LogBox.ScrollToLine($lineIndex) }
 
-    # Wait until scrolling/layout is complete, then draw a real overlay over the match.
-    $matchIndex = $index
-    $matchLength = $Query.Length
-    [void]$script:LogBox.Dispatcher.BeginInvoke(
-        [System.Windows.Threading.DispatcherPriority]::Loaded,
-        [System.Action]{
-            Show-WmtActivityLogHighlight -Index $matchIndex -Length $matchLength
-        }
-    )
+    # Force layout after navigation, then draw a real overlay over the match.
+    $script:LogBox.UpdateLayout()
+    if ($script:LogSearchHighlightLayer) { $script:LogSearchHighlightLayer.UpdateLayout() }
+    Show-WmtActivityLogHighlight -Index $index -Length $Query.Length
 }
 catch {
     Show-WmtActivityLogHighlight -Index $index -Length $Query.Length
