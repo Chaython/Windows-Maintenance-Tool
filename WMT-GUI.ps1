@@ -37241,7 +37241,7 @@ try {
 }
 catch {}
 $packageInstallLogRoot = ""
-$needsPackageInstallLogRoot = ($ActionName -in @("Install", "Update")) -and (@($uniqueItems | Where-Object {
+$needsPackageInstallLogRoot = ($ActionName -in @("Install", "Update", "Uninstall", "Repair")) -and (@($uniqueItems | Where-Object {
             [bool]$_.ProviderLogFilesEnabled -and (([string]$_.Source).Trim().ToLowerInvariant() -eq "winget")
         }).Count -gt 0)
 if ($needsPackageInstallLogRoot) {
@@ -38377,8 +38377,16 @@ $wingetWorkerScript = {
             }
             if ($trimmed -ne $State.LastLine) {
                 $State.LastLine = $trimmed
-                $prefix = if ($IsError) { "!" } else { ">" }
-                Write-Output "LOG:  $prefix $trimmed"
+
+                # When a detailed transcript is enabled, keep the Activity box
+                # focused on actionable status instead of mirroring winget help,
+                # banners, option lists, and other verbose CLI chatter.
+                $showInActivity = [string]::IsNullOrWhiteSpace($TranscriptPath) -or $IsError -or
+                    ($trimmed -match '(?i)(error|failed|failure|not recognized|not found|no installed package|no package found|successfully|cancelled|canceled|reboot|required|requires|resources.+in use|another installation|hash mismatch)')
+                if ($showInActivity) {
+                    $prefix = if ($IsError) { "!" } else { ">" }
+                    Write-Output "LOG:  $prefix $trimmed"
+                }
             }
         }
 
@@ -39573,38 +39581,54 @@ exit /b %WMT_EXIT%
         else {
             # --- WINGET ---
             if ($src -eq "winget") {
-                $flags = "--accept-source-agreements --accept-package-agreements --disable-interactivity"
-                $userFlags = "--accept-source-agreements --accept-package-agreements"
+                # winget uninstall does not accept --accept-package-agreements.
+                # Keep source-agreement/interactivity flags common, and add the
+                # package-agreement flag only to commands that support it.
+                $baseFlags = "--accept-source-agreements --disable-interactivity"
+                $baseUserFlags = "--accept-source-agreements"
+                $packageFlags = "$baseFlags --accept-package-agreements"
+                $packageUserFlags = "$baseUserFlags --accept-package-agreements"
                 if ($providerLogFilesEnabled) {
-                    $flags += " --verbose-logs"
-                    $userFlags += " --verbose-logs"
+                    $baseFlags += " --verbose-logs"
+                    $baseUserFlags += " --verbose-logs"
+                    $packageFlags += " --verbose-logs"
+                    $packageUserFlags += " --verbose-logs"
                 }
                 $includeUnknownFlag = if ($wingetIncludeUnknown) { " --include-unknown" } else { "" }
 
-                if ($providerLogFilesEnabled -and $act -in @("Install", "Update")) {
+                if ($providerLogFilesEnabled -and $act -in @("Install", "Update", "Uninstall", "Repair")) {
                     $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
                     $wingetTranscriptPath = "$diagnosticStem-winget.log"
-                    $wingetInstallerLogPath = "$diagnosticStem-installer.log"
-                    $wingetRetryInstallerLogPath = "$diagnosticStem-retry-installer.log"
-                    Write-Output "LOG:[Diagnostics] Package logs for $name will be written under: $(Split-Path -Parent $diagnosticStem)"
+                    if ($act -in @("Install", "Update")) {
+                        $wingetInstallerLogPath = "$diagnosticStem-installer.log"
+                        $wingetRetryInstallerLogPath = "$diagnosticStem-retry-installer.log"
+                    }
                 }
 
                 if ($act -eq "Install") {
-                    $wingetArgsWithoutInstallerLog = "install --id `"$id`" $flags"
-                    $wingetUserCmdWithoutInstallerLog = "winget install --id `"$id`" $userFlags"
+                    $wingetArgsWithoutInstallerLog = "install --id `"$id`" $packageFlags"
+                    $wingetUserCmdWithoutInstallerLog = "winget install --id `"$id`" $packageUserFlags"
                     $wingetArgs = if ($wingetInstallerLogPath) { "$wingetArgsWithoutInstallerLog --log `"$wingetInstallerLogPath`"" } else { $wingetArgsWithoutInstallerLog }
                     $cmd = "winget $wingetArgs"
                     $userCmd = if ($wingetRetryInstallerLogPath) { "$wingetUserCmdWithoutInstallerLog --log `"$wingetRetryInstallerLogPath`"" } else { $wingetUserCmdWithoutInstallerLog }
                 }
                 if ($act -eq "Update") {
-                    $wingetArgsWithoutInstallerLog = "upgrade --id `"$id`"$includeUnknownFlag $flags"
-                    $wingetUserCmdWithoutInstallerLog = "winget upgrade --id `"$id`"$includeUnknownFlag $userFlags"
+                    $wingetArgsWithoutInstallerLog = "upgrade --id `"$id`"$includeUnknownFlag $packageFlags"
+                    $wingetUserCmdWithoutInstallerLog = "winget upgrade --id `"$id`"$includeUnknownFlag $packageUserFlags"
                     $wingetArgs = if ($wingetInstallerLogPath) { "$wingetArgsWithoutInstallerLog --log `"$wingetInstallerLogPath`"" } else { $wingetArgsWithoutInstallerLog }
                     $cmd = "winget $wingetArgs"
                     $userCmd = if ($wingetRetryInstallerLogPath) { "$wingetUserCmdWithoutInstallerLog --log `"$wingetRetryInstallerLogPath`"" } else { $wingetUserCmdWithoutInstallerLog }
                 }
-                if ($act -eq "Uninstall") { $wingetArgs = "uninstall --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget uninstall --id `"$id`" $userFlags" }
-                if ($act -eq "Repair") { $wingetArgs = "repair --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget repair --id `"$id`" $userFlags" }
+                if ($act -eq "Uninstall") {
+                    $wingetArgs = "uninstall --id `"$id`" $baseFlags"
+                    $cmd = "winget $wingetArgs"
+                    $userCmd = "winget uninstall --id `"$id`" $baseUserFlags"
+                }
+                if ($act -eq "Repair") {
+                    $wingetArgs = "repair --id `"$id`" $packageFlags"
+                    $cmd = "winget $wingetArgs"
+                    $userCmd = "winget repair --id `"$id`" $packageUserFlags"
+                }
             }
             # --- MICROSOFT STORE ---
             elseif ($src -eq "msstore") {
@@ -39654,8 +39678,12 @@ exit /b %WMT_EXIT%
                     $userCmd = $cmd
                 }
                 if ($act -eq "Uninstall") {
-                    $flags = "--accept-source-agreements --accept-package-agreements --disable-interactivity"
-                    $userFlags = "--accept-source-agreements --accept-package-agreements"
+                    $flags = "--accept-source-agreements --disable-interactivity"
+                    $userFlags = "--accept-source-agreements"
+                    if ($providerLogFilesEnabled) {
+                        $flags += " --verbose-logs"
+                        $userFlags += " --verbose-logs"
+                    }
                     $wingetArgs = "uninstall --id `"$id`" --source msstore $flags"
                     $cmd = "winget $wingetArgs"
                     $userCmd = "winget uninstall --id `"$id`" --source msstore $userFlags"
@@ -39964,7 +39992,12 @@ exit /b %WMT_EXIT%
         if ($cmd) {
             Write-Output "LOG:[$act][$index/$total] Starting: $name ($src)..."
             $commandForLog = if (-not [string]::IsNullOrWhiteSpace($displayCmd)) { $displayCmd } else { $cmd }
-            Write-Output "LOG:[$act] Command: $commandForLog"
+            if ($wingetArgs -and -not [string]::IsNullOrWhiteSpace($wingetTranscriptPath)) {
+                Write-Output "LOG:[$act] Running WinGet for: $name"
+            }
+            else {
+                Write-Output "LOG:[$act] Command: $commandForLog"
+            }
 
             # 1. RUN COMMAND (First Attempt - Admin)
             # UX: most package updates run one-by-one in visible windows (auto-close when done),
@@ -40002,18 +40035,11 @@ exit /b %WMT_EXIT%
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
                     $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds
 
-                    # Check if the process crashed or the user manually closed the frozen window
+                    # Normalize a missing/failed visible process result. The final
+                    # result line below reports the failure once, without duplicate chatter.
                     if ($null -eq $p -or $null -eq $p.ExitCode -or $p.ExitCode -ne 0) {
-                        if ($src -eq "msstore" -or $src -eq "gogdl") {
-                            Write-Output "LOG:[$act] $windowTag update window exited with a non-zero code."
-                            $exitCode = if ($p -and $null -ne $p.ExitCode) { $p.ExitCode } else { 1 }
-                            $p = [PSCustomObject]@{ ExitCode = $exitCode }
-                        }
-                        else {
-                            Write-Output "LOG:[$act] $windowTag update window exited with a non-zero code."
-                            $exitCode = if ($p -and $null -ne $p.ExitCode) { $p.ExitCode } else { 1 }
-                            $p = [PSCustomObject]@{ ExitCode = $exitCode }
-                        }
+                        $exitCode = if ($p -and $null -ne $p.ExitCode) { $p.ExitCode } else { 1 }
+                        $p = [PSCustomObject]@{ ExitCode = $exitCode }
                     }
                 }
                 catch {
@@ -40028,12 +40054,7 @@ exit /b %WMT_EXIT%
                 }
 
                 if ($wingetArgs -and -not [string]::IsNullOrWhiteSpace($wingetTranscriptPath)) {
-                    if (Copy-WmtLatestWingetDiagnosticLog -DestinationPath $wingetTranscriptPath -Since $wingetAttemptStartedAt) {
-                        Write-Output "LOG:[Diagnostics] Preserved WinGet verbose diagnostic log: $wingetTranscriptPath"
-                    }
-                    else {
-                        Write-Output "LOG:[Diagnostics] WinGet did not expose a verbose diagnostic file for this visible attempt."
-                    }
+                    [void](Copy-WmtLatestWingetDiagnosticLog -DestinationPath $wingetTranscriptPath -Since $wingetAttemptStartedAt)
                 }
             }
             elseif ($wingetArgs) {
@@ -40081,7 +40102,7 @@ exit /b %WMT_EXIT%
                 $p = $null
                 Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -Result ([ref]$p)
             }
-            Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)"
+            if (-not $wingetArgs) { Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)" }
 
             $hex = "0x{0:x}" -f $p.ExitCode
 
@@ -40148,11 +40169,11 @@ exit /b %WMT_EXIT%
                 if ($ErrorCodes.ContainsKey($hex)) { $errDesc = $ErrorCodes[$hex] }
                 elseif ($ErrorCodes.ContainsKey($dec)) { $errDesc = $ErrorCodes[$dec] }
 
-                if ($wingetInstallerLogPath) {
+                if ($wingetInstallerLogPath -and $hex -ne "0x8a15008e") {
                     Write-WmtInstallerFailureSummary -LogPath $wingetInstallerLogPath -PackageName $name -AttemptLabel "installer"
-                    if (-not [string]::IsNullOrWhiteSpace($wingetTranscriptPath) -and (Test-Path -LiteralPath $wingetTranscriptPath -PathType Leaf)) {
-                        Write-Output "LOG:[Diagnostics] WinGet diagnostic transcript: $wingetTranscriptPath"
-                    }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($wingetTranscriptPath) -and (Test-Path -LiteralPath $wingetTranscriptPath -PathType Leaf)) {
+                    Write-Output "LOG:[Diagnostics] Details saved: $wingetTranscriptPath"
                 }
 
                 # Known non-retry outcomes: avoid opening fallback user-mode consoles.
@@ -40171,8 +40192,7 @@ exit /b %WMT_EXIT%
                     $availableVersionText = ([string]$item.Available).Trim()
                     $versionTransition = if ($currentVersionText -and $availableVersionText) { "$currentVersionText -> $availableVersionText" } else { "current -> available" }
                     Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name ($versionTransition)"
-                    Write-Output "LOG:[WinGet] WinGet blocked the upgrade before launching the new installer because the installer technology changed. No MSI/installer log is expected for this attempt."
-                    Write-Output "LOG:[WinGet] Required migration: uninstall the currently installed package, then install the newer package. WMT will not auto-uninstall it because a failed reinstall could leave the application removed."
+                    Write-Output "LOG:[WinGet] This upgrade requires uninstall + reinstall because the installer technology changed; WMT did not auto-remove the existing install."
                     Write-Output "RESULT:${index}:FAILED:$name"
                     continue
                 }
@@ -40730,10 +40750,15 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 if ($btnWingetUninstall) { $btnWingetUninstall.IsEnabled = $true }
 
                 $nonSuccessCount = $script:WingetProgressSkipped + $script:WingetProgressFailed
-                $shouldRefreshAfterAction = ($script:WingetProgressSuccess -gt 0 -or $nonSuccessCount -eq 0)
+                $completedActionName = ([string]$script:WingetActiveAction).Trim()
+                $verifyUninstallState = ($completedActionName -eq "Uninstall")
+                $shouldRefreshAfterAction = ($script:WingetProgressSuccess -gt 0 -or $nonSuccessCount -eq 0 -or $verifyUninstallState)
 
                 if ($script:WingetProgressSuccess -gt 0) {
                     Write-GuiLog "Action finished. $($script:WingetProgressSuccess) explicit success(es). Refreshing package list..."
+                }
+                elseif ($verifyUninstallState) {
+                    Write-GuiLog "Uninstall finished without confirmed success. Refreshing package list to verify the actual installed state..."
                 }
                 elseif (-not $shouldRefreshAfterAction) {
                     Write-GuiLog "Action finished with no applied updates. Package list was not refreshed."
@@ -40757,7 +40782,7 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 $script:WingetActionStoreUpdateOnly = $false
                 $script:WingetActionForcedTimeout = $false
 
-                # Refresh after successful or silent actions; skipped/failed-only actions keep the current list visible.
+                # Refresh after success, silent completion, or any uninstall attempt. Uninstall exit codes can be imperfect and the visible row must reflect a fresh scan, not optimistic UI state.
                 if ($shouldRefreshAfterAction -and $btnWingetScan) {
                     if (Get-WmtUpdateAutoInstallEnabled) {
                         $script:WmtAutoInstallSuppressNextScan = $true
