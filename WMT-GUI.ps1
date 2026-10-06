@@ -37436,28 +37436,49 @@ $wingetWorkerScript = {
 
         Write-Output "LOG:[Installer] Detailed $AttemptLabel log: $LogPath"
         try {
-            $lines = @(Get-Content -LiteralPath $LogPath -ErrorAction Stop)
-            if ($lines.Count -eq 0) { return }
+            # MSI logs can be very large. Stream the file and keep only a small
+            # rolling window instead of materializing the whole log in memory.
+            $previousLines = [System.Collections.Generic.Queue[string]]::new()
+            $return3Context = [System.Collections.Generic.List[string]]::new()
+            $failureTail = [System.Collections.Generic.List[string]]::new()
+            $captureAfterReturn3 = 0
+            $sawAnyLine = $false
 
-            $return3Index = -1
-            for ($lineIndex = $lines.Count - 1; $lineIndex -ge 0; $lineIndex--) {
-                if ([string]$lines[$lineIndex] -match '(?i)Return value 3') {
-                    $return3Index = $lineIndex
-                    break
+            foreach ($logLine in [System.IO.File]::ReadLines($LogPath)) {
+                $sawAnyLine = $true
+                $lineText = [string]$logLine
+
+                if ($lineText -match '(?i)Return value 3') {
+                    $return3Context.Clear()
+                    foreach ($previousLine in $previousLines.ToArray()) {
+                        [void]$return3Context.Add([string]$previousLine)
+                    }
+                    [void]$return3Context.Add($lineText)
+                    $captureAfterReturn3 = 2
                 }
+                elseif ($captureAfterReturn3 -gt 0) {
+                    [void]$return3Context.Add($lineText)
+                    $captureAfterReturn3--
+                }
+
+                if ($lineText -match '(?i)(error\s+[0-9]{3,5}|installation failed|installer failed|fatal error|exception|customaction.+error|mainenginethread.+returning)') {
+                    [void]$failureTail.Add($lineText)
+                    if ($failureTail.Count -gt 12) { $failureTail.RemoveAt(0) }
+                }
+
+                $previousLines.Enqueue($lineText)
+                while ($previousLines.Count -gt 12) { [void]$previousLines.Dequeue() }
             }
 
+            if (-not $sawAnyLine) { return }
+
             $failureLines = @()
-            if ($return3Index -ge 0) {
-                $startIndex = [Math]::Max(0, $return3Index - 12)
-                $endIndex = [Math]::Min($lines.Count - 1, $return3Index + 2)
-                $failureLines = @($lines[$startIndex..$endIndex])
+            if ($return3Context.Count -gt 0) {
+                $failureLines = @($return3Context.ToArray())
                 Write-Output "LOG:[Installer] MSI failure context for $PackageName (around Return value 3):"
             }
             else {
-                $failureLines = @($lines | Where-Object {
-                        ([string]$_) -match '(?i)(error\s+[0-9]{3,5}|installation failed|installer failed|fatal error|exception|customaction.+error|mainenginethread.+returning)'
-                    } | Select-Object -Last 12)
+                $failureLines = @($failureTail.ToArray())
                 if ($failureLines.Count -gt 0) {
                     Write-Output "LOG:[Installer] Failure indicators found in the $AttemptLabel log for ${PackageName}:"
                 }
@@ -40651,26 +40672,11 @@ $script:ProcessWingetLines = {
                 $script:WingetCurrentPercent = [int]$matches[1]
                 & $script:RefreshWingetProgressUi
             }
-            if ($logMsg -match "^\[[^\]]+\]\[(\d+)/(\d+)\]\s+(SUCCESS|SKIPPED|FAILED|CANCELLED)\b") {
-                $doneIndex = [int]$matches[1]
-                $result = $matches[3]
-                if (-not $script:WingetCompletedIndexes.ContainsKey($doneIndex)) {
-                    $script:WingetCompletedIndexes[$doneIndex] = $true
-                    $script:WingetProgressDone++
-                    if ($result -eq "SUCCESS") {
-                        $script:WingetProgressSuccess++
-                    }
-                    elseif ($result -eq "SKIPPED") {
-                        $script:WingetProgressSkipped++
-                    }
-                    else {
-                        $script:WingetProgressFailed++
-                    }
-                    if ($doneIndex -eq $script:WingetCurrentIndex) { $script:WingetCurrentPercent = 0 }
-                    & $script:SetWingetLastResultUi $result $script:WingetCurrentItemName $doneIndex $script:WingetProgressTotal
-                    & $script:RefreshWingetProgressUi
-                }
-            }
+            # RESULT:<index>:<status>:<name> is the canonical completion
+            # protocol. Do not infer completion from human-readable LOG lines:
+            # those are emitted first and can otherwise consume the index before
+            # RESULT arrives, skipping result-specific behavior such as removing
+            # a successfully uninstalled package from the visible list.
             Write-GuiLog $logMsg
         }
     }
