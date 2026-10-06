@@ -38576,10 +38576,14 @@ exit `$exitCode
             [int]$IdleTimeoutSeconds = 0,
             [string]$ActivityProcessNamePattern = "",
             [string]$CommandLabel = "Command",
+            [string]$TranscriptPath = "",
             [ref]$Result
         )
 
         $Result.Value = $null
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "COMMAND: $Command"
+        }
 
         $pInfo = New-Object System.Diagnostics.ProcessStartInfo
         $pInfo.FileName = "powershell.exe"
@@ -38600,9 +38604,13 @@ exit `$exitCode
             )
 
             if ([string]::IsNullOrWhiteSpace($Text)) { return }
+            $transcriptPrefix = if ($Prefix -eq "!") { "STDERR:" } else { "STDOUT:" }
             foreach ($line in @($Text -split "\r\n|\r|\n")) {
                 $trimmed = ([string]$line).Trim()
                 if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+                    if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                        Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "$transcriptPrefix $trimmed"
+                    }
                     Write-Output "LOG:  $Prefix $trimmed"
                 }
             }
@@ -38713,8 +38721,14 @@ exit `$exitCode
         }
 
         if ($timedOut) {
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: 124 ($timeoutReason)"
+            }
             $Result.Value = [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = $timeoutReason }
             return
+        }
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $($proc.ExitCode)"
         }
         $Result.Value = $proc
     }
@@ -38724,20 +38738,41 @@ exit `$exitCode
     function Invoke-WmtPipDirect {
         param(
             [string]$PythonPath,
-            [object[]]$ArgumentList
+            [object[]]$ArgumentList,
+            [string]$TranscriptPath = ""
         )
 
         if ([string]::IsNullOrWhiteSpace($PythonPath)) { $PythonPath = "python.exe" }
+        $displayArgs = @($ArgumentList | ForEach-Object {
+                $argText = [string]$_
+                if ($argText -match '[\s"]') { '"' + $argText.Replace('"', '\"') + '"' } else { $argText }
+            }) -join " "
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "COMMAND: $PythonPath $displayArgs"
+        }
         try {
             $outputLines = @(& $PythonPath @ArgumentList 2>&1)
             $exitCode = $LASTEXITCODE
+            $normalizedExit = if ($null -eq $exitCode) { 1 } else { [int]$exitCode }
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                foreach ($outputLine in @($outputLines)) {
+                    if ($null -ne $outputLine -and -not [string]::IsNullOrWhiteSpace([string]$outputLine)) {
+                        Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text ("OUTPUT: " + [string]$outputLine)
+                    }
+                }
+                Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $normalizedExit"
+            }
             return [PSCustomObject]@{
-                ExitCode    = if ($null -eq $exitCode) { 1 } else { [int]$exitCode }
+                ExitCode    = $normalizedExit
                 OutputLines = @($outputLines | ForEach-Object { $_.ToString() })
                 TimedOut    = $false
             }
         }
         catch {
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text ("ERROR: " + $_.Exception.Message)
+                Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: 1"
+            }
             return [PSCustomObject]@{
                 ExitCode    = 1
                 OutputLines = @($_.Exception.Message)
@@ -40589,7 +40624,7 @@ exit /b %WMT_EXIT%
             }
             elseif ($pipArguments) {
                 Write-Output "LOG:[$act] Running pip directly with $pythonExePath..."
-                $p = Invoke-WmtPipDirect -PythonPath $pythonExePath -ArgumentList $pipArguments
+                $p = Invoke-WmtPipDirect -PythonPath $pythonExePath -ArgumentList $pipArguments -TranscriptPath $providerTranscriptPath
                 foreach ($pipLine in @($p.OutputLines)) {
                     if (-not [string]::IsNullOrWhiteSpace([string]$pipLine)) {
                         Write-Output "LOG:  > $pipLine"
@@ -40611,7 +40646,8 @@ exit /b %WMT_EXIT%
                     Write-Output "LOG:[$src] Inactivity watchdog enabled: stop after $idleMinutes minutes without downloader CPU or I/O activity."
                 }
                 $p = $null
-                Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -Result ([ref]$p)
+                $headlessTranscriptPath = if ($srcKey -eq "legendary") { "" } else { $providerTranscriptPath }
+                Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -TranscriptPath $headlessTranscriptPath -Result ([ref]$p)
             }
             if (-not $wingetArgs) { Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)" }
             if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
