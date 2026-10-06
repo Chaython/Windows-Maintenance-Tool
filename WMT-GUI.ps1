@@ -57167,6 +57167,33 @@ $btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
 return $result.Value
 }
 
+function New-WmtGogdlOperationLogPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$Action
+)
+
+try {
+    $settings = Get-WmtSettings
+    if (-not (Get-WmtProviderToggle -Settings $settings -ProviderKey "gogdl" -ToggleName "Logs")) { return "" }
+
+    $root = Join-Path (Get-DataPath) "package-install-logs"
+    try { [void][System.IO.Directory]::CreateDirectory($root) }
+    catch {
+        $root = Join-Path $env:TEMP "WMT-PackageInstallLogs"
+        try { [void][System.IO.Directory]::CreateDirectory($root) } catch { return "" }
+    }
+
+    $safeId = ([string]$Id -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeId)) { $safeId = "package" }
+    $safeAction = ([string]$Action -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeAction)) { $safeAction = "Action" }
+    $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+    return (Join-Path $root "$stamp-$safeAction-$safeId-gogdl.log")
+}
+catch { return "" }
+}
+
 function Start-WmtGogdlLibraryDownload {
 param(
     [Parameter(Mandatory = $true)][string]$Name,
@@ -57231,9 +57258,11 @@ if (-not (Test-Path -LiteralPath $launcherDir -PathType Container)) {
     [void][System.IO.Directory]::CreateDirectory($launcherDir)
 }
 $resultPath = Join-Path $launcherDir ("gogdl-result-{0}-{1}.txt" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
+$logPath = New-WmtGogdlOperationLogPath -Id $Id -Action "Install"
 
 $exeLiteral = ConvertTo-WmtPsSingleQuotedLiteral $GogdlExe
 $resultLiteral = ConvertTo-WmtPsSingleQuotedLiteral $resultPath
+$logLiteral = ConvertTo-WmtPsSingleQuotedLiteral $logPath
 $argumentLiterals = @($gogArgs | ForEach-Object { ConvertTo-WmtPsSingleQuotedLiteral ([string]$_) })
 $argumentsLiteral = $argumentLiterals -join ", "
 $titleLiteral = ConvertTo-WmtPsSingleQuotedLiteral ("WMT GOGDL - " + $Name)
@@ -57245,8 +57274,29 @@ try { `$Host.UI.RawUI.WindowTitle = $titleLiteral } catch {}
 `$exe = $exeLiteral
 `$arguments = @($argumentsLiteral)
 `$resultPath = $resultLiteral
-& `$exe @arguments
+`$logPath = $logLiteral
+if (-not [string]::IsNullOrWhiteSpace(`$logPath)) {
+    try {
+        `$header = "[" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") + "] COMMAND: " + `$exe + " " + (`$arguments -join " ") + [Environment]::NewLine
+        [System.IO.File]::WriteAllText(`$logPath, `$header, [System.Text.UTF8Encoding]::new(`$false))
+    }
+    catch {}
+    & `$exe @arguments 2>&1 | Tee-Object -FilePath `$logPath -Append | ForEach-Object { Write-Host `$_ }
+}
+else {
+    & `$exe @arguments
+}
 `$exitCode = if (`$null -eq `$LASTEXITCODE) { 1 } else { [int]`$LASTEXITCODE }
+if (-not [string]::IsNullOrWhiteSpace(`$logPath)) {
+    try {
+        [System.IO.File]::AppendAllText(
+            `$logPath,
+            ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), `$exitCode, [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new(`$false)
+        )
+    }
+    catch {}
+}
 try { [System.IO.File]::WriteAllText(`$resultPath, [string]`$exitCode, [System.Text.UTF8Encoding]::new(`$false)) } catch {}
 if (`$exitCode -ne 0) {
     Write-Host ""
@@ -57269,6 +57319,7 @@ $procStartUtcTicks = [int64]0
 try { $procStartUtcTicks = [int64]$proc.StartTime.ToUniversalTime().Ticks } catch {}
 Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootPath) -InstallPath $expectedInstallPath -Status Pending -ProcessId $proc.Id -ProcessStartUtcTicks $procStartUtcTicks
 Write-GuiLog "Starting GOGDL download for: $Name (id $Id) -> $($Options.RootPath) | language=$($Options.Language) | workers=$($Options.Workers) | build=$(if ($Options.BuildId) { $Options.BuildId } else { 'default' }) | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
+if (-not [string]::IsNullOrWhiteSpace($logPath)) { Write-GuiLog "[Diagnostics] GOGDL install log: $logPath" }
 
 $procRef = $proc
 $resultRef = $resultPath
