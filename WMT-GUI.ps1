@@ -37600,11 +37600,15 @@ $wingetWorkerScript = {
     $script:WmtActiveProviderTranscriptPath = ""
 
     function Write-WmtWorkerOutputItem {
-        param($Value)
+        param(
+            $Value,
+            [switch]$SkipTranscriptMirror
+        )
 
         if ($null -eq $Value) { return }
         $activeTranscript = ([string]$script:WmtActiveProviderTranscriptPath).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($activeTranscript) -and
+        if (-not $SkipTranscriptMirror -and
+            -not [string]::IsNullOrWhiteSpace($activeTranscript) -and
             $Value -is [string] -and ([string]$Value) -like "LOG:*") {
             try {
                 [System.IO.File]::AppendAllText(
@@ -38577,6 +38581,7 @@ exit `$exitCode
             [string]$ActivityProcessNamePattern = "",
             [string]$CommandLabel = "Command",
             [string]$TranscriptPath = "",
+            [switch]$SuppressActiveTranscriptMirror,
             [ref]$Result
         )
 
@@ -38611,7 +38616,8 @@ exit `$exitCode
                     if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
                         Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "$transcriptPrefix $trimmed"
                     }
-                    Write-Output "LOG:  $Prefix $trimmed"
+                    $skipTranscriptMirror = (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) -or [bool]$SuppressActiveTranscriptMirror
+                    Write-WmtWorkerOutputItem -Value "LOG:  $Prefix $trimmed" -SkipTranscriptMirror:$skipTranscriptMirror
                 }
             }
         }
@@ -38825,7 +38831,7 @@ exit `$exitCode
                 $pct = [int]$matches[1]
                 if ($pct -ne $State.LastPct) {
                     $State.LastPct = $pct
-                    Write-Output "LOG:  [winget] Progress: $pct%"
+                    Write-WmtWorkerOutputItem -Value "LOG:  [winget] Progress: $pct%" -SkipTranscriptMirror:(-not [string]::IsNullOrWhiteSpace($TranscriptPath))
                 }
                 return
             }
@@ -38839,7 +38845,7 @@ exit `$exitCode
                     ($trimmed -match '(?i)(error|failed|failure|not recognized|not found|no installed package|no package found|successfully|cancelled|canceled|reboot|required|requires|resources.+in use|another installation|hash mismatch)')
                 if ($showInActivity) {
                     $prefix = if ($IsError) { "!" } else { ">" }
-                    Write-Output "LOG:  $prefix $trimmed"
+                    Write-WmtWorkerOutputItem -Value "LOG:  $prefix $trimmed" -SkipTranscriptMirror:(-not [string]::IsNullOrWhiteSpace($TranscriptPath))
                 }
             }
         }
@@ -39983,6 +39989,7 @@ exit /b %WMT_EXIT%
         $userCmd = ""
         $displayCmd = ""
         $isCustomUpdateCommand = $false
+        $commandOwnsProviderTranscript = $false
         $pipArguments = $null
         $wingetArgs = $null
         $wingetArgsWithoutInstallerLog = $null
@@ -40314,9 +40321,10 @@ exit /b %WMT_EXIT%
                         $idPs = ([string]$id).Replace("'", "''")
                         $logPs = ([string]$providerTranscriptPath).Replace("'", "''")
                         $legendaryArgsText = if ($act -eq "Update") { $legendaryGlobalArgs + " -y update '" + $idPs + "' --update-only " + $legendaryHeadlessArgs } else { $legendaryGlobalArgs + " -y uninstall '" + $idPs + "'" }
-                        $loggedScript = "& '" + $exePs + "' " + $legendaryArgsText + " 2>&1 | Tee-Object -FilePath '" + $logPs + "' -Append | ForEach-Object { Write-Host `$_ }; `$wmtLegendaryExit = `$LASTEXITCODE; exit `$wmtLegendaryExit"
+                        $loggedScript = "& '" + $exePs + "' " + $legendaryArgsText + " 2>&1 | Tee-Object -FilePath '" + $logPs + "' -Append | ForEach-Object { Write-Host `$_ }; `$wmtLegendaryExit = if (`$null -eq `$LASTEXITCODE) { 1 } else { [int]`$LASTEXITCODE }; try { [System.IO.File]::AppendAllText('" + $logPs + "', ('[' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff') + '] EXIT: ' + `$wmtLegendaryExit + [Environment]::NewLine), [System.Text.UTF8Encoding]::new(`$false)) } catch {}; exit `$wmtLegendaryExit"
                         $encodedLoggedScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loggedScript))
                         $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLoggedScript"
+                        $commandOwnsProviderTranscript = $true
                     }
                 }
                 $userCmd = $cmd
@@ -40627,7 +40635,7 @@ exit /b %WMT_EXIT%
                 $p = Invoke-WmtPipDirect -PythonPath $pythonExePath -ArgumentList $pipArguments -TranscriptPath $providerTranscriptPath
                 foreach ($pipLine in @($p.OutputLines)) {
                     if (-not [string]::IsNullOrWhiteSpace([string]$pipLine)) {
-                        Write-Output "LOG:  > $pipLine"
+                        Write-WmtWorkerOutputItem -Value "LOG:  > $pipLine" -SkipTranscriptMirror:(-not [string]::IsNullOrWhiteSpace($providerTranscriptPath))
                     }
                 }
             }
@@ -40646,8 +40654,8 @@ exit /b %WMT_EXIT%
                     Write-Output "LOG:[$src] Inactivity watchdog enabled: stop after $idleMinutes minutes without downloader CPU or I/O activity."
                 }
                 $p = $null
-                $headlessTranscriptPath = if ($srcKey -eq "legendary") { "" } else { $providerTranscriptPath }
-                Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -TranscriptPath $headlessTranscriptPath -Result ([ref]$p)
+                $headlessTranscriptPath = if ($commandOwnsProviderTranscript) { "" } else { $providerTranscriptPath }
+                Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -TranscriptPath $headlessTranscriptPath -SuppressActiveTranscriptMirror:$commandOwnsProviderTranscript -Result ([ref]$p)
             }
             if (-not $wingetArgs) { Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)" }
             if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
@@ -56716,6 +56724,16 @@ if ($exitCode -eq 0 -and $dlcs.Count -gt 0) {
     }
 }
 
+if (-not [string]::IsNullOrWhiteSpace($logPath)) {
+    try {
+        [System.IO.File]::AppendAllText(
+            $logPath,
+            ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), $exitCode, [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    } catch {}
+}
+
 $installPath = ""
 if ($exitCode -eq 0) {
     try {
@@ -58157,6 +58175,13 @@ try {
 } catch {}
 & $exe -y uninstall $appId 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
 $exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+try {
+    [System.IO.File]::AppendAllText(
+        $logPath,
+        ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), $exitCode, [Environment]::NewLine),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+} catch {}
 exit $exitCode
 '@
                     $uninstallScript = $uninstallTemplate.Replace("__EXE__", $exeLiteral).Replace("__APP__", $idLiteral).Replace("__LOG__", $logLiteral)
