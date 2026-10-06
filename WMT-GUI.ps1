@@ -30656,9 +30656,16 @@ powercfg /S SCHEME_CURRENT | Out-Null
                                              Padding="0" Margin="0" FontSize="11"
                                              Foreground="{DynamicResource TextMuted}"
                                              CaretBrush="{DynamicResource TextPrimary}" SelectionBrush="{DynamicResource Accent}"/>
-                                    <Button Name="btnLogClearSearch" Grid.Column="2" Content="X" Width="20" Height="20" Margin="0,0,4,0"
-                                            VerticalAlignment="Center" Visibility="Collapsed" ToolTip="Clear log search"
-                                            Style="{StaticResource SearchClearBtnStyle}"/>
+                                    <Button Name="btnLogClearSearch" Grid.Column="2" Width="20" Height="20" Margin="0,0,4,0"
+                                            VerticalAlignment="Center" HorizontalAlignment="Center"
+                                            Visibility="Collapsed" ToolTip="Clear log search"
+                                            Style="{StaticResource SearchClearBtnStyle}">
+                                        <Path Data="M2,2 L8,8 M8,2 L2,8"
+                                              Stroke="{DynamicResource TextMuted}" StrokeThickness="1.6"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              Width="10" Height="10" Stretch="Uniform"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Button>
                                 </Grid>
                             </Border>
                         </Grid>
