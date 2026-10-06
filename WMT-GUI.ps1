@@ -37230,11 +37230,19 @@ try {
     if ($resolvedPython.Source) { $pythonExePath = [string]$resolvedPython.Source }
 }
 catch {}
+$packageInstallLogRoot = Join-Path (Get-DataPath) "package-install-logs"
+try { [void][System.IO.Directory]::CreateDirectory($packageInstallLogRoot) }
+catch {
+    $packageInstallLogRoot = Join-Path $env:TEMP "WMT-PackageInstallLogs"
+    try { [void][System.IO.Directory]::CreateDirectory($packageInstallLogRoot) } catch {}
+}
+
 $jobArgs = @{
     Items                      = $uniqueItems
     ActionName                 = $ActionName
     CmdTemplate                = $CmdTemplate
     TempPath                   = $env:TEMP
+    PackageInstallLogRoot      = $packageInstallLogRoot
     WingetIncludeUnknown       = $wingetIncludeUnknown
     SilentUpdateInstallEnabled = [bool](Get-WmtUpdateSilentInstallEnabled)
     PythonExePath              = $pythonExePath
@@ -37271,6 +37279,7 @@ $wingetWorkerScript = {
     $act = $ArgsDict.ActionName
     $tmpl = $ArgsDict.CmdTemplate
     $temp = $ArgsDict.TempPath
+    $packageInstallLogRoot = [string]$ArgsDict.PackageInstallLogRoot
     $wingetIncludeUnknown = [bool]$ArgsDict.WingetIncludeUnknown
     $silentUpdateInstallEnabled = [bool]$ArgsDict.SilentUpdateInstallEnabled
     $pythonExePath = [string]$ArgsDict.PythonExePath
@@ -37299,6 +37308,100 @@ $wingetWorkerScript = {
         "0x80070490" = "Element Not Found"; "0x80072ee7" = "DNS Lookup Fail"; "0x80072f8f" = "SSL Cert Error"
         "0x80073d02" = "Resources Currently In Use"; "-2147009278" = "Resources Currently In Use"; "2147958018" = "Resources Currently In Use"
         "1603" = "Fatal MSI Error"
+    }
+
+    function New-WmtPackageDiagnosticStem {
+        param(
+            [string]$PackageId,
+            [string]$ActionLabel
+        )
+
+        $root = ([string]$packageInstallLogRoot).Trim()
+        if ([string]::IsNullOrWhiteSpace($root)) { $root = Join-Path $temp "WMT-PackageInstallLogs" }
+        try { [void][System.IO.Directory]::CreateDirectory($root) }
+        catch {
+            $root = Join-Path $temp "WMT-PackageInstallLogs"
+            try { [void][System.IO.Directory]::CreateDirectory($root) } catch {}
+        }
+
+        $safeId = ([string]$PackageId -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+        if ([string]::IsNullOrWhiteSpace($safeId)) { $safeId = "package" }
+        $safeAction = ([string]$ActionLabel -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+        if ([string]::IsNullOrWhiteSpace($safeAction)) { $safeAction = "action" }
+        $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+        return (Join-Path $root "$stamp-$safeAction-$safeId")
+    }
+
+    function Add-WmtPackageTranscriptLine {
+        param(
+            [string]$Path,
+            [string]$Text
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Path) -or $null -eq $Text) { return }
+        try {
+            [System.IO.File]::AppendAllText(
+                $Path,
+                ("[{0}] {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), [string]$Text, [Environment]::NewLine),
+                [System.Text.UTF8Encoding]::new($false)
+            )
+        }
+        catch {}
+    }
+
+    function Write-WmtInstallerFailureSummary {
+        param(
+            [string]$LogPath,
+            [string]$PackageName,
+            [string]$AttemptLabel = "installer"
+        )
+
+        if ([string]::IsNullOrWhiteSpace($LogPath)) { return }
+        if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+            Write-Output "LOG:[Installer] No $AttemptLabel log was produced at: $LogPath"
+            return
+        }
+
+        Write-Output "LOG:[Installer] Detailed $AttemptLabel log: $LogPath"
+        try {
+            $lines = @(Get-Content -LiteralPath $LogPath -ErrorAction Stop)
+            if ($lines.Count -eq 0) { return }
+
+            $return3Index = -1
+            for ($lineIndex = $lines.Count - 1; $lineIndex -ge 0; $lineIndex--) {
+                if ([string]$lines[$lineIndex] -match '(?i)Return value 3') {
+                    $return3Index = $lineIndex
+                    break
+                }
+            }
+
+            $failureLines = @()
+            if ($return3Index -ge 0) {
+                $startIndex = [Math]::Max(0, $return3Index - 12)
+                $endIndex = [Math]::Min($lines.Count - 1, $return3Index + 2)
+                $failureLines = @($lines[$startIndex..$endIndex])
+                Write-Output "LOG:[Installer] MSI failure context for $PackageName (around Return value 3):"
+            }
+            else {
+                $failureLines = @($lines | Where-Object {
+                        ([string]$_) -match '(?i)(error\s+[0-9]{3,5}|installation failed|installer failed|fatal error|exception|customaction.+error|mainenginethread.+returning)'
+                    } | Select-Object -Last 12)
+                if ($failureLines.Count -gt 0) {
+                    Write-Output "LOG:[Installer] Failure indicators found in the $AttemptLabel log for $PackageName:"
+                }
+            }
+
+            foreach ($failureLine in @($failureLines)) {
+                $text = ([string]$failureLine).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($text)) {
+                    if ($text.Length -gt 700) { $text = $text.Substring(0, 700) + "..." }
+                    Write-Output "LOG:  [installer] $text"
+                }
+            }
+        }
+        catch {
+            Write-Output "LOG:[Installer] Could not summarize $AttemptLabel log: $($_.Exception.Message)"
+        }
     }
 
     function Test-WmtStoreUpdateScanPreferredItem {
@@ -38161,8 +38264,13 @@ $wingetWorkerScript = {
         param(
             [string]$ArgsLine,
             [int]$TimeoutSeconds = 7200,
-            [int]$IdleTimeoutSeconds = 900
+            [int]$IdleTimeoutSeconds = 900,
+            [string]$TranscriptPath = ""
         )
+
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "COMMAND: winget $ArgsLine"
+        }
 
         $pInfo = New-Object System.Diagnostics.ProcessStartInfo
         $pInfo.FileName = "winget"
@@ -38186,6 +38294,10 @@ $wingetWorkerScript = {
             $trimmed = ([string]$Line).Trim()
             $State.MeaningfulActivity = $false
             if ([string]::IsNullOrWhiteSpace($trimmed)) { return }
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                $transcriptPrefix = if ($IsError) { "STDERR:" } else { "STDOUT:" }
+                Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "$transcriptPrefix $trimmed"
+            }
             if ($trimmed -match '^[-\\|/]$') { return }
             $State.MeaningfulActivity = $true
             if ($trimmed -match "(\d+)%") {
@@ -38294,7 +38406,13 @@ $wingetWorkerScript = {
         }
 
         if ($timedOut) {
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: timed out ($timeoutReason)"
+            }
             return [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = $timeoutReason }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $($proc.ExitCode)"
         }
         return $proc
     }
@@ -39317,6 +39435,11 @@ exit /b %WMT_EXIT%
         $isCustomUpdateCommand = $false
         $pipArguments = $null
         $wingetArgs = $null
+        $wingetArgsWithoutInstallerLog = $null
+        $wingetUserCmdWithoutInstallerLog = $null
+        $wingetTranscriptPath = ""
+        $wingetInstallerLogPath = ""
+        $wingetRetryInstallerLogPath = ""
         $storeCliArgs = $null
         $windowsUpdateItem = $null
         $storeForceUpdateScan = $false
@@ -39378,11 +39501,32 @@ exit /b %WMT_EXIT%
         else {
             # --- WINGET ---
             if ($src -eq "winget") {
-                $flags = "--accept-source-agreements --accept-package-agreements --disable-interactivity"
-                $userFlags = "--accept-source-agreements --accept-package-agreements"
+                $flags = "--accept-source-agreements --accept-package-agreements --disable-interactivity --verbose-logs"
+                $userFlags = "--accept-source-agreements --accept-package-agreements --verbose-logs"
                 $includeUnknownFlag = if ($wingetIncludeUnknown) { " --include-unknown" } else { "" }
-                if ($act -eq "Install") { $wingetArgs = "install --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget install --id `"$id`" $userFlags" }
-                if ($act -eq "Update") { $wingetArgs = "upgrade --id `"$id`"$includeUnknownFlag $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget upgrade --id `"$id`"$includeUnknownFlag $userFlags" }
+
+                if ($act -in @("Install", "Update")) {
+                    $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
+                    $wingetTranscriptPath = "$diagnosticStem-winget.log"
+                    $wingetInstallerLogPath = "$diagnosticStem-installer.log"
+                    $wingetRetryInstallerLogPath = "$diagnosticStem-retry-installer.log"
+                    Write-Output "LOG:[Diagnostics] Package logs for $name will be written under: $(Split-Path -Parent $diagnosticStem)"
+                }
+
+                if ($act -eq "Install") {
+                    $wingetArgsWithoutInstallerLog = "install --id `"$id`" $flags"
+                    $wingetUserCmdWithoutInstallerLog = "winget install --id `"$id`" $userFlags"
+                    $wingetArgs = if ($wingetInstallerLogPath) { "$wingetArgsWithoutInstallerLog --log `"$wingetInstallerLogPath`"" } else { $wingetArgsWithoutInstallerLog }
+                    $cmd = "winget $wingetArgs"
+                    $userCmd = if ($wingetRetryInstallerLogPath) { "$wingetUserCmdWithoutInstallerLog --log `"$wingetRetryInstallerLogPath`"" } else { $wingetUserCmdWithoutInstallerLog }
+                }
+                if ($act -eq "Update") {
+                    $wingetArgsWithoutInstallerLog = "upgrade --id `"$id`"$includeUnknownFlag $flags"
+                    $wingetUserCmdWithoutInstallerLog = "winget upgrade --id `"$id`"$includeUnknownFlag $userFlags"
+                    $wingetArgs = if ($wingetInstallerLogPath) { "$wingetArgsWithoutInstallerLog --log `"$wingetInstallerLogPath`"" } else { $wingetArgsWithoutInstallerLog }
+                    $cmd = "winget $wingetArgs"
+                    $userCmd = if ($wingetRetryInstallerLogPath) { "$wingetUserCmdWithoutInstallerLog --log `"$wingetRetryInstallerLogPath`"" } else { $wingetUserCmdWithoutInstallerLog }
+                }
                 if ($act -eq "Uninstall") { $wingetArgs = "uninstall --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget uninstall --id `"$id`" $userFlags" }
                 if ($act -eq "Repair") { $wingetArgs = "repair --id `"$id`" $flags"; $cmd = "winget $wingetArgs"; $userCmd = "winget repair --id `"$id`" $userFlags" }
             }
@@ -39807,7 +39951,7 @@ exit /b %WMT_EXIT%
             }
             elseif ($wingetArgs) {
                 Write-Output "LOG:[$act] Running winget with live output..."
-                $p = Invoke-WingetLive $wingetArgs
+                $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
             }
             elseif ($storeForceUpdateScan) {
                 $p = Invoke-WmtStoreAppUpdateScan -PackageName $name
@@ -39854,6 +39998,24 @@ exit /b %WMT_EXIT%
 
             $hex = "0x{0:x}" -f $p.ExitCode
 
+            # Some manifests explicitly mark --log unsupported. Do not turn
+            # diagnostics into a new install failure: if WinGet rejects the
+            # logging option itself, retry once without --log while preserving
+            # WinGet verbose diagnostics and the WMT transcript.
+            if ($wingetArgsWithoutInstallerLog -and $wingetInstallerLogPath -and $hex -eq "0x8a150001") {
+                Write-Output "LOG:[Diagnostics] WinGet rejected the installer --log option for $name. Retrying without --log."
+                $wingetArgs = $wingetArgsWithoutInstallerLog
+                $cmd = "winget $wingetArgs"
+                $userCmd = $wingetUserCmdWithoutInstallerLog
+                if ($useVisibleWindow) {
+                    $p = Invoke-VisibleCmd $cmd "WMT Winget Retry Without Installer Log - $name"
+                }
+                else {
+                    $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
+                }
+                $hex = "0x{0:x}" -f $p.ExitCode
+            }
+
             # --- AUTO-FIX: SOURCE CORRUPTION ---
             if ($wingetArgs -and $hex -eq "0x8a150003") {
                 Write-Output "LOG:[$act] WARNING: Detected Winget Source Corruption. Auto-fixing..."
@@ -39867,7 +40029,7 @@ exit /b %WMT_EXIT%
                             $p = Invoke-VisibleCmd $retryCmd "WMT Winget Retry - $name"
                         }
                         else {
-                            $p = Invoke-WingetLive $wingetArgs
+                            $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
                         }
                     }
                     else {
@@ -39898,6 +40060,13 @@ exit /b %WMT_EXIT%
 
                 if ($ErrorCodes.ContainsKey($hex)) { $errDesc = $ErrorCodes[$hex] }
                 elseif ($ErrorCodes.ContainsKey($dec)) { $errDesc = $ErrorCodes[$dec] }
+
+                if ($wingetInstallerLogPath) {
+                    Write-WmtInstallerFailureSummary -LogPath $wingetInstallerLogPath -PackageName $name -AttemptLabel "installer"
+                    if (-not [string]::IsNullOrWhiteSpace($wingetTranscriptPath)) {
+                        Write-Output "LOG:[Diagnostics] WinGet stdout/stderr transcript: $wingetTranscriptPath"
+                    }
+                }
 
                 # Known non-retry outcomes: avoid opening fallback user-mode consoles.
                 if ($hex -eq "0x8a150006") {
@@ -39992,6 +40161,9 @@ exit /b %WMT_EXIT%
                     if ($ErrorCodes.ContainsKey($retryHex)) { $retryDescription = $ErrorCodes[$retryHex] }
                     elseif ($ErrorCodes.ContainsKey("$($retryResult.ExitCode)")) { $retryDescription = $ErrorCodes["$($retryResult.ExitCode)"] }
                     Write-Output "LOG:[$act][$index/$total] FAILED [$retryHex] ${retryDescription} - $name (user-mode retry)"
+                    if ($wingetRetryInstallerLogPath) {
+                        Write-WmtInstallerFailureSummary -LogPath $wingetRetryInstallerLogPath -PackageName $name -AttemptLabel "user-mode retry installer"
+                    }
                     Write-Output "RESULT:${index}:FAILED:$name"
                 }
             }
