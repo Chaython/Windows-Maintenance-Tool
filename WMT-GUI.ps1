@@ -30632,8 +30632,36 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
-                    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" CornerRadius="8,8,0,0" Padding="12,8" BorderThickness="0">
-                        <TextBlock Text="Activity Log" FontSize="11" Foreground="{DynamicResource TextMuted}" FontWeight="SemiBold"/>
+                    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" CornerRadius="8,8,0,0" Padding="12,6" BorderThickness="0">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Activity Log" FontSize="11" Foreground="{DynamicResource TextMuted}" FontWeight="SemiBold"
+                                       VerticalAlignment="Center"/>
+                            <Border Name="bdLogSearch" Grid.Column="1" Style="{StaticResource ModernSearchBoxStyle}"
+                                    Width="170" Height="28" Margin="10,0,0,0" VerticalAlignment="Center">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Path Grid.Column="0" Data="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"
+                                          Fill="{DynamicResource TextMuted}" Stretch="Uniform" Height="11" Width="11"
+                                          VerticalAlignment="Center" Margin="8,0,4,0"/>
+                                    <TextBox Name="txtLogSearch" Grid.Column="1" Height="26" Text="Search log..."
+                                             VerticalContentAlignment="Center" Background="Transparent" BorderThickness="0"
+                                             Padding="0" Margin="0" FontSize="11"
+                                             Foreground="{DynamicResource TextMuted}"
+                                             CaretBrush="{DynamicResource TextPrimary}" SelectionBrush="{DynamicResource Accent}"/>
+                                    <Button Name="btnLogClearSearch" Grid.Column="2" Content="X" Width="20" Height="20" Margin="0,0,4,0"
+                                            VerticalAlignment="Center" Visibility="Collapsed" ToolTip="Clear log search"
+                                            Style="{StaticResource SearchClearBtnStyle}"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
                     </Border>
                     <ScrollViewer Name="svLog" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="8" UseLayoutRounding="True" VerticalAlignment="Stretch">
                         <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas, monospace" FontSize="12" 
@@ -32516,6 +32544,120 @@ param([System.Windows.Controls.TextBox]$TextBox)
 if (-not $TextBox) { return }
 $resourceKey = if ($TextBox.Text -eq $script:QuickFindPlaceholder) { "TextMuted" } else { "TextPrimary" }
 $TextBox.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, $resourceKey)
+}
+
+function Set-WmtLogSearchForeground {
+param([System.Windows.Controls.TextBox]$TextBox)
+
+if (-not $TextBox) { return }
+$resourceKey = if ($TextBox.Text -eq $script:LogSearchPlaceholder) { "TextMuted" } else { "TextPrimary" }
+$TextBox.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, $resourceKey)
+}
+
+function Select-WmtActivityLogMatch {
+param(
+    [string]$Query,
+    [switch]$Previous,
+    [switch]$Restart
+)
+
+if (-not $script:LogBox -or [string]::IsNullOrWhiteSpace($Query)) { return $false }
+$text = [string]$script:LogBox.Text
+if ([string]::IsNullOrEmpty($text)) { return $false }
+
+$comparison = [System.StringComparison]::OrdinalIgnoreCase
+$index = -1
+if ($Previous) {
+    $start = if ($Restart) { $text.Length - 1 } else { [Math]::Min($text.Length - 1, [Math]::Max(0, $script:LogBox.SelectionStart - 1)) }
+    if ($start -ge 0) { $index = $text.LastIndexOf($Query, $start, $comparison) }
+    if ($index -lt 0 -and -not $Restart) { $index = $text.LastIndexOf($Query, $text.Length - 1, $comparison) }
+}
+else {
+    $start = if ($Restart) { 0 } else { [Math]::Min($text.Length, $script:LogBox.SelectionStart + $script:LogBox.SelectionLength) }
+    $index = $text.IndexOf($Query, $start, $comparison)
+    if ($index -lt 0 -and -not $Restart -and $start -gt 0) { $index = $text.IndexOf($Query, 0, $comparison) }
+}
+
+if ($index -lt 0) { return $false }
+$script:LogBox.Select($index, $Query.Length)
+try {
+    $lineIndex = $script:LogBox.GetLineIndexFromCharacterIndex($index)
+    if ($lineIndex -ge 0) { $script:LogBox.ScrollToLine($lineIndex) }
+}
+catch {}
+return $true
+}
+
+function Get-WmtActivityLogReferenceAtPoint {
+param(
+    [System.Windows.Controls.TextBox]$TextBox,
+    [System.Windows.Point]$Point
+)
+
+if (-not $TextBox) { return $null }
+$charIndex = $TextBox.GetCharacterIndexFromPoint($Point, $true)
+if ($charIndex -lt 0) { return $null }
+
+$lineIndex = $TextBox.GetLineIndexFromCharacterIndex($charIndex)
+if ($lineIndex -lt 0) { return $null }
+$lineStart = $TextBox.GetCharacterIndexFromLineIndex($lineIndex)
+$lineText = [string]$TextBox.GetLineText($lineIndex)
+if ([string]::IsNullOrWhiteSpace($lineText)) { return $null }
+$column = [Math]::Max(0, $charIndex - $lineStart)
+
+# Web/file URIs are unambiguous and can be opened directly.
+$uriMatches = [regex]::Matches($lineText, '(?i)\b(?:https?|file)://[^\s<>"'']+')
+foreach ($match in $uriMatches) {
+    $target = ([string]$match.Value).TrimEnd('.', ',', ';', ':', ')', ']', '}')
+    $targetLength = $target.Length
+    if ($column -ge $match.Index -and $column -lt ($match.Index + $targetLength)) {
+        return [PSCustomObject]@{ Kind = "Uri"; Target = $target }
+    }
+}
+
+# For Windows/UNC paths, start with the rest of the line and progressively
+# trim trailing descriptive text until an existing file/folder remains.
+$pathMatches = [regex]::Matches($lineText, '(?i)(?:[A-Z]:\\|\\\\)[^<>"\r\n|?*]+')
+foreach ($match in $pathMatches) {
+    if ($column -lt $match.Index -or $column -ge ($match.Index + $match.Length)) { continue }
+    $raw = ([string]$match.Value).Trim()
+    $relativeColumn = [Math]::Max(0, $column - $match.Index)
+    for ($length = $raw.Length; $length -gt $relativeColumn; $length--) {
+        $candidate = $raw.Substring(0, $length).Trim().TrimEnd(')', ']', '}', ',', ';', '.')
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        try {
+            if (Test-Path -LiteralPath $candidate) {
+                return [PSCustomObject]@{ Kind = "Path"; Target = $candidate }
+            }
+        }
+        catch {}
+    }
+}
+
+return $null
+}
+
+function Open-WmtActivityLogReference {
+param($Reference)
+
+if (-not $Reference -or [string]::IsNullOrWhiteSpace([string]$Reference.Target)) { return }
+$target = [string]$Reference.Target
+try {
+    if ([string]$Reference.Kind -eq "Uri") {
+        Start-Process $target | Out-Null
+        return
+    }
+
+    if (Test-Path -LiteralPath $target -PathType Container) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList "`"$target`"" | Out-Null
+    }
+    elseif (Test-Path -LiteralPath $target -PathType Leaf) {
+        Start-Process -FilePath $target | Out-Null
+    }
+}
+catch {
+    Write-GuiLog "Could not open log reference '$target': $($_.Exception.Message)"
+}
 }
 
 function Set-WmtThemePreference {
@@ -34701,15 +34843,83 @@ $lstSearchResults = Get-Ctrl "lstSearchResults"
 $pnlNavButtons = Get-Ctrl "pnlNavButtons"
 $svLog = Get-Ctrl "svLog"
 $LogBox = Get-Ctrl "LogBox"
+$bdLogSearch = Get-Ctrl "bdLogSearch"
+$txtLogSearch = Get-Ctrl "txtLogSearch"
+$btnLogClearSearch = Get-Ctrl "btnLogClearSearch"
 foreach ($itemsControl in @($lstWinget, $lstAppxPackages, $lstFw, $lstCatalog, $lstSearchResults)) {
 Enable-WmtWpfItemsVirtualization -Control $itemsControl
+}
+
+$script:LogSearchPlaceholder = "Search log..."
+if ($txtLogSearch) {
+    $txtLogSearch.Text = $script:LogSearchPlaceholder
+    Set-WmtLogSearchForeground -TextBox $txtLogSearch
+
+    $txtLogSearch.Add_GotFocus({
+        if ($txtLogSearch.Text -eq $script:LogSearchPlaceholder) {
+            $txtLogSearch.Text = ""
+            Set-WmtLogSearchForeground -TextBox $txtLogSearch
+        }
+    })
+    $txtLogSearch.Add_LostFocus({
+        if ([string]::IsNullOrWhiteSpace($txtLogSearch.Text)) {
+            $txtLogSearch.Text = $script:LogSearchPlaceholder
+            Set-WmtLogSearchForeground -TextBox $txtLogSearch
+        }
+    })
+    $txtLogSearch.Add_TextChanged({
+        $query = [string]$txtLogSearch.Text
+        $hasQuery = (-not [string]::IsNullOrWhiteSpace($query)) -and $query -ne $script:LogSearchPlaceholder
+        if ($btnLogClearSearch) { $btnLogClearSearch.Visibility = if ($hasQuery) { "Visible" } else { "Collapsed" } }
+        Set-WmtLogSearchForeground -TextBox $txtLogSearch
+        if ($hasQuery) { [void](Select-WmtActivityLogMatch -Query $query -Restart) }
+    })
+    $txtLogSearch.Add_KeyDown({
+        param($s, $e)
+        $query = [string]$txtLogSearch.Text
+        if ($e.Key -eq "Escape") {
+            $txtLogSearch.Text = ""
+            $e.Handled = $true
+            return
+        }
+        if ($e.Key -ne "Return" -or [string]::IsNullOrWhiteSpace($query) -or $query -eq $script:LogSearchPlaceholder) { return }
+        $goPrevious = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0)
+        [void](Select-WmtActivityLogMatch -Query $query -Previous:$goPrevious)
+        $e.Handled = $true
+    })
+}
+if ($bdLogSearch -and $txtLogSearch) {
+    $bdLogSearch.Add_MouseLeftButtonDown({ $txtLogSearch.Focus() })
+}
+if ($btnLogClearSearch) {
+    $btnLogClearSearch.Add_Click({
+        $txtLogSearch.Text = ""
+        if ($LogBox) {
+            $LogBox.Select($LogBox.Text.Length, 0)
+            $LogBox.ScrollToEnd()
+        }
+        $txtLogSearch.Focus()
+    })
 }
 
 if ($LogBox) {
 $script:WmtLogAutoScrollAttached = $true
 $LogBox.Add_TextChanged({
         param($s, $e)
-        if ($svLog) { $svLog.ScrollToEnd() } else { $s.ScrollToEnd() }
+        $query = if ($txtLogSearch) { [string]$txtLogSearch.Text } else { "" }
+        $searchActive = (-not [string]::IsNullOrWhiteSpace($query)) -and $query -ne $script:LogSearchPlaceholder
+        if (-not $searchActive) {
+            if ($svLog) { $svLog.ScrollToEnd() } else { $s.ScrollToEnd() }
+        }
+    })
+$LogBox.Add_PreviewMouseLeftButtonDown({
+        param($s, $e)
+        if ($e.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
+        $reference = Get-WmtActivityLogReferenceAtPoint -TextBox $s -Point ($e.GetPosition($s))
+        if ($reference) {
+            $e.Handled = $true
+            Open-WmtActivityLogReference -Reference $reference
+        }
     })
 }
 
