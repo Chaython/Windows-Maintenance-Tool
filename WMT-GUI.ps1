@@ -6587,6 +6587,7 @@ $script:WingetJob = $null
 $script:WingetAsyncResult = $null
 $script:WingetOutputQueue = $null
 $script:WingetActiveAction = $null
+$script:WingetActionItems = @()
 $script:WingetActionStoreUpdateOnly = $false
 $script:WmtAutoInstallActive = $false
 $script:WingetCurrentIndex = 0
@@ -37154,6 +37155,10 @@ $script:WingetCurrentItemSource = ""
 $script:WingetCurrentItemStartedAt = $null
 $script:WingetActionForcedTimeout = $false
 $script:WingetCompletedIndexes = @{}
+# Preserve the exact action-order package identities so RESULT:<index> can
+# update only the row that actually completed instead of forcing a provider
+# rescan while uninstall registry/provider state may still be settling.
+$script:WingetActionItems = @($uniqueItems)
 $script:WingetActionStoreUpdateOnly = (
     $ActionName -eq "Update" -and
     $totalItems -gt 0 -and
@@ -40556,6 +40561,56 @@ $script:ProcessWingetLines = {
                 $script:WingetProgressDone++
                 if ($result -eq "SUCCESS") {
                     $script:WingetProgressSuccess++
+
+                    # A successful uninstall is authoritative: the worker only emits
+                    # SUCCESS after a zero/reboot-required provider exit code. Remove
+                    # that exact package from the visible list instead of immediately
+                    # rescanning providers, which can race registry/package metadata
+                    # propagation and briefly re-add the just-uninstalled package.
+                    if (([string]$script:WingetActiveAction).Trim() -eq "Uninstall") {
+                        $actionItems = @($script:WingetActionItems)
+                        $actionItem = if ($doneIndex -ge 1 -and $doneIndex -le $actionItems.Count) {
+                            $actionItems[$doneIndex - 1]
+                        }
+                        else { $null }
+
+                        if ($actionItem) {
+                            $targetSource = ([string]$actionItem.Source).Trim().ToLowerInvariant()
+                            $targetId = ([string]$actionItem.Id).Trim()
+                            $targetName = ([string]$actionItem.Name).Trim()
+
+                            $matchesUninstalledItem = {
+                                param($candidate)
+                                if (-not $candidate -or -not $candidate.PSObject.Properties["Source"]) { return $false }
+
+                                $candidateSource = ([string]$candidate.Source).Trim().ToLowerInvariant()
+                                if (-not [string]::IsNullOrWhiteSpace($targetSource) -and $candidateSource -ne $targetSource) { return $false }
+
+                                $candidateId = ([string]$candidate.Id).Trim()
+                                $candidateName = ([string]$candidate.Name).Trim()
+                                if (-not [string]::IsNullOrWhiteSpace($targetId) -and -not [string]::IsNullOrWhiteSpace($candidateId)) {
+                                    return ($candidateId -eq $targetId)
+                                }
+                                return (-not [string]::IsNullOrWhiteSpace($targetName) -and $candidateName -eq $targetName)
+                            }
+
+                            if ($lstWinget) {
+                                $itemsToRemove = @($lstWinget.Items | Where-Object { & $matchesUninstalledItem $_ })
+                                foreach ($visibleItem in $itemsToRemove) {
+                                    try { $lstWinget.Items.Remove($visibleItem) } catch {}
+                                }
+                            }
+
+                            # Search mode keeps a snapshot of the update list for the
+                            # Clear Search button. Keep that snapshot consistent too,
+                            # otherwise the removed package can reappear without a scan.
+                            if ($script:WingetSavedScanItems) {
+                                $script:WingetSavedScanItems = @(
+                                    $script:WingetSavedScanItems | Where-Object { -not (& $matchesUninstalledItem $_) }
+                                )
+                            }
+                        }
+                    }
                 }
                 elseif ($result -eq "SKIPPED") {
                     $script:WingetProgressSkipped++
@@ -40751,14 +40806,27 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
 
                 $nonSuccessCount = $script:WingetProgressSkipped + $script:WingetProgressFailed
                 $completedActionName = ([string]$script:WingetActiveAction).Trim()
-                $verifyUninstallState = ($completedActionName -eq "Uninstall")
-                $shouldRefreshAfterAction = ($script:WingetProgressSuccess -gt 0 -or $nonSuccessCount -eq 0 -or $verifyUninstallState)
+                $completedUninstall = ($completedActionName -eq "Uninstall")
 
-                if ($script:WingetProgressSuccess -gt 0) {
-                    Write-GuiLog "Action finished. $($script:WingetProgressSuccess) explicit success(es). Refreshing package list..."
+                # Confirmed uninstall results already remove their exact rows above.
+                # Do not immediately rescan after uninstall: provider/registry state
+                # can lag behind the uninstall process exit and make a removed package
+                # appear to come back. Failed/skipped/uncertain rows stay visible.
+                $shouldRefreshAfterAction = (-not $completedUninstall) -and ($script:WingetProgressSuccess -gt 0 -or $nonSuccessCount -eq 0)
+
+                if ($completedUninstall) {
+                    if ($script:WingetProgressSuccess -gt 0) {
+                        Write-GuiLog "Uninstall finished. $($script:WingetProgressSuccess) confirmed uninstall(s) removed from the package list; no immediate rescan was started."
+                    }
+                    elseif ($nonSuccessCount -gt 0) {
+                        Write-GuiLog "Uninstall finished without a confirmed success. Package rows were left unchanged."
+                    }
+                    else {
+                        Write-GuiLog "Uninstall finished without an explicit result. Package rows were left unchanged; refresh later to verify provider state."
+                    }
                 }
-                elseif ($verifyUninstallState) {
-                    Write-GuiLog "Uninstall finished without confirmed success. Refreshing package list to verify the actual installed state..."
+                elseif ($script:WingetProgressSuccess -gt 0) {
+                    Write-GuiLog "Action finished. $($script:WingetProgressSuccess) explicit success(es). Refreshing package list..."
                 }
                 elseif (-not $shouldRefreshAfterAction) {
                     Write-GuiLog "Action finished with no applied updates. Package list was not refreshed."
@@ -40779,10 +40847,13 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 # Clear action ownership before starting the verification scan.
                 $script:WmtAutoInstallActive = $false
                 $script:WingetActiveAction = $null
+                $script:WingetActionItems = @()
                 $script:WingetActionStoreUpdateOnly = $false
                 $script:WingetActionForcedTimeout = $false
 
-                # Refresh after success, silent completion, or any uninstall attempt. Uninstall exit codes can be imperfect and the visible row must reflect a fresh scan, not optimistic UI state.
+                # Installs/updates still verify via a normal refresh. Successful
+                # uninstalls update the visible list directly and intentionally skip
+                # the immediate scan to avoid stale provider/registry state.
                 if ($shouldRefreshAfterAction -and $btnWingetScan) {
                     if (Get-WmtUpdateAutoInstallEnabled) {
                         $script:WmtAutoInstallSuppressNextScan = $true
