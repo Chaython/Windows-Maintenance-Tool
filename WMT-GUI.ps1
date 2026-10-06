@@ -30664,17 +30664,15 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         </Grid>
                     </Border>
                     <ScrollViewer Name="svLog" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="8" UseLayoutRounding="True" VerticalAlignment="Stretch">
-                        <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas, monospace" FontSize="12" 
-                                 Background="Transparent" Foreground="{DynamicResource LogText}" BorderThickness="0" Padding="4"
-                                 VerticalAlignment="Stretch" AcceptsReturn="True"
-                                 SelectionBrush="#FFF2C94C" SelectionOpacity="0.78"
-                                 IsInactiveSelectionHighlightEnabled="True"
-                                 SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display">
-                            <TextBox.Resources>
-                                <!-- WPF uses this system brush when the find box owns keyboard focus. -->
-                                <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#FFF2C94C"/>
-                            </TextBox.Resources>
-                        </TextBox>
+                        <Grid>
+                            <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas, monospace" FontSize="12" 
+                                     Background="Transparent" Foreground="{DynamicResource LogText}" BorderThickness="0" Padding="4"
+                                     VerticalAlignment="Stretch" AcceptsReturn="True"
+                                     SelectionBrush="Transparent" SelectionOpacity="0"
+                                     IsInactiveSelectionHighlightEnabled="False"
+                                     SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display"/>
+                            <Canvas Name="LogSearchHighlightLayer" IsHitTestVisible="False" Panel.ZIndex="20"/>
+                        </Grid>
                     </ScrollViewer>
                 </Grid>
             </Border>
@@ -32561,6 +32559,60 @@ $resourceKey = if ($TextBox.Text -eq $script:LogSearchPlaceholder) { "TextMuted"
 $TextBox.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, $resourceKey)
 }
 
+function Show-WmtActivityLogHighlight {
+param(
+    [int]$Index,
+    [int]$Length
+)
+
+if (-not $script:LogBox -or -not $script:LogSearchHighlightLayer) { return }
+$layer = $script:LogSearchHighlightLayer
+$layer.Children.Clear()
+if ($Index -lt 0 -or $Length -le 0 -or $Index -ge $script:LogBox.Text.Length) { return }
+
+try {
+    # GetRectFromCharacterIndex is independent of keyboard focus, unlike TextBox selection rendering.
+    $startRect = $script:LogBox.GetRectFromCharacterIndex($Index, $true)
+    $endIndex = [Math]::Min($script:LogBox.Text.Length, $Index + $Length)
+    $endRect = $script:LogBox.GetRectFromCharacterIndex($endIndex, $false)
+    if ($startRect.IsEmpty) { return }
+
+    $highlight = New-Object System.Windows.Shapes.Rectangle
+    $highlight.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#B8F2C94C")
+    $highlight.Stroke = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFF2C94C")
+    $highlight.StrokeThickness = 1.0
+    $highlight.RadiusX = 2
+    $highlight.RadiusY = 2
+
+    $left = [Math]::Max(0.0, $startRect.X - 1.0)
+    $top = [Math]::Max(0.0, $startRect.Y - 1.0)
+    $height = [Math]::Max(2.0, $startRect.Height + 2.0)
+
+    if (-not $endRect.IsEmpty -and [Math]::Abs($endRect.Y - $startRect.Y) -lt 1.0) {
+        $width = [Math]::Max(3.0, ($endRect.X - $startRect.X) + 2.0)
+    }
+    else {
+        # Wrapped/multi-line matches get an obvious line-width highlight rather than disappearing.
+        $width = [Math]::Max(3.0, $script:LogBox.ActualWidth - $left - 6.0)
+    }
+
+    $highlight.Width = $width
+    $highlight.Height = $height
+    [System.Windows.Controls.Canvas]::SetLeft($highlight, $left)
+    [System.Windows.Controls.Canvas]::SetTop($highlight, $top)
+    [void]$layer.Children.Add($highlight)
+}
+catch {
+    try { $layer.Children.Clear() } catch {}
+}
+}
+
+function Clear-WmtActivityLogHighlight {
+if ($script:LogSearchHighlightLayer) {
+    try { $script:LogSearchHighlightLayer.Children.Clear() } catch {}
+}
+}
+
 function Select-WmtActivityLogMatch {
 param(
     [string]$Query,
@@ -32589,14 +32641,27 @@ if ($index -lt 0) {
     # Do not leave an older match highlighted when the new query has no hits.
     $collapseAt = [Math]::Min([Math]::Max(0, $script:LogBox.SelectionStart), $text.Length)
     $script:LogBox.Select($collapseAt, 0)
+    Clear-WmtActivityLogHighlight
     return $false
 }
 $script:LogBox.Select($index, $Query.Length)
 try {
     $lineIndex = $script:LogBox.GetLineIndexFromCharacterIndex($index)
     if ($lineIndex -ge 0) { $script:LogBox.ScrollToLine($lineIndex) }
+
+    # Wait until scrolling/layout is complete, then draw a real overlay over the match.
+    $matchIndex = $index
+    $matchLength = $Query.Length
+    [void]$script:LogBox.Dispatcher.BeginInvoke(
+        [System.Windows.Threading.DispatcherPriority]::Loaded,
+        [System.Action]{
+            Show-WmtActivityLogHighlight -Index $matchIndex -Length $matchLength
+        }
+    )
 }
-catch {}
+catch {
+    Show-WmtActivityLogHighlight -Index $index -Length $Query.Length
+}
 return $true
 }
 
@@ -34855,6 +34920,8 @@ $lstSearchResults = Get-Ctrl "lstSearchResults"
 $pnlNavButtons = Get-Ctrl "pnlNavButtons"
 $svLog = Get-Ctrl "svLog"
 $LogBox = Get-Ctrl "LogBox"
+$LogSearchHighlightLayer = Get-Ctrl "LogSearchHighlightLayer"
+$script:LogSearchHighlightLayer = $LogSearchHighlightLayer
 $bdLogSearch = Get-Ctrl "bdLogSearch"
 $txtLogSearch = Get-Ctrl "txtLogSearch"
 $btnLogClearSearch = Get-Ctrl "btnLogClearSearch"
@@ -34890,6 +34957,7 @@ if ($txtLogSearch) {
         elseif ($LogBox) {
             # Clearing the query should remove the visible find highlight without hiding log lines.
             $LogBox.Select($LogBox.SelectionStart, 0)
+            Clear-WmtActivityLogHighlight
         }
     })
     $txtLogSearch.Add_KeyDown({
