@@ -32744,20 +32744,21 @@ if (Test-Path -LiteralPath $Path -PathType Container) {
 }
 if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
 
-# Never execute a program/script merely because its path appeared in the log.
-# Select executable content in Explorer; ordinary documents/logs still open normally.
+# Log contents are not trusted launch instructions. Only directly open a small
+# allowlist of inert document/data formats; select every other file in Explorer.
 $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
-$selectOnlyExtensions = @(
-    ".exe", ".com", ".bat", ".cmd", ".msi", ".msp", ".scr", ".cpl",
-    ".lnk", ".url", ".ps1", ".psm1", ".psd1", ".vbs", ".vbe", ".js",
-    ".jse", ".wsf", ".wsh", ".hta", ".reg"
+$directOpenExtensions = @(
+    ".txt", ".log", ".md", ".csv", ".tsv",
+    ".json", ".xml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico",
+    ".pdf"
 )
-if ($selectOnlyExtensions -contains $extension) {
-    Start-Process -FilePath "explorer.exe" -ArgumentList "/select,`"$Path`"" | Out-Null
+if ($directOpenExtensions -contains $extension) {
+    Start-Process -FilePath $Path | Out-Null
     return
 }
 
-Start-Process -FilePath $Path | Out-Null
+Start-Process -FilePath "explorer.exe" -ArgumentList "/select,`"$Path`"" | Out-Null
 }
 
 function Open-WmtActivityLogReference {
@@ -35046,8 +35047,24 @@ $LogBox.Add_TextChanged({
         }
     })
 $LogBox.Add_SizeChanged({
-        if ($script:LogSearchMatchIndex -ge 0 -and $script:LogSearchMatchLength -gt 0) {
-            try { Show-WmtActivityLogHighlight -Index $script:LogSearchMatchIndex -Length $script:LogSearchMatchLength } catch {}
+        param($s, $e)
+        if ($script:LogSearchMatchIndex -lt 0 -or $script:LogSearchMatchLength -le 0) { return }
+        if ($script:LogSearchHighlightRedrawPending) { return }
+
+        $script:LogSearchHighlightRedrawPending = $true
+        try {
+            [void]$s.Dispatcher.BeginInvoke(
+                [System.Windows.Threading.DispatcherPriority]::Render,
+                [System.Action]{
+                    $script:LogSearchHighlightRedrawPending = $false
+                    if ($script:LogSearchMatchIndex -ge 0 -and $script:LogSearchMatchLength -gt 0) {
+                        try { Show-WmtActivityLogHighlight -Index $script:LogSearchMatchIndex -Length $script:LogSearchMatchLength } catch {}
+                    }
+                }
+            )
+        }
+        catch {
+            $script:LogSearchHighlightRedrawPending = $false
         }
     })
 $LogBox.Add_PreviewMouseLeftButtonUp({
@@ -39174,6 +39191,7 @@ exit /b %WMT_EXIT%
         $fallbackAckPath = Join-Path $TempPath "WMT_StoreCLI_$rand.fallback_ack"
         $runnerPath = Join-Path $TempPath "WMT_StoreCLI_$rand.run.ps1"
         $sendKeysPath = Join-Path $TempPath "WMT_StoreCLI_$rand.ps1"
+        $sendKeysProc = $null
         $safeTitle = (((($PackageName -replace '"', '') -replace '[\r\n]', ' ') -replace '[&|<>^%!]', ' ')).Trim()
         if ([string]::IsNullOrWhiteSpace($safeTitle)) { $safeTitle = "Microsoft Store App" }
         $windowTitle = "WMT Store CLI - $safeTitle"
@@ -39218,9 +39236,47 @@ exit /b %WMT_EXIT%
         function Clear-WmtStoreCliTempFiles {
             param([string[]]$Paths)
 
-            foreach ($path in $Paths) {
-                if ([string]::IsNullOrWhiteSpace($path)) { continue }
-                try { Remove-Item -Path $path -Force -ErrorAction SilentlyContinue } catch {}
+            $pending = @($Paths | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+            for ($attempt = 0; $attempt -lt 4 -and $pending.Count -gt 0; $attempt++) {
+                foreach ($path in @($pending)) {
+                    try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {}
+                }
+
+                $pending = @($pending | Where-Object {
+                        try { Test-Path -LiteralPath $_ } catch { $false }
+                    })
+                if ($pending.Count -gt 0 -and $attempt -lt 3) {
+                    Start-Sleep -Milliseconds (100 * ($attempt + 1))
+                }
+            }
+        }
+
+        function Stop-WmtStoreCliProcessTree {
+            param(
+                [object]$Process,
+                [object]$HelperProcess
+            )
+
+            if ($Process) {
+                try {
+                    if (-not $Process.HasExited) {
+                        & "$env:SystemRoot\System32\taskkill.exe" /PID $Process.Id /T /F 2>$null | Out-Null
+                        try { [void]$Process.WaitForExit(2000) } catch {}
+                    }
+                }
+                catch {
+                    try { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue } catch {}
+                }
+            }
+
+            if ($HelperProcess) {
+                try {
+                    if (-not $HelperProcess.HasExited) {
+                        Stop-Process -Id $HelperProcess.Id -Force -ErrorAction SilentlyContinue
+                        try { [void]$HelperProcess.WaitForExit(1000) } catch {}
+                    }
+                }
+                catch {}
             }
         }
 
@@ -39658,7 +39714,7 @@ exit /b %WMT_EXIT%
             $cmdProc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batPath`"" -PassThru -WindowStyle $storeWindowStyle
             if (-not $silentUpdateInstallEnabled) { Show-WmtStoreCliWindow $cmdProc }
             $safePackageArg = ([string]$PackageName).Replace('"', '')
-            Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$sendKeysPath`" -TargetPid $($cmdProc.Id) -PackageName `"$safePackageArg`" -StatusPath `"$statusPath`" -ResourcesInUsePath `"$resourcesInUsePath`" -ScreenPath `"$screenPath`"" -WindowStyle Hidden
+            $sendKeysProc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$sendKeysPath`" -TargetPid $($cmdProc.Id) -PackageName `"$safePackageArg`" -StatusPath `"$statusPath`" -ResourcesInUsePath `"$resourcesInUsePath`" -ScreenPath `"$screenPath`"" -WindowStyle Hidden -PassThru
             Write-Output "LOG:  [store] Progress: 5%"
 
             $storeCliTimeoutMinutes = if ($ArgumentList.Count -eq 1 -and ([string]$ArgumentList[0]).Trim().ToLowerInvariant() -eq "updates") { 10 } else { 3 }
@@ -39789,10 +39845,7 @@ exit /b %WMT_EXIT%
                         "Store CLI remained at Ready to Download 0% for 30 seconds"
                     }
                     Write-Output "LOG:[Store CLI] $fallbackReasonText; opening Microsoft Store fallback page."
-                    try {
-                        if ($cmdProc -and -not $cmdProc.HasExited) { Stop-Process -Id $cmdProc.Id -Force -ErrorAction SilentlyContinue }
-                    }
-                    catch {}
+                    Stop-WmtStoreCliProcessTree -Process $cmdProc -HelperProcess $sendKeysProc
                     $fallbackResult = Invoke-WmtStoreCliFallback -Reason $fallbackReason -ReasonText $fallbackReasonText -StoreUri $StoreFallbackUri -WebUri $StoreFallbackWebUri
                     Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
                     return [PSCustomObject]@{
@@ -39815,15 +39868,13 @@ exit /b %WMT_EXIT%
             }
 
             Write-Output "LOG:[Store CLI] Timed out waiting for the interactive $($ActionLabel.ToLowerInvariant()) window."
-            try {
-                if ($cmdProc -and -not $cmdProc.HasExited) { Stop-Process -Id $cmdProc.Id -Force -ErrorAction SilentlyContinue }
-            }
-            catch {}
+            Stop-WmtStoreCliProcessTree -Process $cmdProc -HelperProcess $sendKeysProc
             Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
             return [PSCustomObject]@{ ExitCode = -1 }
         }
         catch {
             Write-Output "LOG:[Store CLI] Interactive launch failed: $($_.Exception.Message)"
+            Stop-WmtStoreCliProcessTree -Process $cmdProc -HelperProcess $sendKeysProc
             Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
             return [PSCustomObject]@{ ExitCode = 1 }
         }
