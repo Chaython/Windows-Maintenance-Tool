@@ -37567,7 +37567,7 @@ try {
 catch {}
 $packageInstallLogRoot = ""
 $needsPackageInstallLogRoot = ($ActionName -in @("Install", "Update", "Uninstall", "Repair")) -and (@($uniqueItems | Where-Object {
-            [bool]$_.ProviderLogFilesEnabled -and (([string]$_.Source).Trim().ToLowerInvariant() -eq "winget")
+            [bool]$_.ProviderLogFilesEnabled -and (([string]$_.Source).Trim().ToLowerInvariant() -in @("winget", "legendary"))
         }).Count -gt 0)
 if ($needsPackageInstallLogRoot) {
     $packageInstallLogRoot = Join-Path (Get-DataPath) "package-install-logs"
@@ -39865,6 +39865,7 @@ exit /b %WMT_EXIT%
         $wingetTranscriptPath = ""
         $wingetInstallerLogPath = ""
         $wingetRetryInstallerLogPath = ""
+        $providerTranscriptPath = ""
         $wingetAttemptStartedAt = [datetime]::MinValue
         $storeCliArgs = $null
         $windowsUpdateItem = $null
@@ -40123,6 +40124,30 @@ exit /b %WMT_EXIT%
                 if ($act -eq "Install") { $skipReason = "Epic/Legendary installs must use WMT's interactive game installer." }
                 if ($act -eq "Update") { $cmd = "$legendaryCommand -y update `"$id`" --update-only $legendaryHeadlessArgs" }
                 if ($act -eq "Uninstall") { $cmd = "$legendaryCommand -y uninstall `"$id`"" }
+
+                if ($providerLogFilesEnabled -and $act -in @("Update", "Uninstall") -and -not [string]::IsNullOrWhiteSpace($cmd)) {
+                    $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
+                    $providerTranscriptPath = "$diagnosticStem-legendary.log"
+
+                    $legendaryLogExe = ([string]$legendaryExePath).Trim()
+                    if ([string]::IsNullOrWhiteSpace($legendaryLogExe) -or -not (Test-Path -LiteralPath $legendaryLogExe -PathType Leaf)) {
+                        try {
+                            $legendaryLogCmd = Get-Command legendary -ErrorAction SilentlyContinue
+                            if ($legendaryLogCmd -and $legendaryLogCmd.Source) { $legendaryLogExe = [string]$legendaryLogCmd.Source }
+                        }
+                        catch {}
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($legendaryLogExe)) {
+                        $exePs = ([string]$legendaryLogExe).Replace("'", "''")
+                        $idPs = ([string]$id).Replace("'", "''")
+                        $logPs = ([string]$providerTranscriptPath).Replace("'", "''")
+                        $legendaryArgsText = if ($act -eq "Update") { "-y update '" + $idPs + "' --update-only " + $legendaryHeadlessArgs } else { "-y uninstall '" + $idPs + "'" }
+                        $loggedScript = "& '" + $exePs + "' " + $legendaryArgsText + " 2>&1 | Tee-Object -FilePath '" + $logPs + "' -Append | ForEach-Object { Write-Host `$_ }; `$wmtLegendaryExit = `$LASTEXITCODE; exit `$wmtLegendaryExit"
+                        $encodedLoggedScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loggedScript))
+                        $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLoggedScript"
+                        Write-Output "LOG:[Diagnostics] Legendary $act log will be written to: $providerTranscriptPath"
+                    }
+                }
                 $userCmd = $cmd
             }
             # --- GOGDL / GOG GAMES ---
@@ -40449,6 +40474,9 @@ exit /b %WMT_EXIT%
                 Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -Result ([ref]$p)
             }
             if (-not $wingetArgs) { Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)" }
+            if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
+                Write-Output "LOG:[Diagnostics] Legendary log saved: $providerTranscriptPath"
+            }
 
             $hex = "0x{0:x}" -f $p.ExitCode
 
