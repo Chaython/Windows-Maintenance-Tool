@@ -37111,8 +37111,39 @@ param($ListItems, $ActionName, $CmdTemplate)
 if (-not $ListItems -or $ListItems.Count -eq 0) { return }
 
 $uniqueItems = @($ListItems | Select-Object -Property Source, Name, Id, Version, Available, VersionSort, AvailableSort, IsChecked, LibraryPath, InstallDir, ManifestPath, ExecutablePath, Platform, RawAvailable, WUIsOptional -Unique)
+
+# Per-provider Install/Update permission is enforced here so manual actions,
+# bulk updates, search-result installs, custom commands, and auto-update all
+# honor the same provider setting.
+$actionSettings = Get-WmtSettings
+if ($ActionName -in @("Install", "Update")) {
+    $providerCapsForAction = Get-WmtProviderCapabilities
+    $allowedItems = New-Object System.Collections.Generic.List[object]
+    foreach ($actionItem in @($uniqueItems)) {
+        $providerKey = Get-WmtProviderKeyForPackageSource -Source ([string]$actionItem.Source)
+        $installUpdateAllowed = $true
+        if (-not [string]::IsNullOrWhiteSpace($providerKey) -and $providerCapsForAction.Contains($providerKey)) {
+            $installUpdateAllowed = Get-WmtProviderToggle -Settings $actionSettings -ProviderKey $providerKey -ToggleName "InstallUpdate"
+        }
+
+        if ($installUpdateAllowed) {
+            [void]$allowedItems.Add($actionItem)
+        }
+        else {
+            $blockedName = ([string]$actionItem.Name).Trim()
+            if ([string]::IsNullOrWhiteSpace($blockedName)) { $blockedName = ([string]$actionItem.Id).Trim() }
+            Write-GuiLog "[$ActionName] SKIPPED: $blockedName ($([string]$actionItem.Source)) - Install/Update is disabled for this provider in Manage Package Providers."
+        }
+    }
+    $uniqueItems = @($allowedItems)
+    if ($uniqueItems.Count -eq 0) {
+        Write-GuiLog "$ActionName cancelled: Install/Update is disabled for all selected providers."
+        return
+    }
+}
+
 if ($ActionName -eq "Update") {
-    $customSettings = Get-WmtSettings
+    $customSettings = $actionSettings
     foreach ($updateItem in $uniqueItems) {
         $customUpdateCommand = Get-WmtCustomUpdateCommand -Source ([string]$updateItem.Source) -Id ([string]$updateItem.Id) -Settings $customSettings
         $updateItem | Add-Member -MemberType NoteProperty -Name "CustomUpdateCommand" -Value $customUpdateCommand -Force
@@ -40784,10 +40815,11 @@ $caps = Get-WmtProviderCapabilities
 $key = ([string]$ProviderKey).Trim().ToLowerInvariant()
 $cap = if ($caps.Contains($key)) { $caps[$key] } else { @{ Search = $false; Library = $false } }
 return [ordered]@{
-    Search     = [bool]$cap.Search
-    Scan       = $true
-    Headless   = $false
-    AutoUpdate = $false
+    Search        = [bool]$cap.Search
+    Scan          = $true
+    InstallUpdate = $true
+    Headless      = $false
+    AutoUpdate    = $false
 }
 }
 
@@ -40850,16 +40882,19 @@ try {
             if ([string]::IsNullOrWhiteSpace($k)) { continue }
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $k
             $t = [ordered]@{
-                Search     = [bool]$defaults.Search
-                Scan       = [bool]$defaults.Scan
-                Headless   = [bool]$defaults.Headless
-                AutoUpdate = [bool]$defaults.AutoUpdate
+                Search        = [bool]$defaults.Search
+                Scan          = [bool]$defaults.Scan
+                InstallUpdate = [bool]$defaults.InstallUpdate
+                Headless      = [bool]$defaults.Headless
+                AutoUpdate    = [bool]$defaults.AutoUpdate
             }
             $val = $entry_item.Value
             $s = Get-WmtToggleValue $val "Search"
             if ($null -ne $s) { $t["Search"] = [bool]$s }
             $sc = Get-WmtToggleValue $val "Scan"
             if ($null -ne $sc) { $t["Scan"] = [bool]$sc }
+            $iu = Get-WmtToggleValue $val "InstallUpdate"
+            if ($null -ne $iu) { $t["InstallUpdate"] = [bool]$iu }
             $h = Get-WmtToggleValue $val "Headless"
             if ($null -ne $h) { $t["Headless"] = [bool]$h }
             $a = Get-WmtToggleValue $val "AutoUpdate"
@@ -40898,10 +40933,11 @@ if ($Toggles) {
         $val = $Toggles.$key
         $defaults = Get-WmtProviderToggleDefaults -ProviderKey $k
         $entry = [ordered]@{
-            Search     = if ($defaults.Search) { [bool]$val.Search } else { $false }
-            Scan       = [bool]$val.Scan
-            Headless   = [bool]$val.Headless
-            AutoUpdate = [bool]$val.AutoUpdate
+            Search        = if ($defaults.Search) { [bool]$val.Search } else { $false }
+            Scan          = [bool]$val.Scan
+            InstallUpdate = if ($null -ne $val.InstallUpdate) { [bool]$val.InstallUpdate } else { $true }
+            Headless      = [bool]$val.Headless
+            AutoUpdate    = [bool]$val.AutoUpdate
         }
         $clean[$k] = $entry
     }
@@ -40927,8 +40963,28 @@ $toggles = Get-WmtProviderToggles -Settings $Settings
 $key = ([string]$ProviderKey).Trim().ToLowerInvariant()
 $name = ([string]$ToggleName).Trim()
 if (-not $toggles.Contains($key)) { return $false }
-if (-not $toggles[$key].PSObject.Properties[$name]) { return $false }
-return [bool]$toggles[$key].$name
+$entry = $toggles[$key]
+if ($entry -is [System.Collections.IDictionary]) {
+    if (-not $entry.Contains($name)) { return $false }
+    return [bool]$entry[$name]
+}
+if (-not $entry.PSObject.Properties[$name]) { return $false }
+return [bool]$entry.$name
+}
+
+function Get-WmtProviderKeyForPackageSource {
+param([string]$Source)
+
+$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
+switch ($sourceKey) {
+    "pip3" { return "pip" }
+    "npm (global)" { return "npm" }
+    "pnpm (global)" { return "pnpm" }
+    "choco" { return "chocolatey" }
+    "ruby" { return "gem" }
+    "rust" { return "cargo" }
+    default { return $sourceKey }
+}
 }
 
 # ==========================================
@@ -41741,10 +41797,12 @@ function Format-WmtProviderRowXaml {
     $t = $providerToggles[$key]
     $searchVal = if ($t -is [System.Collections.IDictionary]) { $t["Search"] } else { $t.Search }
     $scanVal = if ($t -is [System.Collections.IDictionary]) { $t["Scan"] } else { $t.Scan }
+    $installUpdateVal = if ($t -is [System.Collections.IDictionary]) { $t["InstallUpdate"] } else { $t.InstallUpdate }
     $headVal = if ($t -is [System.Collections.IDictionary]) { $t["Headless"] } else { $t.Headless }
     $autoVal = if ($t -is [System.Collections.IDictionary]) { $t["AutoUpdate"] } else { $t.AutoUpdate }
     $searchIsChecked = if ($searchSupported -and [bool]$searchVal) { 'True' } else { 'False' }
     $scanIsChecked = if ([bool]$scanVal) { 'True' } else { 'False' }
+    $installUpdateIsChecked = if ([bool]$installUpdateVal) { 'True' } else { 'False' }
     $headlessIsChecked = if ([bool]$headVal) { 'True' } else { 'False' }
     $autoIsChecked = if ([bool]$autoVal) { 'True' } else { 'False' }
 
@@ -41787,9 +41845,10 @@ function Format-WmtProviderRowXaml {
                     <Button Name="$($Provider.Button)" Content="Install" Width="78" Height="26" Grid.Column="3" Margin="8,0,0,0"/>
                 </Grid>
                 <StackPanel Orientation="Horizontal" Margin="30,6,0,0">
-                    <ToggleButton Name="chk${key}Search"     Content="Search"     Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$searchIsChecked"    IsEnabled="$searchEnabled" ToolTip="$searchToolTip"/>
-                    <ToggleButton Name="chk${key}Scan"       Content="Scan"       Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$scanIsChecked"       ToolTip="Include this provider in update scans. Disabling also disables Headless and Auto-update for this provider."/>
-                    <ToggleButton Name="chk${key}Headless"   Content="Headless"   Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$headlessIsChecked"   ToolTip="Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."/>
+                    <ToggleButton Name="chk${key}Search"        Content="Search"         Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$searchIsChecked"        IsEnabled="$searchEnabled" ToolTip="$searchToolTip"/>
+                    <ToggleButton Name="chk${key}Scan"          Content="Scan"           Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$scanIsChecked"           ToolTip="Include this provider in update scans. Disabling also disables Headless and Auto-update for this provider."/>
+                    <ToggleButton Name="chk${key}InstallUpdate" Content="Install/Update" Margin="0,0,8,0" Padding="10,3" MinWidth="92" IsChecked="$installUpdateIsChecked" ToolTip="Allow WMT to execute package Install and Update actions for this provider. Search and scans can remain enabled when this is off."/>
+                    <ToggleButton Name="chk${key}Headless"      Content="Headless"       Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$headlessIsChecked"       ToolTip="Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."/>
                     <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update" Margin="0,0,8,0" Padding="10,3" MinWidth="70" IsChecked="$autoIsChecked"       ToolTip="After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan to be enabled."/>
                     $includeUnknownToggle
                 </StackPanel>
@@ -41847,7 +41906,7 @@ foreach ($p in $providerDefinitions) {
 
     <StackPanel Grid.Row="0">
         <TextBlock Text="Manage Package Providers" FontSize="18" FontWeight="Bold" Margin="0,0,0,4"/>
-        <TextBlock Text="Select which package managers to scan, and configure per-provider Search / Scan / Headless / Auto-update options. Search uses the main Updates search box." Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,0" TextWrapping="Wrap"/>
+        <TextBlock Text="Select which package managers to use, and configure per-provider Search / Scan / Install-Update / Headless / Auto-update options. Disabling Install/Update keeps discovery available while preventing WMT from changing packages through that provider." Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,0" TextWrapping="Wrap"/>
     </StackPanel>
 
     <ScrollViewer Grid.Row="1" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto">
@@ -43017,23 +43076,27 @@ foreach ($provider in $providerDefinitions) {
     $toggles = $providerToggles[$key]
     $searchVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Search"] } else { $toggles.Search }
     $scanVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Scan"] } else { $toggles.Scan }
+    $installUpdateVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["InstallUpdate"] } else { $toggles.InstallUpdate }
     $headVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Headless"] } else { $toggles.Headless }
     $autoVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["AutoUpdate"] } else { $toggles.AutoUpdate }
     $chkSearch = & $getWinCtrl "chk${key}Search"
     $chkScan = & $getWinCtrl "chk${key}Scan"
+    $chkInstallUpdate = & $getWinCtrl "chk${key}InstallUpdate"
     $chkHeadless = & $getWinCtrl "chk${key}Headless"
     $chkAuto = & $getWinCtrl "chk${key}AutoUpdate"
     if ($chkSearch) { $chkSearch.IsChecked = [bool]$searchVal }
     if ($chkScan) { $chkScan.IsChecked = [bool]$scanVal }
+    if ($chkInstallUpdate) { $chkInstallUpdate.IsChecked = [bool]$installUpdateVal }
     if ($chkHeadless) { $chkHeadless.IsChecked = [bool]$headVal }
     if ($chkAuto) { $chkAuto.IsChecked = [bool]$autoVal }
     # Store controls for later event wiring.
     $providerControls[$key] = @{
         Main       = $chkMain
-        Search     = $chkSearch
-        Scan       = $chkScan
-        Headless   = $chkHeadless
-        AutoUpdate = $chkAuto
+        Search        = $chkSearch
+        Scan          = $chkScan
+        InstallUpdate = $chkInstallUpdate
+        Headless      = $chkHeadless
+        AutoUpdate    = $chkAuto
     }
 }
 
@@ -43050,6 +43113,7 @@ $updateProviderToggleState = {
     $searchSupported = [bool]$caps.Search
     $mainChecked = [bool]$controls.Main.IsChecked
     $scanChecked = [bool]$controls.Scan.IsChecked
+    $installUpdateChecked = [bool]$controls.InstallUpdate.IsChecked
 
     # Get provider display name for tooltip messages.
     $provider = @($providerDefinitions | Where-Object { $_.Key -eq $ProviderKey } | Select-Object -First 1)
@@ -43066,8 +43130,9 @@ $updateProviderToggleState = {
     $mainTip = "Enable or disable $dispName for scanning and updates."
     $searchTip = "Allow searching this provider's catalog or owned library from the WMT search box."
     $scanTip = "Include this provider in update scans. Disabling also disables Headless and Auto-update."
+    $installUpdateTip = "Allow WMT to execute package Install and Update actions for this provider. Search and scans remain available when disabled."
     $headlessTip = "Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."
-    $autoTip = "After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan to be enabled."
+    $autoTip = "After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan and Install/Update to be enabled."
 
     if (-not $isInstalled) {
         # Provider not installed: disable main + all toggles.
@@ -43078,6 +43143,7 @@ $updateProviderToggleState = {
         }
         if ($controls.Search) { $controls.Search.IsEnabled = $false; $controls.Search.ToolTip = $notInstalledMsg }
         if ($controls.Scan) { $controls.Scan.IsEnabled = $false; $controls.Scan.ToolTip = $notInstalledMsg }
+        if ($controls.InstallUpdate) { $controls.InstallUpdate.IsEnabled = $false; $controls.InstallUpdate.ToolTip = $notInstalledMsg }
         if ($controls.Headless) { $controls.Headless.IsEnabled = $false; $controls.Headless.ToolTip = $notInstalledMsg }
         if ($controls.AutoUpdate) { $controls.AutoUpdate.IsEnabled = $false; $controls.AutoUpdate.ToolTip = $notInstalledMsg }
 
@@ -43132,6 +43198,18 @@ $updateProviderToggleState = {
         }
     }
 
+    # Install/Update toggle
+    if ($controls.InstallUpdate) {
+        if (-not $mainChecked) {
+            $controls.InstallUpdate.IsEnabled = $false
+            $controls.InstallUpdate.ToolTip = "Enable $dispName (check the box on the left) to allow install/update actions."
+        }
+        else {
+            $controls.InstallUpdate.IsEnabled = $true
+            $controls.InstallUpdate.ToolTip = $installUpdateTip
+        }
+    }
+
     # Headless toggle
     if ($controls.Headless) {
         if (-not $mainChecked) {
@@ -43157,6 +43235,10 @@ $updateProviderToggleState = {
         elseif (-not $scanChecked) {
             $controls.AutoUpdate.IsEnabled = $false
             $controls.AutoUpdate.ToolTip = "Enable Scan for $dispName to use auto-update."
+        }
+        elseif (-not $installUpdateChecked) {
+            $controls.AutoUpdate.IsEnabled = $false
+            $controls.AutoUpdate.ToolTip = "Enable Install/Update for $dispName to use auto-update."
         }
         else {
             $controls.AutoUpdate.IsEnabled = $true
@@ -43199,6 +43281,10 @@ foreach ($provider in $providerDefinitions) {
     if ($controls.Scan) {
         $controls.Scan.Add_Checked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
         $controls.Scan.Add_Unchecked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+    }
+    if ($controls.InstallUpdate) {
+        $controls.InstallUpdate.Add_Checked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+        $controls.InstallUpdate.Add_Unchecked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
     }
 }
 
@@ -43264,14 +43350,16 @@ foreach ($provider in $providerDefinitions) {
             $key = [string]$provider.Key
             $chkSearch = & $getWinCtrl "chk${key}Search"
             $chkScan = & $getWinCtrl "chk${key}Scan"
+            $chkInstallUpdate = & $getWinCtrl "chk${key}InstallUpdate"
             $chkHeadless = & $getWinCtrl "chk${key}Headless"
             $chkAuto = & $getWinCtrl "chk${key}AutoUpdate"
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $key
             $togglesToSave[$key] = [ordered]@{
-                Search     = if ($defaults.Search -and $chkSearch) { [bool]$chkSearch.IsChecked }   else { $false }
-                Scan       = if ($chkScan) { [bool]$chkScan.IsChecked }     else { $true }
-                Headless   = if ($chkHeadless) { [bool]$chkHeadless.IsChecked } else { $false }
-                AutoUpdate = if ($chkAuto) { [bool]$chkAuto.IsChecked }     else { $false }
+                Search        = if ($defaults.Search -and $chkSearch) { [bool]$chkSearch.IsChecked } else { $false }
+                Scan          = if ($chkScan) { [bool]$chkScan.IsChecked } else { $true }
+                InstallUpdate = if ($chkInstallUpdate) { [bool]$chkInstallUpdate.IsChecked } else { $true }
+                Headless      = if ($chkHeadless) { [bool]$chkHeadless.IsChecked } else { $false }
+                AutoUpdate    = if ($chkAuto) { [bool]$chkAuto.IsChecked } else { $false }
             }
         }
         if ($current -is [System.Collections.IDictionary]) {
