@@ -37567,7 +37567,7 @@ try {
 catch {}
 $packageInstallLogRoot = ""
 $needsPackageInstallLogRoot = ($ActionName -in @("Install", "Update", "Uninstall", "Repair")) -and (@($uniqueItems | Where-Object {
-            [bool]$_.ProviderLogFilesEnabled -and (([string]$_.Source).Trim().ToLowerInvariant() -in @("winget", "legendary"))
+            [bool]$_.ProviderLogFilesEnabled
         }).Count -gt 0)
 if ($needsPackageInstallLogRoot) {
     $packageInstallLogRoot = Join-Path (Get-DataPath) "package-install-logs"
@@ -37597,6 +37597,27 @@ $jobArgs = @{
 $wingetWorkerScript = {
     param($ArgsDict, $OutputQueue)
 
+    $script:WmtActiveProviderTranscriptPath = ""
+
+    function Write-WmtWorkerOutputItem {
+        param($Value)
+
+        if ($null -eq $Value) { return }
+        $activeTranscript = ([string]$script:WmtActiveProviderTranscriptPath).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($activeTranscript) -and
+            $Value -is [string] -and ([string]$Value) -like "LOG:*") {
+            try {
+                [System.IO.File]::AppendAllText(
+                    $activeTranscript,
+                    ("[{0}] {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), ([string]$Value).Substring(4), [Environment]::NewLine),
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
+            catch {}
+        }
+        $OutputQueue.Enqueue($Value)
+    }
+
     function Write-Output {
         param(
             [Parameter(ValueFromPipeline = $true, Position = 0)]$InputObject,
@@ -37605,14 +37626,14 @@ $wingetWorkerScript = {
         process {
             if ($null -eq $InputObject) { return }
             if ($NoEnumerate) {
-                $OutputQueue.Enqueue($InputObject)
+                Write-WmtWorkerOutputItem -Value $InputObject
                 return
             }
             if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
-                foreach ($outputItem in $InputObject) { $OutputQueue.Enqueue($outputItem) }
+                foreach ($outputItem in $InputObject) { Write-WmtWorkerOutputItem -Value $outputItem }
             }
             else {
-                $OutputQueue.Enqueue($InputObject)
+                Write-WmtWorkerOutputItem -Value $InputObject
             }
         }
     }
@@ -37704,6 +37725,58 @@ $wingetWorkerScript = {
             )
         }
         catch {}
+    }
+
+    function ConvertTo-WmtTranscriptCommand {
+        param(
+            [string]$Command,
+            [string]$TranscriptPath
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Command) -or [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            return $Command
+        }
+
+        $commandBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Command))
+        $transcriptBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($TranscriptPath))
+        $loggedCommandScript = @"
+`$ErrorActionPreference = 'Continue'
+`$commandText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$commandBase64'))
+`$transcriptPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$transcriptBase64'))
+try {
+    [System.IO.File]::AppendAllText(
+        `$transcriptPath,
+        ("[{0}] COMMAND: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), `$commandText, [Environment]::NewLine),
+        [System.Text.UTF8Encoding]::new(`$false)
+    )
+}
+catch {}
+`$global:LASTEXITCODE = `$null
+`$commandSucceeded = `$true
+try {
+    Invoke-Expression `$commandText 2>&1 |
+        Tee-Object -FilePath `$transcriptPath -Append |
+        ForEach-Object { Write-Host `$_ }
+    `$commandSucceeded = `$?
+}
+catch {
+    `$commandSucceeded = `$false
+    `$errorText = `$_.Exception.Message
+    try { `$errorText | Tee-Object -FilePath `$transcriptPath -Append | ForEach-Object { Write-Host `$_ } } catch { Write-Host `$errorText }
+}
+`$exitCode = if (`$null -ne `$global:LASTEXITCODE) { [int]`$global:LASTEXITCODE } elseif (`$commandSucceeded) { 0 } else { 1 }
+try {
+    [System.IO.File]::AppendAllText(
+        `$transcriptPath,
+        ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), `$exitCode, [Environment]::NewLine),
+        [System.Text.UTF8Encoding]::new(`$false)
+    )
+}
+catch {}
+exit `$exitCode
+"@
+        $encodedLoggedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loggedCommandScript))
+        return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLoggedCommand"
     }
 
     function Copy-WmtLatestWingetDiagnosticLog {
@@ -38838,7 +38911,18 @@ $wingetWorkerScript = {
         return $proc
     }
 
-    function Invoke-VisibleCmd ($command, $title, [int]$HoldSeconds = 0, [int]$TimeoutSeconds = 7200) {
+    function Invoke-VisibleCmd {
+        param(
+            [string]$command,
+            [string]$title,
+            [int]$HoldSeconds = 0,
+            [int]$TimeoutSeconds = 7200,
+            [string]$TranscriptPath = ""
+        )
+
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            $command = ConvertTo-WmtTranscriptCommand -Command $command -TranscriptPath $TranscriptPath
+        }
         if ([string]::IsNullOrWhiteSpace($title)) { $title = "WMT Package Update" }
         $safeTitle = ((($title -replace '"', '') -replace '[\r\n]', ' ') -replace '[&|<>^%!]', ' ').Trim()
         if ($HoldSeconds -gt 0) {
@@ -38873,7 +38957,8 @@ $wingetWorkerScript = {
             [string]$ActionLabel,
             [string]$PackageName,
             [string]$TempPath,
-            [int]$TimeoutSeconds = 14400
+            [int]$TimeoutSeconds = 14400,
+            [string]$TranscriptPath = ""
         )
 
         $rand = [Guid]::NewGuid().ToString("N")
@@ -38884,6 +38969,7 @@ $wingetWorkerScript = {
         if ([string]::IsNullOrWhiteSpace($safeTitle)) { $safeTitle = "WMT User Mode Retry" }
         $safePackageName = (([string]$PackageName -replace '[\r\n]', ' ') -replace '[&|<>^%!]', ' ').Trim()
         if ([string]::IsNullOrWhiteSpace($safePackageName)) { $safePackageName = "package" }
+        $effectiveCommand = if ([string]::IsNullOrWhiteSpace($TranscriptPath)) { $Command } else { ConvertTo-WmtTranscriptCommand -Command $Command -TranscriptPath $TranscriptPath }
 
         $batchContent = @"
 @echo off
@@ -38893,7 +38979,7 @@ echo WMT-GUI: Re-launching $safePackageName in user mode...
 echo.
 echo If an installer window appears, please click through it.
 echo.
-$Command
+$effectiveCommand
 set "WMT_EXIT=%ERRORLEVEL%"
 > "$resultPath" echo %WMT_EXIT%
 echo.
@@ -38996,7 +39082,8 @@ exit /b %WMT_EXIT%
             [string]$TempPath,
             [string]$ActionLabel = "Update",
             [string]$StoreFallbackUri = "",
-            [string]$StoreFallbackWebUri = ""
+            [string]$StoreFallbackWebUri = "",
+            [string]$TranscriptPath = ""
         )
 
         $rand = [Guid]::NewGuid().ToString("N")
@@ -39005,7 +39092,10 @@ exit /b %WMT_EXIT%
         $statusPath = Join-Path $TempPath "WMT_StoreCLI_$rand.status"
         $resourcesInUsePath = Join-Path $TempPath "WMT_StoreCLI_$rand.resources"
         $screenPath = Join-Path $TempPath "WMT_StoreCLI_$rand.screen"
-        $transcriptPath = Join-Path $TempPath "WMT_StoreCLI_$rand.transcript"
+        $transcriptPath = ([string]$TranscriptPath).Trim()
+        if ([string]::IsNullOrWhiteSpace($transcriptPath)) {
+            $transcriptPath = Join-Path $TempPath "WMT_StoreCLI_$rand.transcript"
+        }
         $fallbackAckPath = Join-Path $TempPath "WMT_StoreCLI_$rand.fallback_ack"
         $runnerPath = Join-Path $TempPath "WMT_StoreCLI_$rand.run.ps1"
         $sendKeysPath = Join-Path $TempPath "WMT_StoreCLI_$rand.ps1"
@@ -39467,7 +39557,7 @@ Start-Sleep -Milliseconds 700
 $transcriptPath
 '@
 `$exitCode = 1
-try { Start-Transcript -Path `$transcriptPath -Force | Out-Null } catch {}
+try { Start-Transcript -Path `$transcriptPath -Append -Force | Out-Null } catch {}
 try {
 & store @storeArgs
 if (`$null -ne `$global:LASTEXITCODE) { `$exitCode = [int]`$global:LASTEXITCODE } else { `$exitCode = 0 }
@@ -39866,6 +39956,31 @@ exit /b %WMT_EXIT%
         $wingetInstallerLogPath = ""
         $wingetRetryInstallerLogPath = ""
         $providerTranscriptPath = ""
+        $providerDiagnosticStem = ""
+        $providerLogKey = $srcKey
+        switch ($srcKey) {
+            "pip3" { $providerLogKey = "pip" }
+            "npm (global)" { $providerLogKey = "npm" }
+            "pnpm (global)" { $providerLogKey = "pnpm" }
+            "ruby" { $providerLogKey = "gem" }
+            "rust" { $providerLogKey = "cargo" }
+            "choco" { $providerLogKey = "chocolatey" }
+        }
+        $providerLogKey = (($providerLogKey -replace '[^A-Za-z0-9._-]', '_').Trim('_')).ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($providerLogKey)) { $providerLogKey = "provider" }
+        $providerLogLabel = if ([string]::IsNullOrWhiteSpace([string]$src)) { $providerLogKey } else { [string]$src }
+        if ($providerLogFilesEnabled -and $act -in @("Install", "Update", "Uninstall", "Repair")) {
+            $providerDiagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
+            $providerTranscriptPath = "$providerDiagnosticStem-$providerLogKey.log"
+            $script:WmtActiveProviderTranscriptPath = $providerTranscriptPath
+            Add-WmtPackageTranscriptLine -Path $providerTranscriptPath -Text "PROVIDER: $providerLogLabel"
+            Add-WmtPackageTranscriptLine -Path $providerTranscriptPath -Text "PACKAGE: $name ($id)"
+            Add-WmtPackageTranscriptLine -Path $providerTranscriptPath -Text "ACTION: $act"
+            Write-Output "LOG:[Diagnostics] $providerLogLabel $act log will be written to: $providerTranscriptPath"
+        }
+        else {
+            $script:WmtActiveProviderTranscriptPath = ""
+        }
         $wingetAttemptStartedAt = [datetime]::MinValue
         $storeCliArgs = $null
         $windowsUpdateItem = $null
@@ -39895,6 +40010,9 @@ exit /b %WMT_EXIT%
             $storeUpdateDone++
             if ($storeUpdateDone -ge $storeUpdateTotal) {
                 Close-WmtStoreGui
+            }
+            if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
+                Write-Output "LOG:[Diagnostics] $providerLogLabel log saved: $providerTranscriptPath"
             }
             continue
         }
@@ -39944,8 +40062,10 @@ exit /b %WMT_EXIT%
                 $includeUnknownFlag = if ($wingetIncludeUnknown) { " --include-unknown" } else { "" }
 
                 if ($providerLogFilesEnabled -and $act -in @("Install", "Update", "Uninstall", "Repair")) {
-                    $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
-                    $wingetTranscriptPath = "$diagnosticStem-winget.log"
+                    $diagnosticStem = if (-not [string]::IsNullOrWhiteSpace($providerDiagnosticStem)) { $providerDiagnosticStem } else { New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act }
+                    $wingetTranscriptPath = if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath)) { $providerTranscriptPath } else { "$diagnosticStem-winget.log" }
+                    $providerTranscriptPath = $wingetTranscriptPath
+                    $script:WmtActiveProviderTranscriptPath = $providerTranscriptPath
                     if ($act -in @("Install", "Update")) {
                         $wingetInstallerLogPath = "$diagnosticStem-installer.log"
                         $wingetRetryInstallerLogPath = "$diagnosticStem-retry-installer.log"
@@ -40032,6 +40152,9 @@ exit /b %WMT_EXIT%
                         $userFlags += " --verbose-logs"
                     }
                     $wingetArgs = "uninstall --id `"$id`" --source msstore $flags"
+                    if ($providerLogFilesEnabled -and -not [string]::IsNullOrWhiteSpace($providerTranscriptPath)) {
+                        $wingetTranscriptPath = $providerTranscriptPath
+                    }
                     $cmd = "winget $wingetArgs"
                     $userCmd = "winget uninstall --id `"$id`" --source msstore $userFlags"
                 }
@@ -40093,6 +40216,9 @@ exit /b %WMT_EXIT%
                         Write-Output "LOG:[$act][$index/$total] FAILED: $name (Steam update completion was not confirmed)"
                         Write-Output "RESULT:${index}:FAILED:$name"
                     }
+                    if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
+                        Write-Output "LOG:[Diagnostics] $providerLogLabel log saved: $providerTranscriptPath"
+                    }
                     continue
                 }
                 elseif ($act -eq "Install") {
@@ -40116,6 +40242,9 @@ exit /b %WMT_EXIT%
                         Write-Output "LOG:[$act][$index/$total] FAILED: $name"
                         Write-Output "RESULT:${index}:FAILED:$name"
                     }
+                    if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
+                        Write-Output "LOG:[Diagnostics] $providerLogLabel log saved: $providerTranscriptPath"
+                    }
                     continue
                 }
 
@@ -40128,10 +40257,14 @@ exit /b %WMT_EXIT%
                 if ($act -eq "Install") { $skipReason = "Epic/Legendary installs must use WMT's interactive game installer." }
                 if ($act -eq "Update") { $cmd = "$legendaryCommand $legendaryGlobalArgs -y update `"$id`" --update-only $legendaryHeadlessArgs" }
                 if ($act -eq "Uninstall") { $cmd = "$legendaryCommand $legendaryGlobalArgs -y uninstall `"$id`"" }
+                $displayCmd = $cmd
 
                 if ($providerLogFilesEnabled -and $act -in @("Update", "Uninstall") -and -not [string]::IsNullOrWhiteSpace($cmd)) {
-                    $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
-                    $providerTranscriptPath = "$diagnosticStem-legendary.log"
+                    if ([string]::IsNullOrWhiteSpace($providerTranscriptPath)) {
+                        $diagnosticStem = New-WmtPackageDiagnosticStem -PackageId ([string]$id) -ActionLabel $act
+                        $providerTranscriptPath = "$diagnosticStem-legendary.log"
+                        $script:WmtActiveProviderTranscriptPath = $providerTranscriptPath
+                    }
 
                     $legendaryLogExe = ([string]$legendaryExePath).Trim()
                     if ([string]::IsNullOrWhiteSpace($legendaryLogExe) -or -not (Test-Path -LiteralPath $legendaryLogExe -PathType Leaf)) {
@@ -40149,7 +40282,6 @@ exit /b %WMT_EXIT%
                         $loggedScript = "& '" + $exePs + "' " + $legendaryArgsText + " 2>&1 | Tee-Object -FilePath '" + $logPs + "' -Append | ForEach-Object { Write-Host `$_ }; `$wmtLegendaryExit = `$LASTEXITCODE; exit `$wmtLegendaryExit"
                         $encodedLoggedScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loggedScript))
                         $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLoggedScript"
-                        Write-Output "LOG:[Diagnostics] Legendary $act log will be written to: $providerTranscriptPath"
                     }
                 }
                 $userCmd = $cmd
@@ -40166,6 +40298,9 @@ exit /b %WMT_EXIT%
                     else {
                         Write-Output "LOG:[$act][$index/$total] FAILED: $name"
                         Write-Output "RESULT:${index}:FAILED:$name"
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
+                        Write-Output "LOG:[Diagnostics] $providerLogLabel log saved: $providerTranscriptPath"
                     }
                     continue
                 }
@@ -40408,7 +40543,8 @@ exit /b %WMT_EXIT%
                 Write-Output "LOG:[$act] Launching visible $windowTag window for: $name"
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
-                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds
+                    $visibleTranscriptPath = if ($srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
+                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
                     # Normalize a missing/failed visible process result. The final
                     # result line below reports the failure once, without duplicate chatter.
@@ -40440,7 +40576,7 @@ exit /b %WMT_EXIT%
                 $p = Invoke-WmtStoreAppUpdateScan -PackageName $name
             }
             elseif ($storeCliArgs) {
-                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri
+                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri -TranscriptPath $providerTranscriptPath
             }
             elseif ($windowsUpdateItem) {
                 $p = Invoke-WmtWindowsUpdateInstall -Item $windowsUpdateItem
@@ -40479,7 +40615,7 @@ exit /b %WMT_EXIT%
             }
             if (-not $wingetArgs) { Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)" }
             if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
-                Write-Output "LOG:[Diagnostics] Legendary log saved: $providerTranscriptPath"
+                Write-Output "LOG:[Diagnostics] $providerLogLabel log saved: $providerTranscriptPath"
             }
 
             $hex = "0x{0:x}" -f $p.ExitCode
@@ -40637,7 +40773,7 @@ exit /b %WMT_EXIT%
                 if (-not [string]::IsNullOrWhiteSpace($userCmd)) {
                     Write-Output "LOG:[$act] User-mode retry command: $userCmd"
                 }
-                $retryResult = Invoke-WmtUserModeRetry -Command $userCmd -ActionLabel $act -PackageName $name -TempPath $temp
+                $retryResult = Invoke-WmtUserModeRetry -Command $userCmd -ActionLabel $act -PackageName $name -TempPath $temp -TranscriptPath $providerTranscriptPath
                 if ($retryResult.TimedOut) {
                     Write-Output "LOG:[$act][$index/$total] FAILED: $name (user-mode retry timed out and was stopped)"
                     Write-Output "RESULT:${index}:FAILED:$name"
