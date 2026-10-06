@@ -30675,8 +30675,8 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas, monospace" FontSize="12" 
                                      Background="Transparent" Foreground="{DynamicResource LogText}" BorderThickness="0" Padding="4"
                                      VerticalAlignment="Stretch" AcceptsReturn="True"
-                                     SelectionBrush="Transparent" SelectionOpacity="0"
-                                     IsInactiveSelectionHighlightEnabled="False"
+                                     SelectionBrush="{DynamicResource Accent}" SelectionOpacity="0.55"
+                                     IsInactiveSelectionHighlightEnabled="True"
                                      SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display"/>
                             <Canvas Name="LogSearchHighlightLayer" IsHitTestVisible="False" Panel.ZIndex="20"/>
                         </Grid>
@@ -32615,6 +32615,9 @@ catch {
 }
 
 function Clear-WmtActivityLogHighlight {
+$script:LogSearchMatchIndex = -1
+$script:LogSearchMatchLength = 0
+$script:LogSearchMatchQuery = ""
 if ($script:LogSearchHighlightLayer) {
     try { $script:LogSearchHighlightLayer.Children.Clear() } catch {}
 }
@@ -32633,25 +32636,40 @@ if ([string]::IsNullOrEmpty($text)) { return $false }
 
 $comparison = [System.StringComparison]::OrdinalIgnoreCase
 $index = -1
+$sameQuery = ([string]$script:LogSearchMatchQuery -eq $Query)
+$hasCurrentMatch = $sameQuery -and ($script:LogSearchMatchIndex -ge 0)
+
 if ($Previous) {
-    $start = if ($Restart) { $text.Length - 1 } else { [Math]::Min($text.Length - 1, [Math]::Max(0, $script:LogBox.SelectionStart - 1)) }
+    $start = if ($Restart -or -not $hasCurrentMatch) {
+        $text.Length - 1
+    }
+    else {
+        [Math]::Min($text.Length - 1, [Math]::Max(0, $script:LogSearchMatchIndex - 1))
+    }
     if ($start -ge 0) { $index = $text.LastIndexOf($Query, $start, $comparison) }
     if ($index -lt 0 -and -not $Restart) { $index = $text.LastIndexOf($Query, $text.Length - 1, $comparison) }
 }
 else {
-    $start = if ($Restart) { 0 } else { [Math]::Min($text.Length, $script:LogBox.SelectionStart + $script:LogBox.SelectionLength) }
+    $start = if ($Restart -or -not $hasCurrentMatch) {
+        0
+    }
+    else {
+        [Math]::Min($text.Length, $script:LogSearchMatchIndex + $script:LogSearchMatchLength)
+    }
     $index = $text.IndexOf($Query, $start, $comparison)
     if ($index -lt 0 -and -not $Restart -and $start -gt 0) { $index = $text.IndexOf($Query, 0, $comparison) }
 }
 
 if ($index -lt 0) {
-    # Do not leave an older match highlighted when the new query has no hits.
-    $collapseAt = [Math]::Min([Math]::Max(0, $script:LogBox.SelectionStart), $text.Length)
-    $script:LogBox.Select($collapseAt, 0)
     Clear-WmtActivityLogHighlight
     return $false
 }
-$script:LogBox.Select($index, $Query.Length)
+
+# Search owns its own cursor. Never change LogBox.SelectionStart/SelectionLength;
+# those are reserved for the user's normal mouse/keyboard text selection.
+$script:LogSearchMatchIndex = $index
+$script:LogSearchMatchLength = $Query.Length
+$script:LogSearchMatchQuery = $Query
 try {
     $lineIndex = $script:LogBox.GetLineIndexFromCharacterIndex($index)
     if ($lineIndex -ge 0) { $script:LogBox.ScrollToLine($lineIndex) }
@@ -34957,8 +34975,7 @@ if ($txtLogSearch) {
             [void](Select-WmtActivityLogMatch -Query $query -Restart)
         }
         elseif ($LogBox) {
-            # Clearing the query should remove the visible find highlight without hiding log lines.
-            $LogBox.Select($LogBox.SelectionStart, 0)
+            # Clearing find must not disturb text the user has selected for copying.
             Clear-WmtActivityLogHighlight
         }
     })
@@ -34984,7 +35001,7 @@ if ($btnLogClearSearch) {
     $btnLogClearSearch.Add_Click({
         $txtLogSearch.Text = ""
         if ($LogBox) {
-            $LogBox.Select($LogBox.Text.Length, 0)
+            Clear-WmtActivityLogHighlight
             $LogBox.ScrollToEnd()
         }
         $txtLogSearch.Focus()
@@ -35001,9 +35018,13 @@ $LogBox.Add_TextChanged({
             if ($svLog) { $svLog.ScrollToEnd() } else { $s.ScrollToEnd() }
         }
     })
-$LogBox.Add_PreviewMouseLeftButtonDown({
+$LogBox.Add_PreviewMouseLeftButtonUp({
         param($s, $e)
         if ($e.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
+
+        # A drag-selection must win over clickable path/URL behavior.
+        if ($s.SelectionLength -gt 0) { return }
+
         $reference = Get-WmtActivityLogReferenceAtPoint -TextBox $s -Point ($e.GetPosition($s))
         if ($reference) {
             $e.Handled = $true
