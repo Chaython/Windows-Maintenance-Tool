@@ -32734,6 +32734,32 @@ foreach ($match in $pathMatches) {
 return $null
 }
 
+function Open-WmtActivityLogPath {
+param([string]$Path)
+
+if ([string]::IsNullOrWhiteSpace($Path)) { return }
+if (Test-Path -LiteralPath $Path -PathType Container) {
+    Start-Process -FilePath "explorer.exe" -ArgumentList "`"$Path`"" | Out-Null
+    return
+}
+if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+
+# Never execute a program/script merely because its path appeared in the log.
+# Select executable content in Explorer; ordinary documents/logs still open normally.
+$extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+$selectOnlyExtensions = @(
+    ".exe", ".com", ".bat", ".cmd", ".msi", ".msp", ".scr", ".cpl",
+    ".lnk", ".url", ".ps1", ".psm1", ".psd1", ".vbs", ".vbe", ".js",
+    ".jse", ".wsf", ".wsh", ".hta", ".reg"
+)
+if ($selectOnlyExtensions -contains $extension) {
+    Start-Process -FilePath "explorer.exe" -ArgumentList "/select,`"$Path`"" | Out-Null
+    return
+}
+
+Start-Process -FilePath $Path | Out-Null
+}
+
 function Open-WmtActivityLogReference {
 param($Reference)
 
@@ -32741,16 +32767,17 @@ if (-not $Reference -or [string]::IsNullOrWhiteSpace([string]$Reference.Target))
 $target = [string]$Reference.Target
 try {
     if ([string]$Reference.Kind -eq "Uri") {
-        Start-Process $target | Out-Null
+        if ($target -match '^(?i)file://') {
+            $fileUri = [System.Uri]$target
+            Open-WmtActivityLogPath -Path $fileUri.LocalPath
+        }
+        else {
+            Start-Process $target | Out-Null
+        }
         return
     }
 
-    if (Test-Path -LiteralPath $target -PathType Container) {
-        Start-Process -FilePath "explorer.exe" -ArgumentList "`"$target`"" | Out-Null
-    }
-    elseif (Test-Path -LiteralPath $target -PathType Leaf) {
-        Start-Process -FilePath $target | Out-Null
-    }
+    Open-WmtActivityLogPath -Path $target
 }
 catch {
     Write-GuiLog "Could not open log reference '$target': $($_.Exception.Message)"
@@ -35016,6 +35043,11 @@ $LogBox.Add_TextChanged({
         $searchActive = (-not [string]::IsNullOrWhiteSpace($query)) -and $query -ne $script:LogSearchPlaceholder
         if (-not $searchActive) {
             if ($svLog) { $svLog.ScrollToEnd() } else { $s.ScrollToEnd() }
+        }
+    })
+$LogBox.Add_SizeChanged({
+        if ($script:LogSearchMatchIndex -ge 0 -and $script:LogSearchMatchLength -gt 0) {
+            try { Show-WmtActivityLogHighlight -Index $script:LogSearchMatchIndex -Length $script:LogSearchMatchLength } catch {}
         }
     })
 $LogBox.Add_PreviewMouseLeftButtonUp({
@@ -39134,8 +39166,10 @@ exit /b %WMT_EXIT%
         $resourcesInUsePath = Join-Path $TempPath "WMT_StoreCLI_$rand.resources"
         $screenPath = Join-Path $TempPath "WMT_StoreCLI_$rand.screen"
         $transcriptPath = ([string]$TranscriptPath).Trim()
+        $temporaryTranscriptPath = ""
         if ([string]::IsNullOrWhiteSpace($transcriptPath)) {
             $transcriptPath = Join-Path $TempPath "WMT_StoreCLI_$rand.transcript"
+            $temporaryTranscriptPath = $transcriptPath
         }
         $fallbackAckPath = Join-Path $TempPath "WMT_StoreCLI_$rand.fallback_ack"
         $runnerPath = Join-Path $TempPath "WMT_StoreCLI_$rand.run.ps1"
@@ -39225,13 +39259,6 @@ public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
             catch {}
         }
 
-        function Write-WmtStoreCliActivityEvent {
-            param([string]$Line)
-
-            if ([string]::IsNullOrWhiteSpace($EventPath) -or [string]::IsNullOrWhiteSpace($Line)) { return }
-            try { Add-Content -Path $EventPath -Value $Line -Encoding UTF8 -Force } catch {}
-        }
-
         function Test-WmtStoreCliResourcesInUseText {
             param([string]$Text)
 
@@ -39266,7 +39293,6 @@ public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
                 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
                 $fallbackLine = "STORE_FALLBACK:$encoded"
                 Write-Output $fallbackLine
-                Write-WmtStoreCliActivityEvent $fallbackLine
             }
             catch {}
 
@@ -39317,8 +39343,7 @@ param(
 [string]$PackageName,
 [string]$StatusPath,
 [string]$ResourcesInUsePath,
-[string]$ScreenPath,
-[string]$EventPath
+[string]$ScreenPath
 )
 
 Add-Type -TypeDefinition @"
@@ -39527,9 +39552,6 @@ try {
     Set-Content -Path $StatusPath -Value $line -Encoding Ascii -Force
     if ($Status -eq "RESOURCES_IN_USE" -and -not [string]::IsNullOrWhiteSpace($ResourcesInUsePath)) {
         Set-Content -Path $ResourcesInUsePath -Value $line -Encoding Ascii -Force
-        if (-not [string]::IsNullOrWhiteSpace($EventPath)) {
-            Add-Content -Path $EventPath -Value "LOG:[Store CLI] Error 0x80073d02: The package could not be installed because resources it modifies are currently in use. Close the app and related Store/Xbox windows, then try again." -Encoding UTF8 -Force
-        }
     }
 }
 catch {}
@@ -39636,7 +39658,7 @@ exit /b %WMT_EXIT%
             $cmdProc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batPath`"" -PassThru -WindowStyle $storeWindowStyle
             if (-not $silentUpdateInstallEnabled) { Show-WmtStoreCliWindow $cmdProc }
             $safePackageArg = ([string]$PackageName).Replace('"', '')
-            Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$sendKeysPath`" -TargetPid $($cmdProc.Id) -PackageName `"$safePackageArg`" -StatusPath `"$statusPath`" -ResourcesInUsePath `"$resourcesInUsePath`" -ScreenPath `"$screenPath`" -EventPath `"$EventPath`"" -WindowStyle Hidden
+            Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$sendKeysPath`" -TargetPid $($cmdProc.Id) -PackageName `"$safePackageArg`" -StatusPath `"$statusPath`" -ResourcesInUsePath `"$resourcesInUsePath`" -ScreenPath `"$screenPath`"" -WindowStyle Hidden
             Write-Output "LOG:  [store] Progress: 5%"
 
             $storeCliTimeoutMinutes = if ($ArgumentList.Count -eq 1 -and ([string]$ArgumentList[0]).Trim().ToLowerInvariant() -eq "updates") { 10 } else { 3 }
@@ -39676,14 +39698,13 @@ exit /b %WMT_EXIT%
                     if ($storeCliResourcesInUse -and -not $storeCliResourcesInUseLogged) {
                         $resourcesInUseLog = "LOG:[Store CLI] Error 0x80073d02: The package could not be installed because resources it modifies are currently in use. Close the app and related Store/Xbox windows, then try again."
                         Write-Output $resourcesInUseLog
-                        Write-WmtStoreCliActivityEvent $resourcesInUseLog
                         $storeCliResourcesInUseLogged = $true
                     }
                     $exitCode = [int]$result.ExitCode
                     if ($storeCliResourcesInUse -and ($exitCode -eq 0 -or $exitCode -eq 1)) {
                         $exitCode = -2147009278
                     }
-                    Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath)
+                    Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
                     return [PSCustomObject]@{ ExitCode = $exitCode; ResourcesInUse = $storeCliResourcesInUse }
                 }
 
@@ -39693,7 +39714,6 @@ exit /b %WMT_EXIT%
                     if (Test-WmtStoreCliResourcesInUseText $transcriptText) {
                         $resourcesInUseLog = "LOG:[Store CLI] Error 0x80073d02: The package could not be installed because resources it modifies are currently in use. Close the app and related Store/Xbox windows, then try again."
                         Write-Output $resourcesInUseLog
-                        Write-WmtStoreCliActivityEvent $resourcesInUseLog
                         $storeCliResourcesInUse = $true
                         $storeCliResourcesInUseLogged = $true
                     }
@@ -39701,7 +39721,6 @@ exit /b %WMT_EXIT%
                 if ((Test-Path $resourcesInUsePath) -and -not $storeCliResourcesInUse) {
                     $resourcesInUseLog = "LOG:[Store CLI] Error 0x80073d02: The package could not be installed because resources it modifies are currently in use. Close the app and related Store/Xbox windows, then try again."
                     Write-Output $resourcesInUseLog
-                    Write-WmtStoreCliActivityEvent $resourcesInUseLog
                     $storeCliResourcesInUse = $true
                     $storeCliResourcesInUseLogged = $true
                 }
@@ -39734,7 +39753,6 @@ exit /b %WMT_EXIT%
                                 if (-not $storeCliResourcesInUse) {
                                     $resourcesInUseLog = "LOG:[Store CLI] Error 0x80073d02: The package could not be installed because resources it modifies are currently in use. Close the app and related Store/Xbox windows, then try again."
                                     Write-Output $resourcesInUseLog
-                                    Write-WmtStoreCliActivityEvent $resourcesInUseLog
                                 }
                                 $storeCliResourcesInUse = $true
                                 $storeCliResourcesInUseLogged = $true
@@ -39776,7 +39794,7 @@ exit /b %WMT_EXIT%
                     }
                     catch {}
                     $fallbackResult = Invoke-WmtStoreCliFallback -Reason $fallbackReason -ReasonText $fallbackReasonText -StoreUri $StoreFallbackUri -WebUri $StoreFallbackWebUri
-                    Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath)
+                    Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
                     return [PSCustomObject]@{
                         ExitCode                  = -2
                         StoreFallbackOpened       = $true
@@ -39801,12 +39819,12 @@ exit /b %WMT_EXIT%
                 if ($cmdProc -and -not $cmdProc.HasExited) { Stop-Process -Id $cmdProc.Id -Force -ErrorAction SilentlyContinue }
             }
             catch {}
-            Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath)
+            Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
             return [PSCustomObject]@{ ExitCode = -1 }
         }
         catch {
             Write-Output "LOG:[Store CLI] Interactive launch failed: $($_.Exception.Message)"
-            Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath)
+            Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
             return [PSCustomObject]@{ ExitCode = 1 }
         }
     }
@@ -40236,7 +40254,6 @@ exit /b %WMT_EXIT%
                         $steamEncoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($steamJson))
                         $steamOpenLine = "STEAM_OPEN:$steamEncoded"
                         Write-Output $steamOpenLine
-                        Write-WmtStoreCliActivityEvent $steamOpenLine
                     }
                     catch {
                         Write-Output "LOG:[Steam] Could not prepare Steam request: $($_.Exception.Message)"
