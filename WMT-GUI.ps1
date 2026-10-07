@@ -7930,6 +7930,7 @@ try {
         CleanerAutoCleanMinutes    = [int](Get-WmtCleanerAutoCleanMinutes -Settings $Settings)
         EnabledProviders           = @(Get-WmtSettingsMember -Settings $Settings -Name "EnabledProviders" -Default @("winget"))
         ProviderToggles            = (Get-WmtSettingsMember -Settings $Settings -Name "ProviderToggles" -Default @{})
+        ProviderExecutionOverrides = (Get-WmtSettingsMember -Settings $Settings -Name "ProviderExecutionOverrides" -Default @{})
         WuCategoryToggles          = (Get-WmtSettingsMember -Settings $Settings -Name "WuCategoryToggles" -Default @{})
         CustomDnsServers           = @(Get-WmtSettingsMember -Settings $Settings -Name "CustomDnsServers" -Default @())
         CustomDohTemplate          = [string](Get-WmtSettingsMember -Settings $Settings -Name "CustomDohTemplate" -Default "")
@@ -7999,6 +8000,7 @@ $defaults = @{
     EnabledProviders           = @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     WuCategoryToggles          = @{}
     ProviderToggles            = @{}
+    ProviderExecutionOverrides = @{}
     CustomDnsServers           = @()
     CustomDohTemplate          = ""
     CustomDohEnabled           = $false
@@ -8124,6 +8126,36 @@ if ($json) {
         }
         if ($json.PSObject.Properties["EnabledProviders"]) { $defaults.EnabledProviders = $json.EnabledProviders }
         if ($json.PSObject.Properties["ProviderToggles"]) { $defaults.ProviderToggles = $json.ProviderToggles }
+        if ($json.PSObject.Properties["ProviderExecutionOverrides"]) {
+            $defaults.ProviderExecutionOverrides = $json.ProviderExecutionOverrides
+        }
+        elseif ($json.PSObject.Properties["ProviderToggles"] -and $json.ProviderToggles) {
+            # Before per-provider execution settings were wired, every provider row
+            # persisted Headless=false / AutoUpdate=false by default. Those false
+            # values were display state, not intentional overrides. Migrate only
+            # legacy true opt-ins; false values inherit the global setting.
+            $migratedExecutionOverrides = [ordered]@{}
+            foreach ($providerProp in @($json.ProviderToggles.PSObject.Properties)) {
+                $legacyEntry = $providerProp.Value
+                if (-not $legacyEntry) { continue }
+                $overrideEntry = [ordered]@{}
+                try {
+                    if ($legacyEntry.PSObject.Properties["Headless"] -and
+                        (ConvertTo-WmtSettingsBoolean $legacyEntry.Headless $false)) {
+                        $overrideEntry["Headless"] = $true
+                    }
+                    if ($legacyEntry.PSObject.Properties["AutoUpdate"] -and
+                        (ConvertTo-WmtSettingsBoolean $legacyEntry.AutoUpdate $false)) {
+                        $overrideEntry["AutoUpdate"] = $true
+                    }
+                }
+                catch {}
+                if ($overrideEntry.Count -gt 0) {
+                    $migratedExecutionOverrides[[string]$providerProp.Name] = $overrideEntry
+                }
+            }
+            $defaults.ProviderExecutionOverrides = $migratedExecutionOverrides
+        }
         if ($json.PSObject.Properties["WuCategoryToggles"]) { $defaults.WuCategoryToggles = $json.WuCategoryToggles }
         if ($json.PSObject.Properties["CustomDnsServers"]) {
             $customDnsServers = @()
@@ -39011,8 +39043,7 @@ exit `$exitCode
             [string]$title,
             [int]$HoldSeconds = 0,
             [int]$TimeoutSeconds = 7200,
-            [string]$TranscriptPath = "",
-            [bool]$Headless = $false
+            [string]$TranscriptPath = ""
         )
 
         if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
@@ -39026,8 +39057,7 @@ exit `$exitCode
         else {
             $cmdLine = "/c title $safeTitle && $command"
         }
-        $windowStyle = if ($Headless) { "Hidden" } else { "Normal" }
-        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -PassThru -WindowStyle $windowStyle
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -PassThru -WindowStyle Normal
         $startedAt = Get-Date
         $lastHeartbeat = $startedAt
         while (-not $proc.HasExited) {
@@ -40665,7 +40695,7 @@ exit /b %WMT_EXIT%
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
                     $visibleTranscriptPath = if ($srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
-                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath -Headless:$providerHeadlessEnabled
+                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
                     # Normalize a missing/failed visible process result. The final
                     # result line below reports the failure once, without duplicate chatter.
@@ -40697,7 +40727,7 @@ exit /b %WMT_EXIT%
                 $p = Invoke-WmtStoreAppUpdateScan -PackageName $name
             }
             elseif ($storeCliArgs) {
-                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri -TranscriptPath $providerTranscriptPath -Headless:$providerHeadlessEnabled
+                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri -TranscriptPath $providerTranscriptPath
             }
             elseif ($windowsUpdateItem) {
                 $p = Invoke-WmtWindowsUpdateInstall -Item $windowsUpdateItem
@@ -40752,7 +40782,7 @@ exit /b %WMT_EXIT%
                 $cmd = "winget $wingetArgs"
                 $userCmd = $wingetUserCmdWithoutInstallerLog
                 if ($useVisibleWindow) {
-                    $p = Invoke-VisibleCmd $cmd "WMT Winget Retry Without Installer Log - $name" -Headless:$providerHeadlessEnabled
+                    $p = Invoke-VisibleCmd $cmd "WMT Winget Retry Without Installer Log - $name"
                 }
                 else {
                     $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
@@ -40770,7 +40800,7 @@ exit /b %WMT_EXIT%
                     if ($wingetArgs) {
                         if ($useVisibleWindow) {
                             $retryCmd = "winget $wingetArgs"
-                            $p = Invoke-VisibleCmd $retryCmd "WMT Winget Retry - $name" -Headless:$providerHeadlessEnabled
+                            $p = Invoke-VisibleCmd $retryCmd "WMT Winget Retry - $name"
                         }
                         else {
                             $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
@@ -40879,6 +40909,11 @@ exit /b %WMT_EXIT%
                 }
                 if ($srcKey -eq "pip" -or $srcKey -eq "pip3") {
                     Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (pip user-mode retry disabled)"
+                    Write-Output "RESULT:${index}:FAILED:$name"
+                    continue
+                }
+                if ($providerHeadlessEnabled) {
+                    Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (headless mode; interactive user-mode retry suppressed)"
                     Write-Output "RESULT:${index}:FAILED:$name"
                     continue
                 }
@@ -41641,8 +41676,6 @@ if ($Toggles) {
             Search     = if ($defaults.Search) { [bool]$val.Search } else { $false }
             Scan       = [bool]$val.Scan
             Logs       = if ($val -is [System.Collections.IDictionary]) { if ($val.Contains("Logs")) { [bool]$val["Logs"] } else { $true } } elseif ($null -ne $val.Logs) { [bool]$val.Logs } else { $true }
-            Headless   = [bool]$val.Headless
-            AutoUpdate = [bool]$val.AutoUpdate
         }
         $clean[$k] = $entry
     }
@@ -41690,7 +41723,7 @@ $name = ([string]$ToggleName).Trim()
 $result = [PSCustomObject]@{ IsSet = $false; Value = $false }
 if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($name)) { return $result }
 
-$raw = Get-WmtSettingsMember -Settings $Settings -Name "ProviderToggles" -Default $null
+$raw = Get-WmtSettingsMember -Settings $Settings -Name "ProviderExecutionOverrides" -Default $null
 if (-not $raw) { return $result }
 
 $entry = $null
@@ -41737,8 +41770,18 @@ function Get-WmtEffectiveProviderHeadless {
 param($Settings, [string]$ProviderKey)
 
 if (-not $Settings) { $Settings = Get-WmtSettings }
+$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+
+# Headless is a scan/update execution preference. A provider excluded from scans
+# is effectively not headless, even if it has a saved override.
+if (-not (Get-WmtProviderToggle -Settings $Settings -ProviderKey $key -ToggleName "Scan")) { return $false }
+
+# These providers are GUI-owned by design: Store updates use the Microsoft Store
+# UI and Steam updates are delegated to the Steam client.
+if ($key -in @("msstore", "steam")) { return $false }
+
 $fallback = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $Settings)
-$override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $ProviderKey -ToggleName "Headless"
+$override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $key -ToggleName "Headless"
 if ($override.IsSet) { return [bool]$override.Value }
 return $fallback
 }
@@ -41747,8 +41790,11 @@ function Get-WmtEffectiveProviderAutoUpdate {
 param($Settings, [string]$ProviderKey)
 
 if (-not $Settings) { $Settings = Get-WmtSettings }
+$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+if (-not (Get-WmtProviderToggle -Settings $Settings -ProviderKey $key -ToggleName "Scan")) { return $false }
+
 $fallback = [bool](Get-WmtUpdateAutoInstallEnabled -Settings $Settings)
-$override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $ProviderKey -ToggleName "AutoUpdate"
+$override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $key -ToggleName "AutoUpdate"
 if ($override.IsSet) { return [bool]$override.Value }
 return $fallback
 }
@@ -42642,8 +42688,8 @@ function Format-WmtProviderRowXaml {
                     <ToggleButton Name="chk${key}Search"     Content="Search"     Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$searchIsChecked"    IsEnabled="$searchEnabled" ToolTip="$searchToolTip"/>
                     <ToggleButton Name="chk${key}Scan"       Content="Scan"       Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$scanIsChecked"       ToolTip="Include this provider in update scans. Disabling also disables Headless and Auto-update for this provider."/>
                     <ToggleButton Name="chk${key}Logs"       Content="Log files"  Margin="0,0,8,0" Padding="10,3" MinWidth="68" IsChecked="$logsIsChecked"       ToolTip="Allow WMT to request and keep persistent diagnostic/install log files for this provider. On-screen Activity Log messages are unaffected; providers may still keep mandatory internal logs."/>
-                    <ToggleButton Name="chk${key}Headless"   Content="Headless"   Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$headlessIsChecked"   ToolTip="Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."/>
-                    <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update" Margin="0,0,8,0" Padding="10,3" MinWidth="70" IsChecked="$autoIsChecked"       ToolTip="After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan to be enabled."/>
+                    <ToggleButton Name="chk${key}Headless"   Content="Headless"   Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsThreeState="True" IsChecked="$headlessIsChecked"   ToolTip="Three-state setting: On = force headless, Off = force interactive, mixed = inherit the global Headless setting. Requires Scan."/>
+                    <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update" Margin="0,0,8,0" Padding="10,3" MinWidth="70" IsThreeState="True" IsChecked="$autoIsChecked"       ToolTip="Three-state setting: On = force auto-update, Off = disable it, mixed = inherit the global Auto-install setting. Requires Scan."/>
                     $includeUnknownToggle
                 </StackPanel>
                 $wuCategorySection
@@ -43871,8 +43917,8 @@ foreach ($provider in $providerDefinitions) {
     $searchVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Search"] } else { $toggles.Search }
     $scanVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Scan"] } else { $toggles.Scan }
     $logsVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Logs"] } else { $toggles.Logs }
-    $headVal = Get-WmtEffectiveProviderHeadless -Settings $settings -ProviderKey $key
-    $autoVal = Get-WmtEffectiveProviderAutoUpdate -Settings $settings -ProviderKey $key
+    $headOverride = Get-WmtProviderToggleOverride -Settings $settings -ProviderKey $key -ToggleName "Headless"
+    $autoOverride = Get-WmtProviderToggleOverride -Settings $settings -ProviderKey $key -ToggleName "AutoUpdate"
     $chkSearch = & $getWinCtrl "chk${key}Search"
     $chkScan = & $getWinCtrl "chk${key}Scan"
     $chkLogs = & $getWinCtrl "chk${key}Logs"
@@ -43881,8 +43927,8 @@ foreach ($provider in $providerDefinitions) {
     if ($chkSearch) { $chkSearch.IsChecked = [bool]$searchVal }
     if ($chkScan) { $chkScan.IsChecked = [bool]$scanVal }
     if ($chkLogs) { $chkLogs.IsChecked = [bool]$logsVal }
-    if ($chkHeadless) { $chkHeadless.IsChecked = [bool]$headVal }
-    if ($chkAuto) { $chkAuto.IsChecked = [bool]$autoVal }
+    if ($chkHeadless) { $chkHeadless.IsChecked = if ($headOverride.IsSet) { [bool]$headOverride.Value } else { $null } }
+    if ($chkAuto) { $chkAuto.IsChecked = if ($autoOverride.IsSet) { [bool]$autoOverride.Value } else { $null } }
     # Store controls for later event wiring.
     $providerControls[$key] = @{
         Main       = $chkMain
@@ -43907,6 +43953,9 @@ $updateProviderToggleState = {
     $searchSupported = [bool]$caps.Search
     $mainChecked = [bool]$controls.Main.IsChecked
     $scanChecked = [bool]$controls.Scan.IsChecked
+    $headlessSupported = ($ProviderKey -notin @("msstore", "steam"))
+    $globalHeadlessState = if ($chkUpdateSilentInstall -and [bool]$chkUpdateSilentInstall.IsChecked) { "On" } else { "Off" }
+    $globalAutoState = if ($chkUpdateAutoInstall -and [bool]$chkUpdateAutoInstall.IsChecked) { "On" } else { "Off" }
 
     # Get provider display name for tooltip messages.
     $provider = @($providerDefinitions | Where-Object { $_.Key -eq $ProviderKey } | Select-Object -First 1)
@@ -43924,8 +43973,8 @@ $updateProviderToggleState = {
     $searchTip = "Allow searching this provider's catalog or owned library from the WMT search box."
     $scanTip = "Include this provider in update scans. Disabling also disables Headless and Auto-update."
     $logsTip = "Allow WMT to request and keep persistent diagnostic/install log files for this provider. On-screen Activity Log messages are unaffected; providers may still keep mandatory internal logs."
-    $headlessTip = "Run this provider's update/install commands without showing their console windows. Requires Scan to be enabled."
-    $autoTip = "After a completed scan, automatically install this provider's available updates without confirmation. Requires Scan to be enabled."
+    $headlessTip = "Three-state: On forces headless, Off forces interactive, mixed inherits global Headless (currently $globalHeadlessState). Requires Scan."
+    $autoTip = "Three-state: On forces auto-update, Off disables it, mixed inherits global Auto-install (currently $globalAutoState). Requires Scan."
 
     if (-not $isInstalled) {
         # Provider not installed: disable main + all toggles.
@@ -44005,13 +44054,18 @@ $updateProviderToggleState = {
 
     # Headless toggle
     if ($controls.Headless) {
-        if (-not $mainChecked) {
+        if (-not $headlessSupported) {
+            $controls.Headless.IsChecked = $null
             $controls.Headless.IsEnabled = $false
-            $controls.Headless.ToolTip = "Enable $dispName and Scan to use headless mode."
+            $controls.Headless.ToolTip = "$dispName owns its update UI and cannot be made truly headless by WMT."
+        }
+        elseif (-not $mainChecked) {
+            $controls.Headless.IsEnabled = $false
+            $controls.Headless.ToolTip = "Enable $dispName and Scan to configure headless mode."
         }
         elseif (-not $scanChecked) {
             $controls.Headless.IsEnabled = $false
-            $controls.Headless.ToolTip = "Enable Scan for $dispName to use headless mode."
+            $controls.Headless.ToolTip = "Enable Scan for $dispName to configure headless mode."
         }
         else {
             $controls.Headless.IsEnabled = $true
@@ -44073,6 +44127,20 @@ foreach ($provider in $providerDefinitions) {
     }
 }
 
+$refreshProviderToggleStates = {
+    foreach ($provider in $providerDefinitions) {
+        & $updateProviderToggleState -ProviderKey ([string]$provider.Key)
+    }
+}.GetNewClosure()
+if ($chkUpdateSilentInstall) {
+    $chkUpdateSilentInstall.Add_Checked({ & $refreshProviderToggleStates }.GetNewClosure())
+    $chkUpdateSilentInstall.Add_Unchecked({ & $refreshProviderToggleStates }.GetNewClosure())
+}
+if ($chkUpdateAutoInstall) {
+    $chkUpdateAutoInstall.Add_Checked({ & $refreshProviderToggleStates }.GetNewClosure())
+    $chkUpdateAutoInstall.Add_Unchecked({ & $refreshProviderToggleStates }.GetNewClosure())
+}
+
 & $updateProviderStatuses
 # Re-apply toggle state for all providers now that install state is known.
 # (Done here, not inside $updateProviderStatuses, because $updateProviderToggleState
@@ -44129,8 +44197,10 @@ foreach ($provider in $providerDefinitions) {
             $current | Add-Member -MemberType NoteProperty -Name "WuCategoryToggles" -Value $wuTogglesToSave -Force
         }
 
-        # Build the per-provider toggles object to save.
+        # Save ordinary provider toggles separately from tri-state execution overrides.
+        # Null Headless/AutoUpdate means inherit the corresponding global setting.
         $togglesToSave = [ordered]@{}
+        $executionOverridesToSave = [ordered]@{}
         foreach ($provider in $providerDefinitions) {
             $key = [string]$provider.Key
             $chkSearch = & $getWinCtrl "chk${key}Search"
@@ -44140,21 +44210,39 @@ foreach ($provider in $providerDefinitions) {
             $chkAuto = & $getWinCtrl "chk${key}AutoUpdate"
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $key
             $togglesToSave[$key] = [ordered]@{
-                Search     = if ($defaults.Search -and $chkSearch) { [bool]$chkSearch.IsChecked }   else { $false }
-                Scan       = if ($chkScan) { [bool]$chkScan.IsChecked }     else { $true }
-                Logs       = if ($chkLogs) { [bool]$chkLogs.IsChecked }     else { $true }
-                Headless   = if ($chkHeadless) { [bool]$chkHeadless.IsChecked } else { $false }
-                AutoUpdate = if ($chkAuto) { [bool]$chkAuto.IsChecked }     else { $false }
+                Search = if ($defaults.Search -and $chkSearch) { [bool]$chkSearch.IsChecked } else { $false }
+                Scan   = if ($chkScan) { [bool]$chkScan.IsChecked } else { $true }
+                Logs   = if ($chkLogs) { [bool]$chkLogs.IsChecked } else { $true }
+            }
+
+            $executionEntry = [ordered]@{}
+            if ($key -notin @("msstore", "steam") -and $chkHeadless -and $null -ne $chkHeadless.IsChecked) {
+                $executionEntry["Headless"] = [bool]$chkHeadless.IsChecked
+            }
+            if ($chkAuto -and $null -ne $chkAuto.IsChecked) {
+                $executionEntry["AutoUpdate"] = [bool]$chkAuto.IsChecked
+            }
+            if ($executionEntry.Count -gt 0) {
+                $executionOverridesToSave[$key] = $executionEntry
             }
         }
         if ($current -is [System.Collections.IDictionary]) {
             $current["ProviderToggles"] = $togglesToSave
-        }
-        elseif ($current.PSObject.Properties["ProviderToggles"]) {
-            $current.ProviderToggles = $togglesToSave
+            $current["ProviderExecutionOverrides"] = $executionOverridesToSave
         }
         else {
-            $current | Add-Member -MemberType NoteProperty -Name "ProviderToggles" -Value $togglesToSave -Force
+            if ($current.PSObject.Properties["ProviderToggles"]) {
+                $current.ProviderToggles = $togglesToSave
+            }
+            else {
+                $current | Add-Member -MemberType NoteProperty -Name "ProviderToggles" -Value $togglesToSave -Force
+            }
+            if ($current.PSObject.Properties["ProviderExecutionOverrides"]) {
+                $current.ProviderExecutionOverrides = $executionOverridesToSave
+            }
+            else {
+                $current | Add-Member -MemberType NoteProperty -Name "ProviderExecutionOverrides" -Value $executionOverridesToSave -Force
+            }
         }
 
         $selectedAutoScanMinutes = 0
