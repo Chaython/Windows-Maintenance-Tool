@@ -2908,20 +2908,35 @@ param(
 
 if (-not $PowerShell) { return }
 
+if (-not (Get-Variable -Name WmtDetachedCleanupWorkers -Scope Script -ErrorAction SilentlyContinue) -or -not $script:WmtDetachedCleanupWorkers) {
+    $script:WmtDetachedCleanupWorkers = [System.Collections.ArrayList]::new()
+}
+
+foreach ($existing in @($script:WmtDetachedCleanupWorkers)) {
+    try {
+        if ($existing -and $existing.Async -and $existing.Async.IsCompleted) {
+            try { [void]$existing.PowerShell.EndInvoke($existing.Async) } catch {}
+            try { $existing.PowerShell.Dispose() } catch {}
+            [void]$script:WmtDetachedCleanupWorkers.Remove($existing)
+        }
+    }
+    catch {}
+}
+
 $cleanupPs = [System.Management.Automation.PowerShell]::Create()
+$cleanupAsync = $null
 try {
     [void]$cleanupPs.AddScript({
             param(
                 [System.Management.Automation.PowerShell]$TargetPowerShell,
                 [System.IAsyncResult]$TargetInvocation
             )
-
             try {
                 $finished = $false
                 if ($TargetInvocation) {
                     try { $finished = [bool]$TargetInvocation.IsCompleted } catch {}
                 }
-                if (-not $finished) {
+                else {
                     try {
                         $state = [string]$TargetPowerShell.InvocationStateInfo.State
                         $finished = @("Completed", "Failed", "Stopped") -contains $state
@@ -2929,11 +2944,13 @@ try {
                     catch {}
                 }
 
-                if (-not $finished) {
-                    try { $TargetPowerShell.Stop() } catch {}
-                }
+                if (-not $finished) { try { $TargetPowerShell.Stop() } catch {} }
 
                 if ($TargetInvocation) {
+                    try {
+                        if (-not $TargetInvocation.IsCompleted) { [void]$TargetInvocation.AsyncWaitHandle.WaitOne(5000) }
+                    }
+                    catch {}
                     try {
                         if ($TargetInvocation.IsCompleted) { [void]$TargetPowerShell.EndInvoke($TargetInvocation) }
                     }
@@ -2945,10 +2962,31 @@ try {
                 try { $TargetPowerShell.Dispose() } catch {}
             }
         }).AddArgument($PowerShell).AddArgument($Invocation)
-    [void](Start-WmtDetachedPowerShell -PowerShell $cleanupPs -Name "$Name cleanup")
+
+    $cleanupAsync = $cleanupPs.BeginInvoke()
+    $worker = [PSCustomObject]@{ PowerShell = $cleanupPs; Async = $cleanupAsync; Name = $Name }
+    [void]$script:WmtDetachedCleanupWorkers.Add($worker)
+
+    $workerRef = $worker
+    $operationName = "DetachedCleanup:$($Name):$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Register-WmtUiPollOperation -Name $operationName -IntervalMs 500 -TestComplete {
+            $workerRef.Async -and $workerRef.Async.IsCompleted
+        }.GetNewClosure() -OnComplete {
+            try { [void]$workerRef.PowerShell.EndInvoke($workerRef.Async) } catch {}
+            try { $workerRef.PowerShell.Dispose() } catch {}
+            try { [void]$script:WmtDetachedCleanupWorkers.Remove($workerRef) } catch {}
+        }.GetNewClosure() -OnError {
+            param($Operation, $ErrorRecord)
+            try { Write-GuiLog "$Name detached cleanup monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
+        }.GetNewClosure() | Out-Null
+    }
+    catch {
+        try { Write-GuiLog "$Name cleanup monitor could not be registered: $($_.Exception.Message)" } catch {}
+    }
 }
 catch {
-    try { $cleanupPs.Dispose() } catch {}
+    if (-not $cleanupAsync) { try { $cleanupPs.Dispose() } catch {} }
     try { Write-GuiLog "$Name cleanup could not be scheduled off the UI thread: $($_.Exception.Message)" } catch {}
 }
 }
@@ -2965,14 +3003,11 @@ if (-not $PowerShell) { return }
 $psRef = $PowerShell
 $invokeRef = $Invocation
 $nameRef = $Name
-$stopAsync = $null
+$stopRef = $null
 
-$isFinished = {
+$isInvocationFinished = {
     if ($invokeRef) {
-        try {
-            if ($invokeRef.IsCompleted) { return $true }
-        }
-        catch {}
+        try { return [bool]$invokeRef.IsCompleted } catch { return $false }
     }
     try {
         $state = [string]$psRef.InvocationStateInfo.State
@@ -2982,75 +3017,52 @@ $isFinished = {
     return $false
 }.GetNewClosure()
 
+$canFinalize = {
+    if (-not (& $isInvocationFinished)) { return $false }
+    if ($stopRef) {
+        try { return [bool]$stopRef.IsCompleted } catch { return $false }
+    }
+    return $true
+}.GetNewClosure()
+
 $finalizeCompleted = {
     try {
+        if ($stopRef -and $stopRef.IsCompleted) {
+            try { $psRef.EndStop($stopRef) } catch [System.Management.Automation.PipelineStoppedException] {} catch {}
+        }
         if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
     }
     catch [System.Management.Automation.PipelineStoppedException] {}
-    catch {
-        try { Write-GuiLog "$nameRef stop finalization reported: $($_.Exception.Message)" } catch {}
-    }
-    finally {
-        try { $psRef.Dispose() } catch {}
-    }
+    catch { try { Write-GuiLog "$nameRef stop finalization reported: $($_.Exception.Message)" } catch {} }
+    finally { try { $psRef.Dispose() } catch {} }
 }.GetNewClosure()
 
-try {
-    $stopAsync = $psRef.BeginStop($null, $null)
-}
+try { $stopRef = $psRef.BeginStop($null, $null) }
 catch {
-    if (& $isFinished) {
-        & $finalizeCompleted
-    }
-    else {
-        try { Write-GuiLog "$nameRef async stop could not start; moving cleanup off the UI thread." } catch {}
-        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
-    }
+    if (& $isInvocationFinished) { & $finalizeCompleted }
+    else { Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef }
     return
 }
 
-if (-not $stopAsync) {
-    if (& $isFinished) {
-        & $finalizeCompleted
-    }
-    else {
-        try { Write-GuiLog "$nameRef async stop returned no handle; moving cleanup off the UI thread." } catch {}
-        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
-    }
+if (-not $stopRef) {
+    if (& $isInvocationFinished) { & $finalizeCompleted }
+    else { Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef }
     return
 }
 
-$stopRef = $stopAsync
 $operationName = "StopPowerShell:$($Name):$([Guid]::NewGuid().ToString('N'))"
-
-$testComplete = {
-    $stopDone = [bool]($stopRef -and $stopRef.IsCompleted)
-    return ($stopDone -and (& $isFinished))
-}.GetNewClosure()
-
-$onComplete = {
-    & $finalizeCompleted
-}.GetNewClosure()
-
+$testComplete = { & $canFinalize }.GetNewClosure()
+$onComplete = { & $finalizeCompleted }.GetNewClosure()
 $onTimeout = {
     param($Operation)
-    if (& $isFinished) {
-        & $finalizeCompleted
-        return
-    }
-
+    if (& $canFinalize) { & $finalizeCompleted; return }
     try { Write-GuiLog "$nameRef did not fully stop within 10 seconds; cleanup is continuing off the UI thread." } catch {}
     Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
 }.GetNewClosure()
-
 $onError = {
     param($Operation, $ErrorRecord)
-    if (& $isFinished) {
-        & $finalizeCompleted
-    }
-    else {
-        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
-    }
+    if (& $canFinalize) { & $finalizeCompleted }
+    else { Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef }
     try { Write-GuiLog "$nameRef stop monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
 }.GetNewClosure()
 
@@ -3058,13 +3070,8 @@ try {
     Register-WmtUiPollOperation -Name $operationName -IntervalMs 250 -TimeoutMs 10000 -TestComplete $testComplete -OnComplete $onComplete -OnTimeout $onTimeout -OnError $onError | Out-Null
 }
 catch {
-    if (& $isFinished) {
-        & $finalizeCompleted
-    }
-    else {
-        try { Write-GuiLog "$nameRef stop monitor could not be registered; cleanup is continuing off the UI thread." } catch {}
-        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
-    }
+    if (& $canFinalize) { & $finalizeCompleted }
+    else { Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef }
 }
 }
 
@@ -11072,25 +11079,27 @@ return (($script:DnsRunspace -and $script:DnsAsyncResult -and -not $script:DnsAs
 function Stop-WmtDnsRunspaces {
 try { Unregister-WmtUiPollOperation -Name "DnsAssignment" } catch {}
 try { Unregister-WmtUiPollOperation -Name "DohAction" } catch {}
-if ($script:DnsTimer) {
-    try { $script:DnsTimer.Stop() } catch {}
-    $script:DnsTimer = $null
+if ($script:DnsTimer) { try { $script:DnsTimer.Stop() } catch {}; $script:DnsTimer = $null }
+
+$oldDnsPs = $script:DnsRunspace
+$oldDnsAsync = $script:DnsAsyncResult
+$script:DnsRunspace = $null
+$script:DnsAsyncResult = $null
+if ($oldDnsPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldDnsPs -Invocation $oldDnsAsync -Name "DNS assignment" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldDnsPs -Invocation $oldDnsAsync -Name "DNS assignment" } catch {}
+    }
 }
-if ($script:DnsRunspace) {
-    try { $script:DnsRunspace.Stop() } catch {}
-    try { $script:DnsRunspace.Dispose() } catch {}
-    $script:DnsRunspace = $null
-    $script:DnsAsyncResult = $null
-}
-if ($script:DohTimer) {
-    try { $script:DohTimer.Stop() } catch {}
-    $script:DohTimer = $null
-}
-if ($script:DohRunspace) {
-    try { $script:DohRunspace.Stop() } catch {}
-    try { $script:DohRunspace.Dispose() } catch {}
-    $script:DohRunspace = $null
-    $script:DohAsyncResult = $null
+
+if ($script:DohTimer) { try { $script:DohTimer.Stop() } catch {}; $script:DohTimer = $null }
+$oldDohPs = $script:DohRunspace
+$oldDohAsync = $script:DohAsyncResult
+$script:DohRunspace = $null
+$script:DohAsyncResult = $null
+if ($oldDohPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldDohPs -Invocation $oldDohAsync -Name "DoH action" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldDohPs -Invocation $oldDohAsync -Name "DoH action" } catch {}
+    }
 }
 }
 
@@ -41125,6 +41134,19 @@ exit /b %WMT_EXIT%
                 }
                 if ($p.PSObject.Properties["TimedOut"] -and $p.TimedOut) {
                     $timeoutReason = if ($p.PSObject.Properties["TimeoutReason"] -and -not [string]::IsNullOrWhiteSpace([string]$p.TimeoutReason)) { [string]$p.TimeoutReason } else { "timeout" }
+                    $terminationFailed = [bool]($p.PSObject.Properties["TerminationFailed"] -and $p.TerminationFailed)
+                    if ($terminationFailed) {
+                        Write-Output "LOG:[$act][$index/$total] FAILED: $name ($timeoutReason; Winget could not be confirmed terminated)"
+                        Write-Output "RESULT:${index}:FAILED:$name"
+                        Write-Output "LOG:[$act] Aborting the remaining batch so another package action cannot overlap the surviving Winget process."
+                        for ($remainingIndex = $index + 1; $remainingIndex -le $total; $remainingIndex++) {
+                            $remainingItem = @($items)[$remainingIndex - 1]
+                            $remainingName = if ($remainingItem -and $remainingItem.Name) { [string]$remainingItem.Name } else { "Unstarted item $remainingIndex" }
+                            Write-Output "LOG:[$act][$remainingIndex/$total] FAILED: $remainingName (not started because the previous Winget process may still be running)"
+                            Write-Output "RESULT:${remainingIndex}:FAILED:$remainingName"
+                        }
+                        break
+                    }
                     Write-Output "LOG:[$act][$index/$total] FAILED: $name ($timeoutReason; no user-mode retry)"
                     Write-Output "RESULT:${index}:FAILED:$name"
                     continue
@@ -41611,8 +41633,14 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 $pipElapsedSeconds = ((Get-Date) - $script:WingetCurrentItemStartedAt).TotalSeconds
                 if ($pipElapsedSeconds -ge 600) {
                     $script:WingetActionForcedTimeout = $true
-                    Write-GuiLog "[Pip] $($script:WingetCurrentItemName) exceeded the 10-minute action timeout. Stopping the background job."
-                    try { $script:WingetJob.Stop() } catch {}
+                    Write-GuiLog "[Pip] $($script:WingetCurrentItemName) exceeded the 10-minute action timeout. Requesting asynchronous stop of the background job."
+                    try { [void]$script:WingetJob.BeginStop($null, $null) } catch {
+                        $pipTimeoutPs = $script:WingetJob
+                        $pipTimeoutAsync = $script:WingetAsyncResult
+                        $script:WingetJob = $null
+                        $script:WingetAsyncResult = $null
+                        try { Start-WmtPowerShellCleanupDetached -PowerShell $pipTimeoutPs -Invocation $pipTimeoutAsync -Name "Pip action timeout" } catch {}
+                    }
                 }
             }
             if ($script:WingetAsyncResult -and -not $script:WingetAsyncResult.IsCompleted -and $script:WingetActionStartedAt -and $script:WingetCurrentItemName) {
@@ -50223,22 +50251,27 @@ if ($selectedName) {
 function Stop-FirewallDetailLoad {
 try { Unregister-WmtUiPollOperation -Name "FirewallDetailLoad" } catch {}
 $script:FirewallDetailTimer = $null
-if ($script:FirewallDetailJob) {
-    try { $script:FirewallDetailJob.PowerShell.Stop() } catch {}
-    try { $script:FirewallDetailJob.PowerShell.Dispose() } catch {}
-    $script:FirewallDetailJob = $null
+$oldDetailJob = $script:FirewallDetailJob
+$script:FirewallDetailJob = $null
+if ($oldDetailJob -and $oldDetailJob.PowerShell) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldDetailJob.PowerShell -Invocation $oldDetailJob.Async -Name "Firewall detail load" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldDetailJob.PowerShell -Invocation $oldDetailJob.Async -Name "Firewall detail load" } catch {}
+    }
 }
 }
 
 function Stop-FirewallRuleLoad {
 try { Unregister-WmtUiPollOperation -Name "FirewallRuleLoad" } catch {}
 $script:FirewallLoadTimer = $null
-if ($script:FirewallLoadRunspace) {
-    try { $script:FirewallLoadRunspace.Stop() } catch {}
-    try { $script:FirewallLoadRunspace.Dispose() } catch {}
-    $script:FirewallLoadRunspace = $null
-}
+$oldFirewallPs = $script:FirewallLoadRunspace
+$oldFirewallAsync = $script:FirewallLoadAsyncResult
+$script:FirewallLoadRunspace = $null
 $script:FirewallLoadAsyncResult = $null
+if ($oldFirewallPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldFirewallPs -Invocation $oldFirewallAsync -Name "Firewall rule load" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldFirewallPs -Invocation $oldFirewallAsync -Name "Firewall rule load" } catch {}
+    }
+}
 $script:FirewallLoadInProgress = $false
 $script:FirewallLoadPreloadMode = $false
 if ($btnFwRefresh) { $btnFwRefresh.IsEnabled = $true }
@@ -56040,11 +56073,14 @@ param([switch]$Silent)
 # duplicate-name protection cannot leave the new scan unmonitored.
 try { Unregister-WmtUiPollOperation -Name "LibraryScan" } catch {}
 
-if ($script:WmtLibraryScanRunspace) {
-    try { $script:WmtLibraryScanRunspace.Stop() } catch {}
-    try { $script:WmtLibraryScanRunspace.Dispose() } catch {}
-    $script:WmtLibraryScanRunspace = $null
-    $script:WmtLibraryScanAsyncResult = $null
+$oldLibraryScanPs = $script:WmtLibraryScanRunspace
+$oldLibraryScanAsync = $script:WmtLibraryScanAsyncResult
+$script:WmtLibraryScanRunspace = $null
+$script:WmtLibraryScanAsyncResult = $null
+if ($oldLibraryScanPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldLibraryScanPs -Invocation $oldLibraryScanAsync -Name "Library scan replacement" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldLibraryScanPs -Invocation $oldLibraryScanAsync -Name "Library scan replacement" } catch {}
+    }
 }
 
 if (-not $Silent) {
@@ -59877,12 +59913,17 @@ $script:TweakStatesBgTimeout.Add_Tick({
         $script:TweakStatesBgTimeout.Stop()
         if (-not $script:TweakStatesReady) {
             try { Write-GuiLog "[Tweak States] Background preload timed out (pool may be busy). Showing buttons with default state." } catch {}
-            # Cancel the stuck background job to free the pool slot
-            try { if ($script:TweakStatesBgPS) { $script:TweakStatesBgPS.Stop() ; $script:TweakStatesBgPS.Dispose() } } catch {}
+            $timedOutTweakPs = $script:TweakStatesBgPS
+            $timedOutTweakAsync = $script:TweakStatesBgAsync
             $script:TweakStatesBgAsync = $null
             $script:TweakStatesBgPS = $null
-            # Stop polling timer too
             try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
+            if ($timedOutTweakPs) {
+                try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutTweakPs -Invocation $timedOutTweakAsync -Name "Tweak state preload timeout" } catch {
+                    try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutTweakPs -Invocation $timedOutTweakAsync -Name "Tweak state preload timeout" } catch {}
+                }
+            }
+            # Stop polling timer too
             # Apply whatever cache we have (may be empty) so buttons aren't stuck
             try {
                 Update-TweakButtonStates
@@ -60485,9 +60526,13 @@ try {
     if (-not $needLeg -and -not $needGog -and -not $needPypi -and -not $needSteam) { return }
 
     if ($script:WmtLibraryCacheRunspace) {
-        try { $script:WmtLibraryCacheRunspace.Stop() } catch {}
-        try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
+        $staleLibraryCachePs = $script:WmtLibraryCacheRunspace
+        $staleLibraryCacheAsync = $script:WmtLibraryCacheAsyncResult
         $script:WmtLibraryCacheRunspace = $null
+        $script:WmtLibraryCacheAsyncResult = $null
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $staleLibraryCachePs -Invocation $staleLibraryCacheAsync -Name "Library cache builder replacement" } catch {
+            try { Start-WmtPowerShellCleanupDetached -PowerShell $staleLibraryCachePs -Invocation $staleLibraryCacheAsync -Name "Library cache builder replacement" } catch {}
+        }
     }
 
     # Resolve all paths in the main scope � the background runspace does NOT
@@ -61114,13 +61159,18 @@ if (-not $script:WmtAllowFinalClose -and (Get-WmtRunInTrayOnClose)) {
     }
 }
 
-# Cancel any ongoing scan.
+# Cancel any ongoing scan without blocking the WPF close callback.
 if ($script:ActiveScans) {
-    foreach ($task in $script:ActiveScans) {
-        try { $task.PowerShell.Stop() } catch {}
-        try { $task.PowerShell.Dispose() } catch {}
-    }
+    $closingScans = @($script:ActiveScans)
     $script:ActiveScans.Clear()
+    foreach ($task in $closingScans) {
+        try {
+            if ($task -and $task.PowerShell) {
+                Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan shutdown"
+            }
+        }
+        catch {}
+    }
 }
 if ($script:ScanTimer) { $script:ScanTimer.Stop() }
 if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() }
@@ -61131,15 +61181,19 @@ Stop-WmtCleanerAutoCleanTimer
 Remove-WmtTrayIcon
 Stop-WmtNotificationFallbackTimers
 try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
-try { if ($script:WingetJob) { $script:WingetJob.Stop(); $script:WingetJob.Dispose(); $script:WingetJob = $null } } catch {}
+$closingWingetPs = $script:WingetJob
+$closingWingetAsync = $script:WingetAsyncResult
+$script:WingetJob = $null
 $script:WingetAsyncResult = $null
+if ($closingWingetPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingWingetPs -Invocation $closingWingetAsync -Name "Package action shutdown" } catch {} }
 $script:WingetOutputQueue = $null
 Stop-WmtStartupBackgroundPreload
 try { Unregister-WmtUiPollOperation -Name "WingetSourcePreflight" } catch {}
-if ($script:WingetSourcePreflightRunspace) {
-    try { $script:WingetSourcePreflightRunspace.Stop() } catch {}
-    try { $script:WingetSourcePreflightRunspace.Dispose() } catch {}
-}
+$closingPreflightPs = $script:WingetSourcePreflightRunspace
+$closingPreflightAsync = $script:WingetSourcePreflightAsyncResult
+$script:WingetSourcePreflightRunspace = $null
+$script:WingetSourcePreflightAsyncResult = $null
+if ($closingPreflightPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingPreflightPs -Invocation $closingPreflightAsync -Name "Winget source preflight shutdown" } catch {} }
 Stop-FirewallRuleLoad
 Stop-FirewallDetailLoad
 if ($script:WmtPeriodicMemoryTrimTimer) { try { $script:WmtPeriodicMemoryTrimTimer.Stop() } catch {}; $script:WmtPeriodicMemoryTrimTimer = $null }
@@ -61147,34 +61201,38 @@ Stop-MyDeviceSectionJobs
 Stop-WmtDnsRunspaces
 # Clean up search runspace + timer (in-flight package searches)
 if ($script:SearchTimer) { try { $script:SearchTimer.Stop() } catch {} }
-if ($script:AsyncPowerShell) {
-    try { $script:AsyncPowerShell.Stop() } catch {}
-    try { $script:AsyncPowerShell.Dispose() } catch {}
-    $script:AsyncPowerShell = $null
-}
+$closingSearchPs = $script:AsyncPowerShell
+$closingSearchAsync = $script:AsyncSearch
+$script:AsyncPowerShell = $null
 $script:AsyncSearch = $null
+if ($closingSearchPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingSearchPs -Invocation $closingSearchAsync -Name "Package search shutdown" } catch {} }
 # Clean up tweak states background preload
 try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
-if ($script:TweakStatesBgPS) {
-    try { $script:TweakStatesBgPS.Stop() } catch {}
-    try { $script:TweakStatesBgPS.Dispose() } catch {}
-    $script:TweakStatesBgPS = $null
-}
+$closingTweakPs = $script:TweakStatesBgPS
+$closingTweakAsync = $script:TweakStatesBgAsync
+$script:TweakStatesBgPS = $null
 $script:TweakStatesBgAsync = $null
-# Dispose shared async infrastructure after individual workers have been stopped.
-Stop-WmtUiPoller
-Stop-WmtBackgroundRunspacePool
+if ($closingTweakPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingTweakPs -Invocation $closingTweakAsync -Name "Tweak preload shutdown" } catch {} }
+
 if ($script:WmtRegistryCleanupTimer) { try { $script:WmtRegistryCleanupTimer.Stop() } catch {}; $script:WmtRegistryCleanupTimer = $null }
-if ($script:WmtRegistryCleanupPowerShell) { try { $script:WmtRegistryCleanupPowerShell.Stop() } catch {}; try { $script:WmtRegistryCleanupPowerShell.Dispose() } catch {}; $script:WmtRegistryCleanupPowerShell = $null }
-if ($script:WmtRegistryCleanupRunspace) { try { $script:WmtRegistryCleanupRunspace.Dispose() } catch {}; $script:WmtRegistryCleanupRunspace = $null }
+$closingRegistryPs = $script:WmtRegistryCleanupPowerShell
+$closingRegistryAsync = $script:WmtRegistryCleanupAsync
+$script:WmtRegistryCleanupPowerShell = $null
+$script:WmtRegistryCleanupRunspace = $null
 $script:WmtRegistryCleanupAsync = $null
 $script:WmtRegistryCleanupSync = $null
 $script:WmtRegistryCleanupActive = $false
+if ($closingRegistryPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingRegistryPs -Invocation $closingRegistryAsync -Name "Registry cleanup shutdown" } catch {} }
+
 try { Unregister-WmtUiPollOperation -Name "BitLockerStatus" } catch {}
-if ($script:BitLockerStatusRunspace) {
-    try { $script:BitLockerStatusRunspace.Stop() } catch {}
-    try { $script:BitLockerStatusRunspace.Dispose() } catch {}
-}
+$closingBitLockerPs = $script:BitLockerStatusRunspace
+$closingBitLockerAsync = $script:BitLockerStatusAsyncResult
+$script:BitLockerStatusRunspace = $null
+$script:BitLockerStatusAsyncResult = $null
+if ($closingBitLockerPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingBitLockerPs -Invocation $closingBitLockerAsync -Name "BitLocker status shutdown" } catch {} }
+
+# Do not synchronously close active runspace pools during the WPF close callback.
+Stop-WmtUiPoller
 
 try {
     $settings = Get-WmtSettings
