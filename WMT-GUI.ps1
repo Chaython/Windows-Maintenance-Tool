@@ -41799,9 +41799,10 @@ $key = ([string]$ProviderKey).Trim().ToLowerInvariant()
 # is effectively not headless, even if it has a saved override.
 if (-not (Get-WmtProviderToggle -Settings $Settings -ProviderKey $key -ToggleName "Scan")) { return $false }
 
-# These providers are GUI-owned by design: Store updates use the Microsoft Store
-# UI and Steam updates are delegated to the Steam client.
-if ($key -in @("msstore", "steam")) { return $false }
+# Store/Steam own their update UI, while Windows Update installs through the
+# Windows Update Agent COM API. None of these providers has a separate
+# interactive-console mode for WMT's Headless switch to control.
+if ($key -in @("msstore", "steam", "windowsupdate")) { return $false }
 
 $fallback = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $Settings)
 $override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $key -ToggleName "Headless"
@@ -43976,7 +43977,7 @@ $updateProviderToggleState = {
     $searchSupported = [bool]$caps.Search
     $mainChecked = [bool]$controls.Main.IsChecked
     $scanChecked = [bool]$controls.Scan.IsChecked
-    $headlessSupported = ($ProviderKey -notin @("msstore", "steam"))
+    $headlessSupported = ($ProviderKey -notin @("msstore", "steam", "windowsupdate"))
     $globalHeadlessState = if ($chkUpdateSilentInstall -and [bool]$chkUpdateSilentInstall.IsChecked) { "On" } else { "Off" }
     $globalAutoState = if ($chkUpdateAutoInstall -and [bool]$chkUpdateAutoInstall.IsChecked) { "On" } else { "Off" }
 
@@ -44082,7 +44083,12 @@ $updateProviderToggleState = {
             $controls.Headless.IsChecked = $null
             $controls.Headless.Content = "Headless: n/a"
             $controls.Headless.IsEnabled = $false
-            $controls.Headless.ToolTip = "$dispName owns its update UI and cannot be made truly headless by WMT."
+            $controls.Headless.ToolTip = if ($ProviderKey -eq "windowsupdate") {
+                "Windows Update installs through the Windows Update Agent COM API, so WMT has no separate interactive-console mode for this provider."
+            }
+            else {
+                "$dispName owns its update UI and cannot be made truly headless by WMT."
+            }
         }
         else {
             $controls.Headless.Content = if ($null -eq $controls.Headless.IsChecked) {
@@ -44274,7 +44280,7 @@ foreach ($provider in $providerDefinitions) {
             }
 
             $executionEntry = [ordered]@{}
-            if ($key -notin @("msstore", "steam") -and $chkHeadless -and $null -ne $chkHeadless.IsChecked) {
+            if ($key -notin @("msstore", "steam", "windowsupdate") -and $chkHeadless -and $null -ne $chkHeadless.IsChecked) {
                 $executionEntry["Headless"] = [bool]$chkHeadless.IsChecked
             }
             if ($chkAuto -and $null -ne $chkAuto.IsChecked) {
