@@ -8125,7 +8125,30 @@ if ($json) {
             try { $defaults.CleanerAutoCleanMinutes = [Math]::Max(0, [Math]::Min(525600, [int]$json.CleanerAutoCleanMinutes)) } catch {}
         }
         if ($json.PSObject.Properties["EnabledProviders"]) { $defaults.EnabledProviders = $json.EnabledProviders }
-        if ($json.PSObject.Properties["ProviderToggles"]) { $defaults.ProviderToggles = $json.ProviderToggles }
+        if ($json.PSObject.Properties["ProviderToggles"]) {
+            # Normalize the legacy provider-toggle object to the three ordinary
+            # provider controls. Headless/AutoUpdate now live exclusively in
+            # ProviderExecutionOverrides so there is only one execution source.
+            $normalizedProviderToggles = [ordered]@{}
+            if ($json.ProviderToggles) {
+                foreach ($providerProp in @($json.ProviderToggles.PSObject.Properties)) {
+                    $rawEntry = $providerProp.Value
+                    $cleanEntry = [ordered]@{}
+                    if ($rawEntry) {
+                        foreach ($toggleName in @("Search", "Scan", "Logs")) {
+                            try {
+                                if ($rawEntry.PSObject.Properties[$toggleName]) {
+                                    $cleanEntry[$toggleName] = ConvertTo-WmtSettingsBoolean $rawEntry.$toggleName $false
+                                }
+                            }
+                            catch {}
+                        }
+                    }
+                    $normalizedProviderToggles[[string]$providerProp.Name] = $cleanEntry
+                }
+            }
+            $defaults.ProviderToggles = $normalizedProviderToggles
+        }
         if ($json.PSObject.Properties["ProviderExecutionOverrides"]) {
             $defaults.ProviderExecutionOverrides = $json.ProviderExecutionOverrides
         }
@@ -41563,11 +41586,9 @@ $caps = Get-WmtProviderCapabilities
 $key = ([string]$ProviderKey).Trim().ToLowerInvariant()
 $cap = if ($caps.Contains($key)) { $caps[$key] } else { @{ Search = $false; Library = $false } }
 return [ordered]@{
-    Search     = [bool]$cap.Search
-    Scan       = $true
-    Logs       = $true
-    Headless   = $false
-    AutoUpdate = $false
+    Search = [bool]$cap.Search
+    Scan   = $true
+    Logs   = $true
 }
 }
 
@@ -41630,11 +41651,9 @@ try {
             if ([string]::IsNullOrWhiteSpace($k)) { continue }
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $k
             $t = [ordered]@{
-                Search     = [bool]$defaults.Search
-                Scan       = [bool]$defaults.Scan
-                Logs       = [bool]$defaults.Logs
-                Headless   = [bool]$defaults.Headless
-                AutoUpdate = [bool]$defaults.AutoUpdate
+                Search = [bool]$defaults.Search
+                Scan   = [bool]$defaults.Scan
+                Logs   = [bool]$defaults.Logs
             }
             $val = $entry_item.Value
             $s = Get-WmtToggleValue $val "Search"
@@ -41643,10 +41662,6 @@ try {
             if ($null -ne $sc) { $t["Scan"] = [bool]$sc }
             $lg = Get-WmtToggleValue $val "Logs"
             if ($null -ne $lg) { $t["Logs"] = [bool]$lg }
-            $h = Get-WmtToggleValue $val "Headless"
-            if ($null -ne $h) { $t["Headless"] = [bool]$h }
-            $a = Get-WmtToggleValue $val "AutoUpdate"
-            if ($null -ne $a) { $t["AutoUpdate"] = [bool]$a }
             $toggles[$k] = $t
         }
     }
