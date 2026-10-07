@@ -37483,13 +37483,17 @@ if (-not $ListItems -or $ListItems.Count -eq 0) { return }
 $uniqueItems = @($ListItems | Select-Object -Property Source, Name, Id, Version, Available, VersionSort, AvailableSort, IsChecked, LibraryPath, InstallDir, ManifestPath, ExecutablePath, Platform, RawAvailable, WUIsOptional -Unique)
 $actionSettings = Get-WmtSettings
 $providerCapsForAction = Get-WmtProviderCapabilities
+$globalHeadlessEnabled = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $actionSettings)
 foreach ($actionItem in @($uniqueItems)) {
     $providerKey = Get-WmtProviderKeyForPackageSource -Source ([string]$actionItem.Source)
     $logFilesEnabled = $true
+    $headlessEnabled = $globalHeadlessEnabled
     if (-not [string]::IsNullOrWhiteSpace($providerKey) -and $providerCapsForAction.Contains($providerKey)) {
         $logFilesEnabled = Get-WmtProviderToggle -Settings $actionSettings -ProviderKey $providerKey -ToggleName "Logs"
+        $headlessEnabled = Get-WmtEffectiveProviderHeadless -Settings $actionSettings -ProviderKey $providerKey
     }
     $actionItem | Add-Member -MemberType NoteProperty -Name "ProviderLogFilesEnabled" -Value ([bool]$logFilesEnabled) -Force
+    $actionItem | Add-Member -MemberType NoteProperty -Name "ProviderHeadlessEnabled" -Value ([bool]$headlessEnabled) -Force
 }
 if ($ActionName -eq "Update") {
     $customSettings = $actionSettings
@@ -39007,7 +39011,8 @@ exit `$exitCode
             [string]$title,
             [int]$HoldSeconds = 0,
             [int]$TimeoutSeconds = 7200,
-            [string]$TranscriptPath = ""
+            [string]$TranscriptPath = "",
+            [bool]$Headless = $false
         )
 
         if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
@@ -39021,7 +39026,7 @@ exit `$exitCode
         else {
             $cmdLine = "/c title $safeTitle && $command"
         }
-        $windowStyle = if ($silentUpdateInstallEnabled) { "Hidden" } else { "Normal" }
+        $windowStyle = if ($Headless) { "Hidden" } else { "Normal" }
         $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -PassThru -WindowStyle $windowStyle
         $startedAt = Get-Date
         $lastHeartbeat = $startedAt
@@ -39173,7 +39178,8 @@ exit /b %WMT_EXIT%
             [string]$ActionLabel = "Update",
             [string]$StoreFallbackUri = "",
             [string]$StoreFallbackWebUri = "",
-            [string]$TranscriptPath = ""
+            [string]$TranscriptPath = "",
+            [bool]$Headless = $false
         )
 
         $rand = [Guid]::NewGuid().ToString("N")
@@ -39708,11 +39714,11 @@ exit /b %WMT_EXIT%
             Set-Content -Path $runnerPath -Value $runnerContent -Encoding UTF8 -Force
             Set-Content -Path $sendKeysPath -Value $sendKeysContent -Encoding Ascii -Force
             Set-Content -Path $batPath -Value $batContent -Encoding Ascii -Force
-            $storeWindowStyle = if ($silentUpdateInstallEnabled) { "Hidden" } else { "Normal" }
-            $storeWindowLabel = if ($silentUpdateInstallEnabled) { "headless" } else { "interactive" }
+            $storeWindowStyle = if ($Headless) { "Hidden" } else { "Normal" }
+            $storeWindowLabel = if ($Headless) { "headless" } else { "interactive" }
             Write-Output "LOG:[Store CLI] Launching $storeWindowLabel $($ActionLabel.ToLowerInvariant()) window for: $PackageName"
             $cmdProc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batPath`"" -PassThru -WindowStyle $storeWindowStyle
-            if (-not $silentUpdateInstallEnabled) { Show-WmtStoreCliWindow $cmdProc }
+            if (-not $Headless) { Show-WmtStoreCliWindow $cmdProc }
             $safePackageArg = ([string]$PackageName).Replace('"', '')
             $sendKeysProc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$sendKeysPath`" -TargetPid $($cmdProc.Id) -PackageName `"$safePackageArg`" -StatusPath `"$statusPath`" -ResourcesInUsePath `"$resourcesInUsePath`" -ScreenPath `"$screenPath`"" -WindowStyle Hidden -PassThru
             Write-Output "LOG:  [store] Progress: 5%"
@@ -40054,6 +40060,10 @@ exit /b %WMT_EXIT%
         if ($item.PSObject.Properties["ProviderLogFilesEnabled"]) {
             $providerLogFilesEnabled = [bool]$item.ProviderLogFilesEnabled
         }
+        $providerHeadlessEnabled = $silentUpdateInstallEnabled
+        if ($item.PSObject.Properties["ProviderHeadlessEnabled"]) {
+            $providerHeadlessEnabled = [bool]$item.ProviderHeadlessEnabled
+        }
         $cmd = ""
         $userCmd = ""
         $displayCmd = ""
@@ -40358,7 +40368,7 @@ exit /b %WMT_EXIT%
                     continue
                 }
 
-                $legendaryCommand = Get-WmtLegendaryCommandText -ForPowerShell:($act -ne "Update" -or $silentUpdateInstallEnabled)
+                $legendaryCommand = Get-WmtLegendaryCommandText -ForPowerShell:($act -ne "Update" -or $providerHeadlessEnabled)
                 # Legendary's downloader timeout does not control Epic API metadata calls.
                 # Give the API the same 30-second tolerance used by WMT's library/install paths
                 # instead of Legendary's 10-second default.
@@ -40425,7 +40435,7 @@ exit /b %WMT_EXIT%
                         $skipReason = "GOG install path no longer exists: $installDir"
                     }
                     else {
-                        $gogdlCommand = Get-WmtGogdlCommandText -ForPowerShell:$silentUpdateInstallEnabled
+                        $gogdlCommand = Get-WmtGogdlCommandText -ForPowerShell:$providerHeadlessEnabled
                         $platform = ([string]$item.Platform).Trim().ToLowerInvariant()
                         if ($platform -notin @("windows", "osx", "linux")) { $platform = "windows" }
                         $authConfig = ([string]$gogdlAuthConfigPath).Trim()
@@ -40626,7 +40636,7 @@ exit /b %WMT_EXIT%
             $isPipUpdate = (($src -eq "pip" -or $src -eq "pip3") -and $act -eq "Update")
             $isChocoUpdate = (($src -eq "chocolatey" -or $src -eq "choco") -and $act -eq "Update")
             $isPythonUpdate = ($act -eq "Update" -and (([string]$id -match "(?i)\bpython([0-9\.]*)\b") -or ([string]$name -match "(?i)\bpython([0-9\.]*)\b")))
-            $useVisibleWindow = ($act -eq "Update" -and -not $silentUpdateInstallEnabled -and -not ($src -eq "msstore" -and $storeCliArgs) -and -not $windowsUpdateItem)
+            $useVisibleWindow = ($act -eq "Update" -and -not $providerHeadlessEnabled -and -not ($src -eq "msstore" -and $storeCliArgs) -and -not $windowsUpdateItem)
 
             if ($wingetArgs) { $wingetAttemptStartedAt = Get-Date }
 
@@ -40655,7 +40665,7 @@ exit /b %WMT_EXIT%
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
                     $visibleTranscriptPath = if ($srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
-                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
+                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath -Headless:$providerHeadlessEnabled
 
                     # Normalize a missing/failed visible process result. The final
                     # result line below reports the failure once, without duplicate chatter.
@@ -40687,7 +40697,7 @@ exit /b %WMT_EXIT%
                 $p = Invoke-WmtStoreAppUpdateScan -PackageName $name
             }
             elseif ($storeCliArgs) {
-                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri -TranscriptPath $providerTranscriptPath
+                $p = Invoke-StoreCliInteractive -ArgumentList $storeCliArgs -PackageName $name -TempPath $temp -ActionLabel $act -StoreFallbackUri $storeFallbackUri -StoreFallbackWebUri $storeFallbackWebUri -TranscriptPath $providerTranscriptPath -Headless:$providerHeadlessEnabled
             }
             elseif ($windowsUpdateItem) {
                 $p = Invoke-WmtWindowsUpdateInstall -Item $windowsUpdateItem
@@ -40742,7 +40752,7 @@ exit /b %WMT_EXIT%
                 $cmd = "winget $wingetArgs"
                 $userCmd = $wingetUserCmdWithoutInstallerLog
                 if ($useVisibleWindow) {
-                    $p = Invoke-VisibleCmd $cmd "WMT Winget Retry Without Installer Log - $name"
+                    $p = Invoke-VisibleCmd $cmd "WMT Winget Retry Without Installer Log - $name" -Headless:$providerHeadlessEnabled
                 }
                 else {
                     $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
@@ -40760,7 +40770,7 @@ exit /b %WMT_EXIT%
                     if ($wingetArgs) {
                         if ($useVisibleWindow) {
                             $retryCmd = "winget $wingetArgs"
-                            $p = Invoke-VisibleCmd $retryCmd "WMT Winget Retry - $name"
+                            $p = Invoke-VisibleCmd $retryCmd "WMT Winget Retry - $name" -Headless:$providerHeadlessEnabled
                         }
                         else {
                             $p = Invoke-WingetLive $wingetArgs -TranscriptPath $wingetTranscriptPath
@@ -41461,7 +41471,7 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 # uninstalls update the visible list directly and intentionally skip
                 # the immediate scan to avoid stale provider/registry state.
                 if ($shouldRefreshAfterAction -and $btnWingetScan) {
-                    if (Get-WmtUpdateAutoInstallEnabled) {
+                    if (Test-WmtAnyProviderAutoUpdateEnabled -Settings (Get-WmtSettings)) {
                         $script:WmtAutoInstallSuppressNextScan = $true
                     }
                     $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
@@ -41665,6 +41675,95 @@ if ($entry -is [System.Collections.IDictionary]) {
 }
 if (-not $entry.PSObject.Properties[$name]) { return $false }
 return [bool]$entry.$name
+}
+
+function Get-WmtProviderToggleOverride {
+param(
+    $Settings,
+    [string]$ProviderKey,
+    [string]$ToggleName
+)
+
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$name = ([string]$ToggleName).Trim()
+$result = [PSCustomObject]@{ IsSet = $false; Value = $false }
+if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($name)) { return $result }
+
+$raw = Get-WmtSettingsMember -Settings $Settings -Name "ProviderToggles" -Default $null
+if (-not $raw) { return $result }
+
+$entry = $null
+if ($raw -is [System.Collections.IDictionary]) {
+    if ($raw.Contains($key)) { $entry = $raw[$key] }
+    else {
+        foreach ($candidateKey in @($raw.Keys)) {
+            if ([string]::Equals([string]$candidateKey, $key, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $entry = $raw[$candidateKey]
+                break
+            }
+        }
+    }
+}
+else {
+    try {
+        $property = @($raw.PSObject.Properties | Where-Object { [string]::Equals($_.Name, $key, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+        if ($property.Count -gt 0) { $entry = $property[0].Value }
+    }
+    catch {}
+}
+if (-not $entry) { return $result }
+
+if ($entry -is [System.Collections.IDictionary]) {
+    if ($entry.Contains($name)) {
+        $result.IsSet = $true
+        $result.Value = [bool]$entry[$name]
+    }
+}
+else {
+    try {
+        $property = @($entry.PSObject.Properties | Where-Object { [string]::Equals($_.Name, $name, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+        if ($property.Count -gt 0) {
+            $result.IsSet = $true
+            $result.Value = [bool]$property[0].Value
+        }
+    }
+    catch {}
+}
+return $result
+}
+
+function Get-WmtEffectiveProviderHeadless {
+param($Settings, [string]$ProviderKey)
+
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$fallback = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $Settings)
+$override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $ProviderKey -ToggleName "Headless"
+if ($override.IsSet) { return [bool]$override.Value }
+return $fallback
+}
+
+function Get-WmtEffectiveProviderAutoUpdate {
+param($Settings, [string]$ProviderKey)
+
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$fallback = [bool](Get-WmtUpdateAutoInstallEnabled -Settings $Settings)
+$override = Get-WmtProviderToggleOverride -Settings $Settings -ProviderKey $ProviderKey -ToggleName "AutoUpdate"
+if ($override.IsSet) { return [bool]$override.Value }
+return $fallback
+}
+
+function Test-WmtAnyProviderAutoUpdateEnabled {
+param($Settings)
+
+if (-not $Settings) { $Settings = Get-WmtSettings }
+$providerKeys = @(Get-WmtSettingsMember -Settings $Settings -Name "EnabledProviders" -Default @())
+if ($providerKeys.Count -eq 0) { $providerKeys = @((Get-WmtProviderCapabilities).Keys) }
+
+foreach ($providerKey in @($providerKeys | Select-Object -Unique)) {
+    if (Get-WmtEffectiveProviderAutoUpdate -Settings $Settings -ProviderKey ([string]$providerKey)) { return $true }
+}
+return $false
 }
 
 function Get-WmtProviderKeyForPackageSource {
@@ -42493,8 +42592,8 @@ function Format-WmtProviderRowXaml {
     $searchVal = if ($t -is [System.Collections.IDictionary]) { $t["Search"] } else { $t.Search }
     $scanVal = if ($t -is [System.Collections.IDictionary]) { $t["Scan"] } else { $t.Scan }
     $logsVal = if ($t -is [System.Collections.IDictionary]) { $t["Logs"] } else { $t.Logs }
-    $headVal = if ($t -is [System.Collections.IDictionary]) { $t["Headless"] } else { $t.Headless }
-    $autoVal = if ($t -is [System.Collections.IDictionary]) { $t["AutoUpdate"] } else { $t.AutoUpdate }
+    $headVal = Get-WmtEffectiveProviderHeadless -Settings $settings -ProviderKey $key
+    $autoVal = Get-WmtEffectiveProviderAutoUpdate -Settings $settings -ProviderKey $key
     $searchIsChecked = if ($searchSupported -and [bool]$searchVal) { 'True' } else { 'False' }
     $scanIsChecked = if ([bool]$scanVal) { 'True' } else { 'False' }
     $logsIsChecked = if ([bool]$logsVal) { 'True' } else { 'False' }
@@ -43772,8 +43871,8 @@ foreach ($provider in $providerDefinitions) {
     $searchVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Search"] } else { $toggles.Search }
     $scanVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Scan"] } else { $toggles.Scan }
     $logsVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Logs"] } else { $toggles.Logs }
-    $headVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["Headless"] } else { $toggles.Headless }
-    $autoVal = if ($toggles -is [System.Collections.IDictionary]) { $toggles["AutoUpdate"] } else { $toggles.AutoUpdate }
+    $headVal = Get-WmtEffectiveProviderHeadless -Settings $settings -ProviderKey $key
+    $autoVal = Get-WmtEffectiveProviderAutoUpdate -Settings $settings -ProviderKey $key
     $chkSearch = & $getWinCtrl "chk${key}Search"
     $chkScan = & $getWinCtrl "chk${key}Scan"
     $chkLogs = & $getWinCtrl "chk${key}Logs"
@@ -45191,14 +45290,12 @@ $script:ScanTimer.Add_Tick({
                 Write-GuiLog "Scan Complete. Found $($lstWinget.Items.Count) updates."
             }
 
-            if (Get-WmtUpdateAutoInstallEnabled) {
-                if ($script:WmtAutoInstallSuppressNextScan) {
-                    $script:WmtAutoInstallSuppressNextScan = $false
-                    Write-GuiLog "Auto install skipped for this verification scan."
-                }
-                else {
-                    Invoke-WmtAutoInstallAvailableUpdates
-                }
+            if ($script:WmtAutoInstallSuppressNextScan) {
+                $script:WmtAutoInstallSuppressNextScan = $false
+                Write-GuiLog "Auto install skipped for this verification scan."
+            }
+            else {
+                Invoke-WmtAutoInstallAvailableUpdates
             }
         }
     }
@@ -49102,17 +49199,27 @@ return @($lstWinget.Items | Where-Object {
 }
 
 function Invoke-WmtAutoInstallAvailableUpdates {
-if (-not (Get-WmtUpdateAutoInstallEnabled)) { return }
 if ($script:WmtAutoInstallActive -or $script:WingetActiveAction) {
     Write-GuiLog "Auto install skipped because a package action is already running."
     return
 }
 
-$items = @(Get-WingetListedUpdateItems)
-if ($items.Count -eq 0) {
-    Write-GuiLog "Auto install found no available updates."
+$settings = Get-WmtSettings
+$listedItems = @(Get-WingetListedUpdateItems)
+if ($listedItems.Count -eq 0) {
+    if (Test-WmtAnyProviderAutoUpdateEnabled -Settings $settings) {
+        Write-GuiLog "Auto install found no available updates."
+    }
     return
 }
+
+# Global auto-install is the default. An explicitly saved per-provider Auto-update
+# value overrides it, so individual providers can opt in or out independently.
+$items = @($listedItems | Where-Object {
+        $providerKey = Get-WmtProviderKeyForPackageSource -Source ([string]$_.Source)
+        Get-WmtEffectiveProviderAutoUpdate -Settings $settings -ProviderKey $providerKey
+    })
+if ($items.Count -eq 0) { return }
 
 # Filter for restart risks only; game providers are no longer excluded
 $restartRiskItems = @($items | Where-Object { Test-WingetRestartRiskItem $_ })
