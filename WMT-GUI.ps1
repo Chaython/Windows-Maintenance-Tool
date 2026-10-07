@@ -2026,17 +2026,32 @@ if ($script:StatsTimer) { try { $script:StatsTimer.Stop() } catch {} }
 if ($script:MyDevicePendingSections) {
     try { $script:MyDevicePendingSections.Clear() } catch {}
 }
+
+$sectionJobs = @()
 if ($script:MyDeviceSectionJobs) {
-    foreach ($job in @($script:MyDeviceSectionJobs.Values)) {
-        try { $job.PowerShell.Stop() } catch {}
-        try { $job.PowerShell.Dispose() } catch {}
-    }
-    $script:MyDeviceSectionJobs.Clear()
+    $sectionJobs = @($script:MyDeviceSectionJobs.Values)
+    try { $script:MyDeviceSectionJobs.Clear() } catch {}
 }
-if ($script:StatsRunspace) {
-    try { $script:StatsRunspace.Stop() } catch {}
-    try { $script:StatsRunspace.Dispose() } catch {}
-    $script:StatsRunspace = $null
+foreach ($job in $sectionJobs) {
+    if (-not $job -or -not $job.PowerShell) { continue }
+    $jobName = if ($job.PSObject.Properties["Name"] -and $job.Name) { [string]$job.Name } else { "section" }
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $job.PowerShell -Invocation $job.Async -Name "My Device $jobName refresh"
+    }
+    catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $job.PowerShell -Invocation $job.Async -Name "My Device $jobName refresh" } catch {}
+    }
+}
+
+$oldStatsRunspace = $script:StatsRunspace
+$script:StatsRunspace = $null
+if ($oldStatsRunspace) {
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $oldStatsRunspace -Invocation $null -Name "My Device legacy stats refresh"
+    }
+    catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldStatsRunspace -Invocation $null -Name "My Device legacy stats refresh" } catch {}
+    }
 }
 }
 
@@ -2884,6 +2899,60 @@ catch {
 }
 }
 
+function Start-WmtPowerShellCleanupDetached {
+param(
+    [System.Management.Automation.PowerShell]$PowerShell,
+    [System.IAsyncResult]$Invocation,
+    [string]$Name = "PowerShell invocation"
+)
+
+if (-not $PowerShell) { return }
+
+$cleanupPs = [System.Management.Automation.PowerShell]::Create()
+try {
+    [void]$cleanupPs.AddScript({
+            param(
+                [System.Management.Automation.PowerShell]$TargetPowerShell,
+                [System.IAsyncResult]$TargetInvocation
+            )
+
+            try {
+                $finished = $false
+                if ($TargetInvocation) {
+                    try { $finished = [bool]$TargetInvocation.IsCompleted } catch {}
+                }
+                if (-not $finished) {
+                    try {
+                        $state = [string]$TargetPowerShell.InvocationStateInfo.State
+                        $finished = @("Completed", "Failed", "Stopped") -contains $state
+                    }
+                    catch {}
+                }
+
+                if (-not $finished) {
+                    try { $TargetPowerShell.Stop() } catch {}
+                }
+
+                if ($TargetInvocation) {
+                    try {
+                        if ($TargetInvocation.IsCompleted) { [void]$TargetPowerShell.EndInvoke($TargetInvocation) }
+                    }
+                    catch [System.Management.Automation.PipelineStoppedException] {}
+                    catch {}
+                }
+            }
+            finally {
+                try { $TargetPowerShell.Dispose() } catch {}
+            }
+        }).AddArgument($PowerShell).AddArgument($Invocation)
+    [void](Start-WmtDetachedPowerShell -PowerShell $cleanupPs -Name "$Name cleanup")
+}
+catch {
+    try { $cleanupPs.Dispose() } catch {}
+    try { Write-GuiLog "$Name cleanup could not be scheduled off the UI thread: $($_.Exception.Message)" } catch {}
+}
+}
+
 function Stop-WmtPowerShellInvocationAsync {
 param(
     [System.Management.Automation.PowerShell]$PowerShell,
@@ -2898,35 +2967,24 @@ $invokeRef = $Invocation
 $nameRef = $Name
 $stopAsync = $null
 
-try {
-    $stopAsync = $psRef.BeginStop($null, $null)
-}
-catch {
+$isFinished = {
+    if ($invokeRef) {
+        try {
+            if ($invokeRef.IsCompleted) { return $true }
+        }
+        catch {}
+    }
     try {
-        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
+        $state = [string]$psRef.InvocationStateInfo.State
+        return (@("Completed", "Failed", "Stopped") -contains $state)
     }
     catch {}
-    try { $psRef.Dispose() } catch {}
-    return
-}
-
-if (-not $stopAsync) {
-    try { $psRef.Dispose() } catch {}
-    return
-}
-
-$stopRef = $stopAsync
-$operationName = "StopPowerShell:${Name}:$([Guid]::NewGuid().ToString('N'))"
-
-$testComplete = {
-    $stopDone = [bool]($stopRef -and $stopRef.IsCompleted)
-    $invokeDone = [bool](-not $invokeRef -or $invokeRef.IsCompleted)
-    return ($stopDone -and $invokeDone)
+    return $false
 }.GetNewClosure()
 
-$onComplete = {
+$finalizeCompleted = {
     try {
-        if ($invokeRef) { [void]$psRef.EndInvoke($invokeRef) }
+        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
     }
     catch [System.Management.Automation.PipelineStoppedException] {}
     catch {
@@ -2937,29 +2995,77 @@ $onComplete = {
     }
 }.GetNewClosure()
 
+try {
+    $stopAsync = $psRef.BeginStop($null, $null)
+}
+catch {
+    if (& $isFinished) {
+        & $finalizeCompleted
+    }
+    else {
+        try { Write-GuiLog "$nameRef async stop could not start; moving cleanup off the UI thread." } catch {}
+        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
+    }
+    return
+}
+
+if (-not $stopAsync) {
+    if (& $isFinished) {
+        & $finalizeCompleted
+    }
+    else {
+        try { Write-GuiLog "$nameRef async stop returned no handle; moving cleanup off the UI thread." } catch {}
+        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
+    }
+    return
+}
+
+$stopRef = $stopAsync
+$operationName = "StopPowerShell:$($Name):$([Guid]::NewGuid().ToString('N'))"
+
+$testComplete = {
+    $stopDone = [bool]($stopRef -and $stopRef.IsCompleted)
+    return ($stopDone -and (& $isFinished))
+}.GetNewClosure()
+
+$onComplete = {
+    & $finalizeCompleted
+}.GetNewClosure()
+
 $onTimeout = {
     param($Operation)
-    try {
-        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
+    if (& $isFinished) {
+        & $finalizeCompleted
+        return
     }
-    catch [System.Management.Automation.PipelineStoppedException] {}
-    catch {}
-    try { $psRef.Dispose() } catch {}
-    try { Write-GuiLog "$nameRef did not fully stop within 10 seconds; worker resources were released." } catch {}
+
+    try { Write-GuiLog "$nameRef did not fully stop within 10 seconds; cleanup is continuing off the UI thread." } catch {}
+    Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
 }.GetNewClosure()
 
 $onError = {
     param($Operation, $ErrorRecord)
-    try {
-        if ($invokeRef -and $invokeRef.IsCompleted) { [void]$psRef.EndInvoke($invokeRef) }
+    if (& $isFinished) {
+        & $finalizeCompleted
     }
-    catch [System.Management.Automation.PipelineStoppedException] {}
-    catch {}
-    try { $psRef.Dispose() } catch {}
+    else {
+        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
+    }
     try { Write-GuiLog "$nameRef stop monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
 }.GetNewClosure()
 
-Register-WmtUiPollOperation -Name $operationName -IntervalMs 250 -TimeoutMs 10000 -TestComplete $testComplete -OnComplete $onComplete -OnTimeout $onTimeout -OnError $onError | Out-Null
+try {
+    Register-WmtUiPollOperation -Name $operationName -IntervalMs 250 -TimeoutMs 10000 -TestComplete $testComplete -OnComplete $onComplete -OnTimeout $onTimeout -OnError $onError | Out-Null
+}
+catch {
+    if (& $isFinished) {
+        & $finalizeCompleted
+    }
+    else {
+        try { Write-GuiLog "$nameRef stop monitor could not be registered; cleanup is continuing off the UI thread." } catch {}
+        Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $invokeRef -Name $nameRef
+    }
+}
 }
 
 # ============================================================================
@@ -9132,48 +9238,67 @@ try { Stop-FirewallRuleLoad } catch {}
 try { Stop-DriverLoad } catch {}
 
 try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
-if ($script:WmtAppxLoadRunspace) {
-    try { $script:WmtAppxLoadRunspace.Stop() } catch {}
-    try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
-}
+$oldAppxPs = $script:WmtAppxLoadRunspace
+$oldAppxAsync = $script:WmtAppxLoadAsyncResult
 $script:WmtAppxLoadRunspace = $null
 $script:WmtAppxLoadAsyncResult = $null
+if ($oldAppxPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldAppxPs -Invocation $oldAppxAsync -Name "AppX background load" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldAppxPs -Invocation $oldAppxAsync -Name "AppX background load" } catch {}
+    }
+}
 $script:AppxListLoaded = $false
 
 try { Unregister-WmtUiPollOperation -Name "LibraryCacheBuilder" } catch {}
-if ($script:WmtLibraryCacheRunspace) {
-    try { $script:WmtLibraryCacheRunspace.Stop() } catch {}
-    try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
-}
+$oldLibraryCachePs = $script:WmtLibraryCacheRunspace
+$oldLibraryCacheAsync = $script:WmtLibraryCacheAsyncResult
 $script:WmtLibraryCacheRunspace = $null
 $script:WmtLibraryCacheAsyncResult = $null
+if ($oldLibraryCachePs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldLibraryCachePs -Invocation $oldLibraryCacheAsync -Name "Library cache builder" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldLibraryCachePs -Invocation $oldLibraryCacheAsync -Name "Library cache builder" } catch {}
+    }
+}
 
 try { Unregister-WmtUiPollOperation -Name "LibraryScan" } catch {}
-if ($script:WmtLibraryScanRunspace) {
-    try { $script:WmtLibraryScanRunspace.Stop() } catch {}
-    try { $script:WmtLibraryScanRunspace.Dispose() } catch {}
-}
+$oldLibraryScanPs = $script:WmtLibraryScanRunspace
+$oldLibraryScanAsync = $script:WmtLibraryScanAsyncResult
 $script:WmtLibraryScanRunspace = $null
 $script:WmtLibraryScanAsyncResult = $null
 $script:WmtLibraryScanTimer = $null
+if ($oldLibraryScanPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldLibraryScanPs -Invocation $oldLibraryScanAsync -Name "Library scan" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldLibraryScanPs -Invocation $oldLibraryScanAsync -Name "Library scan" } catch {}
+    }
+}
 
 try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
-if ($script:TweakStatesBgPS) {
-    try { $script:TweakStatesBgPS.Stop() } catch {}
-    try { $script:TweakStatesBgPS.Dispose() } catch {}
+if ($script:TweakStatesBgTimeout) {
+    try { $script:TweakStatesBgTimeout.Stop() } catch {}
+    $script:TweakStatesBgTimeout = $null
 }
+$oldTweakPs = $script:TweakStatesBgPS
+$oldTweakAsync = $script:TweakStatesBgAsync
 $script:TweakStatesBgPS = $null
 $script:TweakStatesBgAsync = $null
+if ($oldTweakPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldTweakPs -Invocation $oldTweakAsync -Name "Tweak state preload" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldTweakPs -Invocation $oldTweakAsync -Name "Tweak state preload" } catch {}
+    }
+}
 $script:TweakStatesBgStarted = $false
 $script:TweakStatesReady = $false
 
 try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
-if ($script:FeaturesCheckPS) {
-    try { $script:FeaturesCheckPS.Stop() } catch {}
-    try { $script:FeaturesCheckPS.Dispose() } catch {}
-}
+$oldFeaturesPs = $script:FeaturesCheckPS
+$oldFeaturesAsync = $script:FeaturesCheckAsync
 $script:FeaturesCheckPS = $null
 $script:FeaturesCheckAsync = $null
+if ($oldFeaturesPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldFeaturesPs -Invocation $oldFeaturesAsync -Name "Optional features check" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldFeaturesPs -Invocation $oldFeaturesAsync -Name "Optional features check" } catch {}
+    }
+}
 $script:OptionalFeaturesReady = $false
 $script:OptionalFeaturesCheckStarted = $false
 }
@@ -10445,9 +10570,13 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                 }
             }
             catch {
-                # Only fall back to direct disposal when async cancellation could
-                # not even be scheduled. The normal timeout path stays off the UI thread.
-                try { if ($timedOutUpdatePs) { $timedOutUpdatePs.Dispose() } } catch {}
+                # Never synchronously dispose a still-active updater from the WPF thread.
+                try {
+                    if ($timedOutUpdatePs) {
+                        Start-WmtPowerShellCleanupDetached -PowerShell $timedOutUpdatePs -Invocation $timedOutUpdateAsync -Name "Self-update check timeout"
+                    }
+                }
+                catch {}
             }
             if ($lb) { $lb.AppendText("[UPDATE] Error: Request timed out.`n"); $lb.ScrollToEnd() }
             return
@@ -38627,27 +38756,46 @@ exit `$exitCode
         param([object]$Process)
 
         if (-not $Process) { return }
+        $processId = 0
+        try { $processId = [int]$Process.Id } catch {}
+
         try {
             $Process.Refresh()
             if ($Process.HasExited) { return }
         }
         catch { return }
 
+        $killProc = $null
         try {
             $killInfo = New-Object System.Diagnostics.ProcessStartInfo
             $killInfo.FileName = "taskkill.exe"
-            $killInfo.Arguments = "/PID $($Process.Id) /T /F"
+            $killInfo.Arguments = "/PID $processId /T /F"
             $killInfo.UseShellExecute = $false
             $killInfo.CreateNoWindow = $true
             $killInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
             $killProc = [System.Diagnostics.Process]::Start($killInfo)
             if ($killProc) {
-                try { [void]$killProc.WaitForExit(5000) }
-                finally { $killProc.Dispose() }
+                try { [void]$killProc.WaitForExit(5000) } catch {}
+            }
+        }
+        catch {}
+        finally {
+            try { if ($killProc) { $killProc.Dispose() } } catch {}
+        }
+
+        # taskkill can launch successfully yet fail to terminate the target.
+        # Verify the original process and force-kill it as a fallback.
+        try {
+            $Process.Refresh()
+            if (-not $Process.HasExited) {
+                try { $Process.Kill() } catch {}
+                try { [void]$Process.WaitForExit(3000) } catch {}
             }
         }
         catch {
-            try { $Process.Kill() } catch {}
+            if ($processId -gt 0) {
+                try { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } catch {}
+            }
         }
     }
 
@@ -38721,7 +38869,9 @@ exit `$exitCode
         $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
         $pInfo.StandardOutputEncoding = $oem
         $pInfo.StandardErrorEncoding = $oem
-        $proc = [System.Diagnostics.Process]::Start($pInfo)
+        $proc = $null
+        try {
+            $proc = [System.Diagnostics.Process]::Start($pInfo)
 
         function Write-WmtCommandOutputChunk {
             param(
@@ -38854,10 +39004,19 @@ exit `$exitCode
             $Result.Value = [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = $timeoutReason }
             return
         }
+        $exitCode = [int]$proc.ExitCode
         if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
-            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $($proc.ExitCode)"
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $exitCode"
         }
-        $Result.Value = $proc
+        $Result.Value = [PSCustomObject]@{
+            ExitCode      = $exitCode
+            TimedOut      = $false
+            TimeoutReason = ""
+        }
+        }
+        finally {
+            try { if ($proc) { $proc.Dispose() } } catch {}
+        }
     }
 
     # Pip can remain alive indefinitely when launched with ProcessStartInfo from inside a background PowerShell worker.
@@ -38929,7 +39088,9 @@ exit `$exitCode
         $pInfo.CreateNoWindow = $true
         $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
         $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
-        $proc = [System.Diagnostics.Process]::Start($pInfo)
+        $proc = $null
+        try {
+            $proc = [System.Diagnostics.Process]::Start($pInfo)
 
         $state = [PSCustomObject]@{ LastLine = ""; LastPct = -1; MeaningfulActivity = $false }
         function Write-WmtWingetLiveLine {
@@ -39036,6 +39197,24 @@ exit `$exitCode
         }
 
         try { [void]$proc.WaitForExit(5000) } catch {}
+        $terminationFailed = $false
+        if ($timedOut) {
+            try {
+                $proc.Refresh()
+                if (-not $proc.HasExited) {
+                    try { $proc.Kill() } catch {}
+                    try { [void]$proc.WaitForExit(3000) } catch {}
+                    try { $proc.Refresh() } catch {}
+                }
+                $terminationFailed = -not $proc.HasExited
+            }
+            catch {
+                $terminationFailed = $true
+            }
+            if ($terminationFailed) {
+                Write-Output "LOG:WARNING: Winget still appears to be running after the timeout termination attempt."
+            }
+        }
         $drainDeadline = (Get-Date).AddSeconds(5)
         while (($outTask -or $errTask) -and (Get-Date) -lt $drainDeadline) {
             if ($outTask -and $outTask.IsCompleted) {
@@ -39065,12 +39244,27 @@ exit `$exitCode
             if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
                 Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: timed out ($timeoutReason)"
             }
-            return [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = $timeoutReason }
+            return [PSCustomObject]@{
+                ExitCode          = 124
+                TimedOut          = $true
+                TimeoutReason     = $timeoutReason
+                TerminationFailed = $terminationFailed
+            }
         }
+        $exitCode = [int]$proc.ExitCode
         if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
-            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $($proc.ExitCode)"
+            Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $exitCode"
         }
-        return $proc
+        return [PSCustomObject]@{
+            ExitCode          = $exitCode
+            TimedOut          = $false
+            TimeoutReason     = ""
+            TerminationFailed = $false
+        }
+        }
+        finally {
+            try { if ($proc) { $proc.Dispose() } } catch {}
+        }
     }
 
     function Invoke-VisibleCmd {
@@ -39260,6 +39454,8 @@ exit /b %WMT_EXIT%
             [bool]$Headless = $false
         )
 
+        $cmdProc = $null
+        $sendKeysProc = $null
         $rand = [Guid]::NewGuid().ToString("N")
         $batPath = Join-Path $TempPath "WMT_StoreCLI_$rand.cmd"
         $resultPath = Join-Path $TempPath "WMT_StoreCLI_$rand.exit"
@@ -39961,6 +40157,10 @@ exit /b %WMT_EXIT%
             Stop-WmtStoreCliProcessTree -Process $cmdProc -HelperProcess $sendKeysProc
             Clear-WmtStoreCliTempFiles @($resultPath, $statusPath, $resourcesInUsePath, $screenPath, $fallbackAckPath, $sendKeysPath, $runnerPath, $batPath, $temporaryTranscriptPath)
             return [PSCustomObject]@{ ExitCode = 1 }
+        }
+        finally {
+            try { if ($sendKeysProc) { $sendKeysProc.Dispose() } } catch {}
+            try { if ($cmdProc) { $cmdProc.Dispose() } } catch {}
         }
     }
 
@@ -43924,6 +44124,8 @@ $startProviderAction = {
                 try { $state.Monitors.Remove($state.Key) } catch {}
                 $exitCode = 1
                 try { $exitCode = [int]$state.Process.ExitCode } catch {}
+                try { if ($state.Process) { $state.Process.Dispose() } } catch {}
+                $state.Process = $null
                 try { Remove-Item -LiteralPath $state.TempScriptPath -Force -ErrorAction SilentlyContinue } catch {}
                 if ($exitCode -eq 0) {
                     try { Write-GuiLog "[$($state.ProviderName)] $($state.Action) completed." } catch {}
@@ -43938,6 +44140,8 @@ $startProviderAction = {
             catch {
                 try { $s.Stop() } catch {}
                 try { $state.Monitors.Remove($state.Key) } catch {}
+                try { if ($state.Process) { $state.Process.Dispose() } } catch {}
+                $state.Process = $null
                 try { Write-GuiLog "[$($state.ProviderName)] Provider completion monitor failed: $($_.Exception.Message)" } catch {}
                 try { & $state.UpdateStatuses } catch {}
             }
@@ -43949,12 +44153,15 @@ $startProviderAction = {
 $win.Add_Closed({
         foreach ($monitor in @($providerActionMonitors.Values)) {
             try { if ($monitor.Timer) { $monitor.Timer.Stop() } } catch {}
+            $monitorProcess = $monitor.Process
             try {
-                if ($monitor.Process -and $monitor.Process.HasExited -and $monitor.TempScriptPath) {
+                if ($monitorProcess -and $monitorProcess.HasExited -and $monitor.TempScriptPath) {
                     Remove-Item -LiteralPath $monitor.TempScriptPath -Force -ErrorAction SilentlyContinue
                 }
             }
             catch {}
+            try { if ($monitorProcess) { $monitorProcess.Dispose() } } catch {}
+            try { $monitor.Process = $null } catch {}
         }
         try { $providerActionMonitors.Clear() } catch {}
     }.GetNewClosure())
