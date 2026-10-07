@@ -10435,7 +10435,20 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
         # A. Timeout Check (20s)
         if ($script:UpdateTicks -gt 40) {
             Unregister-WmtUiPollOperation -Name "SelfUpdateCheck"
-            if ($script:UpdateRunspace) { $script:UpdateRunspace.Dispose() }
+            $timedOutUpdatePs = $script:UpdateRunspace
+            $timedOutUpdateAsync = $script:UpdateAsyncResult
+            $script:UpdateRunspace = $null
+            $script:UpdateAsyncResult = $null
+            try {
+                if ($timedOutUpdatePs) {
+                    Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutUpdatePs -Invocation $timedOutUpdateAsync -Name "Self-update check timeout"
+                }
+            }
+            catch {
+                # Only fall back to direct disposal when async cancellation could
+                # not even be scheduled. The normal timeout path stays off the UI thread.
+                try { if ($timedOutUpdatePs) { $timedOutUpdatePs.Dispose() } } catch {}
+            }
             if ($lb) { $lb.AppendText("[UPDATE] Error: Request timed out.`n"); $lb.ScrollToEnd() }
             return
         }
@@ -39080,23 +39093,35 @@ exit `$exitCode
         else {
             $cmdLine = "/c title $safeTitle && $command"
         }
-        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -PassThru -WindowStyle Normal
-        $startedAt = Get-Date
-        $lastHeartbeat = $startedAt
-        while (-not $proc.HasExited) {
-            $now = Get-Date
-            if ($TimeoutSeconds -gt 0 -and ($now - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
-                Write-Output "LOG:Visible installer exceeded the $TimeoutSeconds-second runtime limit. Stopping its process tree."
-                Stop-WmtChildProcessTree -Process $proc
-                return [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = "visible installer runtime limit" }
+
+        $proc = $null
+        try {
+            $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -PassThru -WindowStyle Normal
+            $startedAt = Get-Date
+            $lastHeartbeat = $startedAt
+            while (-not $proc.HasExited) {
+                $now = Get-Date
+                if ($TimeoutSeconds -gt 0 -and ($now - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
+                    Write-Output "LOG:Visible installer exceeded the $TimeoutSeconds-second runtime limit. Stopping its process tree."
+                    Stop-WmtChildProcessTree -Process $proc
+                    return [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = "visible installer runtime limit" }
+                }
+                if (($now - $lastHeartbeat).TotalSeconds -ge 30) {
+                    Write-Output "LOG:Visible installer still running..."
+                    $lastHeartbeat = $now
+                }
+                Start-Sleep -Milliseconds 500
             }
-            if (($now - $lastHeartbeat).TotalSeconds -ge 30) {
-                Write-Output "LOG:Visible installer still running..."
-                $lastHeartbeat = $now
+
+            $exitCode = [int]$proc.ExitCode
+            return [PSCustomObject]@{
+                ExitCode = $exitCode
+                TimedOut = $false
             }
-            Start-Sleep -Milliseconds 500
         }
-        return $proc
+        finally {
+            try { if ($proc) { $proc.Dispose() } } catch {}
+        }
     }
 
     function Invoke-WmtUserModeRetry {
@@ -41687,18 +41712,57 @@ return $toggles
 function Set-WmtProviderToggles {
 param($Toggles)
 
+function Get-WmtProviderToggleInputValue {
+    param($Value, [string]$Name, [bool]$Default)
+
+    if (-not $Value) { return $Default }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Contains($Name)) { return [bool]$Value[$Name] }
+        foreach ($candidateKey in @($Value.Keys)) {
+            if ([string]::Equals([string]$candidateKey, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return [bool]$Value[$candidateKey]
+            }
+        }
+        return $Default
+    }
+
+    try {
+        $property = @($Value.PSObject.Properties | Where-Object {
+                [string]::Equals($_.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1)
+        if ($property.Count -gt 0) { return [bool]$property[0].Value }
+    }
+    catch {}
+    return $Default
+}
+
 $settings = Get-WmtSettings
 $clean = [ordered]@{}
 if ($Toggles) {
-    foreach ($key in @($Toggles.PSObject.Properties.Name)) {
-        $k = ([string]$key).Trim().ToLowerInvariant()
+    $toggleEntries = @()
+    if ($Toggles -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Toggles.Keys)) {
+            $toggleEntries += [PSCustomObject]@{ Name = [string]$key; Value = $Toggles[$key] }
+        }
+    }
+    else {
+        try {
+            foreach ($property in @($Toggles.PSObject.Properties)) {
+                $toggleEntries += [PSCustomObject]@{ Name = [string]$property.Name; Value = $property.Value }
+            }
+        }
+        catch {}
+    }
+
+    foreach ($toggleEntry in $toggleEntries) {
+        $k = ([string]$toggleEntry.Name).Trim().ToLowerInvariant()
         if ([string]::IsNullOrWhiteSpace($k)) { continue }
-        $val = $Toggles.$key
+        $val = $toggleEntry.Value
         $defaults = Get-WmtProviderToggleDefaults -ProviderKey $k
         $entry = [ordered]@{
-            Search     = if ($defaults.Search) { [bool]$val.Search } else { $false }
-            Scan       = [bool]$val.Scan
-            Logs       = if ($val -is [System.Collections.IDictionary]) { if ($val.Contains("Logs")) { [bool]$val["Logs"] } else { $true } } elseif ($null -ne $val.Logs) { [bool]$val.Logs } else { $true }
+            Search = if ($defaults.Search) { Get-WmtProviderToggleInputValue -Value $val -Name "Search" -Default ([bool]$defaults.Search) } else { $false }
+            Scan   = Get-WmtProviderToggleInputValue -Value $val -Name "Scan" -Default ([bool]$defaults.Scan)
+            Logs   = Get-WmtProviderToggleInputValue -Value $val -Name "Logs" -Default ([bool]$defaults.Logs)
         }
         $clean[$k] = $entry
     }
