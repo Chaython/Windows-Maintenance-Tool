@@ -40661,12 +40661,20 @@ exit /b %WMT_EXIT%
             }
 
             # 1. RUN COMMAND (First Attempt - Admin)
-            # UX: most package updates run one-by-one in visible windows (auto-close when done),
-            # so end-users can follow each update without relying on Activity Log only.
+            # UX: normal installs and updates run one-by-one in visible windows unless
+            # the effective provider Headless setting is enabled. Provider-owned GUI
+            # paths (Store, Steam, Windows Update COM) are handled separately.
             $isPipUpdate = (($src -eq "pip" -or $src -eq "pip3") -and $act -eq "Update")
             $isChocoUpdate = (($src -eq "chocolatey" -or $src -eq "choco") -and $act -eq "Update")
             $isPythonUpdate = ($act -eq "Update" -and (([string]$id -match "(?i)\bpython([0-9\.]*)\b") -or ([string]$name -match "(?i)\bpython([0-9\.]*)\b")))
-            $useVisibleWindow = ($act -eq "Update" -and -not $providerHeadlessEnabled -and -not ($src -eq "msstore" -and $storeCliArgs) -and -not $windowsUpdateItem)
+            $useVisibleWindow = (
+                $act -in @("Install", "Update") -and
+                -not $providerHeadlessEnabled -and
+                -not $storeCliArgs -and
+                -not $storeForceUpdateScan -and
+                -not $windowsUpdateItem -and
+                $srcKey -ne "steam"
+            )
 
             if ($wingetArgs) { $wingetAttemptStartedAt = Get-Date }
 
@@ -40695,7 +40703,7 @@ exit /b %WMT_EXIT%
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
                     $visibleTranscriptPath = if ($srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
-                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag Update - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
+                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
                     # Normalize a missing/failed visible process result. The final
                     # result line below reports the failure once, without duplicate chatter.
@@ -40706,7 +40714,7 @@ exit /b %WMT_EXIT%
                 }
                 catch {
                     if ($src -eq "msstore" -or $src -eq "gogdl") {
-                        Write-Output "LOG:[$act] $windowTag update window was interrupted."
+                        Write-Output "LOG:[$act] $windowTag action window was interrupted."
                         $p = [PSCustomObject]@{ ExitCode = 1 }
                     }
                     else {
@@ -42688,8 +42696,8 @@ function Format-WmtProviderRowXaml {
                     <ToggleButton Name="chk${key}Search"     Content="Search"     Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$searchIsChecked"    IsEnabled="$searchEnabled" ToolTip="$searchToolTip"/>
                     <ToggleButton Name="chk${key}Scan"       Content="Scan"       Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsChecked="$scanIsChecked"       ToolTip="Include this provider in update scans. Disabling also disables Headless and Auto-update for this provider."/>
                     <ToggleButton Name="chk${key}Logs"       Content="Log files"  Margin="0,0,8,0" Padding="10,3" MinWidth="68" IsChecked="$logsIsChecked"       ToolTip="Allow WMT to request and keep persistent diagnostic/install log files for this provider. On-screen Activity Log messages are unaffected; providers may still keep mandatory internal logs."/>
-                    <ToggleButton Name="chk${key}Headless"   Content="Headless"   Margin="0,0,8,0" Padding="10,3" MinWidth="60" IsThreeState="True" IsChecked="$headlessIsChecked"   ToolTip="Three-state setting: On = force headless, Off = force interactive, mixed = inherit the global Headless setting. Requires Scan."/>
-                    <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update" Margin="0,0,8,0" Padding="10,3" MinWidth="70" IsThreeState="True" IsChecked="$autoIsChecked"       ToolTip="Three-state setting: On = force auto-update, Off = disable it, mixed = inherit the global Auto-install setting. Requires Scan."/>
+                    <ToggleButton Name="chk${key}Headless"   Content="Headless: inherit"   Margin="0,0,8,0" Padding="10,3" MinWidth="112" IsThreeState="True" IsChecked="$headlessIsChecked"   ToolTip="Three-state setting: On = force headless, Off = force interactive, inherit = use the global Headless setting. Requires Scan."/>
+                    <ToggleButton Name="chk${key}AutoUpdate" Content="Auto-update: inherit" Margin="0,0,8,0" Padding="10,3" MinWidth="126" IsThreeState="True" IsChecked="$autoIsChecked"       ToolTip="Three-state setting: On = force auto-update, Off = disable it, inherit = use the global Auto-install setting. Requires Scan."/>
                     $includeUnknownToggle
                 </StackPanel>
                 $wuCategorySection
@@ -44052,12 +44060,28 @@ $updateProviderToggleState = {
         }
     }
 
-    # Headless toggle
+    # Headless toggle. Plain three-state ToggleButtons can make the inherited
+    # state easy to confuse with Off, so always spell the state out in Content.
     if ($controls.Headless) {
         if (-not $headlessSupported) {
             $controls.Headless.IsChecked = $null
+            $controls.Headless.Content = "Headless: n/a"
             $controls.Headless.IsEnabled = $false
             $controls.Headless.ToolTip = "$dispName owns its update UI and cannot be made truly headless by WMT."
+        }
+        else {
+            $controls.Headless.Content = if ($null -eq $controls.Headless.IsChecked) {
+                "Headless: inherit"
+            }
+            elseif ([bool]$controls.Headless.IsChecked) {
+                "Headless: on"
+            }
+            else {
+                "Headless: off"
+            }
+        }
+        if (-not $headlessSupported) {
+            # State already finalized above.
         }
         elseif (-not $mainChecked) {
             $controls.Headless.IsEnabled = $false
@@ -44073,8 +44097,17 @@ $updateProviderToggleState = {
         }
     }
 
-    # AutoUpdate toggle
+    # AutoUpdate toggle. Keep the tri-state meaning visible in the button text.
     if ($controls.AutoUpdate) {
+        $controls.AutoUpdate.Content = if ($null -eq $controls.AutoUpdate.IsChecked) {
+            "Auto-update: inherit"
+        }
+        elseif ([bool]$controls.AutoUpdate.IsChecked) {
+            "Auto-update: on"
+        }
+        else {
+            "Auto-update: off"
+        }
         if (-not $mainChecked) {
             $controls.AutoUpdate.IsEnabled = $false
             $controls.AutoUpdate.ToolTip = "Enable $dispName and Scan to use auto-update."
@@ -44124,6 +44157,16 @@ foreach ($provider in $providerDefinitions) {
     if ($controls.Scan) {
         $controls.Scan.Add_Checked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
         $controls.Scan.Add_Unchecked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+    }
+    if ($controls.Headless) {
+        $controls.Headless.Add_Checked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+        $controls.Headless.Add_Unchecked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+        $controls.Headless.Add_Indeterminate({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+    }
+    if ($controls.AutoUpdate) {
+        $controls.AutoUpdate.Add_Checked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+        $controls.AutoUpdate.Add_Unchecked({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
+        $controls.AutoUpdate.Add_Indeterminate({ & $updateProviderToggleState -ProviderKey $key }.GetNewClosure())
     }
 }
 
