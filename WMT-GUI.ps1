@@ -3325,7 +3325,7 @@ if ($script:BitLockerStatusRunspace) {
         Stop-WmtPowerShellInvocationAsync -PowerShell $oldBitLockerPs -Invocation $oldBitLockerAsync -Name "BitLocker status refresh"
     }
     catch {
-        try { $oldBitLockerPs.Dispose() } catch {}
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldBitLockerPs -Invocation $oldBitLockerAsync -Name "BitLocker status refresh" } catch {}
     }
 }
 
@@ -3401,7 +3401,7 @@ Register-WmtUiPollOperation -Name "BitLockerStatus" -IntervalMs 500 -TestComplet
                         Stop-WmtPowerShellInvocationAsync -PowerShell $bitLockerPs -Invocation $bitLockerAsync -Name "BitLocker status timeout"
                     }
                     catch {
-                        try { if ($bitLockerPs) { $bitLockerPs.Dispose() } } catch {}
+                        try { if ($bitLockerPs) { Start-WmtPowerShellCleanupDetached -PowerShell $bitLockerPs -Invocation $bitLockerAsync -Name "BitLocker status timeout" } } catch {}
                     }
                 }
                 else {
@@ -45995,7 +45995,7 @@ $btnWingetScan.Add_Click({
                         Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan timeout"
                     }
                     catch {
-                        try { $task.PowerShell.Dispose() } catch {}
+                        try { Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan timeout" } catch {}
                     }
                 }
                 $script:ActiveScans.Clear()
@@ -47809,7 +47809,7 @@ $btnWingetScan.Add_Click({
                 Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$taskName setup rollback"
             }
             catch {
-                try { $task.PowerShell.Dispose() } catch {}
+                try { Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$taskName setup rollback" } catch {}
             }
         }
         $script:ActiveScans.Clear()
@@ -60431,7 +60431,7 @@ Register-WmtUiPollOperation -Name "AppxBackgroundLoad" -IntervalMs 250 -TestComp
         Stop-WmtPowerShellInvocationAsync -PowerShell $failedPs -Invocation $failedAsync -Name "AppX background load"
     }
     catch {
-        try { if ($failedPs) { $failedPs.Dispose() } } catch {}
+        try { if ($failedPs) { Start-WmtPowerShellCleanupDetached -PowerShell $failedPs -Invocation $failedAsync -Name "AppX background load" } } catch {}
     }
 } | Out-Null
 }
