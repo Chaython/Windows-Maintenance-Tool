@@ -58189,7 +58189,10 @@ $onComplete = {
     if ($installFinalizeState.Completed) { return }
     $installFinalizeState.Attempted = $true
     if ($installFinalizeState.PSObject.Properties['OutcomeApplied'] -and $installFinalizeState.OutcomeApplied) {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+            catch { try { Write-GuiLog "Installer result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+        }
         try { if ($procRef) { $procRef.Dispose() } } catch {}
         $installFinalizeState.Completed = $true
         return
@@ -58341,7 +58344,10 @@ $onComplete = {
     try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
     $installFinalizeState | Add-Member -NotePropertyName OutcomeApplied -NotePropertyValue $true -Force
     # Deleting results is last: failed tracking can retry against the original outcome.
-    if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+            catch { try { Write-GuiLog "Installer result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+        }
     # Preserve the Process until all required bookkeeping succeeded.
     try { if ($procRef) { $procRef.Dispose() } } catch {}
     $installFinalizeState.Completed = $true
@@ -58769,7 +58775,10 @@ $onComplete = {
     if ($installFinalizeState.Completed) { return }
     $installFinalizeState.Attempted = $true
     if ($installFinalizeState.PSObject.Properties['OutcomeApplied'] -and $installFinalizeState.OutcomeApplied) {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+            catch { try { Write-GuiLog "Installer result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+        }
         try { if ($procRef) { $procRef.Dispose() } } catch {}
         $installFinalizeState.Completed = $true
         return
@@ -58829,8 +58838,9 @@ $onComplete = {
 
     try { Start-WmtLibraryScan -Silent } catch {}
     $installFinalizeState | Add-Member -NotePropertyName OutcomeApplied -NotePropertyValue $true -Force
-    try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop } catch {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { throw }
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+        try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+        catch { try { Write-GuiLog "GOGDL result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
     }
     try { if ($procRef) { $procRef.Dispose() } } catch {}
     $installFinalizeState.Completed = $true
