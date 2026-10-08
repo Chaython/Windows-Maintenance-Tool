@@ -35834,6 +35834,69 @@ function Reset-WmtLibraryToCatalog {
     }
 }
 
+# Only three main-window shortcuts: F5 refreshes the visible list, Ctrl+F
+# focuses its search field, and Ctrl+Shift+F opens the global Quick Find.
+# Reuse existing click handlers so all scan guards, state and logging stay intact.
+$window.Add_PreviewKeyDown({
+    param($keySender, $keyArgs)
+    if ($keyArgs.Handled) { return }
+    $key = $keyArgs.Key
+    if ($key -ne [System.Windows.Input.Key]::F5 -and $key -ne [System.Windows.Input.Key]::F) { return }
+
+    try {
+        $modifiers = [int][System.Windows.Input.Keyboard]::Modifiers
+        $control = [int][System.Windows.Input.ModifierKeys]::Control
+        $controlShift = $control -bor [int][System.Windows.Input.ModifierKeys]::Shift
+
+        if ($key -eq [System.Windows.Input.Key]::F5 -and $modifiers -eq 0) {
+            $refreshButton = $null
+            if ($pnlUpdates -and $pnlUpdates.IsVisible) {
+                # Updates navigation alone never scans; F5 is an explicit user scan.
+                if (Get-WmtUpdateScansDisabled) { return }
+                $refreshButton = $btnWingetScan
+            }
+            elseif ($pnlCatalog -and $pnlCatalog.IsVisible) {
+                if ($brdLibraryList -and $brdLibraryList.IsVisible) {
+                    $refreshButton = $btnLibraryRefresh
+                }
+            }
+            elseif ((Get-Ctrl "pnlFirewall").IsVisible) { $refreshButton = $btnFwRefresh }
+            elseif ((Get-Ctrl "pnlDrivers").IsVisible) { $refreshButton = Get-Ctrl "btnDrvReload" }
+
+            if ($refreshButton -and $refreshButton.IsVisible -and $refreshButton.IsEnabled) {
+                $refreshButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+                $keyArgs.Handled = $true
+            }
+            return
+        }
+
+        if ($key -ne [System.Windows.Input.Key]::F) { return }
+        $searchBox = $null
+        if ($modifiers -eq $controlShift) {
+            $searchBox = $txtGlobalSearch
+        }
+        elseif ($modifiers -eq $control) {
+            if (($LogBox -and $LogBox.IsKeyboardFocusWithin) -or
+                ($txtLogSearch -and $txtLogSearch.IsKeyboardFocusWithin)) {
+                $searchBox = $txtLogSearch
+            }
+            elseif ($pnlUpdates -and $pnlUpdates.IsVisible) { $searchBox = $txtWingetSearch }
+            elseif ($pnlCatalog -and $pnlCatalog.IsVisible -and
+                    $brdLibraryList -and $brdLibraryList.IsVisible) { $searchBox = $txtLibrarySearch }
+            elseif ((Get-Ctrl "pnlFirewall").IsVisible) { $searchBox = $txtFwSearch }
+            elseif ((Get-Ctrl "pnlDrivers").IsVisible) { $searchBox = Get-Ctrl "txtDrvSearch" }
+            else { $searchBox = $txtGlobalSearch }
+        }
+        if ($searchBox -and $searchBox.IsVisible -and $searchBox.IsEnabled) {
+            [void]$searchBox.Focus()
+            $keyArgs.Handled = $true
+        }
+    }
+    catch {
+        try { Write-GuiLog "Keyboard shortcut failed: $($_.Exception.Message)" } catch {}
+    }
+})
+
 # --- TABS LOGIC ---
 foreach ($tabButton in $script:WmtTabButtonControls) {
 $tabButton.Add_Click({
