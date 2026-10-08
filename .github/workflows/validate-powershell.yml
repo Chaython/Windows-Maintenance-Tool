@@ -1163,7 +1163,7 @@ jobs:
           Test-Case 'Provider completion uses the timer sender to refresh status and release its monitor' {
               $tickRegistration = $ast.Find({ param($n)
                   $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
-                  $n.Member.Value -eq 'Add_Tick' -and $n.Extent.Text -match 'Provider completion monitor failed:'
+                  $n.Member.Value -eq 'Add_Tick' -and $n.Extent.Text -match 'Provider monitor warning'
               }, $true)
               Assert ($null -ne $tickRegistration) 'Provider completion callback was not found.'
               $callback = Invoke-Expression $tickRegistration.Arguments[0].Extent.Text
@@ -1172,11 +1172,20 @@ jobs:
                   $timer.Interval = [TimeSpan]::FromHours(1)
                   $tempScriptPath = [IO.Path]::GetTempFileName()
                   $status = @{ Refreshed = $false }
+                  $statusCache = @{}
                   $monitors = @{}
                   $monitor = [pscustomobject]@{
                       Key = 'ProviderTest'; Process = [pscustomobject]@{ HasExited = $false; ExitCode = $exitCode }
                       TempScriptPath = $tempScriptPath; ProviderName = 'Test provider'; Action = 'Install'
+                      ProviderKey = 'ProviderTest'
+                      ProviderInfo = [pscustomobject]@{ Key = 'ProviderTest' }
+                      TestInstalled = { param($Provider) return $true }
+                      StatusCache = $statusCache
+                      ExitObserved = $false; CompletionLogged = $false
+                      RefreshCompleted = $false; TempRemoved = $false
+                      LastErrorLogUtc = [DateTime]::MinValue
                       Monitors = $monitors; UpdateStatuses = { $status.Refreshed = $true }.GetNewClosure()
+                      ExitCode = 1
                   }
                   $monitors[$monitor.Key] = $monitor
                   $timer.Tag = $monitor
@@ -1185,12 +1194,21 @@ jobs:
                       & $callback $timer ([EventArgs]::Empty)
                       Assert ($timer.IsEnabled -and $monitors.ContainsKey($monitor.Key)) 'A running provider lost its completion monitor.'
                       Assert ((Test-Path -LiteralPath $tempScriptPath) -and -not $status.Refreshed) 'A running provider was cleaned up early.'
+                      $workingProcess = $monitor.Process
+                      $faultedProcess = [pscustomobject]@{ ExitCode = $exitCode }
+                      $faultedProcess | Add-Member -MemberType ScriptProperty -Name HasExited -Value { throw 'Transient process observation error' }
+                      $monitor.Process = $faultedProcess
+                      & $callback $timer ([EventArgs]::Empty)
+                      Assert ($timer.IsEnabled -and $monitors.ContainsKey($monitor.Key)) 'A transient observation error abandoned a live provider.'
+                      Assert (Test-Path -LiteralPath $tempScriptPath) 'An observation error removed the provider script.'
+                      $monitor.Process = $workingProcess
                       $monitor.Process.HasExited = $true
                       & $callback $timer ([EventArgs]::Empty)
                       Assert (-not $timer.IsEnabled) 'The completed provider timer was not stopped.'
                       Assert (-not $monitors.ContainsKey($monitor.Key)) 'The completed provider monitor was retained.'
                       Assert (-not (Test-Path -LiteralPath $tempScriptPath)) 'The completed provider script was retained.'
                       Assert ($status.Refreshed) 'Provider status was not refreshed after completion.'
+                      Assert ($statusCache.ProviderTest.Installed) 'Provider status cache was not updated after exit.'
                   }
                   finally {
                       $timer.Stop()
