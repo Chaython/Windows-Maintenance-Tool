@@ -1,0 +1,142 @@
+name: One-off WMT v6.7 release rebuild and WinGet sync
+
+on:
+  push:
+    branches: [release-sync-v6.7]
+    paths: [.github/workflows/rebuild-and-sync-winget.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild-and-sync:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      REPO: Chaython/Windows-Maintenance-Tool
+      MANIFEST_REPO: Chaython/winget-pkgs
+      MANIFEST_PATH: manifests/c/Chaython/WindowsMaintenanceTool/6.7/Chaython.WindowsMaintenanceTool.installer.yaml
+    steps:
+      - name: Check out exact source commit
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git init .
+          git remote add origin "https://x-access-token:$env:GH_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin "$env:GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to check out source.' }
+
+      - name: Preflight released version and WinGet fork permissions
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_TOKEN)) {
+            throw 'WINGET_TOKEN secret is required to synchronize the existing pending winget-pkgs PR; no release assets have been changed.'
+          }
+          $headers = @{
+            Authorization = "Bearer $env:WINGET_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'WMT-release-sync'
+          }
+          $url = "https://api.github.com/repos/$env:MANIFEST_REPO/contents/$env:MANIFEST_PATH" + '?ref=master'
+          $manifest = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 30
+          $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($manifest.content -replace '\s', '')))
+          if ($text -notmatch 'PackageVersion:\s*["'']?6\.7' -or
+              $text -notmatch 'releases/download/v6\.7/WindowsMaintenanceTool\.exe') {
+            throw "WinGet manifest is not the expected WMT v6.7 manifest. Refusing to replace the release binary."
+          }
+          $source = Get-Content -LiteralPath '.\WMT-GUI.ps1' -Raw
+          if ($source -notmatch '(?m)^\$AppVersion\s*=\s*["'']6\.7["'']\s*$') {
+            throw 'Source AppVersion differs from v6.7. Publish a new version instead of overwriting a different release.'
+          }
+          $releaseHeaders = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'User-Agent' = 'WMT-release-sync'
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases/tags/v6.7" -Headers $releaseHeaders -TimeoutSec 30
+          if ($release.tag_name -ne 'v6.7') { throw 'Expected v6.7 release not found.' }
+
+      - name: Build PS2EXE executable from current source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\PS2EXE\Build-Exe.ps1 -InstallPS2EXE
+          $exe = '.\dist\WindowsMaintenanceTool.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'PS2EXE did not produce the expected executable.' }
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'dist\WindowsMaintenanceTool.exe.sha256'), "$hash  WindowsMaintenanceTool.exe`n", [Text.Encoding]::ASCII)
+          "release_sha256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Built WMT 6.7 with SHA-256: $hash"
+
+      - name: Check rebuilt executable with Microsoft Defender
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $status = Get-MpComputerStatus -ErrorAction Stop
+          if (-not $status.AntivirusEnabled) { throw 'Microsoft Defender Antivirus is not enabled. Refusing to replace the release without a local antivirus check.' }
+          Update-MpSignature -ErrorAction Stop
+          $exe = (Resolve-Path -LiteralPath '.\dist\WindowsMaintenanceTool.exe').Path
+          Start-MpScan -ScanType CustomScan -ScanPath $exe -ErrorAction Stop
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Defender removed/quarantined rebuilt executable.' }
+          $found = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+            @($_.Resources) | Where-Object { [string]$_ -like "*WindowsMaintenanceTool.exe*" }
+          })
+          if ($found.Count -gt 0) { throw 'Defender detected a threat in the rebuilt executable. No release or manifest will be changed. Request Defender false-positive analysis.' }
+          Write-Host 'Defender local scan completed. A future WinGet cloud/reputation validation may still differ.'
+
+      - name: Replace v6.7 assets and verify published checksum
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release upload v6.7 '.\dist\WindowsMaintenanceTool.exe' '.\dist\WindowsMaintenanceTool.exe.sha256' --clobber --repo $env:REPO
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release upload failed. WinGet manifest will remain unchanged.' }
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'User-Agent' = 'WMT-release-sync'
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases/tags/v6.7" -Headers $headers -TimeoutSec 30
+          $asset = @($release.assets | Where-Object { $_.name -eq 'WindowsMaintenanceTool.exe' }) | Select-Object -First 1
+          if (-not $asset -or $asset.digest -ne "sha256:$env:release_sha256") {
+            throw 'Published release SHA-256 was not confirmed. WinGet manifest NOT updated.'
+          }
+
+      - name: Sync pending WinGet PR manifest with published release
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Authorization = "Bearer $env:WINGET_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'WMT-release-sync'
+          }
+          $url = "https://api.github.com/repos/$env:MANIFEST_REPO/contents/$env:MANIFEST_PATH"
+          $manifest = Invoke-RestMethod -Uri ($url + '?ref=master') -Headers $headers -TimeoutSec 30
+          $content = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($manifest.content -replace '\s', '')))
+          if ($content -notmatch 'PackageVersion:\s*["'']?6\.7' -or
+              $content -notmatch 'releases/download/v6\.7/WindowsMaintenanceTool\.exe') {
+            throw 'Manifest version or installer URL changed; refusing unsafe automatic update.'
+          }
+          $shaMatch = [regex]::Match($content, '(?im)^\s*InstallerSha256:\s*([0-9a-f]{64})\s*$')
+          if (-not $shaMatch.Success) { throw 'Manifest lacks exactly formatted InstallerSha256.' }
+          $updated = $content.Substring(0, $shaMatch.Groups[1].Index) + $env:release_sha256.ToUpperInvariant() + $content.Substring($shaMatch.Groups[1].Index + $shaMatch.Groups[1].Length)
+          if ($updated -eq $content) {
+            Write-Host 'WinGet manifest SHA-256 is already current.'
+            exit 0
+          }
+          $body = @{
+            message = 'Sync WMT v6.7 WinGet installer SHA256 with rebuilt GitHub release'
+            content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($updated))
+            sha = $manifest.sha
+            branch = 'master'
+          } | ConvertTo-Json -Depth 5
+          $result = Invoke-RestMethod -Uri $url -Method Put -Headers $headers -Body $body -ContentType 'application/json' -TimeoutSec 30
+          if (-not $result.commit.sha) { throw 'WinGet manifest update was not acknowledged by GitHub.' }
+          Write-Host "Updated winget-pkgs master commit: $($result.commit.sha)"
+          Write-Host "Expected SHA-256: $env:release_sha256"
