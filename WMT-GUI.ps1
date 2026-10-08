@@ -3305,25 +3305,32 @@ $state = [PSCustomObject]@{
     TestComplete = $TestComplete
     OnComplete = $OnComplete
     OnTick = $OnTick
+    ExitObserved = $false
+    CompletionAttempts = 0
+    LastErrorLogUtc = [DateTime]::MinValue
 }
 $timer.Add_Tick({
     param($sender, $eventArgs)
     $monitor = $state
     if (-not $monitor) { $sender.Stop(); return }
     try {
-        if ($monitor.OnTick) { & $monitor.OnTick $null }
-        if (-not [bool](& $monitor.TestComplete $null)) { return }
+        if (-not $monitor.ExitObserved) {
+            if ($monitor.OnTick) { & $monitor.OnTick $null }
+            if (-not [bool](& $monitor.TestComplete $null)) { return }
+            $monitor.ExitObserved = $true
+        }
+        # Completion may partially succeed. Callbacks must be retry-safe.
+        $monitor.CompletionAttempts++
+        & $monitor.OnComplete $null
         $sender.Stop()
         [void]$monitors.Remove($monitor.Key)
-        & $monitor.OnComplete $null
     }
     catch {
-        # Retain the worker and retry if the exit test fails transiently.
-        # A completion callback is only invoked once, even when bookkeeping throws.
-        if (-not $sender.IsEnabled) {
-            [void]$monitors.Remove($monitor.Key)
-            try { Write-GuiLog "[Async] $Name fallback completion failed: $($_.Exception.Message)" } catch {}
+        if (([DateTime]::UtcNow - $monitor.LastErrorLogUtc).TotalSeconds -ge 10) {
+            $monitor.LastErrorLogUtc = [DateTime]::UtcNow
+            try { Write-GuiLog "[Async] $Name fallback attempt $($monitor.CompletionAttempts) failed: $($_.Exception.Message); retrying." } catch {}
         }
+        # Observation errors cannot prove process exit; retain the handle/timer.
     }
 }.GetNewClosure())
 $monitors[$key] = $state
@@ -14981,13 +14988,34 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
     try {
         $state.PowerShell = New-WmtPooledPowerShell
         [void]$state.PowerShell.AddScript({
-            $logs = wevtutil el
-            $cleared = 0
-            foreach ($log in $logs) {
-                wevtutil cl "$log" 2>$null
-                $cleared++
+            $logs = @(wevtutil el 2>&1)
+            $enumerationExit = [int]$LASTEXITCODE
+            if ($enumerationExit -ne 0) {
+                throw "wevtutil el failed (exit $enumerationExit): $((@($logs) -join '; '))"
             }
-            return $cleared
+            $cleared = 0
+            $failed = 0
+            $failureDetails = [System.Collections.Generic.List[string]]::new()
+            foreach ($entry in $logs) {
+                $logName = ([string]$entry).Trim()
+                if ([string]::IsNullOrWhiteSpace($logName)) { continue }
+                $output = @(wevtutil cl "$logName" 2>&1)
+                $exitCode = [int]$LASTEXITCODE
+                if ($exitCode -eq 0) {
+                    $cleared++
+                }
+                else {
+                    $failed++
+                    if ($failureDetails.Count -lt 10) {
+                        [void]$failureDetails.Add(("$logName (exit $exitCode): " + ((@($output) -join " ") -replace '[\r\n]+', ' ')))
+                    }
+                }
+            }
+            [PSCustomObject]@{
+                Cleared = $cleared
+                Failed = $failed
+                FailureDetails = @($failureDetails.ToArray())
+            }
         })
         $state.Invocation = $state.PowerShell.BeginInvoke()
     }
@@ -15011,12 +15039,24 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
     $eventComplete = {
         param($Operation)
         try {
-            $clearedCount = $state.PowerShell.EndInvoke($state.Invocation)
-            if ($clearedCount -is [System.Collections.ObjectModel.Collection[PSObject]] -and $clearedCount.Count -gt 0) { $clearedCount = $clearedCount[-1] }
-            $successMessage = "Successfully processed $clearedCount Event Logs."
+            $rawClearResult = @($state.PowerShell.EndInvoke($state.Invocation))
+            $clearResult = @($rawClearResult | Where-Object { $null -ne $_ } | Select-Object -Last 1)
+            if ($clearResult.Count -eq 0 -or -not $clearResult[0].PSObject.Properties["Cleared"]) {
+                throw "Event Log worker returned no valid completion summary."
+            }
+            $result = $clearResult[0]
+            $clearedCount = [int]$result.Cleared
+            $failedCount = [int]$result.Failed
+            $successMessage = "Cleared $clearedCount Event Logs; $failedCount failed."
+            if ($failedCount -gt 0) {
+                $details = @($result.FailureDetails) -join "; "
+                if ($details) { $successMessage += " Examples: $details" }
+            }
             Write-GuiLog "[Event Logs] $successMessage"
             if ($state.DialogOpen -and $state.Dialog) {
-                Show-WmtMessageBox -Owner $state.Dialog -Message $successMessage -Title "Success" -Image Information | Out-Null
+                $messageTitle = if ($failedCount -gt 0) { "Event Logs Partially Cleared" } else { "Success" }
+                $messageImage = if ($failedCount -gt 0) { "Warning" } else { "Information" }
+                Show-WmtMessageBox -Owner $state.Dialog -Message $successMessage -Title $messageTitle -Image $messageImage | Out-Null
             }
         }
         catch {
