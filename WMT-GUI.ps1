@@ -15113,19 +15113,28 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
             }
         }
         catch {
-            Write-GuiLog "[Event Logs] Clear failed: $($_.Exception.Message)"
+            # EndInvoke may have thrown before a result was cached. Do not allow
+            # an independent monitor to retry it after the PowerShell is disposed.
+            $state.NotificationCompleted = $true
+            $failureMessage = $_.Exception.Message
+            try { Write-GuiLog "[Event Logs] Clear failed: $failureMessage" } catch {}
             if ($state.DialogOpen -and $state.Dialog) {
-                Show-WmtMessageBox -Owner $state.Dialog -Message "Error: $($_.Exception.Message)" -Title "Error" -Image Error | Out-Null
+                try {
+                    Show-WmtMessageBox -Owner $state.Dialog -Message "Error: $failureMessage" -Title "Error" -Image Error | Out-Null
+                } catch {}
             }
         }
         finally {
+            $state.NotificationCompleted = $true
             try { if ($state.PowerShell) { $state.PowerShell.Dispose() } } catch {}
             $state.Active = $false
             if ($state.DialogOpen) {
-                if ($state.Panel) { $state.Panel.Visibility = [System.Windows.Visibility]::Collapsed }
-                if ($state.Button) { $state.Button.IsEnabled = $true; $state.Button.Content = "Clear Event Logs" }
+                try { if ($state.Panel) { $state.Panel.Visibility = [System.Windows.Visibility]::Collapsed } } catch {}
+                try { if ($state.Button) { $state.Button.IsEnabled = $true; $state.Button.Content = "Clear Event Logs" } } catch {}
             }
-            if ([object]::ReferenceEquals($eventLogStateVar.Value, $state)) { $eventLogStateVar.Value = $null }
+            try {
+                if ([object]::ReferenceEquals($eventLogStateVar.Value, $state)) { $eventLogStateVar.Value = $null }
+            } catch {}
             $state.Dialog = $null; $state.Button = $null; $state.Bar = $null; $state.Panel = $null; $state.Status = $null
         }
     }.GetNewClosure()
