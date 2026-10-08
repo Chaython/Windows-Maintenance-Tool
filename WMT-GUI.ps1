@@ -15025,6 +15025,9 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
         Marquee = 0
         PowerShell = $null
         Invocation = $null
+        ResultWasRead = $false
+        CachedClearResult = $null
+        NotificationCompleted = $false
     }
     $eventLogStateVar.Value = $state
     try {
@@ -15081,10 +15084,7 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
     $eventComplete = {
         param($Operation)
         try {
-            if (-not $state.PSObject.Properties['CachedClearResult']) {
-                $state | Add-Member -NotePropertyName CachedClearResult -NotePropertyValue $null
-                $state | Add-Member -NotePropertyName ResultWasRead -NotePropertyValue $false
-            }
+            if ($state.NotificationCompleted) { return }
             if (-not $state.ResultWasRead) {
                 $state.CachedClearResult = @($state.PowerShell.EndInvoke($state.Invocation))
                 $state.ResultWasRead = $true
@@ -15102,6 +15102,9 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
                 $details = @($result.FailureDetails) -join "; "
                 if ($details) { $successMessage += " Examples: $details" }
             }
+            # Mark before user-facing callbacks so a UI exception never duplicates
+            # notifications when an independent completion monitor retries.
+            $state.NotificationCompleted = $true
             Write-GuiLog "[Event Logs] $successMessage"
             if ($state.DialogOpen -and $state.Dialog) {
                 $messageTitle = if ($failedCount -gt 0) { "Event Logs Partially Cleared" } else { "Success" }
@@ -44814,10 +44817,33 @@ return $false
                     return
                 }
                 if (-not $state.DetectionInvocation.IsCompleted) { return }
-                $installed = [bool](@($state.DetectionPs.EndInvoke($state.DetectionInvocation)) | Select-Object -Last 1)
-                try { $state.DetectionPs.Dispose() } catch {}
-                $state.DetectionPs = $null
-                $state.DetectionInvocation = $null
+                # EndInvoke is single-use. Dispose and clear the handles even on
+                # a terminating detection error; otherwise every timer tick retries
+                # EndInvoke on the same failed/completed invocation.
+                $detectionFailed = $false
+                $installed = $false
+                try {
+                    $installed = [bool](@($state.DetectionPs.EndInvoke($state.DetectionInvocation)) | Select-Object -Last 1)
+                }
+                catch {
+                    $detectionFailed = $true
+                    Write-GuiLog "[$($state.ProviderName)] Installed-state check failed: $($_.Exception.Message)"
+                }
+                finally {
+                    try { $state.DetectionPs.Dispose() } catch {}
+                    $state.DetectionPs = $null
+                    $state.DetectionInvocation = $null
+                }
+                if ($detectionFailed) {
+                    # Preserve the last known state, rather than incorrectly
+                    # labelling an installed provider as missing after a failed check.
+                    if ($state.StatusCache.ContainsKey($state.ProviderKey)) {
+                        $installed = [bool]$state.StatusCache[$state.ProviderKey].Installed
+                    }
+                    elseif ($providerInstallState.ContainsKey($state.ProviderKey)) {
+                        $installed = [bool]$providerInstallState[$state.ProviderKey]
+                    }
+                }
                 $state.StatusCache[$state.ProviderKey] = [PSCustomObject]@{
                     Installed = $installed
                     CheckedUtc = [DateTime]::UtcNow
