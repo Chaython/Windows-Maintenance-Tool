@@ -3196,7 +3196,13 @@ if (-not $script:WmtUiPollTimer) {
             }
             catch {
                 $monitorError = $_
-                try { Write-GuiLog "[Async] $name $phase failed: $($monitorError.Exception.Message)" } catch {}
+                if (-not $op.PSObject.Properties["LastErrorLogUtc"]) {
+                    $op | Add-Member -NotePropertyName LastErrorLogUtc -NotePropertyValue ([DateTime]::MinValue)
+                }
+                if (([DateTime]::UtcNow - $op.LastErrorLogUtc).TotalSeconds -ge 10) {
+                    $op.LastErrorLogUtc = [DateTime]::UtcNow
+                    try { Write-GuiLog "[Async] $name $phase failed: $($monitorError.Exception.Message)" } catch {}
+                }
                 # Do not discard a still-running operation merely because observing it failed.
                 # Missing/failed error handlers must not orphan the worker.
                 if ($op.OnError) {
@@ -6184,6 +6190,16 @@ Register-WmtUiPollOperation -Name "ScheduledTaskBatch" `
             $script:WmtTaskBatchDoneMessage = $null
             Set-WmtBusyCursor
         }
+    } -OnError {
+        param($Operation, $ErrorRecord)
+        Write-GuiLog "[Scheduled Tasks] Batch monitor failed: $($ErrorRecord.Exception.Message)"
+        $failedPs = $script:WmtTaskBatchPs
+        $failedAsync = $script:WmtTaskBatchAsync
+        $script:WmtTaskBatchPs = $null
+        $script:WmtTaskBatchAsync = $null
+        $script:WmtTaskBatchDoneMessage = $null
+        Set-WmtBusyCursor
+        if ($failedPs) { Stop-WmtPowerShellInvocationAsync -PowerShell $failedPs -Invocation $failedAsync -Name "Scheduled task batch monitor" }
     } | Out-Null
 }
 
@@ -6291,6 +6307,16 @@ Register-WmtUiPollOperation -Name "ScheduledTaskView" `
             $script:WmtTaskViewGrid = $null
             $script:WmtTaskViewStatus = $null
         }
+    } -OnError {
+        param($Operation, $ErrorRecord)
+        Write-GuiLog "[Scheduled Tasks] View monitor failed: $($ErrorRecord.Exception.Message)"
+        $failedPs = $script:WmtTaskViewPs
+        $failedAsync = $script:WmtTaskViewAsync
+        $script:WmtTaskViewPs = $null
+        $script:WmtTaskViewAsync = $null
+        $script:WmtTaskViewGrid = $null
+        $script:WmtTaskViewStatus = $null
+        if ($failedPs) { Stop-WmtPowerShellInvocationAsync -PowerShell $failedPs -Invocation $failedAsync -Name "Scheduled task view monitor" }
     } | Out-Null
 }
 
@@ -11465,9 +11491,17 @@ $dnsOnComplete = {
         catch { Write-GuiLog "DNS completion action failed: $($_.Exception.Message)" }
     }
 }.GetNewClosure()
+$dnsOnError = {
+    param($Operation, $ErrorRecord)
+    Write-GuiLog "DNS assignment monitoring failed: $($ErrorRecord.Exception.Message)"
+    if ($dnsRunspace) { Stop-WmtPowerShellInvocationAsync -PowerShell $dnsRunspace -Invocation $dnsAsync -Name "DNS assignment monitor" }
+    if ([object]::ReferenceEquals($dnsRunspaceState.Value, $dnsRunspace)) { $dnsRunspaceState.Value = $null }
+    if ([object]::ReferenceEquals($dnsAsyncState.Value, $dnsAsync)) { $dnsAsyncState.Value = $null }
+    Set-WmtDnsActionButtonsEnabled $true
+}.GetNewClosure()
 Register-WmtUiPollOperation -Name "DnsAssignment" `
     -TestComplete $dnsTestComplete `
-    -OnComplete $dnsOnComplete | Out-Null
+    -OnComplete $dnsOnComplete -OnError $dnsOnError | Out-Null
 return $true
 }
 
@@ -11871,9 +11905,17 @@ $dohOnComplete = {
         Set-WmtDnsActionButtonsEnabled $true
     }
 }.GetNewClosure()
+$dohOnError = {
+    param($Operation, $ErrorRecord)
+    Write-GuiLog "DoH monitoring failed: $($ErrorRecord.Exception.Message)"
+    if ($dohRunspace) { Stop-WmtPowerShellInvocationAsync -PowerShell $dohRunspace -Invocation $dohAsync -Name "DoH action monitor" }
+    if ([object]::ReferenceEquals($dohRunspaceState.Value, $dohRunspace)) { $dohRunspaceState.Value = $null }
+    if ([object]::ReferenceEquals($dohAsyncState.Value, $dohAsync)) { $dohAsyncState.Value = $null }
+    Set-WmtDnsActionButtonsEnabled $true
+}.GetNewClosure()
 Register-WmtUiPollOperation -Name "DohAction" `
     -TestComplete $dohTestComplete `
-    -OnComplete $dohOnComplete | Out-Null
+    -OnComplete $dohOnComplete -OnError $dohOnError | Out-Null
 }
 
 # Redirect existing function calls to the new Async handler
