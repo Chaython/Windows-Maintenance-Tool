@@ -43670,6 +43670,8 @@ $providerControls = @{}
 $providerInstallState = @{}
 if (-not $script:WmtProviderActionMonitors) { $script:WmtProviderActionMonitors = @{} }
 $providerActionMonitors = $script:WmtProviderActionMonitors
+if (-not $script:WmtProviderActionLastStatus) { $script:WmtProviderActionLastStatus = @{} }
+$providerActionStatusCache = $script:WmtProviderActionLastStatus
 
 
 function Get-WmtProviderActionScript {
@@ -44673,49 +44675,80 @@ $startProviderAction = {
         Action         = [string]$action
         Monitors       = $providerActionMonitors
         UpdateStatuses = $updateProviderStatuses
+        ProviderInfo   = $provider
+        TestInstalled  = $testProviderInstalled
+        StatusCache    = $providerActionStatusCache
+        ExitObserved   = $false
+        ExitCode       = 1
+        CompletionLogged = $false
+        RefreshCompleted = $false
+        TempRemoved    = $false
+        LastErrorLogUtc = [DateTime]::MinValue
     }
     $timer.Add_Tick({
-            param($s)
-
-            $state = $monitorState
-            if (-not $state) {
-                try { $s.Stop() } catch {}
-                return
+        param($s)
+        $state = $monitorState
+        try {
+            if (-not $state.ExitObserved) {
+                if (-not $state.Process) { throw "Provider process handle is unavailable." }
+                $exited = $false
+                try {
+                    $state.Process.Refresh()
+                    $exited = [bool]$state.Process.HasExited
+                }
+                catch {
+                    # An observation exception does not mean the installer exited.
+                    throw "Could not determine whether provider installer exited: $($_.Exception.Message)"
+                }
+                if (-not $exited) { return }
+                $state.ExitObserved = $true
+                try { $state.ExitCode = [int]$state.Process.ExitCode } catch {}
             }
 
-            try {
-                $hasExited = $false
-                try { $hasExited = [bool]$state.Process.HasExited } catch { $hasExited = $true }
-                if (-not $hasExited) { return }
-
-                try { $s.Stop() } catch {}
-                try { $state.Monitors.Remove($state.Key) } catch {}
-                $exitCode = 1
-                try { $exitCode = [int]$state.Process.ExitCode } catch {}
-                try { if ($state.Process) { $state.Process.Dispose() } } catch {}
-                $state.Process = $null
-                try { Remove-Item -LiteralPath $state.TempScriptPath -Force -ErrorAction SilentlyContinue } catch {}
-                if ($exitCode -eq 0) {
-                    try { Write-GuiLog "[$($state.ProviderName)] $($state.Action) completed." } catch {}
+            if (-not $state.CompletionLogged) {
+                if ($state.ExitCode -eq 0) {
+                    Write-GuiLog "[$($state.ProviderName)] $($state.Action) completed."
                 }
                 else {
-                    try { Write-GuiLog "[$($state.ProviderName)] $($state.Action) exited with code $exitCode." } catch {}
+                    Write-GuiLog "[$($state.ProviderName)] $($state.Action) exited with code $($state.ExitCode)."
                 }
-                if ($state.UpdateStatuses) {
-                    try { & $state.UpdateStatuses } catch {
-                        try { Write-GuiLog "[$($state.ProviderName)] Could not refresh provider status: $($_.Exception.Message)" } catch {}
-                    }
+                $state.CompletionLogged = $true
+            }
+
+            if (-not $state.RefreshCompleted) {
+                # Refresh the provider's real installed state even with Settings closed.
+                # The status cache is independent of the old dialog's WPF controls.
+                $installed = [bool](& $state.TestInstalled -Provider $state.ProviderInfo)
+                $state.StatusCache[$state.ProviderKey] = [PSCustomObject]@{
+                    Installed = $installed
+                    CheckedUtc = [DateTime]::UtcNow
+                    ExitCode = $state.ExitCode
                 }
+                if ($state.UpdateStatuses) { & $state.UpdateStatuses }
+                $state.RefreshCompleted = $true
             }
-            catch {
-                try { $s.Stop() } catch {}
-                try { $state.Monitors.Remove($state.Key) } catch {}
-                try { if ($state.Process) { $state.Process.Dispose() } } catch {}
-                $state.Process = $null
-                try { Write-GuiLog "[$($state.ProviderName)] Provider completion monitor failed: $($_.Exception.Message)" } catch {}
-                if ($state.UpdateStatuses) { try { & $state.UpdateStatuses } catch {} }
+
+            if (-not $state.TempRemoved) {
+                if ($state.TempScriptPath -and (Test-Path -LiteralPath $state.TempScriptPath)) {
+                    Remove-Item -LiteralPath $state.TempScriptPath -Force -ErrorAction Stop
+                }
+                $state.TempRemoved = $true
             }
-        }.GetNewClosure())
+
+            # Release the process handle only after confirmed exit and bookkeeping.
+            if ($state.Process) { try { $state.Process.Dispose() } catch {} }
+            $state.Process = $null
+            $s.Stop()
+            [void]$state.Monitors.Remove($state.Key)
+        }
+        catch {
+            if (([DateTime]::UtcNow - $state.LastErrorLogUtc).TotalSeconds -ge 10) {
+                $state.LastErrorLogUtc = [DateTime]::UtcNow
+                try { Write-GuiLog "[$($state.ProviderName)] Provider monitor warning (retrying): $($_.Exception.Message)" } catch {}
+            }
+            # Preserve the timer/Process and retry rather than orphaning the installer.
+        }
+    }.GetNewClosure())
     $providerActionMonitors[$monitorKey] = $monitorState
     $timer.Start()
 }.GetNewClosure()
