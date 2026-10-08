@@ -58043,6 +58043,7 @@ $createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
 $createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
 $preInstallDirectoriesRef = @($preInstallDirectories)
 $operationName = "LegendaryLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
+$installFinalizeState = [PSCustomObject]@{ Attempted = $false; Completed = $false }
 
 $testComplete = {
     param($Operation)
@@ -58050,11 +58051,13 @@ $testComplete = {
         if (Test-Path -LiteralPath $resultRef -PathType Leaf) { return $true }
         return [bool]($procRef -and $procRef.HasExited)
     }
-    catch { return $true }
+    catch { return $false }
 }.GetNewClosure()
 
 $onComplete = {
     param($Operation)
+    if ($installFinalizeState.Completed) { return }
+    $installFinalizeState.Attempted = $true
     $exitCode = 1
     $installedPath = ""
     try {
@@ -58198,12 +58201,18 @@ $onComplete = {
             [void]$pendingInstallState.Value.Remove($idRef)
         }
     }
-    catch {}
-    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    catch { throw }
     try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
+    # Preserve the Process until all required bookkeeping succeeded.
+    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    $installFinalizeState.Completed = $true
 }.GetNewClosure()
 
-$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
+$fallbackTestComplete = {
+    param($Operation)
+    if ($installFinalizeState.Attempted) { return $true }
+    try { return [bool]($procRef -and $procRef.HasExited) } catch { return $false }
+}.GetNewClosure()
 $onError = {
     param($Operation, $ErrorRecord)
     $message = ""
@@ -58606,6 +58615,7 @@ $authConfigRef = [string]$AuthConfig
 $createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
 $createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
 $operationName = "GogdlLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
+$installFinalizeState = [PSCustomObject]@{ Attempted = $false; Completed = $false }
 
 $testComplete = {
     param($Operation)
@@ -58613,11 +58623,13 @@ $testComplete = {
         if (Test-Path -LiteralPath $resultRef -PathType Leaf) { return $true }
         return [bool]($procRef -and $procRef.HasExited)
     }
-    catch { return $true }
+    catch { return $false }
 }.GetNewClosure()
 
 $onComplete = {
     param($Operation)
+    if ($installFinalizeState.Completed) { return }
+    $installFinalizeState.Attempted = $true
     $exitCode = 1
     try {
         if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
@@ -58633,12 +58645,9 @@ $onComplete = {
     if ($exitCode -eq 0) {
         $resolvedInstallPath = Resolve-WmtGogdlInstallPath -Id $idRef -RootPath $rootRef -InstallPath $installRef
         if (-not [string]::IsNullOrWhiteSpace($resolvedInstallPath)) {
-            try {
-                $completeMarker = Join-Path $resolvedInstallPath ".wmt-gogdl-installed"
-                [System.IO.File]::WriteAllText($completeMarker, "WMT GOGDL install completed", [System.Text.UTF8Encoding]::new($false))
-            }
-            catch {}
-            try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $resolvedInstallPath -Status Installed -ProcessId 0 } catch {}
+            $completeMarker = Join-Path $resolvedInstallPath ".wmt-gogdl-installed"
+            [System.IO.File]::WriteAllText($completeMarker, "WMT GOGDL install completed", [System.Text.UTF8Encoding]::new($false))
+            Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $resolvedInstallPath -Status Installed -ProcessId 0
             Write-GuiLog "GOGDL download completed successfully: $nameRef (id $idRef) -> $resolvedInstallPath"
             if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
                 try {
@@ -58657,7 +58666,7 @@ $onComplete = {
             }
         }
         else {
-            try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath "" -Status Installed -ProcessId 0 } catch {}
+            Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath "" -Status Installed -ProcessId 0
             Write-GuiLog "GOGDL completed successfully for $nameRef (id $idRef), but WMT could not resolve the final install directory from GOGDL metadata/manifest."
             if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
                 Write-GuiLog "GOGDL shortcut creation was requested for $nameRef, but the final install path could not be resolved."
@@ -58665,16 +58674,23 @@ $onComplete = {
         }
     }
     else {
-        try { Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $installRef -Status Failed -ProcessId 0 } catch {}
+        Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $installRef -Status Failed -ProcessId 0
         Write-GuiLog ("GOGDL download ended with exit code " + $exitCode + ": " + $nameRef + " (id " + $idRef + "). Partial files were kept for resume.")
     }
 
-    try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction SilentlyContinue } catch {}
-    try { if ($procRef) { $procRef.Dispose() } } catch {}
     try { Start-WmtLibraryScan -Silent } catch {}
+    try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop } catch {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { throw }
+    }
+    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    $installFinalizeState.Completed = $true
 }.GetNewClosure()
 
-$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
+$fallbackTestComplete = {
+    param($Operation)
+    if ($installFinalizeState.Attempted) { return $true }
+    try { return [bool]($procRef -and $procRef.HasExited) } catch { return $false }
+}.GetNewClosure()
 $onError = {
     param($Operation, $ErrorRecord)
     $message = ""
