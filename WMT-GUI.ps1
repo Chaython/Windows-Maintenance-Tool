@@ -44808,8 +44808,11 @@ foreach ($commandName in @($providerInfo.Commands)) {
 foreach ($propertyName in @('RegistryPaths','LocalPaths')) {
     if (-not $providerInfo.PSObject.Properties[$propertyName]) { continue }
     foreach ($itemPath in @($providerInfo.$propertyName)) {
-        if (-not [string]::IsNullOrWhiteSpace($itemPath) -and
-            (Test-Path -LiteralPath $itemPath)) { return $true }
+        if ([string]::IsNullOrWhiteSpace($itemPath)) { continue }
+        if ($propertyName -eq 'LocalPaths') {
+            if (Test-Path -LiteralPath $itemPath -PathType Leaf) { return $true }
+        }
+        elseif (Test-Path -LiteralPath $itemPath) { return $true }
     }
 }
 return $false
@@ -44843,23 +44846,17 @@ return $false
                     $state.DetectionPs = $null
                     $state.DetectionInvocation = $null
                 }
-                if ($detectionFailed) {
-                    # Preserve the last known state, rather than incorrectly
-                    # labelling an installed provider as missing after a failed check.
-                    if ($state.StatusCache.ContainsKey($state.ProviderKey)) {
-                        $installed = [bool]$state.StatusCache[$state.ProviderKey].Installed
-                    }
-                    elseif ($providerInstallState.ContainsKey($state.ProviderKey)) {
-                        $installed = [bool]$providerInstallState[$state.ProviderKey]
+                if (-not $detectionFailed) {
+                    $state.StatusCache[$state.ProviderKey] = [PSCustomObject]@{
+                        Installed = $installed
+                        CheckedUtc = [DateTime]::UtcNow
+                        ExitCode = $state.ExitCode
                     }
                 }
-                $state.StatusCache[$state.ProviderKey] = [PSCustomObject]@{
-                    Installed = $installed
-                    CheckedUtc = [DateTime]::UtcNow
-                    ExitCode = $state.ExitCode
-                }
+                # Failure is not proof of absence. Retain the existing cache/status
+                # and avoid writing a fresh "not installed" result on an exception.
                 $state.RefreshCompleted = $true
-                if ($state.UpdateStatuses) { & $state.UpdateStatuses -UseCache }
+                if (-not $detectionFailed -and $state.UpdateStatuses) { & $state.UpdateStatuses -UseCache }
             }
 
             if (-not $state.TempRemoved) {
