@@ -1160,13 +1160,14 @@ jobs:
                   Assert ($state.Closed -and $null -eq $state.Operation) 'A detached grid missed owner cleanup after attachment.'
               } finally { $d.Close() }
           }
-          Test-Case 'Provider completion uses the timer sender to refresh status and release its monitor' {
+          Test-Case 'Provider completion captures state and releases its monitor after verification' {
               $tickRegistration = $ast.Find({ param($n)
                   $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
                   $n.Member.Value -eq 'Add_Tick' -and $n.Extent.Text -match 'Provider monitor warning'
               }, $true)
               Assert ($null -ne $tickRegistration) 'Provider completion callback was not found.'
-              $callback = Invoke-Expression $tickRegistration.Arguments[0].Extent.Text
+              # The callback uses GetNewClosure() to capture $monitorState; DispatcherTimer
+              # has no Tag property. Compile the production callback in each test scope.
               foreach ($exitCode in @(0, 1)) {
                   $timer = [Windows.Threading.DispatcherTimer]::new()
                   $timer.Interval = [TimeSpan]::FromHours(1)
@@ -1178,17 +1179,19 @@ jobs:
                       Key = 'ProviderTest'; Process = [pscustomobject]@{ HasExited = $false; ExitCode = $exitCode }
                       TempScriptPath = $tempScriptPath; ProviderName = 'Test provider'; Action = 'Install'
                       ProviderKey = 'ProviderTest'
-                      ProviderInfo = [pscustomobject]@{ Key = 'ProviderTest' }
-                      TestInstalled = { param($Provider) return $true }
+                      # Get-Command is available in an isolated Windows PowerShell runspace.
+                      ProviderInfo = [pscustomobject]@{ Key = 'ProviderTest'; Commands = [string[]]@('Get-Command') }
                       StatusCache = $statusCache
                       ExitObserved = $false; CompletionLogged = $false
                       RefreshCompleted = $false; TempRemoved = $false
+                      DetectionPs = $null; DetectionInvocation = $null
                       LastErrorLogUtc = [DateTime]::MinValue
                       Monitors = $monitors; UpdateStatuses = { $status.Refreshed = $true }.GetNewClosure()
                       ExitCode = 1
                   }
+                  $monitorState = $monitor
+                  $callback = Invoke-Expression $tickRegistration.Arguments[0].Extent.Text
                   $monitors[$monitor.Key] = $monitor
-                  $timer.Tag = $monitor
                   $timer.Start()
                   try {
                       & $callback $timer ([EventArgs]::Empty)
@@ -1203,15 +1206,22 @@ jobs:
                       Assert (Test-Path -LiteralPath $tempScriptPath) 'An observation error removed the provider script.'
                       $monitor.Process = $workingProcess
                       $monitor.Process.HasExited = $true
-                      & $callback $timer ([EventArgs]::Empty)
+                      # Detection is asynchronous, so permit ticks until EndInvoke is ready.
+                      $watch = [Diagnostics.Stopwatch]::StartNew()
+                      while ($timer.IsEnabled -and $watch.ElapsedMilliseconds -lt 6000) {
+                          & $callback $timer ([EventArgs]::Empty)
+                          if ($timer.IsEnabled) { Start-Sleep -Milliseconds 25 }
+                      }
                       Assert (-not $timer.IsEnabled) 'The completed provider timer was not stopped.'
                       Assert (-not $monitors.ContainsKey($monitor.Key)) 'The completed provider monitor was retained.'
                       Assert (-not (Test-Path -LiteralPath $tempScriptPath)) 'The completed provider script was retained.'
                       Assert ($status.Refreshed) 'Provider status was not refreshed after completion.'
-                      Assert ($statusCache.ProviderTest.Installed) 'Provider status cache was not updated after exit.'
+                      Assert ($statusCache.ProviderTest.Installed) 'Provider installed-state cache was not updated after exit.'
+                      Assert ($statusCache.ProviderTest.ExitCode -eq $exitCode) 'Provider exit code was not preserved.'
                   }
                   finally {
                       $timer.Stop()
+                      if ($monitor.DetectionPs) { try { $monitor.DetectionPs.Dispose() } catch {} }
                       Remove-Item -LiteralPath $tempScriptPath -Force -ErrorAction SilentlyContinue
                   }
               }
