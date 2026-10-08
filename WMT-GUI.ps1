@@ -2882,7 +2882,23 @@ $onError = {
     try { Write-GuiLog "$nameRef monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
 }.GetNewClosure()
 
-Register-WmtUiPollOperation -Name $operationName -IntervalMs 500 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+try {
+    Register-WmtUiPollOperation -Name $operationName -IntervalMs 500 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+}
+catch {
+    $monitorError = $_
+    try {
+        if ($asyncRef -and -not $asyncRef.IsCompleted) {
+            Start-WmtPowerShellCleanupDetached -PowerShell $psRef -Invocation $asyncRef -Name $nameRef
+        }
+        else {
+            try { if ($psRef -and $asyncRef) { [void]$psRef.EndInvoke($asyncRef) } } catch {}
+            try { if ($psRef) { $psRef.Dispose() } } catch {}
+        }
+    }
+    catch {}
+    throw $monitorError
+}
 return $async
 }
 
@@ -2911,6 +2927,7 @@ function Start-WmtPowerShellCleanupDetached {
 param(
     [System.Management.Automation.PowerShell]$PowerShell,
     [System.IAsyncResult]$Invocation,
+    [System.Management.Automation.Runspaces.Runspace]$Runspace,
     [string]$Name = "PowerShell invocation"
 )
 
@@ -2920,12 +2937,15 @@ if (-not (Get-Variable -Name WmtDetachedCleanupWorkers -Scope Script -ErrorActio
     $script:WmtDetachedCleanupWorkers = [System.Collections.ArrayList]::new()
 }
 
-foreach ($existing in @($script:WmtDetachedCleanupWorkers)) {
+# GetNewClosure() creates a dynamic module, so capture the actual main-script
+# tracker object instead of referring to $script: from delayed callbacks.
+$cleanupWorkers = $script:WmtDetachedCleanupWorkers
+foreach ($existing in @($cleanupWorkers)) {
     try {
         if ($existing -and $existing.Async -and $existing.Async.IsCompleted) {
             try { [void]$existing.PowerShell.EndInvoke($existing.Async) } catch {}
             try { $existing.PowerShell.Dispose() } catch {}
-            [void]$script:WmtDetachedCleanupWorkers.Remove($existing)
+            [void]$cleanupWorkers.Remove($existing)
         }
     }
     catch {}
@@ -2937,7 +2957,8 @@ try {
     [void]$cleanupPs.AddScript({
             param(
                 [System.Management.Automation.PowerShell]$TargetPowerShell,
-                [System.IAsyncResult]$TargetInvocation
+                [System.IAsyncResult]$TargetInvocation,
+                [System.Management.Automation.Runspaces.Runspace]$TargetRunspace
             )
             try {
                 $finished = $false
@@ -2968,12 +2989,16 @@ try {
             }
             finally {
                 try { $TargetPowerShell.Dispose() } catch {}
+                if ($TargetRunspace) {
+                    try { $TargetRunspace.Close() } catch {}
+                    try { $TargetRunspace.Dispose() } catch {}
+                }
             }
-        }).AddArgument($PowerShell).AddArgument($Invocation)
+        }).AddArgument($PowerShell).AddArgument($Invocation).AddArgument($Runspace)
 
     $cleanupAsync = $cleanupPs.BeginInvoke()
     $worker = [PSCustomObject]@{ PowerShell = $cleanupPs; Async = $cleanupAsync; Name = $Name }
-    [void]$script:WmtDetachedCleanupWorkers.Add($worker)
+    [void]$cleanupWorkers.Add($worker)
 
     $workerRef = $worker
     $operationName = "DetachedCleanup:$($Name):$([Guid]::NewGuid().ToString('N'))"
@@ -2983,13 +3008,15 @@ try {
         }.GetNewClosure() -OnComplete {
             try { [void]$workerRef.PowerShell.EndInvoke($workerRef.Async) } catch {}
             try { $workerRef.PowerShell.Dispose() } catch {}
-            try { [void]$script:WmtDetachedCleanupWorkers.Remove($workerRef) } catch {}
+            try { [void]$cleanupWorkers.Remove($workerRef) } catch {}
         }.GetNewClosure() -OnError {
             param($Operation, $ErrorRecord)
             try { Write-GuiLog "$Name detached cleanup monitor failed: $($ErrorRecord.Exception.Message)" } catch {}
         }.GetNewClosure() | Out-Null
     }
     catch {
+        # The cleanup worker itself is already running. Keep it in the captured
+        # tracker so a later cleanup request can reap it even without a monitor.
         try { Write-GuiLog "$Name cleanup monitor could not be registered: $($_.Exception.Message)" } catch {}
     }
 }
@@ -15076,19 +15103,36 @@ $invokePreviewDeletion = {
         Async      = $null
         Ended      = $false
     }
+    $deleteWindowClosedWhileRunning = [PSCustomObject]@{ Value = $false }
 
     $disposeWorker = {
-        try { if ($worker.PowerShell) { $worker.PowerShell.Dispose() } } catch {}
-        try {
-            if ($worker.Runspace) {
-                $worker.Runspace.Close()
-                $worker.Runspace.Dispose()
-            }
-        }
-        catch {}
+        $workerPs = $worker.PowerShell
+        $workerRunspace = $worker.Runspace
+        $workerAsync = $worker.Async
         $worker.PowerShell = $null
         $worker.Runspace = $null
         $worker.Async = $null
+
+        $workerStillActive = $false
+        try { $workerStillActive = [bool]($workerPs -and $workerAsync -and -not $workerAsync.IsCompleted) } catch {}
+        if ($workerStillActive) {
+            try {
+                Start-WmtPowerShellCleanupDetached -PowerShell $workerPs -Invocation $workerAsync -Runspace $workerRunspace -Name "Analyze cleanup deletion"
+            }
+            catch {
+                try { Write-GuiLog "Analyze cleanup worker could not be detached safely: $($_.Exception.Message)" } catch {}
+            }
+            return
+        }
+
+        try { if ($workerPs) { $workerPs.Dispose() } } catch {}
+        try {
+            if ($workerRunspace) {
+                $workerRunspace.Close()
+                $workerRunspace.Dispose()
+            }
+        }
+        catch {}
     }.GetNewClosure()
 
     try {
@@ -15171,6 +15215,18 @@ $invokePreviewDeletion = {
             $deleteCurrent.Text = "Stopping after the current item..."
         }.GetNewClosure())
 
+    $deleteWindow.Add_Closing({
+            param($source, $args)
+            $workerActive = $false
+            try { $workerActive = [bool]($worker.Async -and -not $worker.Async.IsCompleted) } catch {}
+            if ($workerActive -and -not [bool]$deleteState["IsCompleted"]) {
+                $deleteWindowClosedWhileRunning.Value = $true
+                $deleteState["Cancel"] = $true
+                try { $btnCancelDelete.IsEnabled = $false } catch {}
+                try { $deleteCurrent.Text = "Cancelling cleanup in the background..." } catch {}
+            }
+        }.GetNewClosure())
+
     $deleteTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $deleteTimer.Interval = [TimeSpan]::FromMilliseconds(150)
     $deleteTimer.Add_Tick({
@@ -15237,6 +15293,11 @@ $invokePreviewDeletion = {
             }
         }
         & $disposeWorker
+    }
+
+    if ($deleteWindowClosedWhileRunning.Value) {
+        Write-GuiLog "Preview cleanup window closed while deletion was active; cancellation is continuing off the UI thread."
+        return
     }
 
     $completedRowIds = @($deleteState["CompletedIds"] | ForEach-Object { [int]$_ })
@@ -19714,16 +19775,31 @@ $cleanupTimer.Add_Tick({
             Show-WmtMessageBox -Message $finalMsg -Title "Result" -Image Information | Out-Null
         }
         catch {
+            $completionError = $_
             try { $cleanupTimer.Stop() } catch {}
-            try { if ($ps) { $ps.Dispose() } } catch {}
-            try { if ($runspace) { $runspace.Dispose() } } catch {}
+
+            $cleanupStillActive = $false
+            try { $cleanupStillActive = [bool]($ps -and $async -and -not $async.IsCompleted) } catch {}
+            if ($cleanupStillActive) {
+                try {
+                    Start-WmtPowerShellCleanupDetached -PowerShell $ps -Invocation $async -Runspace $runspace -Name "Registry cleanup completion recovery"
+                }
+                catch {
+                    try { Write-GuiLog "Registry cleanup recovery could not be detached: $($_.Exception.Message)" } catch {}
+                }
+            }
+            else {
+                try { if ($ps) { $ps.Dispose() } } catch {}
+                try { if ($runspace) { $runspace.Dispose() } } catch {}
+            }
+
             $registryCleanupActiveState.Value = $false
             if ([object]::ReferenceEquals($registryCleanupRunspaceState.Value, $runspace)) { $registryCleanupRunspaceState.Value = $null }
             if ([object]::ReferenceEquals($registryCleanupPowerShellState.Value, $ps)) { $registryCleanupPowerShellState.Value = $null }
             if ([object]::ReferenceEquals($registryCleanupTimerState.Value, $cleanupTimer)) { $registryCleanupTimerState.Value = $null }
             if ([object]::ReferenceEquals($registryCleanupSyncState.Value, $cleanupSync)) { $registryCleanupSyncState.Value = $null }
             $registryCleanupAsyncState.Value = $null
-            Write-GuiLog "Registry cleanup completion handler failed: $($_.Exception.Message)"
+            Write-GuiLog "Registry cleanup completion handler failed: $($completionError.Exception.Message)"
         }
     }.GetNewClosure())
 $script:WmtRegistryCleanupTimer = $cleanupTimer
@@ -39079,33 +39155,143 @@ exit `$exitCode
         param(
             [string]$PythonPath,
             [object[]]$ArgumentList,
-            [string]$TranscriptPath = ""
+            [string]$TranscriptPath = "",
+            [int]$TimeoutSeconds = 600
         )
 
         if ([string]::IsNullOrWhiteSpace($PythonPath)) { $PythonPath = "python.exe" }
-        $displayArgs = @($ArgumentList | ForEach-Object {
-                $argText = [string]$_
-                if ($argText -match '[\s"]') { '"' + $argText.Replace('"', '\"') + '"' } else { $argText }
-            }) -join " "
+
+        function ConvertTo-WmtNativeArgument {
+            param([string]$Value)
+
+            if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+            if ($Value -notmatch '[\s"]') { return $Value }
+
+            $builder = [System.Text.StringBuilder]::new()
+            [void]$builder.Append('"')
+            $backslashes = 0
+            foreach ($ch in $Value.ToCharArray()) {
+                if ($ch -eq [char]92) {
+                    $backslashes++
+                    continue
+                }
+                if ($ch -eq [char]34) {
+                    for ($i = 0; $i -lt (($backslashes * 2) + 1); $i++) { [void]$builder.Append([char]92) }
+                    [void]$builder.Append([char]34)
+                    $backslashes = 0
+                    continue
+                }
+                for ($i = 0; $i -lt $backslashes; $i++) { [void]$builder.Append([char]92) }
+                $backslashes = 0
+                [void]$builder.Append($ch)
+            }
+            for ($i = 0; $i -lt ($backslashes * 2); $i++) { [void]$builder.Append([char]92) }
+            [void]$builder.Append('"')
+            return $builder.ToString()
+        }
+
+        $nativeArgs = @($ArgumentList | ForEach-Object { ConvertTo-WmtNativeArgument -Value ([string]$_) }) -join " "
+        $displayArgs = $nativeArgs
         if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
             Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "COMMAND: $PythonPath $displayArgs"
         }
+
+        $proc = $null
         try {
-            $outputLines = @(& $PythonPath @ArgumentList 2>&1)
-            $exitCode = $LASTEXITCODE
-            $normalizedExit = if ($null -eq $exitCode) { 1 } else { [int]$exitCode }
-            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
-                foreach ($outputLine in @($outputLines)) {
-                    if ($null -ne $outputLine -and -not [string]::IsNullOrWhiteSpace([string]$outputLine)) {
-                        Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text ("OUTPUT: " + [string]$outputLine)
+            $pInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $pInfo.FileName = $PythonPath
+            $pInfo.Arguments = $nativeArgs
+            $pInfo.RedirectStandardOutput = $true
+            $pInfo.RedirectStandardError = $true
+            $pInfo.UseShellExecute = $false
+            $pInfo.CreateNoWindow = $true
+            try { $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+            try { $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+
+            $proc = [System.Diagnostics.Process]::Start($pInfo)
+            if (-not $proc) { throw "Python/pip process failed to start." }
+
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $timeoutMs = if ($TimeoutSeconds -gt 0) { [Math]::Min([int]::MaxValue, [int64]$TimeoutSeconds * 1000) } else { [int]::MaxValue }
+            $exited = $proc.WaitForExit([int]$timeoutMs)
+            $timedOut = -not $exited
+            $terminationFailed = $false
+            $timeoutReason = ""
+
+            if ($timedOut) {
+                $timeoutReason = "Pip exceeded the $TimeoutSeconds-second runtime limit"
+                Stop-WmtChildProcessTree -Process $proc
+                try { [void]$proc.WaitForExit(5000) } catch {}
+                try {
+                    $proc.Refresh()
+                    if (-not $proc.HasExited) {
+                        try { $proc.Kill() } catch {}
+                        try { [void]$proc.WaitForExit(3000) } catch {}
+                        try { $proc.Refresh() } catch {}
+                    }
+                    $terminationFailed = -not $proc.HasExited
+                }
+                catch { $terminationFailed = $true }
+            }
+            else {
+                try { $proc.WaitForExit() } catch {}
+            }
+
+            $drainDeadline = (Get-Date).AddSeconds(5)
+            while (((-not $outTask.IsCompleted) -or (-not $errTask.IsCompleted)) -and (Get-Date) -lt $drainDeadline) {
+                Start-Sleep -Milliseconds 50
+            }
+
+            $outputLines = [System.Collections.Generic.List[string]]::new()
+            if ($outTask.IsCompleted) {
+                try {
+                    $stdout = [string]$outTask.GetAwaiter().GetResult()
+                    foreach ($line in @($stdout -split "\r?\n")) {
+                        if (-not [string]::IsNullOrWhiteSpace($line)) { [void]$outputLines.Add($line) }
                     }
                 }
+                catch {}
+            }
+            if ($errTask.IsCompleted) {
+                try {
+                    $stderr = [string]$errTask.GetAwaiter().GetResult()
+                    foreach ($line in @($stderr -split "\r?\n")) {
+                        if (-not [string]::IsNullOrWhiteSpace($line)) { [void]$outputLines.Add($line) }
+                    }
+                }
+                catch {}
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                foreach ($outputLine in @($outputLines)) {
+                    Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text ("OUTPUT: " + [string]$outputLine)
+                }
+            }
+
+            if ($timedOut) {
+                if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                    Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: timed out ($timeoutReason)"
+                }
+                return [PSCustomObject]@{
+                    ExitCode          = 124
+                    OutputLines       = @($outputLines)
+                    TimedOut          = $true
+                    TimeoutReason     = $timeoutReason
+                    TerminationFailed = $terminationFailed
+                }
+            }
+
+            $normalizedExit = [int]$proc.ExitCode
+            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
                 Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $normalizedExit"
             }
             return [PSCustomObject]@{
-                ExitCode    = $normalizedExit
-                OutputLines = @($outputLines | ForEach-Object { $_.ToString() })
-                TimedOut    = $false
+                ExitCode          = $normalizedExit
+                OutputLines       = @($outputLines)
+                TimedOut          = $false
+                TimeoutReason     = ""
+                TerminationFailed = $false
             }
         }
         catch {
@@ -39114,10 +39300,15 @@ exit `$exitCode
                 Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: 1"
             }
             return [PSCustomObject]@{
-                ExitCode    = 1
-                OutputLines = @($_.Exception.Message)
-                TimedOut    = $false
+                ExitCode          = 1
+                OutputLines       = @($_.Exception.Message)
+                TimedOut          = $false
+                TimeoutReason     = ""
+                TerminationFailed = $false
             }
+        }
+        finally {
+            try { if ($proc) { $proc.Dispose() } } catch {}
         }
     }
 
@@ -41050,7 +41241,7 @@ exit /b %WMT_EXIT%
             }
             elseif ($pipArguments) {
                 Write-Output "LOG:[$act] Running pip directly with $pythonExePath..."
-                $p = Invoke-WmtPipDirect -PythonPath $pythonExePath -ArgumentList $pipArguments -TranscriptPath $providerTranscriptPath
+                $p = Invoke-WmtPipDirect -PythonPath $pythonExePath -ArgumentList $pipArguments -TranscriptPath $providerTranscriptPath -TimeoutSeconds 600
                 foreach ($pipLine in @($p.OutputLines)) {
                     if (-not [string]::IsNullOrWhiteSpace([string]$pipLine)) {
                         Write-WmtWorkerOutputItem -Value "LOG:  > $pipLine" -SkipTranscriptMirror:(-not [string]::IsNullOrWhiteSpace($providerTranscriptPath))
@@ -41669,25 +41860,6 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 return
             }
             & $script:DrainWingetOutputQueue
-            $pipItemRunning = (
-                $script:WingetAsyncResult -and -not $script:WingetAsyncResult.IsCompleted -and
-                $script:WingetCurrentItemSource -in @("pip", "pip3") -and
-                $script:WingetCurrentItemStartedAt
-            )
-            if ($pipItemRunning -and -not $script:WingetActionForcedTimeout) {
-                $pipElapsedSeconds = ((Get-Date) - $script:WingetCurrentItemStartedAt).TotalSeconds
-                if ($pipElapsedSeconds -ge 600) {
-                    $script:WingetActionForcedTimeout = $true
-                    Write-GuiLog "[Pip] $($script:WingetCurrentItemName) exceeded the 10-minute action timeout. Requesting asynchronous stop of the background job."
-                    try { [void]$script:WingetJob.BeginStop($null, $null) } catch {
-                        $pipTimeoutPs = $script:WingetJob
-                        $pipTimeoutAsync = $script:WingetAsyncResult
-                        $script:WingetJob = $null
-                        $script:WingetAsyncResult = $null
-                        try { Start-WmtPowerShellCleanupDetached -PowerShell $pipTimeoutPs -Invocation $pipTimeoutAsync -Name "Pip action timeout" } catch {}
-                    }
-                }
-            }
             if ($script:WingetAsyncResult -and -not $script:WingetAsyncResult.IsCompleted -and $script:WingetActionStartedAt -and $script:WingetCurrentItemName) {
                 try {
                     $elapsed = (Get-Date) - $script:WingetActionStartedAt
@@ -61267,12 +61439,13 @@ if ($closingTweakPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $clo
 if ($script:WmtRegistryCleanupTimer) { try { $script:WmtRegistryCleanupTimer.Stop() } catch {}; $script:WmtRegistryCleanupTimer = $null }
 $closingRegistryPs = $script:WmtRegistryCleanupPowerShell
 $closingRegistryAsync = $script:WmtRegistryCleanupAsync
+$closingRegistryRunspace = $script:WmtRegistryCleanupRunspace
 $script:WmtRegistryCleanupPowerShell = $null
 $script:WmtRegistryCleanupRunspace = $null
 $script:WmtRegistryCleanupAsync = $null
 $script:WmtRegistryCleanupSync = $null
 $script:WmtRegistryCleanupActive = $false
-if ($closingRegistryPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingRegistryPs -Invocation $closingRegistryAsync -Name "Registry cleanup shutdown" } catch {} }
+if ($closingRegistryPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingRegistryPs -Invocation $closingRegistryAsync -Runspace $closingRegistryRunspace -Name "Registry cleanup shutdown" } catch {} }
 
 try { Unregister-WmtUiPollOperation -Name "BitLockerStatus" } catch {}
 $closingBitLockerPs = $script:BitLockerStatusRunspace
