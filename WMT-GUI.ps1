@@ -2107,17 +2107,17 @@ param(
     [bool]$CreateNoWindow = $true,
     [switch]$KillTree
 )
-
 $result = [PSCustomObject]@{
-    ExitCode  = -1
-    StdOut    = ""
-    StdErr    = ""
-    Combined  = ""
-    TimedOut  = $false
-    ProcessId = 0
-    Error     = ""
+    ExitCode           = -1
+    StdOut             = ""
+    StdErr             = ""
+    Combined           = ""
+    TimedOut           = $false
+    TerminationFailed  = $false
+    OutputReadTimedOut = $false
+    ProcessId          = 0
+    Error              = ""
 }
-
 $proc = $null
 try {
     $textEncoding = switch ($Encoding) {
@@ -2126,7 +2126,6 @@ try {
         "Default" { [System.Text.Encoding]::Default }
         default   { [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) }
     }
-
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $FilePath
     $psi.Arguments = $Arguments
@@ -2136,43 +2135,68 @@ try {
     $psi.RedirectStandardError = $true
     try { $psi.StandardOutputEncoding = $textEncoding } catch {}
     try { $psi.StandardErrorEncoding = $textEncoding } catch {}
-
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
     if (-not $proc.Start()) { throw "Process failed to start." }
-
     $result.ProcessId = $proc.Id
     $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
     $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $exited = $proc.WaitForExit([Math]::Max(1, $TimeoutMs))
-
+    $exited = [bool]$proc.WaitForExit([Math]::Max(1, $TimeoutMs))
     if (-not $exited) {
         $result.TimedOut = $true
         if ($KillTree) {
+            # taskkill itself can hang; a synchronous Start-Process -Wait is not safe here.
+            $killProcess = $null
             try {
                 $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
-                if (Test-Path -LiteralPath $taskkill) {
-                    Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -Wait -ErrorAction Stop | Out-Null
+                if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+                    $killProcess = Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -PassThru -ErrorAction Stop
+                    if ($killProcess -and -not $killProcess.WaitForExit(5000)) {
+                        try { $killProcess.Kill() } catch {}
+                    }
                 }
-                else { $proc.Kill() }
             }
-            catch { try { $proc.Kill() } catch {} }
+            catch {}
+            finally { try { if ($killProcess) { $killProcess.Dispose() } } catch {} }
         }
-        else { try { $proc.Kill() } catch {} }
-        try { [void]$proc.WaitForExit(2000) } catch {}
+        # Also try the root when tree termination failed or is still in progress.
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+        try { $exited = [bool]$proc.WaitForExit(2000) } catch { $exited = $false }
+        if (-not $exited) { try { $exited = [bool]$proc.HasExited } catch {} }
+        if (-not $exited) {
+            $result.TerminationFailed = $true
+            $result.Error = "Process timed out and termination could not be verified."
+            return $result
+        }
     }
-    else { try { [void]$proc.WaitForExit() } catch {} }
-
-    try { $result.StdOut = [string]$stdoutTask.GetAwaiter().GetResult() } catch {}
-    try { $result.StdErr = [string]$stderrTask.GetAwaiter().GetResult() } catch {}
-    try { if ($proc.HasExited) { $result.ExitCode = [int]$proc.ExitCode } } catch {}
+    # Descendants may hold redirected handles open after the process exits.
+    $readCompleted = $false
+    try {
+        $readCompleted = [System.Threading.Tasks.Task]::WaitAll(
+            [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), 3000)
+    }
+    catch { $result.Error = "Failed reading process output: $($_.Exception.Message)" }
+    if ($stdoutTask.IsCompleted -and -not $stdoutTask.IsFaulted -and -not $stdoutTask.IsCanceled) {
+        try { $result.StdOut = [string]$stdoutTask.Result } catch {}
+    }
+    if ($stderrTask.IsCompleted -and -not $stderrTask.IsFaulted -and -not $stderrTask.IsCanceled) {
+        try { $result.StdErr = [string]$stderrTask.Result } catch {}
+    }
     $result.Combined = "$($result.StdOut)$($result.StdErr)"
+    if (-not $readCompleted) {
+        $result.OutputReadTimedOut = $true
+        if ($result.TimedOut) { $result.TerminationFailed = $true }
+        if ([string]::IsNullOrWhiteSpace($result.Error)) {
+            $result.Error = "Process output did not finish within 3 seconds of exit; a child may still hold the pipe."
+        }
+        return $result
+    }
+    try { $result.ExitCode = [int]$proc.ExitCode } catch {}
 }
 catch { $result.Error = $_.Exception.Message }
 finally { if ($proc) { try { $proc.Dispose() } catch {} } }
 return $result
 }
-
 function Invoke-WmtCliText {
 param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -27805,6 +27829,9 @@ $doRemove = {
             foreach ($item in @($Items)) {
                 $name = [string]$item.PublishedName
                 $forceDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments ("/delete-driver " + $name + " /uninstall /force") -TimeoutMs 120000 -Encoding OEM -KillTree
+                if ($forceDelete.TerminationFailed -or $forceDelete.OutputReadTimedOut) {
+                    throw "Stopping driver removal: pnputil termination or output completion is unverified for $name."
+                }
                 if ($forceDelete.ExitCode -eq 0 -or $forceDelete.ExitCode -eq 3010) {
                     [void]$deleted.Add($name)
                 }
@@ -27868,6 +27895,9 @@ $doRemove = {
         foreach ($item in @($Items)) {
             $name = [string]$item.PublishedName
             $driverDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments ("/delete-driver " + $name + " /uninstall") -TimeoutMs 120000 -Encoding OEM -KillTree
+            if ($driverDelete.TerminationFailed -or $driverDelete.OutputReadTimedOut) {
+                throw "Stopping driver removal: pnputil termination or output completion is unverified for $name."
+            }
             if ($driverDelete.ExitCode -eq 0 -or $driverDelete.ExitCode -eq 3010) {
                 [void]$deleted.Add($name)
             }
@@ -44856,14 +44886,22 @@ return $false
                 # Failure is not proof of absence. Retain the existing cache/status
                 # and avoid writing a fresh "not installed" result on an exception.
                 $state.RefreshCompleted = $true
-                if (-not $detectionFailed -and $state.UpdateStatuses) { & $state.UpdateStatuses -UseCache }
+                # A failed probe is not proof of absence; restore all action buttons from cached state.
+                if ($state.UpdateStatuses) {
+                    try { & $state.UpdateStatuses -UseCache }
+                    catch { try { Write-GuiLog "[$($state.ProviderName)] Could not refresh provider controls: $($_.Exception.Message)" } catch {} }
+                }
             }
 
             if (-not $state.TempRemoved) {
-                if ($state.TempScriptPath -and (Test-Path -LiteralPath $state.TempScriptPath)) {
-                    Remove-Item -LiteralPath $state.TempScriptPath -Force -ErrorAction Stop
+                # Temporary-file cleanup must never prevent an exited provider from finalizing.
+                try {
+                    if ($state.TempScriptPath -and (Test-Path -LiteralPath $state.TempScriptPath -PathType Leaf)) {
+                        Remove-Item -LiteralPath $state.TempScriptPath -Force -ErrorAction Stop
+                    }
                 }
-                $state.TempRemoved = $true
+                catch { try { Write-GuiLog "[$($state.ProviderName)] Temporary installer cleanup warning: $($_.Exception.Message)" } catch {} }
+                finally { $state.TempRemoved = $true }
             }
 
             # Release the process handle only after confirmed exit and bookkeeping.
@@ -57909,8 +57947,22 @@ $btnInstall.Add_Click({
                 $lblError.Text = "Game folder must be a relative folder inside the install root."
                 return
             }
-            if ($gameFolder.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) {
+            if ($gameFolder.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0 -or
+                $gameFolder -match '[<>:"|?*\x00-\x1F]') {
                 $lblError.Text = "The game folder contains invalid characters."
+                return
+            }
+            try {
+                $fullRoot = [System.IO.Path]::GetFullPath($root)
+                $fullDestination = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($fullRoot, $gameFolder))
+                $rootPrefix = $fullRoot.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+                if (-not $fullDestination.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $lblError.Text = "Game folder cannot navigate outside the selected install root."
+                    return
+                }
+            }
+            catch {
+                $lblError.Text = "Invalid game folder path: $($_.Exception.Message)"
                 return
             }
         }
@@ -59062,25 +59114,48 @@ function Invoke-WmtLibraryInstall {
                         $outTask = $proc.StandardOutput.ReadToEndAsync()
                         $errTask = $proc.StandardError.ReadToEndAsync()
                         $timedOut = -not $proc.WaitForExit($TimeoutMs)
+                        $exited = -not $timedOut
                         if ($timedOut) {
-                            try { $proc.Kill() } catch {}
-                            try { [void]$proc.WaitForExit(3000) } catch {}
+                            $killProcess = $null
+                            try {
+                                $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+                                if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+                                    $killProcess = Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -PassThru -ErrorAction Stop
+                                    if ($killProcess -and -not $killProcess.WaitForExit(5000)) {
+                                        try { $killProcess.Kill() } catch {}
+                                    }
+                                }
+                            }
+                            catch {}
+                            finally { try { if ($killProcess) { $killProcess.Dispose() } } catch {} }
+                            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                            try { $exited = [bool]$proc.WaitForExit(3000) } catch { $exited = $false }
+                            if (-not $exited) { try { $exited = [bool]$proc.HasExited } catch {} }
                         }
-                        else {
-                            $proc.WaitForExit()
+                        $readCompleted = $false
+                        if ($exited) {
+                            try {
+                                $readCompleted = [System.Threading.Tasks.Task]::WaitAll(
+                                    [System.Threading.Tasks.Task[]]@($outTask, $errTask), 3000)
+                            }
+                            catch {}
                         }
-
                         $stdout = ""
                         $stderr = ""
-                        try { $stdout = [string]$outTask.GetAwaiter().GetResult() } catch {}
-                        try { $stderr = [string]$errTask.GetAwaiter().GetResult() } catch {}
-                        $exitCode = if ($timedOut) { 124 } else { try { [int]$proc.ExitCode } catch { 1 } }
-
+                        if ($readCompleted) {
+                            try { $stdout = [string]$outTask.Result } catch {}
+                            try { $stderr = [string]$errTask.Result } catch {}
+                        }
+                        $outputReadTimedOut = ($exited -and -not $readCompleted)
+                        $exitCode = if ($timedOut -or -not $exited -or $outputReadTimedOut) { 124 }
+                            else { try { [int]$proc.ExitCode } catch { 1 } }
                         return [PSCustomObject]@{
-                            ExitCode = $exitCode
-                            TimedOut = $timedOut
-                            StdOut   = $stdout
-                            StdErr   = $stderr
+                            ExitCode           = $exitCode
+                            TimedOut           = ($timedOut -or $outputReadTimedOut)
+                            TerminationFailed  = (-not $exited -or ($timedOut -and $outputReadTimedOut))
+                            OutputReadTimedOut = $outputReadTimedOut
+                            StdOut             = $stdout
+                            StdErr             = $stderr
                         }
                     }
                     finally {
