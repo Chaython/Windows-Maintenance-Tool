@@ -2748,9 +2748,17 @@ if ($pool) {
         # Closing an in-use pool waits for active invocations and can freeze WPF.
         # Fail without touching the shared reference; callers may retry later.
         try {
-            if ($pool.RunspacePoolStateInfo.State -eq [System.Management.Automation.Runspaces.RunspacePoolState]::Opened -and
-                $pool.GetAvailableRunspaces() -lt $pool.GetMaxRunspaces()) {
-                throw "The $PoolKind pool still has active workers."
+            $poolState = [string]$pool.RunspacePoolStateInfo.State
+            if ($poolState -eq "Opened") {
+                $maxRunspaces = [int]$pool.GetMaxRunspaces()
+                $freeRunspaces = [int]$pool.GetAvailableRunspaces()
+                if ($maxRunspaces -le 0 -or $freeRunspaces -ne $maxRunspaces) {
+                    throw "The $PoolKind pool may still have active workers ($freeRunspaces of $maxRunspaces available)."
+                }
+            }
+            elseif ($poolState -ne "Closed") {
+                # Never synchronously close a pool in an uncertain state.
+                throw "The $PoolKind pool is in state '$poolState'. Defer its reset."
             }
         }
         catch { throw "Cannot reset the $PoolKind runspace pool while its idle state is unconfirmed: $($_.Exception.Message)" }
@@ -2954,6 +2962,10 @@ param(
 )
 
 if (-not $PowerShell) { return }
+if ($CompletionState) {
+    $CompletionState.CleanupSchedulingFailed = $false
+    $CompletionState.CleanupError = ""
+}
 
 if (-not (Get-Variable -Name WmtDetachedCleanupWorkers -Scope Script -ErrorAction SilentlyContinue) -or -not $script:WmtDetachedCleanupWorkers) {
     $script:WmtDetachedCleanupWorkers = [System.Collections.ArrayList]::new()
@@ -3021,6 +3033,7 @@ try {
         }).AddArgument($PowerShell).AddArgument($Invocation).AddArgument($Runspace).AddArgument($CompletionState)
 
     $cleanupAsync = $cleanupPs.BeginInvoke()
+    if ($CompletionState) { $CompletionState.CleanupScheduled = $true }
     $worker = [PSCustomObject]@{ PowerShell = $cleanupPs; Async = $cleanupAsync; Name = $Name }
     [void]$cleanupWorkers.Add($worker)
 
@@ -3046,6 +3059,10 @@ try {
 }
 catch {
     if (-not $cleanupAsync) { try { $cleanupPs.Dispose() } catch {} }
+    if ($CompletionState -and -not $cleanupAsync) {
+        $CompletionState.CleanupSchedulingFailed = $true
+        $CompletionState.CleanupError = $_.Exception.Message
+    }
     try { Write-GuiLog "$Name cleanup could not be scheduled off the UI thread: $($_.Exception.Message)" } catch {}
 }
 }
@@ -3155,24 +3172,50 @@ if (-not $script:WmtUiPollTimer) {
                 $nowUtc = [DateTime]::UtcNow
                 if ($op.IntervalMs -gt 0 -and $op.LastTickUtc -and (($nowUtc - $op.LastTickUtc).TotalMilliseconds -lt $op.IntervalMs)) { continue }
                 $op.LastTickUtc = $nowUtc
+                $phase = "Tick"
                 if ($op.OnTick) { & $op.OnTick $op }
-                $timedOut = ($op.TimeoutMs -gt 0 -and ((($nowUtc - $op.StartedAt).TotalMilliseconds) -ge $op.TimeoutMs))
-                if ($timedOut) {
-                    [void]$script:WmtUiPollOperations.Remove($name)
-                    if ($op.OnTimeout) { & $op.OnTimeout $op }
-                    continue
-                }
+                # OnTick can unregister/replace itself. Never act on stale operations.
+                if (-not $script:WmtUiPollOperations.Contains($name) -or
+                    -not [object]::ReferenceEquals($script:WmtUiPollOperations[$name], $op)) { continue }
+                $phase = "TestComplete"
                 $complete = $false
                 if ($op.TestComplete) { $complete = [bool](& $op.TestComplete $op) }
                 if ($complete) {
                     [void]$script:WmtUiPollOperations.Remove($name)
+                    $phase = "OnComplete"
                     if ($op.OnComplete) { & $op.OnComplete $op }
+                    continue
+                }
+                # Prefer a completed worker over a timeout when dispatcher ticks arrive late.
+                $timedOut = ($op.TimeoutMs -gt 0 -and ((($nowUtc - $op.StartedAt).TotalMilliseconds) -ge $op.TimeoutMs))
+                if ($timedOut) {
+                    [void]$script:WmtUiPollOperations.Remove($name)
+                    $phase = "OnTimeout"
+                    if ($op.OnTimeout) { & $op.OnTimeout $op }
                 }
             }
             catch {
-                [void]$script:WmtUiPollOperations.Remove($name)
-                try { Write-GuiLog "[Async] $name monitor failed: $($_.Exception.Message)" } catch {}
-                if ($op.OnError) { try { & $op.OnError $op $_ } catch {} }
+                $monitorError = $_
+                try { Write-GuiLog "[Async] $name $phase failed: $($monitorError.Exception.Message)" } catch {}
+                # Do not discard a still-running operation merely because observing it failed.
+                # Missing/failed error handlers must not orphan the worker.
+                if ($op.OnError) {
+                    try {
+                        & $op.OnError $op $monitorError
+                        if ($script:WmtUiPollOperations.Contains($name) -and
+                            [object]::ReferenceEquals($script:WmtUiPollOperations[$name], $op)) {
+                            [void]$script:WmtUiPollOperations.Remove($name)
+                        }
+                    }
+                    catch {
+                        try { Write-GuiLog "[Async] $name recovery failed; will retry: $($_.Exception.Message)" } catch {}
+                    }
+                }
+                elseif ($phase -eq "OnComplete" -or $phase -eq "OnTimeout") {
+                    # Completion callbacks may have side effects. Do not rerun them blindly.
+                    try { Write-GuiLog "[Async] $name completion requires manual recovery (no error callback)." } catch {}
+                }
+                # In Tick/TestComplete failure without OnError, retain and retry next tick.
             }
         }
         if ($script:WmtUiPollOperations.Count -eq 0 -and $script:WmtUiPollTimer) { $script:WmtUiPollTimer.Stop() }
@@ -20150,10 +20193,19 @@ if ($Action -eq "DeepClean") {
 
     $registryCancelState = [hashtable]::Synchronized(@{
         StopStarted = $false
+        CleanupScheduled = $false
+        CleanupSchedulingFailed = $false
         CleanupCompleted = $false
+        Attempts = 0
+        RetryAfterUtc = [DateTime]::MinValue
     })
     $requestRegistryCancel = {
-        if ($syncHash.CancelRequested) { return }
+        if ($syncHash.CancelRequested) {
+            if ($registryCancelState.Attempts -ge 3 -and -not $registryCancelState.CleanupScheduled) {
+                $pForm.Hide() # Keep the timer and worker alive; reaping continues in background.
+            }
+            return
+        }
         $syncHash.CancelRequested = $true
         $syncHash.Status = "Cancelling registry scan..."
         $syncHash.Error = "Registry scan canceled."
@@ -24972,12 +25024,38 @@ if ($Action -eq "DeepClean") {
 
             if ($syncHash.CancelRequested) {
                 $pLabel.Text = "Cancelling registry scan..."
-                if (-not $registryCancelState.StopStarted) {
+                # When cleanup cannot be scheduled, retry without blocking WPF.
+                if (-not $registryCancelState.StopStarted -and [DateTime]::UtcNow -ge $registryCancelState.RetryAfterUtc) {
                     $registryCancelState.StopStarted = $true
-                    # Stop/EndInvoke/Dispose and dedicated runspace Close all run off WPF.
-                    Start-WmtPowerShellCleanupDetached -PowerShell $ps -Invocation $registryScanAsync -Runspace $rs -Name "Registry deep scan" -CompletionState $registryCancelState
+                    $registryCancelState.Attempts = [int]$registryCancelState.Attempts + 1
+                    try {
+                        Start-WmtPowerShellCleanupDetached -PowerShell $ps -Invocation $registryScanAsync -Runspace $rs -Name "Registry deep scan" -CompletionState $registryCancelState
+                    }
+                    catch {
+                        $registryCancelState.CleanupSchedulingFailed = $true
+                        $registryCancelState.CleanupError = $_.Exception.Message
+                    }
+                    if ($registryCancelState.CleanupSchedulingFailed) {
+                        $registryCancelState.StopStarted = $false
+                        $registryCancelState.RetryAfterUtc = [DateTime]::UtcNow.AddSeconds([Math]::Min(5, [int]$registryCancelState.Attempts))
+                    }
                 }
-                if (-not $registryCancelState.CleanupCompleted) { return }
+                if (-not $registryCancelState.CleanupCompleted -and -not $registryCancelState.CleanupScheduled -and
+                    $registryScanAsync -and $registryScanAsync.IsCompleted) {
+                    # The scan ended cooperatively; it is now safe to clean up on WPF.
+                    try { [void]$ps.EndInvoke($registryScanAsync) } catch {}
+                    try { $ps.Dispose() } catch {}
+                    try { $rs.Dispose() } catch {}
+                    $registryCancelState.CleanupCompleted = $true
+                }
+                if (-not $registryCancelState.CleanupCompleted) {
+                    if ($registryCancelState.Attempts -ge 3 -and -not $registryCancelState.CleanupScheduled) {
+                        $btnCancelScan.IsEnabled = $true
+                        $btnCancelScan.Content = "Hide"
+                        $pLabel.Text = "Stopping registry scan in background (Hide is available)."
+                    }
+                    return
+                }
                 $timer.Stop()
                 $pForm.Close()
                 Write-GuiLog "Registry scan canceled."
