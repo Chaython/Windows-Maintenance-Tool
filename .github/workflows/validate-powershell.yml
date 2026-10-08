@@ -1220,6 +1220,7 @@ jobs:
                       ExitObserved = $false; CompletionLogged = $false
                       RefreshCompleted = $false; TempRemoved = $false
                       DetectionPs = $null; DetectionInvocation = $null
+                      DetectionStartedUtc = [DateTime]::MinValue
                       LastErrorLogUtc = [DateTime]::MinValue
                       Monitors = $monitors; UpdateStatuses = { $status.Refreshed = $true }.GetNewClosure()
                       ExitCode = 1
