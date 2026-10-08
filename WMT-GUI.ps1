@@ -44731,10 +44731,11 @@ $startProviderAction = {
         TempRemoved    = $false
         LastErrorLogUtc = [DateTime]::MinValue
     }
-    $timer.Tag = $monitorState
+    # DispatcherTimer has no Tag property. Capture this operation's state
+    # explicitly so reopening Settings cannot redirect an older callback.
     $timer.Add_Tick({
         param($s)
-        $state = $s.Tag
+        $state = $monitorState
         try {
             if (-not $state.ExitObserved) {
                 if (-not $state.Process) { throw "Provider process handle is unavailable." }
