@@ -3316,9 +3316,9 @@ $state = [PSCustomObject]@{
     LastErrorLogUtc = [DateTime]::MinValue
 }
 $timer.Add_Tick({
-    param($sender, $eventArgs)
+    param($timerSource, $tickEvent)
     $monitor = $state
-    if (-not $monitor) { $sender.Stop(); return }
+    if (-not $monitor) { $timerSource.Stop(); return }
     try {
         if (-not $monitor.ExitObserved) {
             if ($monitor.OnTick) { & $monitor.OnTick $null }
@@ -3328,7 +3328,7 @@ $timer.Add_Tick({
         # Completion may partially succeed. Callbacks must be retry-safe.
         $monitor.CompletionAttempts++
         & $monitor.OnComplete $null
-        $sender.Stop()
+        $timerSource.Stop()
         [void]$monitors.Remove($monitor.Key)
     }
     catch {
@@ -15081,7 +15081,15 @@ if ($btnEventLogs) { $btnEventLogs.Add_Click({
     $eventComplete = {
         param($Operation)
         try {
-            $rawClearResult = @($state.PowerShell.EndInvoke($state.Invocation))
+            if (-not $state.PSObject.Properties['CachedClearResult']) {
+                $state | Add-Member -NotePropertyName CachedClearResult -NotePropertyValue $null
+                $state | Add-Member -NotePropertyName ResultWasRead -NotePropertyValue $false
+            }
+            if (-not $state.ResultWasRead) {
+                $state.CachedClearResult = @($state.PowerShell.EndInvoke($state.Invocation))
+                $state.ResultWasRead = $true
+            }
+            $rawClearResult = @($state.CachedClearResult)
             $clearResult = @($rawClearResult | Where-Object { $null -ne $_ } | Select-Object -Last 1)
             if ($clearResult.Count -eq 0 -or -not $clearResult[0].PSObject.Properties["Cleared"]) {
                 throw "Event Log worker returned no valid completion summary."
@@ -15483,7 +15491,7 @@ $invokePreviewDeletion = {
         }.GetNewClosure())
 
     $deleteWindow.Add_Closing({
-            param($source, $args)
+            param($source, $closingEvent)
             $workerActive = $false
             try { $workerActive = [bool]($worker.Async -and -not $worker.Async.IsCompleted) } catch {}
             if ($workerActive -and -not [bool]$deleteState["IsCompleted"]) {
@@ -20301,7 +20309,7 @@ if ($Action -eq "DeepClean") {
     $btnCancelScan.Add_Click({ & $requestRegistryCancel }.GetNewClosure())
     $registryScanState = [PSCustomObject]@{ Invocation = $null }
     $pForm.Add_Closing({
-        param($sender, $e)
+        param($closingSource, $e)
         if ($registryScanState.Invocation -and -not $registryScanState.Invocation.IsCompleted -and -not $registryCancelState.CleanupCompleted) {
             $e.Cancel = $true
             & $requestRegistryCancel
@@ -44607,11 +44615,16 @@ $testProviderInstalled = {
     return $false
 }.GetNewClosure()
 $updateProviderStatuses = {
-    & $updateProviderPathEnvironment
+    param([switch]$UseCache)
+    if (-not $UseCache) { & $updateProviderPathEnvironment }
     foreach ($provider in $providerDefinitions) {
         $labelCtrl = & $getWinCtrl $provider.Label
         $buttonCtrl = & $getWinCtrl $provider.Button
-        $installed = [bool](& $testProviderInstalled -Provider $provider)
+        $installed = if ($UseCache) {
+            if ($providerActionStatusCache.ContainsKey($provider.Key)) { [bool]$providerActionStatusCache[$provider.Key].Installed }
+            elseif ($providerInstallState.ContainsKey($provider.Key)) { [bool]$providerInstallState[$provider.Key] }
+            else { $false }
+        } else { [bool](& $testProviderInstalled -Provider $provider) }
         $providerInstallState[$provider.Key] = $installed
 
         if ($installed) {
@@ -44728,6 +44741,8 @@ $startProviderAction = {
         ExitCode       = 1
         CompletionLogged = $false
         RefreshCompleted = $false
+        DetectionPs = $null
+        DetectionInvocation = $null
         TempRemoved    = $false
         LastErrorLogUtc = [DateTime]::MinValue
     }
@@ -44766,14 +44781,50 @@ $startProviderAction = {
             if (-not $state.RefreshCompleted) {
                 # Refresh the provider's real installed state even with Settings closed.
                 # The status cache is independent of the old dialog's WPF controls.
-                $installed = [bool](& $state.TestInstalled -Provider $state.ProviderInfo)
+                if (-not $state.DetectionPs) {
+                    # Background runspace keeps Get-Command, registry and disk checks off WPF.
+                    $detector = [PowerShell]::Create()
+                    $detectScript = @'
+param($providerInfo)
+$env:Path = (@([Environment]::GetEnvironmentVariable('Path','Machine'),
+               [Environment]::GetEnvironmentVariable('Path','User'),
+               [Environment]::GetEnvironmentVariable('Path','Process')) -join ';')
+foreach ($commandName in @($providerInfo.Commands)) {
+    if (-not [string]::IsNullOrWhiteSpace($commandName) -and
+        (Get-Command $commandName -ErrorAction SilentlyContinue)) { return $true }
+}
+foreach ($propertyName in @('RegistryPaths','LocalPaths')) {
+    if (-not $providerInfo.PSObject.Properties[$propertyName]) { continue }
+    foreach ($itemPath in @($providerInfo.$propertyName)) {
+        if (-not [string]::IsNullOrWhiteSpace($itemPath) -and
+            (Test-Path -LiteralPath $itemPath)) { return $true }
+    }
+}
+return $false
+'@
+                    try {
+                        [void]$detector.AddScript($detectScript).AddArgument($state.ProviderInfo)
+                        $state.DetectionInvocation = $detector.BeginInvoke()
+                        $state.DetectionPs = $detector
+                    }
+                    catch {
+                        try { $detector.Dispose() } catch {}
+                        throw
+                    }
+                    return
+                }
+                if (-not $state.DetectionInvocation.IsCompleted) { return }
+                $installed = [bool](@($state.DetectionPs.EndInvoke($state.DetectionInvocation)) | Select-Object -Last 1)
+                try { $state.DetectionPs.Dispose() } catch {}
+                $state.DetectionPs = $null
+                $state.DetectionInvocation = $null
                 $state.StatusCache[$state.ProviderKey] = [PSCustomObject]@{
                     Installed = $installed
                     CheckedUtc = [DateTime]::UtcNow
                     ExitCode = $state.ExitCode
                 }
-                if ($state.UpdateStatuses) { & $state.UpdateStatuses }
                 $state.RefreshCompleted = $true
+                if ($state.UpdateStatuses) { & $state.UpdateStatuses -UseCache }
             }
 
             if (-not $state.TempRemoved) {
@@ -58096,7 +58147,6 @@ $installFinalizeState = [PSCustomObject]@{ Attempted = $false; Completed = $fals
 $testComplete = {
     param($Operation)
     try {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { return $true }
         return [bool]($procRef -and $procRef.HasExited)
     }
     catch { return $false }
@@ -58106,6 +58156,12 @@ $onComplete = {
     param($Operation)
     if ($installFinalizeState.Completed) { return }
     $installFinalizeState.Attempted = $true
+    if ($installFinalizeState.PSObject.Properties['OutcomeApplied'] -and $installFinalizeState.OutcomeApplied) {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+        try { if ($procRef) { $procRef.Dispose() } } catch {}
+        $installFinalizeState.Completed = $true
+        return
+    }
     $exitCode = 1
     $installedPath = ""
     if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
@@ -58248,6 +58304,7 @@ $onComplete = {
         [void]$pendingInstallState.Value.Remove($idRef)
     }
     try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
+    $installFinalizeState | Add-Member -NotePropertyName OutcomeApplied -NotePropertyValue $true -Force
     # Deleting results is last: failed tracking can retry against the original outcome.
     if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
     # Preserve the Process until all required bookkeeping succeeded.
@@ -58667,7 +58724,6 @@ $installFinalizeState = [PSCustomObject]@{ Attempted = $false; Completed = $fals
 $testComplete = {
     param($Operation)
     try {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { return $true }
         return [bool]($procRef -and $procRef.HasExited)
     }
     catch { return $false }
@@ -58677,6 +58733,12 @@ $onComplete = {
     param($Operation)
     if ($installFinalizeState.Completed) { return }
     $installFinalizeState.Attempted = $true
+    if ($installFinalizeState.PSObject.Properties['OutcomeApplied'] -and $installFinalizeState.OutcomeApplied) {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+        try { if ($procRef) { $procRef.Dispose() } } catch {}
+        $installFinalizeState.Completed = $true
+        return
+    }
     $exitCode = 1
     if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
         $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
@@ -58726,6 +58788,7 @@ $onComplete = {
     }
 
     try { Start-WmtLibraryScan -Silent } catch {}
+    $installFinalizeState | Add-Member -NotePropertyName OutcomeApplied -NotePropertyValue $true -Force
     try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop } catch {
         if (Test-Path -LiteralPath $resultRef -PathType Leaf) { throw }
     }
