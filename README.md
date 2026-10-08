@@ -98,6 +98,18 @@ v6.7 is a broad maintenance and reliability update focused on background executi
 
 </details>
 
+## Keyboard Shortcuts
+
+The main WMT window supports a few familiar, context-sensitive shortcuts:
+
+| Shortcut | Action |
+| --- | --- |
+| **F5** | Refresh the visible Updates, Drivers, Firewall, or Your Library view, if its refresh action is enabled. |
+| **Ctrl+F** | Focus the search field for the visible Updates, Drivers, Firewall, or Your Library view (or Quick Find elsewhere). When the activity log has focus, search the log instead. |
+| **Ctrl+Shift+F** | Focus global Quick Find. |
+
+F5 on Updates is an explicit package scan: merely visiting the Updates tab does **not** trigger a scan. Refresh shortcuts reuse the corresponding on-screen actions and respect disabled controls. Other pages do not run a refresh action on F5.
+
 ## Core Features
 
 <details>
