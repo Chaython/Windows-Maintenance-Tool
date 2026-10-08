@@ -20279,16 +20279,19 @@ if ($Action -eq "DeepClean") {
         CleanupSchedulingFailed = $false
         CleanupCompleted = $false
         Attempts = 0
+        RequestedAtUtc = [DateTime]::MinValue
         RetryAfterUtc = [DateTime]::MinValue
     })
     $requestRegistryCancel = {
         if ($syncHash.CancelRequested) {
-            if ($registryCancelState.Attempts -ge 3 -and -not $registryCancelState.CleanupScheduled) {
-                $pForm.Hide() # Keep the timer and worker alive; reaping continues in background.
+            if ($registryCancelState.RequestedAtUtc -ne [DateTime]::MinValue -and
+                ([DateTime]::UtcNow - $registryCancelState.RequestedAtUtc).TotalSeconds -ge 5) {
+                $pForm.Hide() # Worker and timer remain alive; cancel finalizes in background.
             }
             return
         }
         $syncHash.CancelRequested = $true
+        $registryCancelState.RequestedAtUtc = [DateTime]::UtcNow
         $syncHash.Status = "Cancelling registry scan..."
         $syncHash.Error = "Registry scan canceled."
         $btnCancelScan.IsEnabled = $false
@@ -25131,10 +25134,11 @@ if ($Action -eq "DeepClean") {
                     $registryCancelState.CleanupCompleted = $true
                 }
                 if (-not $registryCancelState.CleanupCompleted) {
-                    if ($registryCancelState.Attempts -ge 3 -and -not $registryCancelState.CleanupScheduled) {
+                    if ($registryCancelState.RequestedAtUtc -ne [DateTime]::MinValue -and
+                        ([DateTime]::UtcNow - $registryCancelState.RequestedAtUtc).TotalSeconds -ge 5) {
                         $btnCancelScan.IsEnabled = $true
                         $btnCancelScan.Content = "Hide"
-                        $pLabel.Text = "Stopping registry scan in background (Hide is available)."
+                        $pLabel.Text = "Cancelling scan; hide this dialog while cleanup continues."
                     }
                     return
                 }
