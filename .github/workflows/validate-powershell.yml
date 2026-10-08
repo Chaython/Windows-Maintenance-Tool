@@ -80,6 +80,41 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Smoke test process timeouts and output capture
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $parseErrors = $null
+          $sourcePath = (Resolve-Path '.\WMT-GUI.ps1').Path
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
+          $processFunction = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $node.Name -eq 'Invoke-WmtProcess'
+          }, $true)
+          if (-not $processFunction) { throw 'Invoke-WmtProcess was not found.' }
+          Invoke-Expression $processFunction.Extent.Text
+          $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $success = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "Write-Output WMT_PROCESS_OK"' -TimeoutMs 20000 -Encoding UTF8 -KillTree
+          if ($success.ExitCode -ne 0 -or $success.TimedOut -or $success.OutputReadTimedOut -or
+              $success.TerminationFailed -or $success.StdOut -notmatch 'WMT_PROCESS_OK') {
+              throw ("Normal process output capture failed: " + ($success | ConvertTo-Json -Compress))
+          }
+          $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+          $timeoutResult = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "Start-Sleep -Seconds 20"' -TimeoutMs 2500 -Encoding UTF8 -KillTree
+          $stopwatch.Stop()
+          if (-not $timeoutResult.TimedOut) { throw 'Timed-out process did not report a timeout.' }
+          if ($stopwatch.Elapsed.TotalSeconds -gt 18) {
+              throw ("Timed-out process blocked for {0:N1} seconds." -f $stopwatch.Elapsed.TotalSeconds)
+          }
+          if (-not $timeoutResult.PSObject.Properties['TerminationFailed'] -or
+              -not $timeoutResult.PSObject.Properties['OutputReadTimedOut']) {
+              throw 'Termination/output-read diagnostics are missing.'
+          }
+          Write-Host 'PASS: Process output capture and bounded termination.'
+
       - name: Test shared WPF controls
         shell: powershell -NoProfile -STA -ExecutionPolicy Bypass -File {0}
         run: |
