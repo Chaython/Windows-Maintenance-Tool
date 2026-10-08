@@ -44727,15 +44727,16 @@ $startProviderAction = {
         TempRemoved    = $false
         LastErrorLogUtc = [DateTime]::MinValue
     }
+    $timer.Tag = $monitorState
     $timer.Add_Tick({
         param($s)
-        $state = $monitorState
+        $state = $s.Tag
         try {
             if (-not $state.ExitObserved) {
                 if (-not $state.Process) { throw "Provider process handle is unavailable." }
                 $exited = $false
                 try {
-                    $state.Process.Refresh()
+                    try { $state.Process.Refresh() } catch {}
                     $exited = [bool]$state.Process.HasExited
                 }
                 catch {
