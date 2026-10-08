@@ -44785,6 +44785,7 @@ $startProviderAction = {
         RefreshCompleted = $false
         DetectionPs = $null
         DetectionInvocation = $null
+        DetectionStartedUtc = [DateTime]::MinValue
         TempRemoved    = $false
         LastErrorLogUtc = [DateTime]::MinValue
     }
@@ -44851,6 +44852,7 @@ return $false
                         [void]$detector.AddScript($detectScript).AddArgument($state.ProviderInfo)
                         $state.DetectionInvocation = $detector.BeginInvoke()
                         $state.DetectionPs = $detector
+                        $state.DetectionStartedUtc = [DateTime]::UtcNow
                     }
                     catch {
                         try { $detector.Dispose() } catch {}
@@ -44858,7 +44860,31 @@ return $false
                     }
                     return
                 }
-                if (-not $state.DetectionInvocation.IsCompleted) { return }
+                if (-not $state.DetectionInvocation.IsCompleted) {
+                    # Get-Command/registry/network-path checks can stall indefinitely.
+                    # Do not strand the provider monitor or leave its buttons disabled.
+                    if ($state.DetectionStartedUtc -eq [DateTime]::MinValue -or
+                        ([DateTime]::UtcNow - $state.DetectionStartedUtc).TotalSeconds -lt 20) { return }
+                    $detectorToStop = $state.DetectionPs
+                    $invocationToStop = $state.DetectionInvocation
+                    $state.DetectionPs = $null
+                    $state.DetectionInvocation = $null
+                    $state.RefreshCompleted = $true
+                    try { Write-GuiLog "[$($state.ProviderName)] Installed-state detection timed out; preserving last known status." } catch {}
+                    if ($detectorToStop) {
+                        try {
+                            Stop-WmtPowerShellInvocationAsync -PowerShell $detectorToStop -Invocation $invocationToStop -Name "Provider detection $($state.ProviderName)"
+                        }
+                        catch {
+                            try { Write-GuiLog "[$($state.ProviderName)] Background detection cancellation warning: $($_.Exception.Message)" } catch {}
+                        }
+                    }
+                    if ($state.UpdateStatuses) {
+                        try { & $state.UpdateStatuses -UseCache }
+                        catch { try { Write-GuiLog "[$($state.ProviderName)] Could not restore cached provider controls: $($_.Exception.Message)" } catch {} }
+                    }
+                    return
+                }
                 # EndInvoke is single-use. Dispose and clear the handles even on
                 # a terminating detection error; otherwise every timer tick retries
                 # EndInvoke on the same failed/completed invocation.
