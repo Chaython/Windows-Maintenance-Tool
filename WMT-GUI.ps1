@@ -35860,11 +35860,9 @@ $tabButton.Add_Click({
         # Drivers cache has a TTL; Start-DriverListLoad returns immediately while
         # it is fresh and transparently refreshes stale data in the background.
         if ($s.Name -eq "btnTabDrivers") { Start-DriverListLoad }
-        if ($s.Name -eq "btnTabUpdates") {
-            if ($lstWinget.Items.Count -eq 0 -and -not (Get-WmtUpdateScansDisabled)) {
-                $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
-            }
-        }
+        # Navigating to Updates must not start a package scan, even when the
+        # previous scan found zero updates. The list remains as-is until the
+        # user clicks Check Package Updates or the configured auto-scan runs.
         if ($s.Name -eq "btnTabSupport") {
             # Re-check the real Task Scheduler state whenever the Support tab
             # is shown so the Start with Windows button always reflects off/on.
