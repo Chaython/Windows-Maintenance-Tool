@@ -2744,6 +2744,17 @@ function Reset-WmtRunspacePool {
 param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
 $pool = if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool } else { $script:WmtBackgroundPool }
 if ($pool) {
+    if ($pool -is [System.Management.Automation.Runspaces.RunspacePool]) {
+        # Closing an in-use pool waits for active invocations and can freeze WPF.
+        # Fail without touching the shared reference; callers may retry later.
+        try {
+            if ($pool.RunspacePoolStateInfo.State -eq [System.Management.Automation.Runspaces.RunspacePoolState]::Opened -and
+                $pool.GetAvailableRunspaces() -lt $pool.GetMaxRunspaces()) {
+                throw "The $PoolKind pool still has active workers."
+            }
+        }
+        catch { throw "Cannot reset the $PoolKind runspace pool while its idle state is unconfirmed: $($_.Exception.Message)" }
+    }
     try { $pool.Close() } catch {}
     try { $pool.Dispose() } catch {}
 }
@@ -2805,11 +2816,21 @@ for ($attempt = 1; $attempt -le 2; $attempt++) {
     catch {
         $lastError = $_.Exception
         try { Write-GuiLog "[RunspacePool:$PoolKind] Worker creation attempt $attempt failed: $($lastError.Message)" } catch {}
-        Reset-WmtRunspacePool -PoolKind $PoolKind
+        # A failed worker allocation does not imply the shared pool is idle.
+        # Retry allocation without closing other operations' runspaces.
+        if ($attempt -lt 2) {
+            try {
+                $existingPool = if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool } else { $script:WmtBackgroundPool }
+                if ($existingPool -and $existingPool.RunspacePoolStateInfo.State -ne [System.Management.Automation.Runspaces.RunspacePoolState]::Opened) {
+                    Reset-WmtRunspacePool -PoolKind $PoolKind
+                }
+            }
+            catch { try { Write-GuiLog "[RunspacePool:$PoolKind] Deferred pool reset: $($_.Exception.Message)" } catch {} }
+        }
     }
 }
 
-throw "Unable to create a $PoolKind PowerShell worker after rebuilding the runspace pool. $($lastError.Message)"
+throw "Unable to create a $PoolKind PowerShell worker after retrying worker creation. $($lastError.Message)"
 }
 
 function Start-WmtDetachedPowerShell {
@@ -2928,7 +2949,8 @@ param(
     [System.Management.Automation.PowerShell]$PowerShell,
     [System.IAsyncResult]$Invocation,
     [System.Management.Automation.Runspaces.Runspace]$Runspace,
-    [string]$Name = "PowerShell invocation"
+    [string]$Name = "PowerShell invocation",
+    [hashtable]$CompletionState
 )
 
 if (-not $PowerShell) { return }
@@ -2958,7 +2980,8 @@ try {
             param(
                 [System.Management.Automation.PowerShell]$TargetPowerShell,
                 [System.IAsyncResult]$TargetInvocation,
-                [System.Management.Automation.Runspaces.Runspace]$TargetRunspace
+                [System.Management.Automation.Runspaces.Runspace]$TargetRunspace,
+                [hashtable]$CleanupState
             )
             try {
                 $finished = $false
@@ -2993,8 +3016,9 @@ try {
                     try { $TargetRunspace.Close() } catch {}
                     try { $TargetRunspace.Dispose() } catch {}
                 }
+                if ($CleanupState) { $CleanupState.CleanupCompleted = $true }
             }
-        }).AddArgument($PowerShell).AddArgument($Invocation).AddArgument($Runspace)
+        }).AddArgument($PowerShell).AddArgument($Invocation).AddArgument($Runspace).AddArgument($CompletionState)
 
     $cleanupAsync = $cleanupPs.BeginInvoke()
     $worker = [PSCustomObject]@{ PowerShell = $cleanupPs; Async = $cleanupAsync; Name = $Name }
@@ -3215,6 +3239,54 @@ function Unregister-WmtUiPollOperation {
 param([Parameter(Mandatory = $true)][string]$Name)
 if ($script:WmtUiPollOperations -and $script:WmtUiPollOperations.Contains($Name)) { [void]$script:WmtUiPollOperations.Remove($Name) }
 if ($script:WmtUiPollOperations.Count -eq 0 -and $script:WmtUiPollTimer) { $script:WmtUiPollTimer.Stop() }
+}
+
+# Independently track already-started processes if the shared poller fails.
+# Never discard the Process handle or run completion bookkeeping before exit.
+function Start-WmtFallbackUiMonitor {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][scriptblock]$TestComplete,
+    [Parameter(Mandatory = $true)][scriptblock]$OnComplete,
+    [scriptblock]$OnTick,
+    [int]$IntervalMs = 1000
+)
+if (-not $script:WmtFallbackUiMonitors) { $script:WmtFallbackUiMonitors = @{} }
+$monitors = $script:WmtFallbackUiMonitors
+$key = "$Name-$([Guid]::NewGuid().ToString('N'))"
+$timer = [System.Windows.Threading.DispatcherTimer]::new()
+$timer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(200, $IntervalMs))
+$state = [PSCustomObject]@{
+    Key = $key
+    Timer = $timer
+    TestComplete = $TestComplete
+    OnComplete = $OnComplete
+    OnTick = $OnTick
+}
+$timer.Tag = $state
+$timer.Add_Tick({
+    param($sender, $eventArgs)
+    $monitor = $sender.Tag
+    if (-not $monitor) { $sender.Stop(); return }
+    try {
+        if ($monitor.OnTick) { & $monitor.OnTick $null }
+        if (-not [bool](& $monitor.TestComplete $null)) { return }
+        $sender.Stop()
+        [void]$monitors.Remove($monitor.Key)
+        & $monitor.OnComplete $null
+    }
+    catch {
+        # Retain the worker and retry if the exit test fails transiently.
+        # A completion callback is only invoked once, even when bookkeeping throws.
+        if (-not $sender.IsEnabled) {
+            [void]$monitors.Remove($monitor.Key)
+            try { Write-GuiLog "[Async] $Name fallback completion failed: $($_.Exception.Message)" } catch {}
+        }
+    }
+}.GetNewClosure())
+$monitors[$key] = $state
+$timer.Start()
+return $state
 }
 
 function Stop-WmtUiPoller {
@@ -14813,57 +14885,128 @@ if ($btnClean) { $btnClean.Add_Click({ & $submitCleanupSelection "Clean" }.GetNe
 if ($btnAnalyze) { $btnAnalyze.Add_Click({ & $submitCleanupSelection "Analyze" }.GetNewClosure()) }
 if ($btnCancel) { $btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure()) }
 
+# Script-scope identity prevents reopening Cleaner from overwriting a live event-log job.
+if (-not (Get-Variable -Name WmtEventLogClearState -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:WmtEventLogClearState = $null
+}
+$eventLogStateVar = Get-Variable -Name WmtEventLogClearState -Scope Script
+if ($eventLogStateVar.Value -and $eventLogStateVar.Value.Active) {
+    $eventLogStateVar.Value.DialogOpen = $true
+    $eventLogStateVar.Value.Dialog = $dialog
+    $eventLogStateVar.Value.Button = $btnEventLogs
+    $eventLogStateVar.Value.Panel = $pnlEventLogProgress
+    $eventLogStateVar.Value.Bar = $pbEventLogProgress
+    $eventLogStateVar.Value.Status = $lblEventLogStatus
+    if ($btnEventLogs) { $btnEventLogs.IsEnabled = $false; $btnEventLogs.Content = "Clearing..." }
+    if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Visible }
+    if ($lblEventLogStatus) { $lblEventLogStatus.Text = "Clearing event logs..." }
+}
+$dialog.Add_Closed({
+    $active = $eventLogStateVar.Value
+    if ($active -and [object]::ReferenceEquals($active.Dialog, $dialog)) {
+        $active.DialogOpen = $false
+        $active.Dialog = $null
+        $active.Button = $null
+        $active.Panel = $null
+        $active.Bar = $null
+        $active.Status = $null
+    }
+}.GetNewClosure())
+
 if ($btnEventLogs) { $btnEventLogs.Add_Click({
-        $confirm = Show-WmtMessageBox -Owner $dialog -Message "Clear all Windows Event Logs?`n`nThis safely flushes all registered Event Logs on your system." -Title "Confirm Clear Logs" -Button YesNo -Image Warning
-        if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
-            $btnEventLogs.IsEnabled = $false
-            $btnEventLogs.Content = "Clearing..."
+    if ($eventLogStateVar.Value -and $eventLogStateVar.Value.Active) { return }
+    $confirm = Show-WmtMessageBox -Owner $dialog -Message "Clear all Windows Event Logs?`n`nThis safely flushes all registered Event Logs on your system." -Title "Confirm Clear Logs" -Button YesNo -Image Warning
+    if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-            # Show progress bar
-            if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Visible }
-            if ($pbEventLogProgress) { $pbEventLogProgress.Value = 0 }
-            if ($lblEventLogStatus) { $lblEventLogStatus.Text = "Clearing event logs..." }
+    $btnEventLogs.IsEnabled = $false
+    $btnEventLogs.Content = "Clearing..."
+    if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Visible }
+    if ($pbEventLogProgress) { $pbEventLogProgress.Value = 0 }
+    if ($lblEventLogStatus) { $lblEventLogStatus.Text = "Clearing event logs..." }
+    $state = [PSCustomObject]@{
+        Active = $true
+        DialogOpen = $true
+        Dialog = $dialog
+        Button = $btnEventLogs
+        Panel = $pnlEventLogProgress
+        Bar = $pbEventLogProgress
+        Status = $lblEventLogStatus
+        Marquee = 0
+        PowerShell = $null
+        Invocation = $null
+    }
+    $eventLogStateVar.Value = $state
+    try {
+        $state.PowerShell = New-WmtPooledPowerShell
+        [void]$state.PowerShell.AddScript({
+            $logs = wevtutil el
+            $cleared = 0
+            foreach ($log in $logs) {
+                wevtutil cl "$log" 2>$null
+                $cleared++
+            }
+            return $cleared
+        })
+        $state.Invocation = $state.PowerShell.BeginInvoke()
+    }
+    catch {
+        if ($state.PowerShell -and -not $state.Invocation) { try { $state.PowerShell.Dispose() } catch {} }
+        $state.Active = $false
+        if ([object]::ReferenceEquals($eventLogStateVar.Value, $state)) { $eventLogStateVar.Value = $null }
+        $btnEventLogs.IsEnabled = $true
+        $btnEventLogs.Content = "Clear Event Logs"
+        if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Collapsed }
+        Write-GuiLog "[Event Logs] Could not start: $($_.Exception.Message)"
+        return
+    }
 
-            $script:EventLogRunspace = New-WmtPooledPowerShell
-            $null = $script:EventLogRunspace.AddScript({
-                    $logs = wevtutil el
-                    $cleared = 0
-                    foreach ($log in $logs) {
-                        wevtutil cl "$log" 2>$null
-                        $cleared++
-                    }
-                    return $cleared
-                })
-            $script:EventLogAsyncResult = $script:EventLogRunspace.BeginInvoke()
-
-            $script:marqueeVal = 0
-            $script:EventLogTimer = $null
-            Register-WmtUiPollOperation -Name "EventLogClear" `
-                -TestComplete { $script:EventLogAsyncResult -and $script:EventLogAsyncResult.IsCompleted } `
-                -OnTick {
-                    $script:marqueeVal = ($script:marqueeVal + 3) % 110
-                    if ($pbEventLogProgress) { $pbEventLogProgress.Value = [Math]::Min($script:marqueeVal, 100) }
-                } `
-                -OnComplete {
-                    if ($pnlEventLogProgress) { $pnlEventLogProgress.Visibility = [System.Windows.Visibility]::Collapsed }
-                    $btnEventLogs.IsEnabled = $true
-                    $btnEventLogs.Content = "Clear Event Logs"
-                    try {
-                        $clearedCount = $script:EventLogRunspace.EndInvoke($script:EventLogAsyncResult)
-                        if ($clearedCount -is [System.Collections.ObjectModel.Collection[PSObject]] -and $clearedCount.Count -gt 0) { $clearedCount = $clearedCount[-1] }
-                        $successMessage = "Successfully processed $clearedCount Event Logs."
-                        Write-GuiLog "[Event Logs] $successMessage"
-                        Show-WmtMessageBox -Owner $dialog -Message $successMessage -Title "Success" -Image Information | Out-Null
-                    }
-                    catch { Show-WmtMessageBox -Owner $dialog -Message "Error: $($_.Exception.Message)" -Title "Error" -Image Error | Out-Null }
-                    finally {
-                        try { if ($script:EventLogRunspace) { $script:EventLogRunspace.Dispose() } } catch {}
-                        $script:EventLogRunspace = $null
-                        $script:EventLogAsyncResult = $null
-                    }
-                } | Out-Null
+    $eventTest = { param($Operation) $state.Invocation -and $state.Invocation.IsCompleted }.GetNewClosure()
+    $eventTick = {
+        param($Operation)
+        $state.Marquee = ($state.Marquee + 3) % 110
+        if ($state.DialogOpen -and $state.Bar) { $state.Bar.Value = [Math]::Min($state.Marquee, 100) }
+    }.GetNewClosure()
+    $eventComplete = {
+        param($Operation)
+        try {
+            $clearedCount = $state.PowerShell.EndInvoke($state.Invocation)
+            if ($clearedCount -is [System.Collections.ObjectModel.Collection[PSObject]] -and $clearedCount.Count -gt 0) { $clearedCount = $clearedCount[-1] }
+            $successMessage = "Successfully processed $clearedCount Event Logs."
+            Write-GuiLog "[Event Logs] $successMessage"
+            if ($state.DialogOpen -and $state.Dialog) {
+                Show-WmtMessageBox -Owner $state.Dialog -Message $successMessage -Title "Success" -Image Information | Out-Null
+            }
         }
-    }) }
+        catch {
+            Write-GuiLog "[Event Logs] Clear failed: $($_.Exception.Message)"
+            if ($state.DialogOpen -and $state.Dialog) {
+                Show-WmtMessageBox -Owner $state.Dialog -Message "Error: $($_.Exception.Message)" -Title "Error" -Image Error | Out-Null
+            }
+        }
+        finally {
+            try { if ($state.PowerShell) { $state.PowerShell.Dispose() } } catch {}
+            $state.Active = $false
+            if ($state.DialogOpen) {
+                if ($state.Panel) { $state.Panel.Visibility = [System.Windows.Visibility]::Collapsed }
+                if ($state.Button) { $state.Button.IsEnabled = $true; $state.Button.Content = "Clear Event Logs" }
+            }
+            if ([object]::ReferenceEquals($eventLogStateVar.Value, $state)) { $eventLogStateVar.Value = $null }
+            $state.Dialog = $null; $state.Button = $null; $state.Bar = $null; $state.Panel = $null; $state.Status = $null
+        }
+    }.GetNewClosure()
+    $eventError = {
+        param($Operation, $ErrorRecord)
+        Write-GuiLog "[Event Logs] Shared monitor failed; switching to independent completion monitor: $($ErrorRecord.Exception.Message)"
+        Start-WmtFallbackUiMonitor -Name "EventLogClear" -TestComplete $eventTest -OnTick $eventTick -OnComplete $eventComplete | Out-Null
+    }.GetNewClosure()
+    try {
+        Register-WmtUiPollOperation -Name "EventLogClear" -TestComplete $eventTest -OnTick $eventTick -OnComplete $eventComplete -OnError $eventError | Out-Null
+    }
+    catch {
+        Write-GuiLog "[Event Logs] Shared monitor unavailable; switching to independent monitor: $($_.Exception.Message)"
+        Start-WmtFallbackUiMonitor -Name "EventLogClear" -TestComplete $eventTest -OnTick $eventTick -OnComplete $eventComplete | Out-Null
+    }
+}.GetNewClosure()) }
 
 $dialog.ShowDialog() | Out-Null
 return $selectionState.Result
@@ -20006,13 +20149,27 @@ if ($Action -eq "DeepClean") {
             Error           = $null
         })
 
-    $btnCancelScan.Add_Click({
-            $syncHash.CancelRequested = $true
-            $syncHash.Status = "Canceling scan..."
-            $syncHash.Error = "Registry scan canceled."
-            $syncHash.IsCompleted = $true
-            try { if ($ps) { $ps.Stop() } } catch {}
-        }.GetNewClosure())
+    $registryCancelState = [hashtable]::Synchronized(@{
+        StopStarted = $false
+        CleanupCompleted = $false
+    })
+    $requestRegistryCancel = {
+        if ($syncHash.CancelRequested) { return }
+        $syncHash.CancelRequested = $true
+        $syncHash.Status = "Cancelling registry scan..."
+        $syncHash.Error = "Registry scan canceled."
+        $btnCancelScan.IsEnabled = $false
+        $btnCancelScan.Content = "Cancelling..."
+        $pLabel.Text = "Cancelling registry scan..."
+    }.GetNewClosure()
+    $btnCancelScan.Add_Click({ & $requestRegistryCancel }.GetNewClosure())
+    $pForm.Add_Closing({
+        param($sender, $e)
+        if ($registryScanAsync -and -not $registryScanAsync.IsCompleted -and -not $registryCancelState.CleanupCompleted) {
+            $e.Cancel = $true
+            & $requestRegistryCancel
+        }
+    }.GetNewClosure())
     $pForm.Show()
 
     # --- RUNSPACE CONFIGURATION ---
@@ -24812,7 +24969,22 @@ if ($Action -eq "DeepClean") {
             $pLabel.Text = $statusText
             $pBar.Value = $syncHash.Progress
 
-            if ($syncHash.IsCompleted) {
+            if ($syncHash.CancelRequested) {
+                $pLabel.Text = "Cancelling registry scan..."
+                if (-not $registryCancelState.StopStarted) {
+                    $registryCancelState.StopStarted = $true
+                    # Stop/EndInvoke/Dispose and dedicated runspace Close all run off WPF.
+                    Start-WmtPowerShellCleanupDetached -PowerShell $ps -Invocation $registryScanAsync -Runspace $rs -Name "Registry deep scan" -CompletionState $registryCancelState
+                }
+                if (-not $registryCancelState.CleanupCompleted) { return }
+                $timer.Stop()
+                $pForm.Close()
+                Write-GuiLog "Registry scan canceled."
+                return
+            }
+
+            # SyncHash.IsCompleted is set in worker code, before EndInvoke is safe.
+            if ($syncHash.IsCompleted -and $registryScanAsync -and $registryScanAsync.IsCompleted) {
                 $timer.Stop()
                 $pForm.Close()
                 try { if ($registryScanAsync) { [void]$ps.EndInvoke($registryScanAsync) } } catch {}
@@ -39032,6 +39204,7 @@ exit `$exitCode
         $lastHeartbeat = $startedAt
         $timedOut = $false
         $timeoutReason = ""
+        $timeoutTreeSignature = ""
         $lastActivityAt = $startedAt
         $lastActivitySignature = ""
         $nextActivityCheck = $startedAt
@@ -39063,6 +39236,7 @@ exit `$exitCode
                 $timedOut = $true
                 $timeoutReason = "total runtime"
                 Write-Output "LOG:$CommandLabel timed out after $TimeoutSeconds seconds. Stopping its process tree."
+                $timeoutTreeSignature = Get-WmtProcessTreeActivitySignature -RootProcessId $proc.Id
                 Stop-WmtChildProcessTree -Process $proc
                 break
             }
@@ -39077,6 +39251,7 @@ exit `$exitCode
                         $timedOut = $true
                         $timeoutReason = "no process activity"
                         Write-Output "LOG:$CommandLabel showed no process activity for $IdleTimeoutSeconds seconds. Stopping its process tree."
+                        $timeoutTreeSignature = Get-WmtProcessTreeActivitySignature -RootProcessId $proc.Id
                         Stop-WmtChildProcessTree -Process $proc
                         break
                     }
@@ -39099,6 +39274,30 @@ exit `$exitCode
             }
         }
         catch {}
+
+        $terminationFailed = $false
+        if ($timedOut) {
+            try { $proc.Refresh(); $terminationFailed = -not $proc.HasExited }
+            catch { $terminationFailed = $true }
+            # If enumeration fails we cannot prove child installers were terminated.
+            if ([string]::IsNullOrWhiteSpace($timeoutTreeSignature)) {
+                $terminationFailed = $true
+            }
+            else {
+                foreach ($processEntry in @($timeoutTreeSignature -split '\\|')) {
+                    $treeProcessId = 0
+                    if (-not [int]::TryParse(([string]$processEntry -split ':', 2)[0], [ref]$treeProcessId)) { $terminationFailed = $true; continue }
+                    try {
+                        $survivor = Get-Process -Id $treeProcessId -ErrorAction SilentlyContinue
+                        if ($survivor -and -not $survivor.HasExited) { $terminationFailed = $true }
+                    }
+                    catch { $terminationFailed = $true }
+                }
+            }
+            if ($terminationFailed) {
+                Write-Output "LOG:WARNING: $CommandLabel could not confirm termination of every child process; aborting the remaining package batch."
+            }
+        }
 
         $drainDeadline = (Get-Date).AddSeconds(5)
         while (($outTask -or $errTask) -and (Get-Date) -lt $drainDeadline) {
@@ -39131,7 +39330,7 @@ exit `$exitCode
             if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
                 Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: 124 ($timeoutReason)"
             }
-            $Result.Value = [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = $timeoutReason }
+            $Result.Value = [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = $timeoutReason; TerminationFailed = $terminationFailed }
             return
         }
         $exitCode = [int]$proc.ExitCode
@@ -39139,9 +39338,10 @@ exit `$exitCode
             Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text "EXIT: $exitCode"
         }
         $Result.Value = [PSCustomObject]@{
-            ExitCode      = $exitCode
-            TimedOut      = $false
-            TimeoutReason = ""
+            ExitCode          = $exitCode
+            TimedOut          = $false
+            TimeoutReason     = ""
+            TerminationFailed = $false
         }
         }
         finally {
@@ -43349,7 +43549,8 @@ $btnWuCatInsider = Get-WinCtrl "btnWuCatInsider"
 $providerControls = @{}
 
 $providerInstallState = @{}
-$providerActionMonitors = @{}
+if (-not $script:WmtProviderActionMonitors) { $script:WmtProviderActionMonitors = @{} }
+$providerActionMonitors = $script:WmtProviderActionMonitors
 
 
 function Get-WmtProviderActionScript {
@@ -44285,6 +44486,10 @@ $startProviderAction = {
 
     $provider = @($providerDefinitions | Where-Object { $_.Key -eq $ProviderKey } | Select-Object -First 1)
     if (-not $provider) { return }
+    if (@($providerActionMonitors.Values | Where-Object { $_.ProviderKey -eq $ProviderKey }).Count -gt 0) {
+        Write-GuiLog "[$($provider.DisplayName)] A provider action is already running."
+        return
+    }
 
     $installed = if ($providerInstallState.ContainsKey($ProviderKey)) { [bool]$providerInstallState[$ProviderKey] } else { [bool](& $testProviderInstalled -Provider $provider) }
     $action = if (($ProviderKey -eq "steam" -or $ProviderKey -eq "windowsupdate") -and $installed) { "Open" } elseif ($installed) { "Repair" } else { "Install" }
@@ -44378,8 +44583,10 @@ $startProviderAction = {
                 else {
                     try { Write-GuiLog "[$($state.ProviderName)] $($state.Action) exited with code $exitCode." } catch {}
                 }
-                try { & $state.UpdateStatuses } catch {
-                    try { Write-GuiLog "[$($state.ProviderName)] Could not refresh provider status: $($_.Exception.Message)" } catch {}
+                if ($state.UpdateStatuses) {
+                    try { & $state.UpdateStatuses } catch {
+                        try { Write-GuiLog "[$($state.ProviderName)] Could not refresh provider status: $($_.Exception.Message)" } catch {}
+                    }
                 }
             }
             catch {
@@ -44388,7 +44595,7 @@ $startProviderAction = {
                 try { if ($state.Process) { $state.Process.Dispose() } } catch {}
                 $state.Process = $null
                 try { Write-GuiLog "[$($state.ProviderName)] Provider completion monitor failed: $($_.Exception.Message)" } catch {}
-                try { & $state.UpdateStatuses } catch {}
+                if ($state.UpdateStatuses) { try { & $state.UpdateStatuses } catch {} }
             }
         })
     $providerActionMonitors[$monitorKey] = $monitorState
@@ -44396,20 +44603,12 @@ $startProviderAction = {
 }.GetNewClosure()
 
 $win.Add_Closed({
-        foreach ($monitor in @($providerActionMonitors.Values)) {
-            try { if ($monitor.Timer) { $monitor.Timer.Stop() } } catch {}
-            $monitorProcess = $monitor.Process
-            try {
-                if ($monitorProcess -and $monitorProcess.HasExited -and $monitor.TempScriptPath) {
-                    Remove-Item -LiteralPath $monitor.TempScriptPath -Force -ErrorAction SilentlyContinue
-                }
-            }
-            catch {}
-            try { if ($monitorProcess) { $monitorProcess.Dispose() } } catch {}
-            try { $monitor.Process = $null } catch {}
-        }
-        try { $providerActionMonitors.Clear() } catch {}
-    }.GetNewClosure())
+    # Keep DispatcherTimers and Process handles alive until each provider exits.
+    # The old window's controls cannot be refreshed after it is closed.
+    foreach ($monitor in @($providerActionMonitors.Values)) {
+        $monitor.UpdateStatuses = $null
+    }
+}.GetNewClosure())
 # Load settings
 $autoScanMinutes = Get-WmtUpdateAutoScanMinutes -Settings $settings
 if ($cmbAutoScanInterval) {
@@ -44722,6 +44921,16 @@ if ($chkUpdateAutoInstall) {
 }
 
 & $updateProviderStatuses
+# Reopened settings must show already-running operations and prevent duplicates.
+foreach ($monitor in @($providerActionMonitors.Values)) {
+    $runningProvider = @($providerDefinitions | Where-Object { $_.Key -eq $monitor.ProviderKey } | Select-Object -First 1)
+    if ($runningProvider) {
+        $runningButton = & $getWinCtrl $runningProvider.Button
+        $runningLabel = & $getWinCtrl $runningProvider.Label
+        if ($runningButton) { $runningButton.IsEnabled = $false; $runningButton.Content = "Running" }
+        if ($runningLabel) { $runningLabel.Text = "$($monitor.Action) running..." }
+    }
+}
 # Re-apply toggle state for all providers now that install state is known.
 # (Done here, not inside $updateProviderStatuses, because $updateProviderToggleState
 # is defined below and .GetNewClosure() on $updateProviderStatuses would capture $null.)
@@ -57846,14 +58055,17 @@ $onError = {
     param($Operation, $ErrorRecord)
     $message = ""
     try { $message = $ErrorRecord.Exception.Message } catch { $message = [string]$ErrorRecord }
-    Write-GuiLog ("Legendary install monitor failed for " + $nameRef + ": " + $message + ". The Legendary process was left running.")
+    Write-GuiLog ("Legendary install monitor failed for " + $nameRef + ": " + $message + ". Switching to independent exit monitoring.")
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
 }.GetNewClosure()
+$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
 
 try {
     Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
 }
 catch {
-    Write-GuiLog "Legendary started, but WMT could not monitor its completion: $($_.Exception.Message)"
+    Write-GuiLog "Legendary shared monitor registration failed; using independent exit monitoring: $($_.Exception.Message)"
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
 }
 }
 
@@ -58314,16 +58526,17 @@ $onError = {
     param($Operation, $ErrorRecord)
     $message = ""
     try { $message = $ErrorRecord.Exception.Message } catch { $message = [string]$ErrorRecord }
-    Write-GuiLog ("GOGDL download monitor failed for " + $nameRef + ": " + $message + ". The GOGDL process was left running.")
-    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    Write-GuiLog ("GOGDL download monitor failed for " + $nameRef + ": " + $message + ". Switching to independent exit monitoring.")
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
 }.GetNewClosure()
+$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
 
 try {
     Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
 }
 catch {
-    Write-GuiLog "GOGDL started, but WMT could not monitor its completion: $($_.Exception.Message)"
-    try { $proc.Dispose() } catch {}
+    Write-GuiLog "GOGDL shared monitor registration failed; using independent exit monitoring: $($_.Exception.Message)"
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
 }
 }
 
