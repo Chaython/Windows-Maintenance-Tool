@@ -58102,17 +58102,18 @@ $onComplete = {
     $installFinalizeState.Attempted = $true
     $exitCode = 1
     $installedPath = ""
-    try {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
-            $resultJson = Get-Content -LiteralPath $resultRef -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            $exitCode = [int]$resultJson.ExitCode
-            $installedPath = ([string]$resultJson.InstallPath).Trim()
-        }
-        elseif ($procRef) {
-            $exitCode = [int]$procRef.ExitCode
-        }
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+        # A result file can be observed while its writer is still flushing.
+        # Preserve it and retry rather than reporting a spurious failure.
+        $resultJson = Get-Content -LiteralPath $resultRef -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (-not $resultJson.PSObject.Properties["ExitCode"]) { throw "Legendary result is incomplete; retrying finalization." }
+        $exitCode = [int]$resultJson.ExitCode
+        $installedPath = ([string]$resultJson.InstallPath).Trim()
     }
-    catch {}
+    elseif ($procRef) {
+        if (-not $procRef.HasExited) { throw "Legendary result not yet available; retrying finalization." }
+        $exitCode = [int]$procRef.ExitCode
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($installedPath) -and
         -not (Test-Path -LiteralPath $installedPath -PathType Container)) {
@@ -58236,15 +58237,13 @@ $onComplete = {
         Write-GuiLog "[Diagnostics] Legendary log saved: $logRef"
     }
 
-    try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction SilentlyContinue } catch {}
-    try {
-        if ($pendingInstallState.Value -and $pendingInstallState.Value.ContainsKey($idRef) -and
-            [object]::ReferenceEquals($pendingInstallState.Value[$idRef], $procRef)) {
-            [void]$pendingInstallState.Value.Remove($idRef)
-        }
+    if ($pendingInstallState.Value -and $pendingInstallState.Value.ContainsKey($idRef) -and
+        [object]::ReferenceEquals($pendingInstallState.Value[$idRef], $procRef)) {
+        [void]$pendingInstallState.Value.Remove($idRef)
     }
-    catch { throw }
     try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
+    # Deleting results is last: failed tracking can retry against the original outcome.
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
     # Preserve the Process until all required bookkeeping succeeded.
     try { if ($procRef) { $procRef.Dispose() } } catch {}
     $installFinalizeState.Completed = $true
@@ -58673,16 +58672,16 @@ $onComplete = {
     if ($installFinalizeState.Completed) { return }
     $installFinalizeState.Attempted = $true
     $exitCode = 1
-    try {
-        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
-            $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
-            [void][int]::TryParse($exitText, [ref]$exitCode)
-        }
-        elseif ($procRef) {
-            $exitCode = [int]$procRef.ExitCode
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+        $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
+        if (-not [int]::TryParse($exitText, [ref]$exitCode)) {
+            throw "GOGDL exit result is incomplete; retrying finalization."
         }
     }
-    catch {}
+    elseif ($procRef) {
+        if (-not $procRef.HasExited) { throw "GOGDL result not yet available; retrying finalization." }
+        $exitCode = [int]$procRef.ExitCode
+    }
 
     if ($exitCode -eq 0) {
         $resolvedInstallPath = Resolve-WmtGogdlInstallPath -Id $idRef -RootPath $rootRef -InstallPath $installRef
