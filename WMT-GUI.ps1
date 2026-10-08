@@ -3263,10 +3263,9 @@ $state = [PSCustomObject]@{
     OnComplete = $OnComplete
     OnTick = $OnTick
 }
-$timer.Tag = $state
 $timer.Add_Tick({
     param($sender, $eventArgs)
-    $monitor = $sender.Tag
+    $monitor = $state
     if (-not $monitor) { $sender.Stop(); return }
     try {
         if ($monitor.OnTick) { & $monitor.OnTick $null }
@@ -20163,9 +20162,10 @@ if ($Action -eq "DeepClean") {
         $pLabel.Text = "Cancelling registry scan..."
     }.GetNewClosure()
     $btnCancelScan.Add_Click({ & $requestRegistryCancel }.GetNewClosure())
+    $registryScanState = [PSCustomObject]@{ Invocation = $null }
     $pForm.Add_Closing({
         param($sender, $e)
-        if ($registryScanAsync -and -not $registryScanAsync.IsCompleted -and -not $registryCancelState.CleanupCompleted) {
+        if ($registryScanState.Invocation -and -not $registryScanState.Invocation.IsCompleted -and -not $registryCancelState.CleanupCompleted) {
             $e.Cancel = $true
             & $requestRegistryCancel
         }
@@ -24957,6 +24957,7 @@ if ($Action -eq "DeepClean") {
         })
 
     $registryScanAsync = $ps.BeginInvoke()
+    $registryScanState.Invocation = $registryScanAsync
 
     # --- UI TIMER (Main Thread) ---
     $timer = New-Object System.Windows.Threading.DispatcherTimer
@@ -39284,7 +39285,7 @@ exit `$exitCode
                 $terminationFailed = $true
             }
             else {
-                foreach ($processEntry in @($timeoutTreeSignature -split '\\|')) {
+                foreach ($processEntry in @($timeoutTreeSignature -split '\|')) {
                     $treeProcessId = 0
                     if (-not [int]::TryParse(([string]$processEntry -split ':', 2)[0], [ref]$treeProcessId)) { $terminationFailed = $true; continue }
                     try {
@@ -44555,11 +44556,10 @@ $startProviderAction = {
         Monitors       = $providerActionMonitors
         UpdateStatuses = $updateProviderStatuses
     }
-    $timer.Tag = $monitorState
     $timer.Add_Tick({
             param($s)
 
-            $state = $s.Tag
+            $state = $monitorState
             if (-not $state) {
                 try { $s.Stop() } catch {}
                 return
@@ -44597,7 +44597,7 @@ $startProviderAction = {
                 try { Write-GuiLog "[$($state.ProviderName)] Provider completion monitor failed: $($_.Exception.Message)" } catch {}
                 if ($state.UpdateStatuses) { try { & $state.UpdateStatuses } catch {} }
             }
-        })
+        }.GetNewClosure())
     $providerActionMonitors[$monitorKey] = $monitorState
     $timer.Start()
 }.GetNewClosure()
@@ -44923,6 +44923,7 @@ if ($chkUpdateAutoInstall) {
 & $updateProviderStatuses
 # Reopened settings must show already-running operations and prevent duplicates.
 foreach ($monitor in @($providerActionMonitors.Values)) {
+    $monitor.UpdateStatuses = $updateProviderStatuses
     $runningProvider = @($providerDefinitions | Where-Object { $_.Key -eq $monitor.ProviderKey } | Select-Object -First 1)
     if ($runningProvider) {
         $runningButton = & $getWinCtrl $runningProvider.Button
@@ -58051,6 +58052,7 @@ $onComplete = {
     try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
 }.GetNewClosure()
 
+$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
 $onError = {
     param($Operation, $ErrorRecord)
     $message = ""
@@ -58058,7 +58060,6 @@ $onError = {
     Write-GuiLog ("Legendary install monitor failed for " + $nameRef + ": " + $message + ". Switching to independent exit monitoring.")
     Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
 }.GetNewClosure()
-$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
 
 try {
     Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
@@ -58522,6 +58523,7 @@ $onComplete = {
     try { Start-WmtLibraryScan -Silent } catch {}
 }.GetNewClosure()
 
+$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
 $onError = {
     param($Operation, $ErrorRecord)
     $message = ""
@@ -58529,7 +58531,6 @@ $onError = {
     Write-GuiLog ("GOGDL download monitor failed for " + $nameRef + ": " + $message + ". Switching to independent exit monitoring.")
     Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
 }.GetNewClosure()
-$fallbackTestComplete = { param($Operation) $procRef -and $procRef.HasExited }.GetNewClosure()
 
 try {
     Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
