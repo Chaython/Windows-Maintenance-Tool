@@ -58196,17 +58196,20 @@ $onComplete = {
     }
     $exitCode = 1
     $installedPath = ""
+    # Completion monitor already verified exit. A truncated result file cannot
+    # become complete after its writer has exited; use the process exit code.
+    if (-not $procRef -or -not $procRef.HasExited) { throw "Legendary process exit not verified." }
+    $exitCode = [int]$procRef.ExitCode
     if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
-        # A result file can be observed while its writer is still flushing.
-        # Preserve it and retry rather than reporting a spurious failure.
-        $resultJson = Get-Content -LiteralPath $resultRef -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if (-not $resultJson.PSObject.Properties["ExitCode"]) { throw "Legendary result is incomplete; retrying finalization." }
-        $exitCode = [int]$resultJson.ExitCode
-        $installedPath = ([string]$resultJson.InstallPath).Trim()
-    }
-    elseif ($procRef) {
-        if (-not $procRef.HasExited) { throw "Legendary result not yet available; retrying finalization." }
-        $exitCode = [int]$procRef.ExitCode
+        try {
+            $resultJson = Get-Content -LiteralPath $resultRef -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if (-not $resultJson.PSObject.Properties["ExitCode"]) { throw "Missing ExitCode field." }
+            $exitCode = [int]$resultJson.ExitCode
+            $installedPath = ([string]$resultJson.InstallPath).Trim()
+        }
+        catch {
+            Write-GuiLog "Legendary result file is invalid after process exit; using process exit code $exitCode. $($_.Exception.Message)"
+        }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($installedPath) -and
@@ -58772,15 +58775,20 @@ $onComplete = {
         return
     }
     $exitCode = 1
+    if (-not $procRef -or -not $procRef.HasExited) { throw "GOGDL process exit not verified." }
+    $exitCode = [int]$procRef.ExitCode
     if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
-        $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
-        if (-not [int]::TryParse($exitText, [ref]$exitCode)) {
-            throw "GOGDL exit result is incomplete; retrying finalization."
+        try {
+            $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
+            $parsedExitCode = 0
+            if (-not [int]::TryParse($exitText, [ref]$parsedExitCode)) {
+                throw "Invalid exit-code text."
+            }
+            $exitCode = $parsedExitCode
         }
-    }
-    elseif ($procRef) {
-        if (-not $procRef.HasExited) { throw "GOGDL result not yet available; retrying finalization." }
-        $exitCode = [int]$procRef.ExitCode
+        catch {
+            Write-GuiLog "GOGDL result file is invalid after process exit; using process exit code $exitCode. $($_.Exception.Message)"
+        }
     }
 
     if ($exitCode -eq 0) {
