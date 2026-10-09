@@ -201,6 +201,9 @@ jobs:
               }
               Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
           }
+          # Exit explicitly after verifying the deliberately failing child process.
+          # Otherwise GitHub Actions inherits native LASTEXITCODE=7.
+          exit 0
 
       - name: Test shared WPF controls
         shell: powershell -NoProfile -STA -ExecutionPolicy Bypass -File {0}
