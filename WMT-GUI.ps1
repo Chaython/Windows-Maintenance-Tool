@@ -41161,7 +41161,10 @@ exit /b %WMT_EXIT%
             # -EncodedCommand avoids quoting damage when the custom command contains
             # quotes, pipes, ampersands, subexpressions, URLs, etc.
             $encodedCustomCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($expandedCustomCommand))
-            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCustomCommand"
+            # Merge native stdout/stderr in cmd.exe before PowerShell reads the
+            # custom override's output. PowerShell 5.1 can otherwise lose
+            # child-cmd stderr when nesting multiple PowerShell hosts.
+            $cmd = "cmd.exe /d /c `"powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCustomCommand 2>&1`""
             $userCmd = $cmd
             $displayCmd = $expandedCustomCommand
             $isCustomUpdateCommand = $true
