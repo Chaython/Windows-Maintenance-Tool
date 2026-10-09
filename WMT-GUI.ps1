@@ -38586,7 +38586,7 @@ catch {}
 `$global:LASTEXITCODE = `$null
 `$commandSucceeded = `$true
 try {
-    Invoke-Expression `$commandText 2>&1 |
+    Invoke-Expression `$commandText *>&1 |
         Tee-Object -FilePath `$transcriptPath -Append |
         ForEach-Object { Write-Host `$_ }
     `$commandSucceeded = `$?
@@ -41671,7 +41671,12 @@ exit /b %WMT_EXIT%
                 Write-Output "LOG:[$act] Launching visible $windowTag window for: $name"
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
-                    $visibleTranscriptPath = if ($srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
+                    # Native WinGet/Legendary logging is handled separately, but a saved
+                    # custom override is a PowerShell command, not a native WinGet run.
+                    # Always pipe the visible custom command (and inherited child
+                    # stdout/stderr) through ConvertTo-WmtTranscriptCommand so its
+                    # console output reaches the package-install-logs transcript.
+                    $visibleTranscriptPath = if (-not $isCustomUpdateCommand -and $srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
                     $p = Invoke-VisibleCmd $cmd "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
                     # Normalize a missing/failed visible process result. The final
