@@ -38712,7 +38712,16 @@ try {
                 # statements and installer return codes behave as before.
                 # Decode its PowerShell stream records to text rather than
                 # pasting XML serialization or noisy download-progress records.
-                $xmlText = [regex]::Replace($stderrText, '^\s*#< CLIXML[^\r\n]*(?:\r?\n)', '')
+                # PowerShell/native child processes may write plain stderr
+                # before or after the CLIXML envelope. Isolate the document
+                # rather than parsing unrelated error text as XML.
+                $xmlStart = $stderrText.IndexOf('<Objs', [System.StringComparison]::Ordinal)
+                $xmlEnd = $stderrText.LastIndexOf('</Objs>', [System.StringComparison]::Ordinal)
+                if ($xmlStart -lt 0 -or $xmlEnd -lt $xmlStart) { throw 'PowerShell stream envelope is incomplete.' }
+                $xmlEnd += '</Objs>'.Length
+                $xmlText = $stderrText.Substring($xmlStart, $xmlEnd - $xmlStart)
+                $otherStderr = $stderrText.Substring(0, $xmlStart) + [Environment]::NewLine + $stderrText.Substring($xmlEnd)
+                $otherStderr = [regex]::Replace($otherStderr, '(?m)^[ \t]*#< CLIXML[ \t]*\r?\n?', '')
                 $xmlSettings = [System.Xml.XmlReaderSettings]::new()
                 $xmlSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
                 $xmlSettings.XmlResolver = $null
@@ -38723,6 +38732,15 @@ try {
                 if ($document.DocumentElement.LocalName -ne 'Objs') { throw 'Unexpected PowerShell stream format.' }
                 $stdoutText = $stdoutTail.ToString()
                 foreach ($record in $document.DocumentElement.ChildNodes) {
+                    if ($record.NodeType -eq [System.Xml.XmlNodeType]::Text -or
+                        $record.NodeType -eq [System.Xml.XmlNodeType]::CDATA) {
+                        $nativeText = ([string]$record.InnerText).Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($nativeText)) {
+                            try { [System.IO.File]::AppendAllText($transcriptPath, ($nativeText + [Environment]::NewLine), $utf8) } catch {}
+                            [Console]::Error.WriteLine($nativeText)
+                        }
+                        continue
+                    }
                     if ($record.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
                     $stream = if ($record.Attributes['S']) { [string]$record.Attributes['S'].Value } else { '' }
                     # Repeated CLIXML download progress is not useful in an
@@ -38753,6 +38771,11 @@ try {
                     try { [System.IO.File]::AppendAllText($transcriptPath, ($humanLine + [Environment]::NewLine), $utf8) } catch {}
                     if ($stream -in @('error', 'warning')) { [Console]::Error.WriteLine($humanLine) }
                     else { [Console]::Out.WriteLine($humanLine) }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($otherStderr)) {
+                    $otherStderr = $otherStderr.Trim()
+                    try { [System.IO.File]::AppendAllText($transcriptPath, ($otherStderr + [Environment]::NewLine), $utf8) } catch {}
+                    [Console]::Error.WriteLine($otherStderr)
                 }
             }
             catch {
