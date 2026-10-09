@@ -38640,6 +38640,8 @@ $transcriptPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64St
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 $exitCode = 1
 $proc = $null
+$stderrCapture = [System.Text.StringBuilder]::new()
+$stdoutTail = [System.Text.StringBuilder]::new()
 try {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = 'powershell.exe'
@@ -38670,6 +38672,11 @@ try {
             } else {
                 $chunk = -join $outBuffer[0..($count - 1)]
                 try { [System.IO.File]::AppendAllText($transcriptPath, $chunk, $utf8) } catch {}
+                [void]$stdoutTail.Append($chunk)
+                # Retain only recent stdout for deduping CLIXML Write-Host messages.
+                if ($stdoutTail.Length -gt 262144) {
+                    [void]$stdoutTail.Remove(0, $stdoutTail.Length - 262144)
+                }
                 [Console]::Out.Write($chunk)
                 $outBuffer = New-Object char[] 4096
                 $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
@@ -38682,8 +38689,10 @@ try {
                 $errTask = $null
             } else {
                 $chunk = -join $errBuffer[0..($count - 1)]
-                try { [System.IO.File]::AppendAllText($transcriptPath, $chunk, $utf8) } catch {}
-                [Console]::Error.Write($chunk)
+                # Windows PowerShell 5.1 serializes redirected host/progress
+                # records as CLIXML on stderr. Buffer stderr separately so
+                # markup never mixes with readable stdout in the package log.
+                [void]$stderrCapture.Append($chunk)
                 $errBuffer = New-Object char[] 4096
                 $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
             }
@@ -38694,6 +38703,75 @@ try {
     }
     $proc.WaitForExit()
     $exitCode = [int]$proc.ExitCode
+
+    if ($stderrCapture.Length -gt 0) {
+        $stderrText = $stderrCapture.ToString()
+        if ($stderrText -match '^\s*#< CLIXML(?:\r?\n)') {
+            try {
+                # Keep external commands in their own process so custom 'exit'
+                # statements and installer return codes behave as before.
+                # Decode its PowerShell stream records to text rather than
+                # pasting XML serialization or noisy download-progress records.
+                $xmlText = [regex]::Replace($stderrText, '^\s*#< CLIXML[^\r\n]*(?:\r?\n)', '')
+                $xmlSettings = [System.Xml.XmlReaderSettings]::new()
+                $xmlSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+                $xmlSettings.XmlResolver = $null
+                $document = [System.Xml.XmlDocument]::new()
+                $document.XmlResolver = $null
+                $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xmlText), $xmlSettings)
+                try { $document.Load($reader) } finally { $reader.Dispose() }
+                if ($document.DocumentElement.LocalName -ne 'Objs') { throw 'Unexpected PowerShell stream format.' }
+                $stdoutText = $stdoutTail.ToString()
+                foreach ($record in $document.DocumentElement.ChildNodes) {
+                    if ($record.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                    $stream = if ($record.Attributes['S']) { [string]$record.Attributes['S'].Value } else { '' }
+                    # Repeated CLIXML download progress is not useful in an
+                    # installation report; keep warnings and errors instead.
+                    if ($stream -eq 'progress') { continue }
+                    $message = ''
+                    if ($record.LocalName -eq 'Obj') {
+                        $textNode = $record.SelectSingleNode("./*[local-name()='ToString']")
+                        if (-not $textNode) {
+                            $textNode = $record.SelectSingleNode(".//*[local-name()='S' and @N='Message']")
+                        }
+                        if ($textNode) { $message = $textNode.InnerText }
+                    }
+                    else { $message = $record.InnerText }
+                    $message = [System.Xml.XmlConvert]::DecodeName([string]$message).Trim()
+                    if ([string]::IsNullOrWhiteSpace($message)) { continue }
+                    # Write-Host is often present in both stdout and the
+                    # information stream. Avoid writing the same text twice.
+                    if ($stream -eq 'information' -and $stdoutText.Contains($message)) { continue }
+                    $prefix = switch ($stream) {
+                        'error'   { 'ERROR: ' }
+                        'warning' { 'WARNING: ' }
+                        'verbose' { 'VERBOSE: ' }
+                        'debug'   { 'DEBUG: ' }
+                        default   { '' }
+                    }
+                    $humanLine = $prefix + $message
+                    try { [System.IO.File]::AppendAllText($transcriptPath, ($humanLine + [Environment]::NewLine), $utf8) } catch {}
+                    if ($stream -in @('error', 'warning')) { [Console]::Error.WriteLine($humanLine) }
+                    else { [Console]::Out.WriteLine($humanLine) }
+                }
+            }
+            catch {
+                # Preserve full diagnostics if malformed CLIXML cannot be read,
+                # but do not contaminate the primary human-readable log.
+                $rawXmlPath = $transcriptPath + '.clixml'
+                try { [System.IO.File]::WriteAllText($rawXmlPath, $stderrText, $utf8) } catch {}
+                $errorLine = "PowerShell stream decode failed: $($_.Exception.Message). Raw output: $rawXmlPath"
+                try { [System.IO.File]::AppendAllText($transcriptPath, ($errorLine + [Environment]::NewLine), $utf8) } catch {}
+                [Console]::Error.WriteLine($errorLine)
+            }
+        }
+        else {
+            # Ordinary native stderr is already plain text and should remain
+            # verbatim, including any useful compiler or installer diagnostics.
+            try { [System.IO.File]::AppendAllText($transcriptPath, $stderrText, $utf8) } catch {}
+            [Console]::Error.Write($stderrText)
+        }
+    }
 } catch {
     $message = "Custom update output capture failed: $($_.Exception.Message)"
     try { [System.IO.File]::AppendAllText($transcriptPath, ($message + [Environment]::NewLine), $utf8) } catch {}
