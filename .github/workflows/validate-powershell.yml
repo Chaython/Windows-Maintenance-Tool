@@ -159,13 +159,15 @@ jobs:
               $encodedCustomCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
               $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCustomCommand"
               $providerTranscriptPath = $logPath
+              $generatedRunnerFiles = New-Object 'System.Collections.Generic.List[string]'
               foreach ($provider in @('winget', 'legendary')) {
                   $srcKey = $provider
                   $isCustomUpdateCommand = $true
                   Invoke-Expression $routeBlock
-                  if ($visibleCommand -eq $cmd -or $visibleTranscriptPath -ne '') {
+                  if ($visibleCommand -eq $cmd -or $visibleTranscriptPath -ne '' -or -not (Test-Path -LiteralPath $customCaptureRunnerPath)) {
                       throw "Custom override for $provider did not select native child capture."
                   }
+                  $generatedRunnerFiles.Add($customCaptureRunnerPath)
                   $isCustomUpdateCommand = $false
                   Invoke-Expression $routeBlock
                   if ($visibleCommand -ne $cmd -or $visibleTranscriptPath -ne '') {
@@ -182,6 +184,7 @@ jobs:
               $srcKey = 'winget'
               $isCustomUpdateCommand = $true
               Invoke-Expression $routeBlock
+              $generatedRunnerFiles.Add($customCaptureRunnerPath)
               & cmd.exe /d /c $visibleCommand
               if ($LASTEXITCODE -ne 7) { throw "Custom exit code lost: $LASTEXITCODE" }
               $logged = [IO.File]::ReadAllText($logPath)
@@ -193,6 +196,9 @@ jobs:
               Write-Host 'PASS: Custom overrides captured child stdout/stderr and propagated exit status.'
           }
           finally {
+              foreach ($path in @($generatedRunnerFiles)) {
+                  Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+              }
               Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
           }
 
