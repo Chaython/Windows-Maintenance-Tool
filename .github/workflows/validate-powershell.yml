@@ -165,7 +165,7 @@ jobs:
           exit 7
           '@
               $encodedChild = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-              $customCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
+              $customCommand = 'cmd.exe /d /c "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + $encodedChild + ' 2>&1"'
               $loggedCommand = ConvertTo-WmtTranscriptCommand -Command $customCommand -TranscriptPath $logPath
               & cmd.exe /d /c $loggedCommand
               if ($LASTEXITCODE -ne 7) { throw "Custom exit code lost: $LASTEXITCODE" }
