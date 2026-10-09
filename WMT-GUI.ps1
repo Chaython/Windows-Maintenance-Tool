@@ -43789,7 +43789,7 @@ foreach ($p in $providerDefinitions) {
                 <CheckBox Name="chkUpdateAutoInstall" Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Content="Automatically install available updates after scans" Margin="0,8,0,0"
                           ToolTip="After each completed scan, automatically update listed packages without confirmation. Packages known to risk an automatic restart are skipped."/>
                 <TextBlock Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,8,0,0"
-                           Text="Auto scan runs while WMT is open or hidden in the tray. Auto install runs after completed manual, startup, and scheduled scans; restart-risk packages are skipped. Per-provider Headless / Auto-update options above override these global settings."
+                           Text="When update scans and background jobs are enabled, WMT scans once on launch even if the auto-scan interval is disabled. Scheduled scans run while open or hidden in the tray. Auto install may run after completed scans; restart-risk packages are skipped. Per-provider Headless / Auto-update options above override these global settings."
                            Foreground="{DynamicResource TextSecondary}" FontStyle="Italic" TextWrapping="Wrap"/>
             </Grid>
         </Border>
@@ -46094,10 +46094,13 @@ $script:WmtCleanerAutoCleanTimerTickHandler = $null
 }
 
 function Invoke-WmtUpdateAutoScan {
-param([switch]$Force)
+param([switch]$Force, [switch]$Startup)
 
+# A startup scan is independent of the recurring auto-scan interval and
+# respects the user's disabled-scans and disabled-background-jobs settings.
 $minutes = Get-WmtUpdateAutoScanMinutes
-if ($minutes -le 0 -and -not $Force) { return }
+if ($minutes -le 0 -and -not ($Force -or $Startup)) { return }
+if ($Startup -and (Get-WmtDisableBackgroundJobs)) { return }
 
 if (Get-WmtUpdateScansDisabled -and -not $Force) { return }
 
@@ -46114,7 +46117,7 @@ if (Test-WmtUpdateAutoScanBusy) {
 if (-not $btnWingetScan) { return }
 $script:WmtUpdateAutoScanLastRun = Get-Date
 $script:WmtUpdateAutoScanPending = $true
-Write-GuiLog "Auto scan starting in background..."
+Write-GuiLog $(if ($Startup) { "Startup update scan starting in background..." } else { "Auto scan starting in background..." })
 try {
     $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
 }
@@ -55562,7 +55565,7 @@ function Update-WmtUpdateScansButton {
         -IsOn (-not $disabled) `
         -OnLabel "Update Scans: On" `
         -OffLabel "Update Scans: Off" `
-        -Description "Automatic and tray-triggered update scans run on schedule when enabled. Manual scans always remain available, even when disabled."
+        -Description "Automatic scans run once on launch and subsequently on the configured schedule when update scans and background jobs are enabled. Manual scans are available from Updates."
     # Keep the scan button and related update-action buttons in sync with the toggle state.
     $scanBtn = Get-Ctrl "btnWingetScan"
     if ($scanBtn) { $scanBtn.IsEnabled = (-not $disabled) }
@@ -61138,7 +61141,7 @@ $script:preloadDeferTimer.Start()
     [Action] { Start-UpdateCheckBackground }
 )
 
-# 3b. Enable periodic update auto scan if configured in Provider settings.
+# 3b. Start a one-time startup scan, plus periodic scans if configured.
 # Deferred to Background priority � toast registration is not needed immediately.
 [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
     [System.Windows.Threading.DispatcherPriority]::Background,
@@ -61149,6 +61152,12 @@ $script:preloadDeferTimer.Start()
         if (-not (Get-WmtDisableBackgroundJobs -Settings $settings)) {
             if (-not (Get-WmtUpdateScansDisabled -Settings $settings)) {
                 Start-WmtUpdateAutoScanTimer -ResetNextRun
+                # One scan on launch, even when the recurring interval is disabled.
+                # Keep the startup trigger out of Updates tab navigation.
+                if (-not $script:WmtStartupUpdateScanTriggered) {
+                    $script:WmtStartupUpdateScanTriggered = $true
+                    Invoke-WmtUpdateAutoScan -Startup
+                }
             }
             Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun
             Start-WmtCleanerAutoCleanTimer
