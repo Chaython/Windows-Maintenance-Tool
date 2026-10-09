@@ -115,6 +115,70 @@ jobs:
           }
           Write-Host 'PASS: Process output capture and bounded termination.'
 
+      - name: Smoke test custom command transcript and provider routing
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourcePath = (Resolve-Path '.\\WMT-GUI.ps1').Path
+          $source = [IO.File]::ReadAllText($sourcePath)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
+
+          # Exercise the actual routing expression without starting the WPF application.
+          $routeLines = @($source -split '\r?\n' | Where-Object { $_ -match '^\s*\$visibleTranscriptPath\s*=\s*if\s' })
+          if ($routeLines.Count -ne 1) { throw 'Visible transcript routing assignment not found uniquely.' }
+          $providerTranscriptPath = 'custom-test.log'
+          foreach ($provider in @('winget', 'legendary')) {
+              $srcKey = $provider
+              $isCustomUpdateCommand = $true
+              Invoke-Expression $routeLines[0]
+              if ($visibleTranscriptPath -ne $providerTranscriptPath) {
+                  throw "Custom override for $provider does not get a transcript."
+              }
+              $isCustomUpdateCommand = $false
+              Invoke-Expression $routeLines[0]
+              if ($visibleTranscriptPath -ne '') {
+                  throw "Native $provider logging was changed and may duplicate output."
+              }
+          }
+          $srcKey = 'npm'
+          Invoke-Expression $routeLines[0]
+          if ($visibleTranscriptPath -ne $providerTranscriptPath) { throw 'Normal provider capture regressed.' }
+
+          # A nested PowerShell override starts cmd.exe, writes to stdout and stderr,
+          # and returns a failure exit code. The visible transcript wrapper must
+          # preserve all three instead of only recording WMT's launch/result lines.
+          $transcriptFunction = $ast.Find({
+              param($node)
+              $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+              $node.Name -eq 'ConvertTo-WmtTranscriptCommand'
+          }, $true)
+          if (-not $transcriptFunction) { throw 'Transcript command helper not found.' }
+          Invoke-Expression $transcriptFunction.Extent.Text
+          $logPath = [IO.Path]::GetTempFileName()
+          try {
+              $childScript = @'
+          Write-Host 'WMT_CUSTOM_HOST_TEST'
+          cmd.exe /d /c 'echo WMT_CUSTOM_CMD_OUT & echo WMT_CUSTOM_CMD_ERR 1>&2'
+          exit 7
+          '@
+              $encodedChild = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+              $customCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
+              $loggedCommand = ConvertTo-WmtTranscriptCommand -Command $customCommand -TranscriptPath $logPath
+              & cmd.exe /d /c $loggedCommand | Out-Null
+              if ($LASTEXITCODE -ne 7) { throw "Custom exit code lost: $LASTEXITCODE" }
+              $logged = [IO.File]::ReadAllText($logPath)
+              foreach ($marker in @('WMT_CUSTOM_HOST_TEST', 'WMT_CUSTOM_CMD_OUT', 'WMT_CUSTOM_CMD_ERR', 'EXIT: 7')) {
+                  if (-not $logged.Contains($marker)) { throw "Missing child console output in transcript: $marker" }
+              }
+              Write-Host 'PASS: Custom command and child CMD output captured with exit status.'
+          }
+          finally {
+              Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Test shared WPF controls
         shell: powershell -NoProfile -STA -ExecutionPolicy Bypass -File {0}
         run: |
