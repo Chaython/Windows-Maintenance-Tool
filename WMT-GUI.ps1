@@ -38583,18 +38583,26 @@ try {
     )
 }
 catch {}
+# Windows PowerShell 5.1 Tee-Object -Append writes UTF-16 even when the
+# transcript header is UTF-8. Write each captured line using the same UTF-8
+# encoding as the parent WMT worker to keep the log readable/searchable.
+`$transcriptUtf8 = [System.Text.UTF8Encoding]::new(`$false)
 `$global:LASTEXITCODE = `$null
 `$commandSucceeded = `$true
 try {
     Invoke-Expression `$commandText *>&1 |
-        Tee-Object -FilePath `$transcriptPath -Append |
-        ForEach-Object { Write-Host `$_ }
+        ForEach-Object {
+            `$line = [string]`$_
+            try { [System.IO.File]::AppendAllText(`$transcriptPath, (`$line + [Environment]::NewLine), `$transcriptUtf8) } catch {}
+            Write-Host `$line
+        }
     `$commandSucceeded = `$?
 }
 catch {
     `$commandSucceeded = `$false
     `$errorText = `$_.Exception.Message
-    try { `$errorText | Tee-Object -FilePath `$transcriptPath -Append | ForEach-Object { Write-Host `$_ } } catch { Write-Host `$errorText }
+    try { [System.IO.File]::AppendAllText(`$transcriptPath, (`$errorText + [Environment]::NewLine), `$transcriptUtf8) } catch {}
+    Write-Host `$errorText
 }
 `$exitCode = if (`$null -ne `$global:LASTEXITCODE) { [int]`$global:LASTEXITCODE } elseif (`$commandSucceeded) { 0 } else { 1 }
 try {
