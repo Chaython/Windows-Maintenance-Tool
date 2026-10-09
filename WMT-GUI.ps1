@@ -38731,6 +38731,7 @@ try {
                 try { $document.Load($reader) } finally { $reader.Dispose() }
                 if ($document.DocumentElement.LocalName -ne 'Objs') { throw 'Unexpected PowerShell stream format.' }
                 $stdoutText = $stdoutTail.ToString()
+                $errorLines = [System.Collections.Generic.List[string]]::new()
                 foreach ($record in $document.DocumentElement.ChildNodes) {
                     if ($record.NodeType -eq [System.Xml.XmlNodeType]::Text -or
                         $record.NodeType -eq [System.Xml.XmlNodeType]::CDATA) {
@@ -38772,6 +38773,13 @@ try {
                         $message = $matches[1].Trim()
                     }
                     if ([string]::IsNullOrWhiteSpace($message)) { continue }
+                    if ($stream -eq 'error') {
+                        # Windows PowerShell may serialize each line of an
+                        # ErrorRecord separately, including the entire command
+                        # source. Reassemble before choosing the real message.
+                        [void]$errorLines.Add($message)
+                        continue
+                    }
                     # Write-Host is often present in both stdout and the
                     # information stream. Avoid writing the same text twice.
                     if ($stream -eq 'information' -and $stdoutText.Contains($message)) { continue }
@@ -38786,6 +38794,24 @@ try {
                     try { [System.IO.File]::AppendAllText($transcriptPath, ($humanLine + [Environment]::NewLine), $utf8) } catch {}
                     if ($stream -in @('error', 'warning')) { [Console]::Error.WriteLine($humanLine) }
                     else { [Console]::Out.WriteLine($humanLine) }
+                }
+                if ($errorLines.Count -gt 0) {
+                    $allErrors = [string]::Join([Environment]::NewLine, $errorLines)
+                    $briefErrors = [regex]::Matches($allErrors, '(?m)\s:\s([^\r\n]+)\r?\n\s*\+\s*CategoryInfo')
+                    $messagesToShow = [System.Collections.Generic.List[string]]::new()
+                    if ($briefErrors.Count -gt 0) {
+                        foreach ($match in $briefErrors) {
+                            [void]$messagesToShow.Add($match.Groups[1].Value.Trim())
+                        }
+                    }
+                    else {
+                        foreach ($errorLine in $errorLines) { [void]$messagesToShow.Add($errorLine) }
+                    }
+                    foreach ($errorMessage in $messagesToShow) {
+                        $humanError = 'ERROR: ' + $errorMessage
+                        try { [System.IO.File]::AppendAllText($transcriptPath, ($humanError + [Environment]::NewLine), $utf8) } catch {}
+                        [Console]::Error.WriteLine($humanError)
+                    }
                 }
                 if (-not [string]::IsNullOrWhiteSpace($otherStderr)) {
                     $otherStderr = $otherStderr.Trim()
