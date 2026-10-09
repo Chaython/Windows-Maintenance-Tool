@@ -167,11 +167,11 @@ jobs:
               $encodedChild = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
               $customCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
               $loggedCommand = ConvertTo-WmtTranscriptCommand -Command $customCommand -TranscriptPath $logPath
-              & cmd.exe /d /c $loggedCommand | Out-Null
+              & cmd.exe /d /c $loggedCommand
               if ($LASTEXITCODE -ne 7) { throw "Custom exit code lost: $LASTEXITCODE" }
               $logged = [IO.File]::ReadAllText($logPath)
               foreach ($marker in @('WMT_CUSTOM_HOST_TEST', 'WMT_CUSTOM_CMD_OUT', 'WMT_CUSTOM_CMD_ERR', 'EXIT: 7')) {
-                  if (-not $logged.Contains($marker)) { throw "Missing child console output in transcript: $marker" }
+                  if (-not $logged.Contains($marker)) { throw "Missing child console output in transcript: $marker. Transcript: $($logged.Substring(0, [Math]::Min(1500, $logged.Length)))" }
               }
               Write-Host 'PASS: Custom command and child CMD output captured with exit status.'
           }
