@@ -152,7 +152,10 @@ jobs:
           $logPath = [IO.Path]::GetTempFileName()
           try {
               $childScript = @'
+          Write-Progress -Activity 'Reading web response' -Status 'Reading response stream...' -PercentComplete 10
           Write-Host 'WMT_CUSTOM_HOST_TEST'
+          Write-Warning 'WMT_CUSTOM_WARNING'
+          Write-Error 'WMT_CUSTOM_ERROR'
           cmd.exe /d /c 'echo WMT_CUSTOM_CMD_OUT & echo WMT_CUSTOM_CMD_ERR 1>&2'
           exit 7
           '@
@@ -188,12 +191,18 @@ jobs:
               & cmd.exe /d /c $visibleCommand
               if ($LASTEXITCODE -ne 7) { throw "Custom exit code lost: $LASTEXITCODE" }
               $logged = [IO.File]::ReadAllText($logPath)
-              foreach ($marker in @('WMT_CUSTOM_HOST_TEST', 'WMT_CUSTOM_CMD_OUT', 'WMT_CUSTOM_CMD_ERR', 'EXIT: 7')) {
+              foreach ($marker in @('WMT_CUSTOM_HOST_TEST', 'WMT_CUSTOM_WARNING', 'WMT_CUSTOM_ERROR', 'WMT_CUSTOM_CMD_OUT', 'WMT_CUSTOM_CMD_ERR', 'EXIT: 7')) {
                   if (-not $logged.Contains($marker)) {
                       throw "Missing native child output: $marker. Transcript: $($logged.Substring(0, [Math]::Min(1600, $logged.Length)))"
                   }
               }
-              Write-Host 'PASS: Custom overrides captured child stdout/stderr and propagated exit status.'
+              if ($logged -match '#< CLIXML|<Objs Version|Reading web response|Raw output:') {
+                  throw 'Package log contains raw PowerShell CLIXML or noisy progress instead of readable output.'
+              }
+              if (([regex]::Matches($logged, 'WMT_CUSTOM_HOST_TEST')).Count -ne 1) {
+                  throw 'Write-Host message was duplicated in the package log.'
+              }
+              Write-Host 'PASS: Custom overrides produced human-readable stdout/stderr, warnings, errors and exit status.'
           }
           finally {
               foreach ($path in @($generatedRunnerFiles)) {
