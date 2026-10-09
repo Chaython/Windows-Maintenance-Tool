@@ -38765,6 +38765,12 @@ try {
                     }
                     else { $message = $record.InnerText }
                     $message = [System.Xml.XmlConvert]::DecodeName([string]$message).Trim()
+                    if ($stream -eq 'error' -and $message -match '(?m)\s:\s([^\r\n]+)\r?\n\s*\+\s*CategoryInfo') {
+                        # Serialized ErrorRecord.ToString can prepend every
+                        # line of the invoked multiline PowerShell script.
+                        # Keep only the actual exception text before metadata.
+                        $message = $matches[1].Trim()
+                    }
                     if ([string]::IsNullOrWhiteSpace($message)) { continue }
                     # Write-Host is often present in both stdout and the
                     # information stream. Avoid writing the same text twice.
