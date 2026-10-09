@@ -38619,6 +38619,95 @@ exit `$exitCode
         return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLoggedCommand"
     }
 
+    # A visible custom PowerShell override runs inside the WMT cmd window, but
+    # its stdout/stderr must be captured from the actual child process. Piping
+    # nested powershell.exe through Tee-Object is unreliable in Windows PS 5.1
+    # (and Tee-Object -Append writes UTF-16 into our UTF-8 transcripts).
+    function ConvertTo-WmtCapturedCustomPowerShellCommand {
+        param(
+            [string]$EncodedCommand,
+            [string]$TranscriptPath
+        )
+
+        if ([string]::IsNullOrWhiteSpace($EncodedCommand) -or [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+            return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $EncodedCommand"
+        }
+
+        $pathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($TranscriptPath))
+        $runner = @'
+$ErrorActionPreference = 'Continue'
+$transcriptPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__WMT_LOG_PATH__'))
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$exitCode = 1
+$proc = $null
+try {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand __WMT_USER_COMMAND__'
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    try {
+        $psi.StandardOutputEncoding = [Console]::OutputEncoding
+        $psi.StandardErrorEncoding = [Console]::OutputEncoding
+    } catch {}
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outBuffer = New-Object char[] 4096
+    $errBuffer = New-Object char[] 4096
+    $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
+
+    # Drain both native pipes while the child is running. Reading both at once
+    # prevents a full stderr pipe from deadlocking an otherwise quiet installer.
+    while (-not $proc.HasExited -or $outTask -or $errTask) {
+        if ($outTask -and $outTask.IsCompleted) {
+            $count = 0
+            try { $count = [int]$outTask.GetAwaiter().GetResult() } catch {}
+            if ($count -le 0) {
+                $outTask = $null
+            } else {
+                $chunk = -join $outBuffer[0..($count - 1)]
+                try { [System.IO.File]::AppendAllText($transcriptPath, $chunk, $utf8) } catch {}
+                [Console]::Out.Write($chunk)
+                $outBuffer = New-Object char[] 4096
+                $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
+            }
+        }
+        if ($errTask -and $errTask.IsCompleted) {
+            $count = 0
+            try { $count = [int]$errTask.GetAwaiter().GetResult() } catch {}
+            if ($count -le 0) {
+                $errTask = $null
+            } else {
+                $chunk = -join $errBuffer[0..($count - 1)]
+                try { [System.IO.File]::AppendAllText($transcriptPath, $chunk, $utf8) } catch {}
+                [Console]::Error.Write($chunk)
+                $errBuffer = New-Object char[] 4096
+                $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
+            }
+        }
+        if (-not (($outTask -and $outTask.IsCompleted) -or ($errTask -and $errTask.IsCompleted))) {
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    $proc.WaitForExit()
+    $exitCode = [int]$proc.ExitCode
+} catch {
+    $message = "Custom update output capture failed: $($_.Exception.Message)"
+    try { [System.IO.File]::AppendAllText($transcriptPath, ($message + [Environment]::NewLine), $utf8) } catch {}
+    [Console]::Error.WriteLine($message)
+} finally {
+    try { if ($proc) { $proc.Dispose() } } catch {}
+}
+exit $exitCode
+'@
+        $runner = $runner.Replace('__WMT_USER_COMMAND__', $EncodedCommand).Replace('__WMT_LOG_PATH__', $pathBase64)
+        $encodedRunner = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runner))
+        return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedRunner"
+    }
+
     function Copy-WmtLatestWingetDiagnosticLog {
         param(
             [string]$DestinationPath,
@@ -41161,10 +41250,7 @@ exit /b %WMT_EXIT%
             # -EncodedCommand avoids quoting damage when the custom command contains
             # quotes, pipes, ampersands, subexpressions, URLs, etc.
             $encodedCustomCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($expandedCustomCommand))
-            # Merge native stdout/stderr in cmd.exe before PowerShell reads the
-            # custom override's output. PowerShell 5.1 can otherwise lose
-            # child-cmd stderr when nesting multiple PowerShell hosts.
-            $cmd = "cmd.exe /d /c `"powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCustomCommand 2>&1`""
+            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCustomCommand"
             $userCmd = $cmd
             $displayCmd = $expandedCustomCommand
             $isCustomUpdateCommand = $true
@@ -41682,13 +41768,15 @@ exit /b %WMT_EXIT%
                 Write-Output "LOG:[$act] Launching visible $windowTag window for: $name"
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
-                    # Native WinGet/Legendary logging is handled separately, but a saved
-                    # custom override is a PowerShell command, not a native WinGet run.
-                    # Always pipe the visible custom command (and inherited child
-                    # stdout/stderr) through ConvertTo-WmtTranscriptCommand so its
-                    # console output reaches the package-install-logs transcript.
-                    $visibleTranscriptPath = if (-not $isCustomUpdateCommand -and $srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
-                    $p = Invoke-VisibleCmd $cmd "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
+                    # Custom overrides use a native stdout/stderr reader that mirrors
+                    # their child output to this visible window and the UTF-8 log.
+                    # Never wrap that runner in Tee-Object a second time.
+                    $visibleCommand = $cmd
+                    if ($isCustomUpdateCommand -and -not [string]::IsNullOrWhiteSpace($providerTranscriptPath)) {
+                        $visibleCommand = ConvertTo-WmtCapturedCustomPowerShellCommand -EncodedCommand $encodedCustomCommand -TranscriptPath $providerTranscriptPath
+                    }
+                    $visibleTranscriptPath = if ($isCustomUpdateCommand -or $srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
+                    $p = Invoke-VisibleCmd $visibleCommand "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
                     # Normalize a missing/failed visible process result. The final
                     # result line below reports the failure once, without duplicate chatter.
