@@ -38748,7 +38748,16 @@ try {
                     if ($stream -eq 'progress') { continue }
                     $message = ''
                     if ($record.LocalName -eq 'Obj') {
-                        $textNode = $record.SelectSingleNode("./*[local-name()='ToString']")
+                        $textNode = $null
+                        if ($stream -eq 'error') {
+                            # The serialized ErrorRecord.ToString often embeds the
+                            # entire multiline command as well as the error. Prefer
+                            # Exception.Message for a concise, actionable line.
+                            $textNode = $record.SelectSingleNode(".//*[local-name()='Obj' and @N='Exception']//*[local-name()='S' and @N='Message']")
+                        }
+                        if (-not $textNode) {
+                            $textNode = $record.SelectSingleNode("./*[local-name()='ToString']")
+                        }
                         if (-not $textNode) {
                             $textNode = $record.SelectSingleNode(".//*[local-name()='S' and @N='Message']")
                         }
