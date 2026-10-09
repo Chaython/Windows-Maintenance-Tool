@@ -38711,8 +38711,15 @@ try {
 exit $exitCode
 '@
         $runner = $runner.Replace('__WMT_USER_COMMAND__', $EncodedCommand).Replace('__WMT_LOG_PATH__', $pathBase64)
-        $encodedRunner = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runner))
-        return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedRunner"
+        # cmd.exe has an ~8191-character command-line limit. Store this verbose
+        # native-stream runner in a short-lived .ps1 instead of nesting another
+        # long -EncodedCommand in the visible CMD invocation.
+        $runnerPath = Join-Path ([System.IO.Path]::GetTempPath()) ("WMT-CustomCapture-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
+        [System.IO.File]::WriteAllText($runnerPath, $runner, [System.Text.UTF8Encoding]::new($true))
+        return [PSCustomObject]@{
+            Command    = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`""
+            RunnerPath = $runnerPath
+        }
     }
 
     function Copy-WmtLatestWingetDiagnosticLog {
@@ -41779,8 +41786,11 @@ exit /b %WMT_EXIT%
                     # their child output to this visible window and the UTF-8 log.
                     # Never wrap that runner in Tee-Object a second time.
                     $visibleCommand = $cmd
+                    $customCaptureRunnerPath = ""
                     if ($isCustomUpdateCommand -and -not [string]::IsNullOrWhiteSpace($providerTranscriptPath)) {
-                        $visibleCommand = ConvertTo-WmtCapturedCustomPowerShellCommand -EncodedCommand $encodedCustomCommand -TranscriptPath $providerTranscriptPath
+                        $nativeCapture = ConvertTo-WmtCapturedCustomPowerShellCommand -EncodedCommand $encodedCustomCommand -TranscriptPath $providerTranscriptPath
+                        $visibleCommand = [string]$nativeCapture.Command
+                        $customCaptureRunnerPath = [string]$nativeCapture.RunnerPath
                     }
                     $visibleTranscriptPath = if ($isCustomUpdateCommand -or $srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
                     $p = Invoke-VisibleCmd $visibleCommand "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
@@ -41800,6 +41810,13 @@ exit /b %WMT_EXIT%
                     else {
                         Write-Output "LOG:[$act] Visible window forcefully closed or interrupted."
                         $p = [PSCustomObject]@{ ExitCode = 1 }
+                    }
+                }
+                finally {
+                    # The generated runner carries the encoded custom command.
+                    # Never leave it behind in the user's TEMP folder.
+                    if (-not [string]::IsNullOrWhiteSpace($customCaptureRunnerPath)) {
+                        try { Remove-Item -LiteralPath $customCaptureRunnerPath -Force -ErrorAction SilentlyContinue } catch {}
                     }
                 }
 
