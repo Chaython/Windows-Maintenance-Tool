@@ -38701,6 +38701,13 @@ try {
 } finally {
     try { if ($proc) { $proc.Dispose() } } catch {}
 }
+try {
+    [System.IO.File]::AppendAllText(
+        $transcriptPath,
+        ("{0}[{1}] EXIT: {2}{0}" -f [Environment]::NewLine, (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $exitCode),
+        $utf8
+    )
+} catch {}
 exit $exitCode
 '@
         $runner = $runner.Replace('__WMT_USER_COMMAND__', $EncodedCommand).Replace('__WMT_LOG_PATH__', $pathBase64)
