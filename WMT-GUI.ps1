@@ -37932,6 +37932,16 @@ function Add-WmtQuickFindOriginalButton {
         if ([System.Windows.Data.BindingOperations]::IsDataBound($Button, $property)) { return $false }
     }
     if ($Button.Command -and $inheritedContext) { return $false }
+    # Attached buttons can have content/template bindings depending on their
+    # original ancestor. Never break those bindings through reparenting.
+    foreach ($property in @(
+        [System.Windows.Controls.ContentControl]::ContentProperty,
+        [System.Windows.Controls.Control]::TemplateProperty,
+        [System.Windows.FrameworkElement]::StyleProperty,
+        [System.Windows.FrameworkElement]::DataContextProperty
+    )) {
+        if ([System.Windows.Data.BindingOperations]::IsDataBound($Button, $property)) { return $false }
+    }
     try {
         [void]$originalParent.Children.Remove($Button)
         $originalParent.Children.Insert($index, $placeholder)
@@ -38098,7 +38108,9 @@ function Update-WmtQuickFindResults {
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
                 $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 $stateName = [string]$entry.Item.Button.Name
-                if ($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($stateName)) {
+                if (-not $script:TweakStatesReady -or -not $script:OptionalFeaturesReady) {
+                    $stateLabel.Text = "State: Checking..."
+                } elseif ($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($stateName)) {
                     $stateLabel.Text = if ($script:OptionalFeatureStateCache[$stateName]) { "State: Enabled" } else { "State: Disabled" }
                 } elseif ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName -and -not $script:OptionalFeaturesReady) {
                     $stateLabel.Text = "State: Checking Windows feature..."
