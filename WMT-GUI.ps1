@@ -2762,6 +2762,10 @@ foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess",
     }
     catch {}
 }
+foreach ($helperName in @('ConvertTo-WmtPagefileConfiguration', 'Get-WmtPagefileRegistryConfiguration', 'Get-WmtPagefileConfiguration', 'Get-WmtPagefileConfiguredState', 'Write-WmtPagefileBackup', 'Read-WmtPagefileBackup', 'Set-WmtPagefileConfiguration', 'Invoke-WmtPagefileToggle')) {
+    $helper = Get-Command $helperName -CommandType Function -ErrorAction Stop
+    [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition))
+}
 return $iss
 }
 
@@ -31113,6 +31117,247 @@ powercfg /setdcvalueindex SCHEME_CURRENT $SubGroup $Setting $Value | Out-Null
 powercfg /S SCHEME_CURRENT | Out-Null
 }
 
+function ConvertTo-WmtPagefileConfiguration {
+param([Parameter(Mandatory = $true)]$Configuration)
+if (-not $Configuration -or
+    ($Configuration.Version -isnot [int] -and $Configuration.Version -isnot [long]) -or $Configuration.Version -ne 1 -or
+    $Configuration.AutomaticManagedPagefile -isnot [bool] -or $Configuration.PagingFilesPresent -isnot [bool] -or
+    $Configuration.PagingFiles -isnot [array]) {
+    throw 'Invalid or unsupported pagefile restore configuration.'
+}
+foreach ($entry in $Configuration.PagingFiles) {
+    if ($entry -isnot [string] -or $entry -match '[\r\n\x00]') { throw 'Invalid pagefile restore entry.' }
+}
+if (-not $Configuration.PagingFilesPresent -and $Configuration.PagingFiles.Count -ne 0) { throw 'Absent PagingFiles value has unexpected entries.' }
+return [pscustomobject][ordered]@{
+    Version = 1
+    AutomaticManagedPagefile = [bool]$Configuration.AutomaticManagedPagefile
+    PagingFilesPresent = [bool]$Configuration.PagingFilesPresent
+    PagingFiles = [string[]]$Configuration.PagingFiles
+}
+}
+
+function Get-WmtPagefileRegistryConfiguration {
+param()
+$key = $null
+try {
+    $key = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -ErrorAction Stop
+    if (-not $key) { throw 'Memory Management registry key was not returned.' }
+    $present = @($key.GetValueNames()) -contains 'PagingFiles'
+    $entries = [string[]]@()
+    if ($present) {
+        if ([string]$key.GetValueKind('PagingFiles') -ne 'MultiString') { throw 'PagingFiles must be a registry MultiString.' }
+        $raw = $key.GetValue('PagingFiles', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($raw -isnot [string[]]) { throw 'PagingFiles multi-string query returned invalid data.' }
+        $entries = [string[]]$raw
+    }
+    return [pscustomobject]@{ PagingFilesPresent = [bool]$present; PagingFiles = $entries }
+}
+finally { if ($key -is [IDisposable]) { $key.Dispose() } }
+}
+
+function Get-WmtPagefileConfiguration {
+param()
+$computer = @(Get-CimInstance -ClassName Win32_ComputerSystem -Property AutomaticManagedPagefile -OperationTimeoutSec 5 -ErrorAction Stop)
+if ($computer.Count -ne 1 -or $computer[0].AutomaticManagedPagefile -isnot [bool]) { throw 'Pagefile query did not return a known automatic-management state.' }
+$registry = Get-WmtPagefileRegistryConfiguration
+return (ConvertTo-WmtPagefileConfiguration ([pscustomobject]@{
+            Version = 1; AutomaticManagedPagefile = [bool]$computer[0].AutomaticManagedPagefile
+            PagingFilesPresent = $registry.PagingFilesPresent; PagingFiles = [string[]]$registry.PagingFiles
+        }))
+}
+
+function Get-WmtPagefileConfiguredState {
+param([Parameter(Mandatory = $true)]$Configuration)
+$config = ConvertTo-WmtPagefileConfiguration $Configuration
+if ($config.AutomaticManagedPagefile) { return $true }
+foreach ($entry in $config.PagingFiles) { if (-not [string]::IsNullOrWhiteSpace($entry)) { return $true } }
+return $false
+}
+
+function Write-WmtPagefileBackup {
+param([Parameter(Mandatory = $true)]$Configuration, [Parameter(Mandatory = $true)][string]$BackupPath)
+$config = ConvertTo-WmtPagefileConfiguration $Configuration
+$path = [IO.Path]::GetFullPath($BackupPath)
+$directory = [IO.Path]::GetDirectoryName($path)
+[void][IO.Directory]::CreateDirectory($directory)
+$temporary = Join-Path $directory ('.pagefile-' + [guid]::NewGuid().ToString('N') + '.tmp')
+try {
+    [IO.File]::WriteAllText($temporary, ($config | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    if ([IO.File]::Exists($path)) { [IO.File]::Replace($temporary, $path, $null) }
+    else { [IO.File]::Move($temporary, $path) }
+}
+finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Read-WmtPagefileBackup {
+param([Parameter(Mandatory = $true)][string]$BackupPath)
+# Only a genuinely missing file selects the default. Access failures and corrupt
+# backups must remain failures instead of silently discarding a restore point.
+try { [void][IO.File]::GetAttributes($BackupPath) }
+catch [IO.FileNotFoundException] { return $null }
+catch [IO.DirectoryNotFoundException] { return $null }
+$config = [IO.File]::ReadAllText($BackupPath) | ConvertFrom-Json -ErrorAction Stop
+return (ConvertTo-WmtPagefileConfiguration $config)
+}
+
+function Set-WmtPagefileConfiguration {
+param([Parameter(Mandatory = $true)]$Configuration, [switch]$AutomaticDefault)
+if ($AutomaticDefault) { $automatic = $true }
+else { $Configuration = ConvertTo-WmtPagefileConfiguration $Configuration; $automatic = $Configuration.AutomaticManagedPagefile }
+$computer = @(Get-CimInstance -ClassName Win32_ComputerSystem -Property AutomaticManagedPagefile -OperationTimeoutSec 5 -ErrorAction Stop)
+if ($computer.Count -ne 1 -or $computer[0].AutomaticManagedPagefile -isnot [bool]) { throw 'Pagefile query did not return a known automatic-management state.' }
+# AutomaticManagedPagefile is writable. Let Windows choose its defaults when
+# there is no previous configuration; otherwise restore the exact registry value.
+# https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-computersystem
+Set-CimInstance -InputObject $computer[0] -Property @{ AutomaticManagedPagefile = [bool]$automatic } -OperationTimeoutSec 5 -ErrorAction Stop | Out-Null
+if ($AutomaticDefault) { return }
+$path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+if ($Configuration.PagingFilesPresent) {
+    New-ItemProperty -LiteralPath $path -Name PagingFiles -Value ([string[]]$Configuration.PagingFiles) -PropertyType MultiString -Force -ErrorAction Stop | Out-Null
+}
+else {
+    $current = Get-WmtPagefileRegistryConfiguration
+    if ($current.PagingFilesPresent) { Remove-ItemProperty -LiteralPath $path -Name PagingFiles -ErrorAction Stop }
+}
+}
+
+function Invoke-WmtPagefileToggle {
+param([Parameter(Mandatory = $true)][bool]$Enable, [Parameter(Mandatory = $true)][string]$BackupPath)
+$original = Get-WmtPagefileConfiguration
+$wasEnabled = Get-WmtPagefileConfiguredState $original
+if ($wasEnabled -eq $Enable) {
+    return [pscustomobject]@{ Success = $true; Enabled = $wasEnabled; RestartRequired = $true; AlreadyInRequestedState = $true }
+}
+$automaticDefault = $false
+if ($Enable) {
+    $target = Read-WmtPagefileBackup -BackupPath $BackupPath
+    if ($null -eq $target) { $automaticDefault = $true; $target = $original }
+    elseif (-not (Get-WmtPagefileConfiguredState $target)) { throw 'Saved pagefile restore configuration is disabled; an enabled restore point is required.' }
+}
+else {
+    # A repeated disable returned above, so it cannot replace a good enabled
+    # restore snapshot with the already-disabled configuration.
+    Write-WmtPagefileBackup -Configuration $original -BackupPath $BackupPath
+    $target = [pscustomobject]@{ Version = 1; AutomaticManagedPagefile = $false; PagingFilesPresent = $true; PagingFiles = [string[]]@() }
+}
+try {
+    Set-WmtPagefileConfiguration -Configuration $target -AutomaticDefault:$automaticDefault
+    $actual = Get-WmtPagefileConfiguration
+    if ((Get-WmtPagefileConfiguredState $actual) -ne $Enable -or
+        ($automaticDefault -and -not $actual.AutomaticManagedPagefile) -or
+        (-not $automaticDefault -and ($actual | ConvertTo-Json -Compress) -cne ($target | ConvertTo-Json -Compress))) {
+        throw 'Pagefile write verification failed: the actual configuration does not match the requested settings.'
+    }
+}
+catch {
+    $failure = $_.Exception.Message
+    try {
+        Set-WmtPagefileConfiguration -Configuration $original
+        $rolledBack = Get-WmtPagefileConfiguration
+        if (($rolledBack | ConvertTo-Json -Compress) -cne ($original | ConvertTo-Json -Compress)) { throw 'Restored settings do not match the original configuration.' }
+    }
+    catch { throw "Pagefile change failed: $failure Rollback failed: $($_.Exception.Message)" }
+    throw "Pagefile change failed: $failure Original configuration restored."
+}
+return [pscustomobject]@{ Success = $true; Enabled = [bool]$Enable; RestartRequired = $true; AlreadyInRequestedState = $false }
+}
+
+function Get-WmtPagefileCachedState {
+param()
+if ($script:TweakNonRegDataCache -and $script:TweakNonRegDataCache.ContainsKey('PagefileStateKnown')) {
+    if ($script:TweakNonRegDataCache.PagefileStateKnown -eq $true -and $script:TweakNonRegDataCache.PagefileEnabled -is [bool]) { return [bool]$script:TweakNonRegDataCache.PagefileEnabled }
+    return $null
+}
+$path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+if (-not $script:TweakButtonStatesCache -or -not $script:TweakButtonStatesCache.ContainsKey($path)) { return $null }
+$item = $script:TweakButtonStatesCache[$path]
+if (-not $item -or -not $item.PSObject.Properties['PagingFiles'] -or $item.PagingFiles -isnot [string[]]) { return $null }
+foreach ($entry in $item.PagingFiles) { if (-not [string]::IsNullOrWhiteSpace($entry)) { return $true } }
+return $false
+}
+
+function Update-WmtPagefileButtonState {
+param($Enabled, [switch]$RefreshCache)
+$button = Get-Ctrl 'btnTogglePagefile'
+if ($RefreshCache) {
+    Clear-WmtRegCache @('HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management')
+    if (-not $script:TweakNonRegDataCache) { $script:TweakNonRegDataCache = @{} }
+    $script:TweakNonRegDataCache['PagefileStateKnown'] = ($Enabled -is [bool])
+    $script:TweakNonRegDataCache['PagefileEnabled'] = $Enabled
+}
+if (-not $button) { return }
+if ($script:WmtPagefileUiState -and $script:WmtPagefileUiState.Busy) { $button.IsEnabled = $false; return }
+$button.IsEnabled = $true
+if ($Enabled -is [bool]) {
+    # The shared toggle labels describe the current configuration. The applied
+    # tweak is disabling the pagefile; Windows' default enabled state stays gray.
+    Update-WmtTweakToggle $button (-not $Enabled) 'Pagefile Disabled' 'Pagefile Enabled'
+}
+else {
+    if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')) { $script:TweakCurrentStates.Remove('btnTogglePagefile') }
+    $button.Content = 'Pagefile status unknown'
+    $button.Style = ($window.FindResource('ActionBtn') -as [Windows.Style])
+    $button.ToolTip = 'Pagefile configuration could not be read. Click to check again in the background. Restart Windows after changing the pagefile.'
+}
+}
+
+function Invoke-WmtPagefileButtonToggle {
+param()
+$button = Get-Ctrl 'btnTogglePagefile'
+if (-not $button) { return }
+if (-not $script:WmtPagefileUiState) { $script:WmtPagefileUiState = @{ Busy = $false; Generation = 0; LastRequestState = '' } }
+$state = $script:WmtPagefileUiState
+if ($state.Busy) { return }
+$known = $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')
+$enable = $false
+if ($known) {
+    $enable = [bool]$script:TweakCurrentStates['btnTogglePagefile'].On
+    if (-not $enable) {
+        $answer = Show-WmtMessageBox -Owner $window -Message 'Disable the pagefile? This reduces available committed memory and can prevent Windows crash dumps. Keeping it enabled is recommended. Restart Windows for the change to take effect.' -Title 'Disable Pagefile' -Button YesNo -Image Warning
+        if ($answer -ne [Windows.MessageBoxResult]::Yes) { $state.LastRequestState = 'Cancelled'; return }
+    }
+}
+$state.Busy = $true; $state.Generation = [int]$state.Generation + 1; $state.LastRequestState = 'Queued'
+$button.IsEnabled = $false
+$failed = {
+    param($errorRecord)
+    $state.Busy = $false; $state.LastRequestState = 'Failed'
+    Update-WmtPagefileButtonState -Enabled $null -RefreshCache
+    Write-GuiLog "Pagefile operation failed: $errorRecord"
+}.GetNewClosure()
+$complete = {
+    param($results)
+    $items = @($results)
+    if ($items.Count -ne 1 -or $items[0].Success -isnot [bool] -or -not $items[0].Success -or $items[0].Enabled -isnot [bool]) {
+        & $failed 'Pagefile worker returned no verified state.'; return
+    }
+    $state.Busy = $false; $state.LastRequestState = 'Succeeded'
+    Update-WmtPagefileButtonState -Enabled ([bool]$items[0].Enabled) -RefreshCache
+    if ($known) { Write-GuiLog "Pagefile $(if ($items[0].Enabled) { 'enabled' } else { 'disabled' }). Restart Windows for the change to take effect." }
+    else { Write-GuiLog 'Pagefile status refreshed. Click again to change it.' }
+}.GetNewClosure()
+try {
+    if ($known) {
+        $backupPath = Join-Path (Get-DataPath) 'pagefile-restore.json'
+        $job = Invoke-WmtUiBackgroundCommand -Name 'PagefileToggle' -Msg 'Updating pagefile configuration...' -TimeoutMs 120000 -SuppressResultLog -ArgumentList @($enable, $backupPath) -Sb {
+            param([bool]$Enable, [string]$BackupPath)
+            Invoke-WmtPagefileToggle -Enable $Enable -BackupPath $BackupPath
+        } -OnComplete $complete -OnError $failed
+    }
+    else {
+        $state.LastRequestState = 'Checking'
+        $job = Invoke-WmtUiBackgroundCommand -Name 'PagefileToggle' -Msg 'Checking pagefile configuration...' -TimeoutMs 30000 -SuppressResultLog -Sb {
+            $config = Get-WmtPagefileConfiguration
+            [pscustomobject]@{ Success = $true; Enabled = (Get-WmtPagefileConfiguredState $config) }
+        } -OnComplete $complete -OnError $failed
+    }
+    if (-not $job -and $state.Busy) { & $failed 'Background worker could not be started.' }
+}
+catch { & $failed $_ }
+}
+
+
 # ==========================================
 # 3. XAML GUI
 # ==========================================
@@ -31843,6 +32088,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                                 <Button Name="btnToggleHibernate" Content="Disable Hibernation" Style="{StaticResource ActionBtn}" ToolTip="Toggle hibernation. When enabled (blue), hibernation is off and hiberfil.sys is deleted."/>
                                 <Button Name="btnToggleSuperfetch" Content="Disable Superfetch" Style="{StaticResource ActionBtn}" ToolTip="Toggle SysMain (Superfetch) service. When enabled (blue), Superfetch is disabled."/>
                                 <Button Name="btnToggleMemCompress" Content="Disable Mem Compression" Style="{StaticResource ActionBtn}" ToolTip="Toggle Windows memory compression. Compresses inactive RAM pages to free physical memory."/>
+                                <Button Name="btnTogglePagefile" Content="Pagefile status unknown" Style="{StaticResource ActionBtn}" ToolTip="Pagefile configuration is loading. Keeping it enabled is recommended for committed memory and Windows crash dumps. Restart Windows after changing it."/>
                                 <Button Name="btnPerfUltimatePower" Content="Ultimate Performance" Style="{StaticResource PositiveBtn}" ToolTip="Enable the Ultimate Performance power plan. Removes all power throttling for maximum performance. Best for desktops and high-performance laptops."/>
                                 <Button Name="btnToggleHags" Content="Enable HAGS" Style="{StaticResource ActionBtn}" ToolTip="Current state: Enable HAGS (Gray = inactive/default)&#10;Click to switch to: Disable HAGS (Blue)&#10;Restart the app or game for changes to take effect.&#10;&#10;Hardware-Accelerated GPU Scheduling (HAGS) lets the GPU manage its own memory and render queues independently of the CPU, reducing latency and improving frame pacing in games. Requires a modern GPU (NVIDIA Pascal+ / AMD RDNA+) and recent drivers. Some older games or capture software may be incompatible."/>
                                 <Button Name="btnPowerBatterySaverOff" Content="Saver Off" Style="{StaticResource ActionBtn}" ToolTip="Set battery saver threshold to 0 percent."/>
@@ -34036,6 +34282,7 @@ $btnToggleHibernate = Get-Ctrl "btnToggleHibernate"
 $btnMyDeviceHibernateToggle = Get-Ctrl "btnMyDeviceHibernateToggle"
 $btnToggleSuperfetch = Get-Ctrl "btnToggleSuperfetch"
 $btnToggleMemCompress = Get-Ctrl "btnToggleMemCompress"
+$btnTogglePagefile = Get-Ctrl "btnTogglePagefile"
 $btnMyDeviceMemCompressToggle = Get-Ctrl "btnMyDeviceMemCompressToggle"
 $btnToggleHags = Get-Ctrl "btnToggleHags"
 $btnMyDeviceHagsToggle = Get-Ctrl "btnMyDeviceHagsToggle"
@@ -37175,6 +37422,7 @@ $btnToggleSpatialAudio.Add_Click({
     })
 }
 
+Register-WmtTweakButton "btnTogglePagefile" { Invoke-WmtPagefileButtonToggle }
 Register-WmtTweakButton "btnSoundSettings" { Start-Process "ms-settings:sound" }
 
 # Display
@@ -37604,6 +37852,7 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnToggleHibernate" "Hibernation Toggle" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleSuperfetch" "Superfetch Toggle" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleMemCompress" "Memory Compression" "btnTabTweaks"
+    Add-SearchIndexEntry "btnTogglePagefile" "Pagefile Virtual Memory Toggle" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleHags" "HAGS GPU Scheduling" "btnTabTweaks"
     Add-SearchIndexEntry "btnPowerBatterySaverOff" "Battery Saver Off" "btnTabTweaks"
     Add-SearchIndexEntry "btnPowerBatterySaver20" "Battery Saver 20%" "btnTabTweaks"
