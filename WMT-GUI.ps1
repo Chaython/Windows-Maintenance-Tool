@@ -27163,6 +27163,7 @@ $setBusy = {
 # Use one dedicated, bounded child PowerShell process and a dialog-owned timer.
 $ghostScanScript = @'
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 try {
     Import-Module PnpDevice -ErrorAction Stop
     $found = [System.Collections.Generic.List[object]]::new()
@@ -27180,7 +27181,9 @@ try {
     ConvertTo-Json -InputObject ($found.ToArray()) -Compress -Depth 3
 }
 catch {
-    [Console]::Error.WriteLine($_.Exception.Message)
+    # Redirected WinPS stderr often contains only CLIXML progress noise.
+    # Emit a plain marker on stdout so the parent can expose the real error.
+    Write-Output ("WMT_GHOST_ERROR: " + $_.Exception.Message)
     exit 1
 }
 '@
@@ -27245,8 +27248,15 @@ $load = {
                         [IO.File]::ReadAllText($state.ErrFile)
                     } else { "" }
                     if ($exitCode -ne 0) {
-                        $reason = ($stderrText -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -Last 1)
-                        if ([string]::IsNullOrWhiteSpace($reason)) { $reason = "PowerShell exited with code $exitCode." }
+                        $stdoutText = if (Test-Path -LiteralPath $state.OutFile) {
+                            [IO.File]::ReadAllText($state.OutFile, [Text.Encoding]::UTF8)
+                        } else { "" }
+                        $reason = ($stdoutText -split '\r?\n' | Where-Object { $_ -like 'WMT_GHOST_ERROR:*' } | Select-Object -Last 1)
+                        if ([string]::IsNullOrWhiteSpace($reason)) {
+                            $reason = if ($stderrText -and $stderrText -notmatch '^#< CLIXML') {
+                                ($stderrText -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -Last 1)
+                            } else { "PowerShell exited with code $exitCode." }
+                        }
                         throw ("Device enumeration failed: " + $reason)
                     }
                     if (-not (Test-Path -LiteralPath $state.OutFile)) {
