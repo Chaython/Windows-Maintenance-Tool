@@ -2762,9 +2762,13 @@ foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess",
     }
     catch {}
 }
+# Other feature tests create runspaces before the pagefile helpers are loaded.
+# Register only functions present in the calling session.
 foreach ($helperName in @('ConvertTo-WmtPagefileConfiguration', 'Get-WmtPagefileRegistryConfiguration', 'Get-WmtPagefileConfiguration', 'Get-WmtPagefileConfiguredState', 'Write-WmtPagefileBackup', 'Read-WmtPagefileBackup', 'Set-WmtPagefileConfiguration', 'Invoke-WmtPagefileToggle')) {
-    $helper = Get-Command $helperName -CommandType Function -ErrorAction Stop
-    [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition))
+    $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
+    if ($helper) {
+        [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition))
+    }
 }
 return $iss
 }
@@ -31342,14 +31346,21 @@ if ($computer.Count -ne 1 -or $computer[0].AutomaticManagedPagefile -isnot [bool
 # https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-computersystem
 Set-CimInstance -InputObject $computer[0] -Property @{ AutomaticManagedPagefile = [bool]$automatic } -OperationTimeoutSec 5 -ErrorAction Stop | Out-Null
 if ($AutomaticDefault) { return }
-$path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
-if ($Configuration.PagingFilesPresent) {
-    New-ItemProperty -LiteralPath $path -Name PagingFiles -Value ([string[]]$Configuration.PagingFiles) -PropertyType MultiString -Force -ErrorAction Stop | Out-Null
+# REG_MULTI_SZ can legitimately contain zero entries. Write through RegistryKey
+# rather than parameter binding that may unwrap an empty array.
+$key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+    'SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management', $true
+)
+if (-not $key) { throw 'Unable to open Memory Management registry key for writing.' }
+try {
+    if ($Configuration.PagingFilesPresent) {
+        $key.SetValue('PagingFiles', [string[]]$Configuration.PagingFiles, [Microsoft.Win32.RegistryValueKind]::MultiString)
+    }
+    elseif (@($key.GetValueNames()) -contains 'PagingFiles') {
+        $key.DeleteValue('PagingFiles', $false)
+    }
 }
-else {
-    $current = Get-WmtPagefileRegistryConfiguration
-    if ($current.PagingFilesPresent) { Remove-ItemProperty -LiteralPath $path -Name PagingFiles -ErrorAction Stop }
-}
+finally { $key.Dispose() }
 }
 
 function Invoke-WmtPagefileToggle {
@@ -31395,16 +31406,15 @@ return [pscustomobject]@{ Success = $true; Enabled = [bool]$Enable; RestartRequi
 
 function Get-WmtPagefileCachedState {
 param()
+# PagingFiles alone is not authoritative: Windows may automatically manage
+# pagefiles even when the registry value is empty.
+if ($script:WmtPagefileLastKnown -is [bool]) { return [bool]$script:WmtPagefileLastKnown }
 if ($script:TweakNonRegDataCache -and $script:TweakNonRegDataCache.ContainsKey('PagefileStateKnown')) {
-    if ($script:TweakNonRegDataCache.PagefileStateKnown -eq $true -and $script:TweakNonRegDataCache.PagefileEnabled -is [bool]) { return [bool]$script:TweakNonRegDataCache.PagefileEnabled }
-    return $null
+    if ($script:TweakNonRegDataCache.PagefileStateKnown -eq $true -and $script:TweakNonRegDataCache.PagefileEnabled -is [bool]) {
+        return [bool]$script:TweakNonRegDataCache.PagefileEnabled
+    }
 }
-$path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
-if (-not $script:TweakButtonStatesCache -or -not $script:TweakButtonStatesCache.ContainsKey($path)) { return $null }
-$item = $script:TweakButtonStatesCache[$path]
-if (-not $item -or -not $item.PSObject.Properties['PagingFiles'] -or $item.PagingFiles -isnot [string[]]) { return $null }
-foreach ($entry in $item.PagingFiles) { if (-not [string]::IsNullOrWhiteSpace($entry)) { return $true } }
-return $false
+return $null
 }
 
 function Update-WmtPagefileButtonState {
@@ -31413,6 +31423,7 @@ $button = Get-Ctrl 'btnTogglePagefile'
 if ($RefreshCache) {
     Clear-WmtRegCache @('HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management')
     if (-not $script:TweakNonRegDataCache) { $script:TweakNonRegDataCache = @{} }
+    $script:WmtPagefileLastKnown = $Enabled
     $script:TweakNonRegDataCache['PagefileStateKnown'] = ($Enabled -is [bool])
     $script:TweakNonRegDataCache['PagefileEnabled'] = $Enabled
 }
@@ -31433,13 +31444,13 @@ else {
 }
 
 function Invoke-WmtPagefileButtonToggle {
-param()
+param([switch]$RefreshOnly)
 $button = Get-Ctrl 'btnTogglePagefile'
 if (-not $button) { return }
 if (-not $script:WmtPagefileUiState) { $script:WmtPagefileUiState = @{ Busy = $false; Generation = 0; LastRequestState = '' } }
 $state = $script:WmtPagefileUiState
 if ($state.Busy) { return }
-$known = $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')
+$known = (-not $RefreshOnly) -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')
 $enable = $false
 if ($known) {
     $enable = [bool]$script:TweakCurrentStates['btnTogglePagefile'].On
@@ -37558,6 +37569,8 @@ $btnToggleSpatialAudio.Add_Click({
 
 Register-WmtTweakButton "btnTogglePagefile" { Invoke-WmtPagefileButtonToggle }
 Update-WmtPagefileButtonState -Enabled (Get-WmtPagefileCachedState)
+# Query actual pagefile state asynchronously on launch, without a dummy click.
+Invoke-WmtPagefileButtonToggle -RefreshOnly
 Register-WmtTweakButton "btnSoundSettings" { Start-Process "ms-settings:sound" }
 
 # Display
