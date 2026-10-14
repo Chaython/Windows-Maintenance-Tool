@@ -26951,30 +26951,35 @@ Write-GuiLog "Starting Driver Export Tool..."
 $dataPath = try { Get-DataPath } catch { Join-Path $env:PUBLIC "WMT_Exports" }
 
 $content = @"
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <Grid Grid.Row="0" Margin="0,0,0,12">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="220"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <TextBlock Text="Class" Foreground="{DynamicResource TextSecondary}"/>
-        <TextBox Name="txtSearch" Grid.Column="1" Height="34" VerticalContentAlignment="Center"/>
-    </Grid>
+    <Border Grid.Row="0" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="16,12">
+        <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <TextBlock Text="Class" Foreground="{DynamicResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+            <TextBox Name="txtSearch" Grid.Column="1" Height="34" VerticalContentAlignment="Center"/>
+        </Grid>
+    </Border>
     <Grid Grid.Row="1">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="220"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <ListBox Name="lstClasses"/>
-        <DataGrid Name="dgDrivers" Grid.Column="2" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="220"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <ListBox Name="lstClasses" BorderThickness="0,0,1,0" BorderBrush="{DynamicResource BorderBrush}"/>
+        <DataGrid Name="dgDrivers" Grid.Column="1" BorderThickness="0" IsReadOnly="True" SelectionMode="Extended" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
     </Grid>
-    <Grid Grid.Row="2" Margin="0,12,0,0">
-        <TextBlock Name="lblStatus" Text="Loading drivers..." VerticalAlignment="Center" Foreground="{DynamicResource Accent}"/>
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnExportSel" Content="Export Selected" MinWidth="128" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0" IsEnabled="False"/>
-            <Button Name="btnExportAll" Content="Export All" MinWidth="104" Margin="0,0,8,0" IsEnabled="False"/>
-            <Button Name="btnClose" Content="Close" Width="90" IsCancel="True"/>
-        </StackPanel>
-    </Grid>
+    <Border Grid.Row="2" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="16,12">
+        <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <TextBlock Name="lblStatus" Text="Loading drivers..." VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Accent}" Margin="0,0,16,0"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Name="btnExportSel" Content="Export Selected" MinWidth="128" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0" IsEnabled="False"/>
+                <Button Name="btnExportAll" Content="Export All" MinWidth="104" Margin="0,0,8,0" IsEnabled="False"/>
+                <Button Name="btnClose" Content="Close" Width="90" IsCancel="True"/>
+            </StackPanel>
+        </Grid>
+    </Border>
 </Grid>
 "@
 $dialog = New-WmtWindowFromXaml -Title "Driver Export Tool" -ContentXaml $content -Width 940 -Height 680 -MinWidth 760 -MinHeight 520
@@ -28114,17 +28119,19 @@ if ($backups -and $backups.Count -gt 0) {
         })
 
     $content = @"
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <ListBox Name="lstBackups" DisplayMemberPath="Display"/>
-    <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
-        <Button Name="btnUse" Content="Use Selected" MinWidth="118" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
-        <Button Name="btnBrowse" Content="Browse" Width="96" Margin="0,0,8,0"/>
-        <Button Name="btnCancel" Content="Cancel" Width="96" IsCancel="True"/>
-    </StackPanel>
+    <ListBox Name="lstBackups" DisplayMemberPath="Display" BorderThickness="0"/>
+    <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="16,12">
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Name="btnUse" Content="Use Selected" MinWidth="118" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
+            <Button Name="btnBrowse" Content="Browse" Width="96" Margin="0,0,8,0"/>
+            <Button Name="btnCancel" Content="Cancel" Width="96" IsCancel="True"/>
+        </StackPanel>
+    </Border>
 </Grid>
 "@
     $dialog = New-WmtWindowFromXaml -Title "Select Driver Backup" -ContentXaml $content -Width 640 -Height 420 -MinWidth 520 -MinHeight 340

@@ -129,6 +129,44 @@ jobs:
           }
           Write-Host 'PASS: fast ghost candidates, deduplication, edge-to-edge dialog, removal presence guard, and themed headers.'
 
+      - name: Smoke test driver dialog edge-to-edge layouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $dialogs = @(
+              @{ Function = 'Invoke-ExportDrivers'; ListName = 'dgDrivers'; Controls = @('txtSearch','lstClasses','lblStatus','btnExportSel','btnExportAll','btnClose') },
+              @{ Function = 'Show-DriverCleanupDialog'; ListName = 'dgDrivers'; Controls = @('lblCleanupStatus','pbCleanupProgress','btnRemoveSel','btnRemoveAll','btnClose') },
+              @{ Function = 'Invoke-RestoreDrivers'; ListName = 'lstBackups'; Controls = @('btnUse','btnBrowse','btnCancel') }
+          )
+          foreach ($spec in $dialogs) {
+              $marker = 'function ' + $spec.Function + ' {'
+              $start = $source.IndexOf($marker, [StringComparison]::Ordinal)
+              if ($start -lt 0) { throw ('Missing dialog owner: ' + $spec.Function) }
+              $tail = $source.Substring($start)
+              $match = [regex]::Match($tail, '(?ms)^\s*\$content\s*=\s*@"\r?\n(.*?)\r?\n"@')
+              if (-not $match.Success) { throw ('Missing content XAML: ' + $spec.Function) }
+              [xml]$xaml = $match.Groups[1].Value
+              if ($xaml.DocumentElement.LocalName -ne 'Grid' -or $xaml.DocumentElement.HasAttribute('Margin')) {
+                  throw ('Root Grid not edge-to-edge: ' + $spec.Function)
+              }
+              $content = $match.Groups[1].Value
+              foreach ($control in @($spec.Controls + @($spec.ListName))) {
+                  if ($content -notmatch ('Name="' + [regex]::Escape($control) + '"')) {
+                      throw ('Missing ' + $control + ' in ' + $spec.Function)
+                  }
+              }
+              if ($content -notmatch 'Border Grid.Row="\d" Background="\{DynamicResource BgPanel\}"' -or
+                  $content -notmatch 'BorderThickness="0,1,0,0"') {
+                  throw ('Missing themed full-width footer: ' + $spec.Function)
+              }
+              if ($content -notmatch ('Name="' + [regex]::Escape($spec.ListName) + '"[^\r\n]*BorderThickness="0"') -and
+                  $content -notmatch ('Name="' + [regex]::Escape($spec.ListName) + '"[^\r\n]*')) {
+                  throw ('Missing edge-to-edge list/grid: ' + $spec.Function)
+              }
+              Write-Host ('PASS: ' + $spec.Function + ' full-width dialog layout.')
+          }
+
       - name: Smoke test process timeouts and output capture
         shell: powershell
         run: |

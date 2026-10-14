@@ -204,6 +204,7 @@ F5 on Updates is an explicit package scan: merely visiting the Updates tab does 
 - Performance service optimization/revert controls.
 - Hibernation, SysMain, memory compression, power plan, Windows Update policy, and optional Windows feature controls.
 - Ghost-device cleanup uses a fast direct PnP enumeration to list potential disconnected/Unknown-status devices in an edge-to-edge review dialog, with separate Refresh, Remove Selected and Remove All controls. Device presence is rechecked immediately before removal; connected devices are skipped. An Unknown status by itself does not mean the device is disconnected.
+- Driver cleanup, driver export, and driver backup selection use edge-to-edge list/grid layouts with full-width themed footer controls; confirmation prompts retain compact padding.
 - Pagefile management detects automatic and custom configurations in the background, confirms before disabling, saves the previous settings to `data/pagefile-restore.json`, restores the previous configuration when re-enabled, and verifies writes with rollback on errors. If no saved configuration exists, enabling uses Windows automatic management. Restart Windows for changes to take effect. Disabling pagefiles is **not recommended**: it reduces available committed memory and can prevent crash dumps.
 - Taskbar alignment, search, widgets, Task View, Chat, combine behavior, and related shell controls.
 - Clock options including 12/24-hour format and seconds display.
