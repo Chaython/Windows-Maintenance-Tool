@@ -37971,6 +37971,13 @@ function Open-WmtQuickFindTarget {
     }
     $nav.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     $target = $Entry.Item.Button
+    # Search results can outlive a dynamic page refresh. Do not scroll to or
+    # operate a control that has since been detached/replaced.
+    if ($target -and (-not $target.Parent -or
+        ($window.FindName([string]$target.Name) -and
+         -not [object]::ReferenceEquals($target, $window.FindName([string]$target.Name))))) {
+        $target = $null
+    }
     if ($target -and $target.Name -in @("btnShowCatalog", "btnShowLibrary")) {
         # The catalogue/library buttons navigate views rather than run a tool.
         if ($btnShowCatalog -and $btnShowCatalog.IsEnabled) {
@@ -37986,7 +37993,16 @@ function Open-WmtQuickFindTarget {
 }
 function Update-WmtQuickFindResults {
     if (-not $pnlQuickFindMatches -or -not $lblQuickFindSummary -or -not $txtGlobalSearch) { return }
-    if (-not $pnlQuickFind.IsVisible -or $script:WmtQuickFindUpdating) { return }
+    if (-not $pnlQuickFind.IsVisible) { return }
+    if ($script:WmtQuickFindUpdating) {
+        # Queue another pass rather than losing background state/index changes
+        # that arrive while the current WPF render is in progress.
+        if ($script:WmtQuickFindRenderTimer) {
+            $script:WmtQuickFindRenderTimer.Stop()
+            $script:WmtQuickFindRenderTimer.Start()
+        }
+        return
+    }
     $script:WmtQuickFindUpdating = $true
     try {
     Restore-WmtQuickFindButtons
@@ -38011,8 +38027,14 @@ function Update-WmtQuickFindResults {
         # Dynamic pages can replace controls after the index was built. Resolve
         # the current named instance instead of hosting a detached stale button.
         $name = [string]$entry.Item.Button.Name
-        $current = Get-Ctrl $name
-        if (-not $current -or $current -isnot [System.Windows.Controls.Button]) { continue }
+        # Get-Ctrl uses a persistent cache, which can point to replaced controls.
+        # Prefer the live namescope and only fall back to a still-attached control.
+        $current = $window.FindName($name)
+        if (-not $current -and $entry.Item.Button -and $entry.Item.Button.Parent) {
+            $current = $entry.Item.Button
+        }
+        if (-not $current -or $current -isnot [System.Windows.Controls.Button] -or -not $current.Parent) { continue }
+        $script:WmtControlCache[$name] = $current
         if (-not [object]::ReferenceEquals($current, $entry.Item.Button)) {
             $entry.Item.Button = $current
         }
