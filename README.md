@@ -37,6 +37,19 @@ If your antivirus reports WMT as a PUP or false positive, submit the file to the
 VirusTotal maintains a broader vendor contact directory here: https://docs.virustotal.com/docs/false-positive-contacts
 </details>
 
+## Code signing policy
+
+SignPath Authenticode signing is **prepared but disabled** pending foundation
+approval. Future approved releases can use SignPath Foundation in addition
+to GitHub's Sigstore build provenance. Current releases must not be assumed
+to have Authenticode signatures.
+
+See the [Code signing policy and activation guide](docs/CODE_SIGNING.md)
+for release approvers, security expectations, SignPath project setup,
+required GitHub variables/secrets, and verification instructions. The
+proposed [SignPath artifact configuration](.signpath/artifact-configurations/default.xml)
+enforces WMT's executable metadata when approved and activated.
+
 ## Verify release provenance (Sigstore / GitHub Attestations)
 
 Official EXE releases produced by the **Build PS2EXE Release** GitHub Actions workflow now include a `WindowsMaintenanceTool.exe.sigstore.json` attestation bundle and a SHA-256 checksum. The build workflow uses GitHub's public Sigstore integration to issue a short-lived signing certificate, attest the built executable, and verify its provenance before publishing. Existing releases built before this change do **not** have this attestation.
@@ -448,7 +461,7 @@ WMT stores generated data next to the script in its local `data` folder.
 <summary><strong>Development and Releases</strong></summary>
 
 - `.github/workflows/validate-powershell.yml` validates PowerShell syntax and can also be run manually.
-- `.github/workflows/release-ps2exe.yml` builds PS2EXE releases and supports manual release controls.
+- `.github/workflows/release-ps2exe.yml` builds PS2EXE releases and supports manual release controls, Sigstore build attestations, and optional SignPath Authenticode signing after approval.
 - Release tooling includes optional WinGet submission and Chocolatey package publication paths when the required secrets/package entries are available.
 - Long-running GUI operations are increasingly routed through shared runspace/process/polling infrastructure to keep the main WPF dispatcher responsive.
 
