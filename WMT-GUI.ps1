@@ -38061,7 +38061,8 @@ function Update-WmtQuickFindResults {
             # state, styling, icon, and dynamic label. This is not a proxy/auto-click.
             $original = $entry.Item.Button
             $canHost = ($original -is [System.Windows.Controls.Button]) -and
-                       ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates"))
+                       ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates")) -and
+                       ($entry.Item.Tab -ne "btnTabTweaks" -or ($script:TweakStatesReady -and $script:OptionalFeaturesReady))
             $hosted = $false
             if ($canHost) { $hosted = Add-WmtQuickFindOriginalButton -Button $original -DestinationPanel $body }
             if (-not $hosted) {
