@@ -126,10 +126,14 @@ jobs:
               if ($rows.Count -ne 1 -or [string]$rows[0].InstanceId -ne 'USB\TEST_GHOST') {
                   throw ('Ghost-device worker returned unexpected data: ' + $json)
               }
-              $fullHeaders = [regex]::Matches($source,
-                  '<Setter TargetName="HeaderBorder" Property="Background" Value="\{DynamicResource BgPanel\}"/>')
-              if ($fullHeaders.Count -lt 2) { throw 'The GridView and DataGrid filler headers are not themed.' }
-              Write-Host 'PASS: Ghost-device child returns only candidates; themed filler headers are present.'
+              $themedHeaderBands = [regex]::Matches($source,
+                  '<ControlTemplate TargetType="\{x:Type (?:GridViewColumnHeader|DataGridColumnHeader)\}">\s*<Grid Background="\{DynamicResource BgPanel\}">')
+              $transparentFillers = [regex]::Matches($source,
+                  '<Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>')
+              if ($themedHeaderBands.Count -ne 2 -or $transparentFillers.Count -lt 2) {
+                  throw 'The full-width header band must be themed while filler headers remain transparent and inert.'
+              }
+              Write-Host 'PASS: Ghost-device child returns only candidates; full-width themed header bands preserve inert fillers.'
           }
           finally {
               if ($process) {
