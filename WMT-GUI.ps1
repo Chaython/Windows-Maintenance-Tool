@@ -295,6 +295,7 @@ param(
     [int]$TimeoutMs = 0,
     [scriptblock]$OnComplete,
     [scriptblock]$OnError,
+    [ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background",
     [switch]$SuppressResultLog,
     $Progress,
     [switch]$ShowProgress
@@ -328,7 +329,7 @@ try {
         $Progress.Name = $Name
         Set-WmtAsyncProgressState -Progress $Progress -State Running -Message $Msg
     }
-    $ps = New-WmtPooledPowerShell -PoolKind Background
+    $ps = New-WmtPooledPowerShell -PoolKind $PoolKind
     [void]$ps.AddScript($Sb.ToString())
     foreach ($arg in @($ArgumentList)) { [void]$ps.AddArgument($arg) }
     Write-GuiLog $Msg
@@ -27146,7 +27147,7 @@ Set-WmtDataGridColumns -DataGrid $dg -Columns @("InstanceId", "Class", "Friendly
 # GetNewClosure() (where $script: would otherwise point at the closure module).
 $driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script -ErrorAction SilentlyContinue
 $driverCacheLoadedAtState = Get-Variable -Name DriverCacheLoadedAt -Scope Script -ErrorAction SilentlyContinue
-$state = @{ Busy = $false; Generation = 0 }
+$state = @{ Busy = $false; Generation = 0; Started = $false }
 
 $setBusy = {
     param([bool]$Busy, [string]$Message)
@@ -27192,24 +27193,33 @@ $load = {
     $failed = {
         param($err)
         if ($generation -ne [int]$state.Generation) { return }
-        & $setBusy $false "Ghost-device scan failed or timed out."
         $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+        & $setBusy $false ("Ghost-device scan failed: " + $msg)
         Write-GuiLog "[Drivers] Ghost-device scan failed: $msg"
     }.GetNewClosure()
 
     Invoke-WmtUiBackgroundCommand -Name ("GhostDeviceScan_" + [guid]::NewGuid().ToString("N")) -Msg "Scanning disconnected devices..." -SuppressResultLog -TimeoutMs 60000 -Sb {
-        # Get-PnpDevice without -PresentOnly includes non-present devnodes. Build
-        # a present-ID set and return only devices that are actually absent,
-        # instead of treating Status=Unknown as synonymous with disconnected.
+        # Explicitly load PnpDevice in the pooled runspace. Never silently
+        # treat a failed present-device query as an empty set: that would
+        # incorrectly classify every installed device as safe to remove.
+        Import-Module PnpDevice -ErrorAction Stop
+        $allDevices = @(Get-PnpDevice -ErrorAction Stop)
+        if ($allDevices.Count -eq 0) {
+            throw "Get-PnpDevice returned no devices. Check Plug and Play/CIM services."
+        }
+        $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction Stop)
+        if ($presentDevices.Count -eq 0) {
+            throw "Present-device enumeration returned no devices. Refusing an unsafe ghost-device scan."
+        }
         $presentIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($p in @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)) {
+        foreach ($p in $presentDevices) {
             if ($p.InstanceId) { [void]$presentIds.Add([string]$p.InstanceId) }
         }
-
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $ghosts = [System.Collections.Generic.List[object]]::new()
-        foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue)) {
+        foreach ($d in $allDevices) {
             $id = [string]$d.InstanceId
-            if ([string]::IsNullOrWhiteSpace($id) -or $presentIds.Contains($id)) { continue }
+            if ([string]::IsNullOrWhiteSpace($id) -or $presentIds.Contains($id) -or -not $seen.Add($id)) { continue }
             [void]$ghosts.Add([PSCustomObject]@{
                 InstanceId   = $id
                 Class        = [string]$d.Class
@@ -27217,7 +27227,7 @@ $load = {
             })
         }
         [PSCustomObject]@{ Items = $ghosts.ToArray() }
-    } -OnComplete $done -OnError $failed | Out-Null
+    } -PoolKind UiSupport -OnComplete $done -OnError $failed | Out-Null
 }.GetNewClosure()
 
 $removeRows = {
@@ -27257,24 +27267,57 @@ $removeRows = {
 
     Invoke-WmtUiBackgroundCommand -Name ("GhostDeviceRemove_" + [guid]::NewGuid().ToString("N")) -Msg "Removing disconnected devices..." -SuppressResultLog -TimeoutMs 120000 -Sb {
         param($InstanceIds)
+        # Device presence can change after the review list was opened. Fail
+        # closed if re-enumeration fails; never remove an active device.
+        Import-Module PnpDevice -ErrorAction Stop
+        $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction Stop)
+        if ($presentDevices.Count -eq 0) {
+            throw "Unable to verify present devices; no devices were removed."
+        }
+        $presentIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $presentDevices) {
+            if ($p.InstanceId) { [void]$presentIds.Add([string]$p.InstanceId) }
+        }
         foreach ($id in @($InstanceIds)) {
-            $out = @(& pnputil.exe /remove-device $id 2>&1)
-            $exit = $LASTEXITCODE
-            [PSCustomObject]@{
-                InstanceId = [string]$id
-                Success = ($exit -eq 0 -or $exit -eq 3010)
-                ExitCode = $exit
-                Output = ((@($out) | ForEach-Object { [string]$_ }) -join "`n")
+            if ([string]::IsNullOrWhiteSpace([string]$id)) { continue }
+            if ($presentIds.Contains([string]$id)) {
+                [PSCustomObject]@{
+                    InstanceId = [string]$id
+                    Success = $false
+                    ExitCode = "Present"
+                    Output = "Device reconnected after the scan; skipped for safety."
+                }
+                continue
+            }
+            try {
+                $out = @(& pnputil.exe /remove-device $id 2>&1)
+                $exit = $LASTEXITCODE
+                [PSCustomObject]@{
+                    InstanceId = [string]$id
+                    Success = ($exit -eq 0 -or $exit -eq 3010)
+                    ExitCode = $exit
+                    Output = ((@($out) | ForEach-Object { [string]$_ }) -join "`n")
+                }
+            }
+            catch {
+                [PSCustomObject]@{
+                    InstanceId = [string]$id
+                    Success = $false
+                    ExitCode = -1
+                    Output = $_.Exception.Message
+                }
             }
         }
-    } -ArgumentList (, $ids) -OnComplete $done -OnError $failed | Out-Null
+    } -PoolKind UiSupport -ArgumentList (, $ids) -OnComplete $done -OnError $failed | Out-Null
 }.GetNewClosure()
 
 $btnRefresh.Add_Click({ & $load }.GetNewClosure())
 $btnRemoveSel.Add_Click({ & $removeRows -Rows @($dg.SelectedItems) }.GetNewClosure())
 $btnRemoveAll.Add_Click({ & $removeRows -Rows @($items) }.GetNewClosure())
 $btnClose.Add_Click({ $state.Generation++; $dialog.Close() }.GetNewClosure())
-$dialog.Add_ContentRendered({ & $load }.GetNewClosure())
+# Loaded reliably fires as the dialog is shown; ContentRendered can be
+# delayed by expensive layout work. Only launch the first scan once.
+$dialog.Add_Loaded({ if (-not $state.Started) { $state.Started = $true; & $load } }.GetNewClosure())
 $dialog.ShowDialog() | Out-Null
 }
 
