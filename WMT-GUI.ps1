@@ -9612,7 +9612,9 @@ if (-not $script:WmtAppxLoadRunspace) {
 try {
     if ($pnlQuickFindMatches -and $pnlQuickFind -and -not $pnlQuickFind.IsVisible) {
         Restore-WmtQuickFindButtons
-        $pnlQuickFindMatches.Children.Clear()
+        if (-not $script:WmtQuickFindMovedButtons -or $script:WmtQuickFindMovedButtons.Count -eq 0) {
+            $pnlQuickFindMatches.Children.Clear()
+        }
     }
 } catch {}
 }
