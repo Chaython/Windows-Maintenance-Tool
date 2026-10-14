@@ -80,6 +80,65 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Smoke test isolated ghost-device scan
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $match = [regex]::Match($source, "(?ms)^\$ghostScanScript\s*=\s*@'\r?\n(.*?)\r?\n'@")
+          if (-not $match.Success) { throw 'Ghost-device worker script was not found.' }
+          $scanScript = $match.Groups[1].Value
+
+          # Replace only hardware discovery with a predictable fixture.
+          # Exercise the real child-process JSON pipeline without removing hardware.
+          $fakePnp = @'
+          function Get-PnpDevice {
+              [CmdletBinding()]
+              param()
+              [PSCustomObject]@{ Status = 'Unknown'; InstanceId = 'USB\TEST_GHOST'; Class = 'USB'; FriendlyName = 'Disconnected test device' }
+              [PSCustomObject]@{ Status = 'OK'; InstanceId = 'USB\TEST_CONNECTED'; Class = 'USB'; FriendlyName = 'Connected test device' }
+          }
+          '@
+          $scanScript = $scanScript.Replace('Import-Module PnpDevice -ErrorAction Stop', $fakePnp)
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scanScript))
+          $out = Join-Path $env:TEMP ('wmt-ghost-' + [guid]::NewGuid().ToString('N') + '.out')
+          $err = $out + '.err'
+          $process = $null
+          try {
+              $args = @{
+                  FilePath = (Join-Path $PSHOME 'powershell.exe')
+                  ArgumentList = @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
+                  PassThru = $true
+                  WindowStyle = 'Hidden'
+                  RedirectStandardOutput = $out
+                  RedirectStandardError = $err
+              }
+              $process = Start-Process @args
+              if (-not $process.WaitForExit(20000)) {
+                  $process.Kill()
+                  throw 'Ghost-device scan child exceeded the 20-second test deadline.'
+              }
+              if ($process.ExitCode -ne 0) {
+                  throw ('Ghost-device scan child failed: ' + [IO.File]::ReadAllText($err))
+              }
+              $json = [IO.File]::ReadAllText($out,[Text.Encoding]::UTF8)
+              $rows = @(ConvertFrom-Json -InputObject $json)
+              if ($rows.Count -ne 1 -or [string]$rows[0].InstanceId -ne 'USB\TEST_GHOST') {
+                  throw ('Ghost-device worker returned unexpected data: ' + $json)
+              }
+              $fullHeaders = [regex]::Matches($source,
+                  '<Setter TargetName="HeaderBorder" Property="Background" Value="\{DynamicResource BgPanel\}"/>')
+              if ($fullHeaders.Count -lt 2) { throw 'The GridView and DataGrid filler headers are not themed.' }
+              Write-Host 'PASS: Ghost-device child returns only candidates; themed filler headers are present.'
+          }
+          finally {
+              if ($process) {
+                  try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+                  $process.Dispose()
+              }
+              Remove-Item -LiteralPath $out,$err -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Smoke test process timeouts and output capture
         shell: powershell
         run: |
