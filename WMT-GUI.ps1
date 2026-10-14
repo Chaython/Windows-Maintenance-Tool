@@ -2755,7 +2755,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -27652,10 +27652,136 @@ foreach ($d in $drivers) {
 return @($drivers)
 }
 
+function Get-WmtDriverCleanupUsage {
+param([string]$PublishedName = '')
+# A successful empty query is known usage; a failed query must never become [].
+$query = @{ ClassName = 'Win32_PnPSignedDriver'; Property = 'InfName'; OperationTimeoutSec = 30; ErrorAction = 'Stop' }
+if ($PublishedName) {
+    if ($PublishedName -notmatch '^oem\d+\.inf$') { throw 'The published driver package name is invalid.' }
+    # A targeted refresh avoids enumerating every device again for each package.
+    $query.Filter = "InfName = '$PublishedName'"
+}
+$inUse = @(
+    Get-CimInstance @query |
+    Where-Object { $_.InfName -match '^oem\d+\.inf$' } |
+    Select-Object -ExpandProperty InfName -Unique
+)
+return [PSCustomObject]@{ Succeeded = $true; InUseInfs = [string[]]$inUse }
+}
+
+function Invoke-WmtDriverCleanupBatch {
+param(
+    [object[]]$Items,
+    [ValidateSet('Backup', 'NoBackup', 'Force')][string]$Mode,
+    [string]$BackupRoot,
+    [hashtable]$CleanupProgress
+)
+$backupCount = 0
+$deleted = [System.Collections.Generic.List[string]]::new()
+$failures = [System.Collections.Generic.List[object]]::new()
+$packageResults = [System.Collections.Generic.List[object]]::new()
+$stopReason = ''
+$batchUsage = $null
+if ($CleanupProgress) { $CleanupProgress.Stage = 'Checking usage' }
+try { $batchUsage = Get-WmtDriverCleanupUsage }
+catch { $stopReason = 'Could not verify current driver usage: ' + $_.Exception.Message }
+
+foreach ($item in @($Items)) {
+    $name = [string]$item.PublishedName
+    $failure = $null
+    $backupPath = if ($Mode -eq 'Force') { [string]$item.BackupPath } else { '' }
+    $backedUp = ($Mode -eq 'Force' -and [bool]$item.BackedUp)
+    $stage = 'Usage'
+    $processResult = $null
+    if ($CleanupProgress) {
+        $CleanupProgress.Package = $name
+        $CleanupProgress.Stage = 'Checking usage'
+    }
+    try {
+        if ($CleanupProgress -and $CleanupProgress.Cancelled) { throw 'Driver cleanup was cancelled when the dialog closed.' }
+        if ($stopReason) { throw $stopReason }
+        if ($name -notmatch '^oem\d+\.inf$') { throw 'The published driver package name is invalid.' }
+        if ($batchUsage.InUseInfs -contains $name) { throw 'This driver package is now in use by a device.' }
+        if ($Mode -eq 'Force' -and -not [bool]$item.ForceEligible) { throw 'This package is not eligible for a force retry.' }
+
+        if ($Mode -eq 'Backup') {
+            $stage = 'Backup'
+            if ($CleanupProgress) { $CleanupProgress.Stage = 'Backing up' }
+            # Published names identify packages even when OriginalName is shared.
+            $backupPath = Join-Path $BackupRoot ($name + '\' + [guid]::NewGuid().ToString('N'))
+            [void][System.IO.Directory]::CreateDirectory($backupPath)
+            $processResult = Invoke-WmtProcess -FilePath 'pnputil.exe' -Arguments ('/export-driver ' + $name + ' "' + $backupPath + '"') -TimeoutMs 120000 -Encoding OEM -KillTree
+            if ($processResult.TerminationFailed -or $processResult.OutputReadTimedOut) {
+                $stopReason = 'Stopping driver cleanup: export termination or output completion is unverified for ' + $name + '.'
+                throw $stopReason
+            }
+            if ($processResult.TimedOut -or $processResult.ExitCode -ne 0 -or $processResult.Error) { throw 'Driver backup failed; this package was not removed.' }
+            $backedUp = $true
+            $backupCount++
+        }
+
+        # Repeat immediately before each deletion, including after a slow export.
+        $stage = 'Usage'
+        $processResult = $null
+        if ($CleanupProgress) { $CleanupProgress.Stage = 'Checking usage' }
+        if ($CleanupProgress -and $CleanupProgress.Cancelled) { throw 'Driver cleanup was cancelled when the dialog closed.' }
+        try { $freshUsage = Get-WmtDriverCleanupUsage -PublishedName $name }
+        catch {
+            $stopReason = 'Could not verify current driver usage: ' + $_.Exception.Message
+            throw $stopReason
+        }
+        if ($freshUsage.InUseInfs -contains $name) { throw 'This driver package is now in use by a device.' }
+        if ($CleanupProgress -and $CleanupProgress.Cancelled) { throw 'Driver cleanup was cancelled when the dialog closed.' }
+        $stage = 'Deletion'
+        if ($CleanupProgress) { $CleanupProgress.Stage = if ($Mode -eq 'Force') { 'Force removing' } else { 'Removing' } }
+        $arguments = '/delete-driver ' + $name + ' /uninstall'
+        if ($Mode -eq 'Force') { $arguments += ' /force' }
+        $processResult = Invoke-WmtProcess -FilePath 'pnputil.exe' -Arguments $arguments -TimeoutMs 120000 -Encoding OEM -KillTree
+        if ($processResult.TerminationFailed -or $processResult.OutputReadTimedOut) {
+            $stopReason = 'Stopping driver cleanup: removal termination or output completion is unverified for ' + $name + '.'
+            throw $stopReason
+        }
+        if ($processResult.TimedOut -or $processResult.Error -or ($processResult.ExitCode -ne 0 -and $processResult.ExitCode -ne 3010)) { throw 'Driver removal failed.' }
+        [void]$deleted.Add($name)
+        [void]$packageResults.Add([PSCustomObject]@{ PublishedName = $name; Stage = 'Deleted'; Success = $true; BackedUp = $backedUp; BackupPath = $backupPath; ExitCode = [int]$processResult.ExitCode })
+    }
+    catch {
+        $failure = [PSCustomObject]@{
+            PublishedName = $name
+            OriginalName = [string]$item.OriginalName
+            Stage = $stage
+            ForceEligible = ($Mode -ne 'Force' -and $stage -eq 'Deletion' -and $null -ne $processResult -and -not $processResult.TimedOut -and -not $processResult.TerminationFailed -and -not $processResult.OutputReadTimedOut -and -not $processResult.Error)
+            BackedUp = $backedUp
+            BackupPath = $backupPath
+            StdOut = if ($processResult) { [string]$processResult.StdOut } else { '' }
+            StdErr = if ($processResult) { (([string]$processResult.StdErr + "`n" + [string]$processResult.Error + "`n" + $_.Exception.Message).Trim()) } else { $_.Exception.Message }
+            TimedOut = if ($processResult) { [bool]$processResult.TimedOut } else { $false }
+            ExitCode = if ($processResult) { [int]$processResult.ExitCode } else { -1 }
+            Success = $false
+        }
+        [void]$failures.Add($failure)
+        [void]$packageResults.Add($failure)
+    }
+    finally {
+        if ($CleanupProgress) { $CleanupProgress.Completed = [int]$CleanupProgress.Completed + 1 }
+    }
+}
+if ($CleanupProgress) { $CleanupProgress.Stage = if ($stopReason) { 'Stopped' } else { 'Complete' } }
+return [PSCustomObject]@{
+    Deleted = $deleted.ToArray()
+    Failures = $failures.ToArray()
+    Failed = $failures.Count
+    BackupCount = $backupCount
+    BackupPath = $BackupRoot
+    PackageResults = $packageResults.ToArray()
+}
+}
+
 function Show-DriverCleanupDialog {
 param(
     [object[]]$DriverOutput = $null,
-    [string[]]$InUseInfs = $null
+    [string[]]$InUseInfs = $null,
+    [switch]$UsageScanSucceeded
 )
 
 if ($null -eq $DriverOutput) {
@@ -27666,7 +27792,11 @@ if ($null -eq $DriverOutput) {
             Show-WmtMessageBox -Message "Driver store scan returned no result." -Title "Clean Old Drivers" -Image Warning | Out-Null
             return
         }
-        Show-DriverCleanupDialog -DriverOutput @($payload[0].DriverOutput) -InUseInfs @($payload[0].InUseInfs)
+        if (-not [bool]$payload[0].UsageScanSucceeded) {
+            Show-WmtMessageBox -Message "Driver usage could not be verified. Cleanup was stopped." -Title "Clean Old Drivers" -Image Warning | Out-Null
+            return
+        }
+        Show-DriverCleanupDialog -DriverOutput @($payload[0].DriverOutput) -InUseInfs @($payload[0].InUseInfs) -UsageScanSucceeded
     }.GetNewClosure()
     $scanError = {
         param($err)
@@ -27676,29 +27806,36 @@ if ($null -eq $DriverOutput) {
 
     Invoke-WmtUiBackgroundCommand -Name "DriverCleanupScan" -Msg "Scanning driver store..." -TimeoutMs 120000 -SuppressResultLog -Sb {
         $driverOutput = @(pnputil.exe /enum-drivers 2>&1 | ForEach-Object { [string]$_ })
-        $inUse = @()
-        try {
-            $inUse = @(
-                Get-CimInstance -ClassName Win32_PnPSignedDriver -Property InfName -ErrorAction Stop |
-                Where-Object { $_.InfName -match '^oem\d+\.inf$' } |
-                Select-Object -ExpandProperty InfName -Unique
-            )
-        }
-        catch {}
+        $usage = Get-WmtDriverCleanupUsage
         [PSCustomObject]@{
             DriverOutput = $driverOutput
-            InUseInfs    = [string[]]$inUse
+            InUseInfs    = [string[]]$usage.InUseInfs
+            UsageScanSucceeded = [bool]$usage.Succeeded
         }
     } -OnComplete $scanComplete -OnError $scanError | Out-Null
     return
 }
 
+if (-not $UsageScanSucceeded -or $null -eq $InUseInfs) {
+    Show-WmtMessageBox -Message "Driver usage is unknown. Scan again before removing driver packages." -Title "Clean Old Drivers" -Image Warning | Out-Null
+    return
+}
 $drivers = Get-WmtDriverStorePackages -RawOutput $DriverOutput
 $inUseInfs = @($InUseInfs)
 
 $toDelete = @()
 $skippedInUse = 0
-foreach ($group in @($drivers | Where-Object { $_.OriginalName } | Group-Object OriginalName)) {
+# Missing identity metadata cannot prove that two packages replace each other.
+$knownDrivers = @($drivers | Where-Object {
+    $_.PublishedName -match '^oem\d+\.inf$' -and
+    $_.OriginalName -match '^[^\\/:*?"<>|%]+\.inf$' -and
+    -not [string]::IsNullOrWhiteSpace([string]$_.Provider) -and
+    -not [string]::IsNullOrWhiteSpace([string]$_.Class) -and
+    $_.OriginalName -notmatch '^(Unknown|N/A)$|%' -and
+    $_.Provider -notmatch '^(Unknown|N/A)$|%' -and
+    $_.Class -notmatch '^(Unknown|N/A)$|%'
+})
+foreach ($group in @($knownDrivers | Group-Object -Property OriginalName, Provider, Class)) {
     if ($group.Count -lt 2) { continue }
 
     # Rank the group: the in-use copy first (it must be kept), then the highest
@@ -27740,19 +27877,28 @@ if (-not $toDelete -or $toDelete.Count -eq 0) {
 }
 
 $content = @"
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <DataGrid Name="dgDrivers" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2"/>
-    <Grid Grid.Row="1" Margin="0,12,0,0">
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
-            <Button Name="btnRemoveAll" Content="Remove All" MinWidth="116" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
-            <Button Name="btnRemoveSel" Content="Remove Selected" MinWidth="140" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
-        </StackPanel>
-        <Button Name="btnClose" Content="Close" Width="90" HorizontalAlignment="Right" IsCancel="True"/>
-    </Grid>
+    <DataGrid Name="dgDrivers" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2" BorderThickness="0"/>
+    <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="16,12">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Name="lblCleanupStatus" Text="Ready to clean old driver packages." TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <ProgressBar Name="pbCleanupProgress" Grid.Row="1" Height="4" Minimum="0" Maximum="1" Value="0" Margin="0,0,0,12"/>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Left">
+                <Button Name="btnRemoveAll" Content="Remove All" MinWidth="116" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
+                <Button Name="btnRemoveSel" Content="Remove Selected" MinWidth="140" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
+            </StackPanel>
+            <Button Name="btnClose" Grid.Row="2" Content="Close" Width="90" HorizontalAlignment="Right" IsCancel="True"/>
+        </Grid>
+    </Border>
 </Grid>
 "@
 $dialog = New-WmtWindowFromXaml -Title "Clean Old Drivers" -ContentXaml $content -Width 960 -Height 620 -MinWidth 760 -MinHeight 480
@@ -27760,6 +27906,26 @@ $dg = $dialog.FindName("dgDrivers")
 $btnRemoveAll = $dialog.FindName("btnRemoveAll")
 $btnRemoveSel = $dialog.FindName("btnRemoveSel")
 $btnClose = $dialog.FindName("btnClose")
+$cleanupStatus = $dialog.FindName("lblCleanupStatus")
+$cleanupBar = $dialog.FindName("pbCleanupProgress")
+$cleanupProgress = [hashtable]::Synchronized(@{ Package = ''; Stage = 'Ready'; Completed = 0; Total = 0; Cancelled = $false })
+$progressTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$progressTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+$progressTick = {
+    if ($cleanupProgress.Cancelled) { $progressTimer.Stop(); return }
+    $completed = [int]$cleanupProgress.Completed
+    $total = [int]$cleanupProgress.Total
+    $cleanupBar.Maximum = [Math]::Max(1, $total)
+    $cleanupBar.Value = [Math]::Min($completed, [Math]::Max(1, $total))
+    $package = [string]$cleanupProgress.Package
+    $cleanupStatus.Text = "{0}/{1} completed - {2}{3}" -f $completed, $total, [string]$cleanupProgress.Stage, $(if ($package) { ' - ' + $package } else { '' })
+}.GetNewClosure()
+$progressTimer.Add_Tick($progressTick)
+$dialog.Add_Closed({
+    $cleanupProgress.Cancelled = $true
+    $progressTimer.Stop()
+    $progressTimer.Remove_Tick($progressTick)
+}.GetNewClosure())
 
 $currentList = [System.Collections.Generic.List[object]]::new()
 foreach ($item in @($toDelete)) { [void]$currentList.Add($item) }
@@ -27820,14 +27986,19 @@ $doRemove = {
     $cleanupRemoveAllRef = $btnRemoveAll
     $cleanupRemoveSelectedRef = $btnRemoveSel
     $cleanupCloseRef = $btnClose
+    $cleanupProgressRef = $cleanupProgress
+    $cleanupProgressTimerRef = $progressTimer
+    $cleanupProgressTickRef = $progressTick
+    $cleanupStatusRef = $cleanupStatus
+    $cleanupBarRef = $cleanupBar
     $itemsToRemove = @($Items | ForEach-Object { if ($_.PSObject.Properties["Source"]) { $_.Source } else { $_ } })
     if ($itemsToRemove.Count -eq 0) { return }
 
     $mode = & $chooseCleanupMode -Count $itemsToRemove.Count
     if ($mode -eq "Cancel") { return }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmm'
-    $mainBkPath = Join-Path (Get-DataPath) "Drivers_Backup_$timestamp"
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $mainBkPath = Join-Path (Get-DataPath) ("Drivers_Backup_{0}_{1}" -f $timestamp, [guid]::NewGuid().ToString('N'))
     $workItems = @(
         $itemsToRemove | ForEach-Object {
             [PSCustomObject]@{
@@ -27842,6 +28013,12 @@ $doRemove = {
     $btnRemoveSel.IsEnabled = $false
     $btnClose.IsEnabled = $false
     $dialog.Title = if ($mode -eq "Backup") { "Backing up and removing drivers..." } else { "Removing drivers..." }
+    $cleanupProgressRef.Package = ''
+    $cleanupProgressRef.Stage = 'Checking usage'
+    $cleanupProgressRef.Completed = 0
+    $cleanupProgressRef.Total = $workItems.Count
+    & $cleanupProgressTickRef
+    $cleanupProgressTimerRef.Start()
     Set-WmtBusyCursor -Busy
 
     $finalizeCleanup = {
@@ -27865,10 +28042,16 @@ $doRemove = {
                     $cleanupCurrentListRef.RemoveAt($idx)
                 }
             }
-            & $cleanupLoadGridRef
+            if (-not $cleanupProgressRef.Cancelled) { & $cleanupLoadGridRef }
             Remove-DriverRowsFromCache -RemovedInfs @($removedSet)
         }
 
+        $cleanupProgressTimerRef.Stop()
+        Set-WmtBusyCursor
+        if ($cleanupProgressRef.Cancelled) { return }
+        $cleanupStatusRef.Text = "Completed - Deleted: $($removedSet.Count); Failed: $FailedCount"
+        $cleanupBarRef.Maximum = [Math]::Max(1, [int]$cleanupProgressRef.Total)
+        $cleanupBarRef.Value = [Math]::Min([int]$cleanupProgressRef.Completed, $cleanupBarRef.Maximum)
         $resMsg = "Done.`nDeleted: $($removedSet.Count)`nFailed: $FailedCount"
         if ($mode -eq "Backup") {
             $resMsg += "`nBackups: $BackupCount`nPath: $BackupPath"
@@ -27904,8 +28087,16 @@ $doRemove = {
         $deleted = @($result.Deleted)
         $failures = @($result.Failures)
         $forceItems = [System.Collections.Generic.List[object]]::new()
-
+        if ($cleanupProgressRef.Cancelled) {
+            & $finalizeCleanupForFirstPass $deleted $failures.Count ([int]$result.BackupCount) ([string]$result.BackupPath)
+            return
+        }
+        $cleanupProgressRef.Stage = 'Awaiting retry decision'
         foreach ($failure in $failures) {
+            if (-not [bool]$failure.ForceEligible) {
+                Write-GuiLog ("Driver cleanup skipped {0} at {1}: {2}" -f $failure.PublishedName, $failure.Stage, $failure.StdErr)
+                continue
+            }
             $detail = (([string]$failure.StdOut + "`n" + [string]$failure.StdErr).Trim())
             if ([bool]$failure.TimedOut) {
                 $detail = ($detail + "`nDriver removal timed out.").Trim()
@@ -27928,6 +28119,9 @@ $doRemove = {
         $finalizeCleanupCallback = $finalizeCleanupForFirstPass
         $deletedBeforeForce = [string[]]@($deleted)
         $forceItemCount = [int]$forceItems.Count
+        $unresolvedFirstPassCount = [int]($failures.Count - $forceItems.Count)
+        $forceProgressRef = $cleanupProgressRef
+        $forceProgressTickRef = $cleanupProgressTickRef
         $backupCountAfterFirstPass = [int]$result.BackupCount
         $backupPathAfterFirstPass = [string]$result.BackupPath
 
@@ -27944,43 +28138,32 @@ $doRemove = {
                 $forcedDeleted = @($forcePayload[0].Deleted)
                 $forcedFailed = [int]$forcePayload[0].Failed
             }
-            & $finalizeCleanupCallback @($deletedBeforeForce + $forcedDeleted) $forcedFailed $backupCountAfterFirstPass $backupPathAfterFirstPass
+            & $finalizeCleanupCallback @($deletedBeforeForce + $forcedDeleted) ($unresolvedFirstPassCount + $forcedFailed) $backupCountAfterFirstPass $backupPathAfterFirstPass
         }.GetNewClosure()
 
         $forceError = {
             param($err)
-            & $finalizeCleanupCallback $deletedBeforeForce $forceItemCount $backupCountAfterFirstPass $backupPathAfterFirstPass
+            & $finalizeCleanupCallback $deletedBeforeForce ($unresolvedFirstPassCount + $forceItemCount) $backupCountAfterFirstPass $backupPathAfterFirstPass
         }.GetNewClosure()
 
-        $forceArgs = [object[]]@((, @($forceItems.ToArray())))
-        Invoke-WmtUiBackgroundCommand -Name ("DriverCleanupForce_" + [guid]::NewGuid().ToString("N")) -Msg "Force-removing selected driver packages..." -TimeoutMs ([Math]::Max(120000, 125000 * $forceItems.Count)) -SuppressResultLog -Sb {
-            param($Items)
-
-            $deleted = [System.Collections.Generic.List[string]]::new()
-            $failed = 0
-            foreach ($item in @($Items)) {
-                $name = [string]$item.PublishedName
-                $forceDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments ("/delete-driver " + $name + " /uninstall /force") -TimeoutMs 120000 -Encoding OEM -KillTree
-                if ($forceDelete.TerminationFailed -or $forceDelete.OutputReadTimedOut) {
-                    throw "Stopping driver removal: pnputil termination or output completion is unverified for $name."
-                }
-                if ($forceDelete.ExitCode -eq 0 -or $forceDelete.ExitCode -eq 3010) {
-                    [void]$deleted.Add($name)
-                }
-                else {
-                    $failed++
-                }
-            }
-
-            [PSCustomObject]@{
-                Deleted = $deleted.ToArray()
-                Failed  = $failed
-            }
+        $forceProgressRef.Package = ''
+        $forceProgressRef.Stage = 'Checking usage'
+        $forceProgressRef.Completed = 0
+        $forceProgressRef.Total = $forceItemCount
+        & $forceProgressTickRef
+        $forceArgs = [object[]]@(@($forceItems.ToArray()), 'Force', $backupPathAfterFirstPass, $forceProgressRef)
+        Invoke-WmtUiBackgroundCommand -Name ("DriverCleanupForce_" + [guid]::NewGuid().ToString("N")) -Msg "Force-removing selected driver packages..." -TimeoutMs ([Math]::Max(120000, 60000 + 160000 * $forceItemCount)) -SuppressResultLog -Sb {
+            param($Items, [string]$Mode, [string]$BackupRoot, [hashtable]$CleanupProgress)
+            Invoke-WmtDriverCleanupBatch -Items $Items -Mode $Mode -BackupRoot $BackupRoot -CleanupProgress $CleanupProgress
         } -ArgumentList $forceArgs -OnComplete $forceComplete -OnError $forceError | Out-Null
     }.GetNewClosure()
 
     $firstPassError = {
         param($err)
+        $cleanupProgressTimerRef.Stop()
+        Set-WmtBusyCursor
+        if ($cleanupProgressRef.Cancelled) { return }
+        $cleanupStatusRef.Text = 'Driver cleanup stopped because of an error.'
         $cleanupDialogRef.Title = "Clean Old Drivers"
         $cleanupRemoveAllRef.IsEnabled = $true
         $cleanupRemoveSelectedRef.IsEnabled = $true
@@ -27992,64 +28175,11 @@ $doRemove = {
 
     # The outer argument list already keeps the batch as its first element.
     # Another unary comma nests the batch and joins all INF names into one target.
-    $workerArgs = [object[]]@($workItems, $mode, $mainBkPath)
-    Invoke-WmtUiBackgroundCommand -Name ("DriverCleanup_" + [guid]::NewGuid().ToString("N")) -Msg "Cleaning old driver packages..." -TimeoutMs ([Math]::Max(120000, 125000 * $workItems.Count)) -SuppressResultLog -Sb {
-        param(
-            $Items,
-            [string]$Mode,
-            [string]$BackupRoot
-        )
-
-        $backupCount = 0
-        $deleted = [System.Collections.Generic.List[string]]::new()
-        $failures = [System.Collections.Generic.List[object]]::new()
-
-        if ($Mode -eq "Backup") {
-            if (-not (Test-Path -LiteralPath $BackupRoot)) {
-                New-Item -Path $BackupRoot -ItemType Directory -Force | Out-Null
-            }
-            foreach ($item in @($Items)) {
-                $folderName = if (-not [string]::IsNullOrWhiteSpace([string]$item.OriginalName)) {
-                    [string]$item.OriginalName
-                }
-                else {
-                    [string]$item.PublishedName
-                }
-                $drvPath = Join-Path $BackupRoot $folderName
-                New-Item -Path $drvPath -ItemType Directory -Force | Out-Null
-                $proc = Start-Process pnputil.exe -ArgumentList "/export-driver", ([string]$item.PublishedName), ('"' + $drvPath + '"') -NoNewWindow -Wait -PassThru
-                $backupExitCode = [int]$proc.ExitCode
-                try { $proc.Dispose() } catch {}
-                if ($backupExitCode -eq 0) { $backupCount++ }
-            }
-        }
-
-        foreach ($item in @($Items)) {
-            $name = [string]$item.PublishedName
-            $driverDelete = Invoke-WmtProcess -FilePath "pnputil.exe" -Arguments ("/delete-driver " + $name + " /uninstall") -TimeoutMs 120000 -Encoding OEM -KillTree
-            if ($driverDelete.TerminationFailed -or $driverDelete.OutputReadTimedOut) {
-                throw "Stopping driver removal: pnputil termination or output completion is unverified for $name."
-            }
-            if ($driverDelete.ExitCode -eq 0 -or $driverDelete.ExitCode -eq 3010) {
-                [void]$deleted.Add($name)
-            }
-            else {
-                [void]$failures.Add([PSCustomObject]@{
-                        PublishedName = $name
-                        OriginalName  = [string]$item.OriginalName
-                        StdOut        = [string]$driverDelete.StdOut
-                        StdErr        = [string]$driverDelete.StdErr
-                        TimedOut      = [bool]$driverDelete.TimedOut
-                    })
-            }
-        }
-
-        [PSCustomObject]@{
-            Deleted     = $deleted.ToArray()
-            Failures    = $failures.ToArray()
-            BackupCount = $backupCount
-            BackupPath  = $BackupRoot
-        }
+    $workerArgs = [object[]]@($workItems, $mode, $mainBkPath, $cleanupProgressRef)
+    $perPackageBudget = if ($mode -eq 'Backup') { 310000 } else { 160000 }
+    Invoke-WmtUiBackgroundCommand -Name ("DriverCleanup_" + [guid]::NewGuid().ToString("N")) -Msg "Cleaning old driver packages..." -TimeoutMs ([Math]::Max(120000, 60000 + $perPackageBudget * $workItems.Count)) -SuppressResultLog -Sb {
+        param($Items, [string]$Mode, [string]$BackupRoot, [hashtable]$CleanupProgress)
+        Invoke-WmtDriverCleanupBatch -Items $Items -Mode $Mode -BackupRoot $BackupRoot -CleanupProgress $CleanupProgress
     } -ArgumentList $workerArgs -OnComplete $firstPassComplete -OnError $firstPassError | Out-Null
 }.GetNewClosure()
 
