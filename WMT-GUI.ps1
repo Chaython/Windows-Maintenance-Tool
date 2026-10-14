@@ -38048,7 +38048,9 @@ function Update-WmtQuickFindResults {
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
                 $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 $stateName = [string]$entry.Item.Button.Name
-                if ($script:TweakStatesReady -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
+                if ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName -and -not $script:OptionalFeaturesReady) {
+                    $stateLabel.Text = "State: Checking Windows feature..."
+                } elseif ($script:TweakStatesReady -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
                     $stateLabel.Text = if ($script:TweakCurrentStates[$stateName].On) { "State: Enabled" } else { "State: Disabled" }
                 } elseif (-not $script:TweakStatesReady) {
                     $stateLabel.Text = "State: Checking..."
@@ -38069,7 +38071,8 @@ function Update-WmtQuickFindResults {
                 # Controls that depend on their page context (including the
                 # catalogue/library navigators and search fields) stay in place.
                 $open = [System.Windows.Controls.Button]::new()
-                $open.Content = "Open section"
+                $open.Content = if ($entry.Item.Tab -eq "btnTabTweaks" -and
+                    (-not $script:TweakStatesReady -or -not $script:OptionalFeaturesReady)) { "Open Tweaks (loading)" } else { "Open section" }
                 $open.Style = $window.FindResource("ActionBtn")
                 $open.HorizontalAlignment = "Left"
                 $open.Margin = [System.Windows.Thickness]::new(0,9,0,0)
@@ -61739,17 +61742,17 @@ try {
                 try {
                     Update-TweakButtonStates
                     $script:TweakStatesReady = $true
-                    Set-TweakStatesLoadingOverlay -Visible $false
+                    Sync-WmtTweakOverlayHide
                 }
                 catch {
                     try { Write-GuiLog "[Tweak States] Retry also failed: $($_.Exception.Message)" } catch {}
                     $script:TweakStatesReady = $false
-                    Show-TweakStatesLoadError -Message "Retry failed: $($_.Exception.Message). The Tweaks page is still usable but toggle states may be inaccurate."
+                    Show-TweakStatesLoadError -Message "Retry failed: $($_.Exception.Message). Tweak controls remain blocked."
                 }
             }
         })
     }
-    # Auto-hide error overlay after 8 seconds so the page remains usable
+    # Do not auto-hide the blocking overlay while states remain unverified.
     if ($script:TweakOverlayAutoHideTimer) { try { $script:TweakOverlayAutoHideTimer.Stop() } catch {} }
     # Keep the blocker visible until a successful retry.
 } catch {}
@@ -62138,6 +62141,8 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                 Sync-WmtTweakOverlayHide
                 Show-TweakStatesLoadError -Message "Background tweak state load failed: $errMsg. Buttons will use live registry reads."
             }
+            if ($script:TweakStatesBgTimeout) { try { $script:TweakStatesBgTimeout.Stop() } catch {}; $script:TweakStatesBgTimeout = $null }
+            if (-not $script:TweakStatesReady) { $script:TweakStatesBgStarted = $false }
             try { $script:TweakStatesBgPS.Dispose() } catch {}
             $script:TweakStatesBgAsync = $null
             $script:TweakStatesBgPS = $null
@@ -62313,6 +62318,7 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
             # Mark optional features as ready and coordinate overlay hide
             $script:OptionalFeaturesReady = $true
             Sync-WmtTweakOverlayHide
+            if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindResults }
         }
     } | Out-Null
 }
