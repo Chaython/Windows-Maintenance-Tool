@@ -31719,14 +31719,29 @@ catch { & $failed $_ }
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
 
-            <!-- Header/Search -->
-            <Border Name="bdQuickFind" Grid.Row="0" Background="{DynamicResource BgDark}" Margin="16,20,16,12" CornerRadius="8" BorderThickness="0" Cursor="IBeam">
-                <StackPanel Margin="12">
-                    <TextBlock Text="Quick Find" FontSize="11" Foreground="{DynamicResource TextMuted}" FontWeight="SemiBold" Margin="0,0,0,8"/>
-                    <TextBox Name="txtGlobalSearch" Height="36" ToolTip="Search any function..." VerticalContentAlignment="Center"
-                             Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}"
-                             BorderThickness="0" Padding="10,0"/>
-                </StackPanel>
+            <!-- Quick Find shares the search field styling of the other WMT pages, without an outer card. -->
+            <Border Name="bdQuickFind" Grid.Row="0" Style="{StaticResource ModernSearchBoxStyle}"
+                    Margin="16,20,16,8" Cursor="IBeam">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Path Grid.Column="0" Data="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"
+                          Fill="{DynamicResource TextMuted}" Stretch="Uniform" Height="14" Width="14"
+                          VerticalAlignment="Center" Margin="12,0,6,0"/>
+                    <TextBox Name="txtGlobalSearch" Grid.Column="1" Height="38" ToolTip="Search any function..."
+                             VerticalContentAlignment="Center" Background="Transparent" BorderThickness="0"
+                             Padding="0" Margin="0" FontSize="14"
+                             Foreground="{DynamicResource TextMuted}"
+                             CaretBrush="{DynamicResource TextPrimary}" SelectionBrush="{DynamicResource Accent}"/>
+                    <Button Name="btnQuickFindClearSearch" Grid.Column="2" Content="X"
+                            Width="28" Height="28" Margin="0,0,6,0"
+                            VerticalAlignment="Center" HorizontalAlignment="Center"
+                            Visibility="Collapsed" ToolTip="Clear search"
+                            Style="{StaticResource SearchClearBtnStyle}"/>
+                </Grid>
             </Border>
 
             <!-- Navigation -->
@@ -36116,6 +36131,7 @@ $btnCreditChaython = Get-Ctrl "btnCreditChaython"
 
 $bdQuickFind = Get-Ctrl "bdQuickFind"
 $txtGlobalSearch = Get-Ctrl "txtGlobalSearch"
+$btnQuickFindClearSearch = Get-Ctrl "btnQuickFindClearSearch"
 $lstSearchResults = Get-Ctrl "lstSearchResults"
 $pnlNavButtons = Get-Ctrl "pnlNavButtons"
 $svLog = Get-Ctrl "svLog"
@@ -36234,26 +36250,49 @@ $LogBox.Add_PreviewMouseLeftButtonUp({
     })
 }
 
-# Quick Find placeholder + focus behavior
+# Quick Find placeholder, clear control, and focus border (same as the other search fields).
 $script:QuickFindPlaceholder = "Search tools..."
 if ($txtGlobalSearch) {
-$txtGlobalSearch.Text = $script:QuickFindPlaceholder
-Set-WmtQuickFindForeground -TextBox $txtGlobalSearch
-$txtGlobalSearch.Add_GotFocus({
+    $txtGlobalSearch.Text = $script:QuickFindPlaceholder
+    Set-WmtQuickFindForeground -TextBox $txtGlobalSearch
+    $txtGlobalSearch.Add_GotFocus({
         if ($txtGlobalSearch.Text -eq $script:QuickFindPlaceholder) {
             $txtGlobalSearch.Text = ""
             Set-WmtQuickFindForeground -TextBox $txtGlobalSearch
         }
+        if ($bdQuickFind) {
+            $bdQuickFind.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "Accent")
+            $bdQuickFind.BorderThickness = [System.Windows.Thickness]::new(2)
+        }
     })
-$txtGlobalSearch.Add_LostFocus({
+    $txtGlobalSearch.Add_LostFocus({
         if ([string]::IsNullOrWhiteSpace($txtGlobalSearch.Text)) {
             $txtGlobalSearch.Text = $script:QuickFindPlaceholder
             Set-WmtQuickFindForeground -TextBox $txtGlobalSearch
         }
+        if ($bdQuickFind) {
+            # Clearing local values restores the shared style, including its hover trigger.
+            $bdQuickFind.ClearValue([System.Windows.Controls.Border]::BorderBrushProperty)
+            $bdQuickFind.ClearValue([System.Windows.Controls.Border]::BorderThicknessProperty)
+        }
+    })
+    $txtGlobalSearch.Add_TextChanged({
+        Set-WmtQuickFindForeground -TextBox $txtGlobalSearch
+        if ($btnQuickFindClearSearch) {
+            $hasQuery = (-not [string]::IsNullOrWhiteSpace($txtGlobalSearch.Text)) -and
+                        ($txtGlobalSearch.Text -ne $script:QuickFindPlaceholder)
+            $btnQuickFindClearSearch.Visibility = if ($hasQuery) { "Visible" } else { "Collapsed" }
+        }
+    })
+}
+if ($btnQuickFindClearSearch -and $txtGlobalSearch) {
+    $btnQuickFindClearSearch.Add_Click({
+        $txtGlobalSearch.Clear()
+        [void]$txtGlobalSearch.Focus()
     })
 }
 if ($bdQuickFind -and $txtGlobalSearch) {
-$bdQuickFind.Add_MouseLeftButtonDown({ $txtGlobalSearch.Focus() })
+    $bdQuickFind.Add_MouseLeftButtonDown({ [void]$txtGlobalSearch.Focus() })
 }
 
 # Helper: if library sub-view is active, switch back to catalog list.
