@@ -129,6 +129,24 @@ jobs:
           }
           Write-Host 'PASS: fast ghost candidates, deduplication, edge-to-edge dialog, removal presence guard, and themed headers.'
 
+      - name: Smoke test installer, catalogue and import timeouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $checks = @(
+              @{ Label = 'visible installer preserves timeout metadata'; Pattern = '(?s)if \(\$null -eq \$p -or \$null -eq \$p\.ExitCode\).*?TerminationFailed = \$false' },
+              @{ Label = 'visible installer fails closed on timeout'; Pattern = '(?s)visible installer runtime limit.*?TerminationFailed = \$true' },
+              @{ Label = 'library scan has timeout and error callbacks'; Pattern = '(?s)TimeoutMs 120000 -OnTimeout \{.*?-OnError \{' },
+              @{ Label = 'game import watchdog'; Pattern = 'GameLibraryImport.*?-TimeoutMs 7260000' },
+              @{ Label = 'cache build watchdog'; Pattern = 'LibraryCacheBuilder.*?-TimeoutMs 1800000' },
+              @{ Label = 'game import cleanup avoids synchronous Stop'; Pattern = 'Stop-WmtPowerShellInvocationAsync -PowerShell \$active -Invocation \$async -Name "Game import timeout"' }
+          )
+          foreach ($check in $checks) {
+              if (-not [regex]::IsMatch($source, $check.Pattern)) { throw ('Timeout regression: ' + $check.Label) }
+              Write-Host ('PASS: ' + $check.Label)
+          }
+
       - name: Smoke test driver dialog edge-to-edge layouts
         shell: powershell
         run: |
