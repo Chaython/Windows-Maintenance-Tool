@@ -9608,9 +9608,12 @@ if (-not $script:WmtAppxLoadRunspace) {
     try { if ($lstAppxPackages) { $lstAppxPackages.Items.Clear() } } catch {}
 }
 
-# Quick Find results are disposable and can retain references into several
-# page models even after the search flyout is no longer visible.
-try { if ($lstSearchResults) { $lstSearchResults.Items.Clear() } } catch {}
+# Dynamic Quick Find cards are disposable while the results page is hidden.
+try {
+    if ($pnlQuickFindMatches -and $pnlQuickFind -and -not $pnlQuickFind.IsVisible) {
+        $pnlQuickFindMatches.Children.Clear()
+    }
+} catch {}
 }
 
 function Invoke-WmtMemoryTrim {
@@ -31712,9 +31715,8 @@ catch { & $failed $_ }
     <Border Grid.Column="0" Background="{DynamicResource BgPanel}" BorderThickness="0">
         <Grid>
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/> 
-                <RowDefinition Height="Auto"/> 
-                <RowDefinition Height="Auto"/>    
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="6"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
@@ -31746,7 +31748,6 @@ catch { & $failed $_ }
 
             <!-- Navigation -->
             <StackPanel Grid.Row="1" Margin="8,8,8,0">
-                <TextBlock Text="NAVIGATION" Style="{StaticResource SubHeader}" Margin="12,0,0,4"/>
                 <StackPanel Name="pnlNavButtons">
                     <Button Name="btnTabUpdates" Content="Updates" Style="{StaticResource NavBtn}" Tag="pnlUpdates"/>
                     <Button Name="btnTabTweaks" Content="Tweaks" Style="{StaticResource NavBtn}" Tag="pnlTweaks"/>
@@ -31769,14 +31770,12 @@ catch { & $failed $_ }
                 </StackPanel>
             </StackPanel>
 
-            <ListBox Name="lstSearchResults" Grid.Row="2" Background="{DynamicResource BgDark}" BorderThickness="0" Foreground="{DynamicResource Accent}" Visibility="Collapsed" Margin="8" MaxHeight="220"/>
-
-            <GridSplitter Grid.Row="3" Height="8" Margin="12,0" HorizontalAlignment="Stretch" VerticalAlignment="Center"
+            <GridSplitter Grid.Row="2" Height="8" Margin="12,0" HorizontalAlignment="Stretch" VerticalAlignment="Center"
                           Background="Transparent" Cursor="SizeNS" ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"
                           ShowsPreview="True"/>
 
             <!-- Log Panel -->
-            <Border Grid.Row="4" Background="{DynamicResource BgDark}" Margin="12" CornerRadius="8" BorderThickness="0" MinHeight="140" VerticalAlignment="Stretch">
+            <Border Grid.Row="3" Background="{DynamicResource BgDark}" Margin="12" CornerRadius="8" BorderThickness="0" MinHeight="140" VerticalAlignment="Stretch">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -31838,6 +31837,27 @@ catch { & $failed $_ }
 
     <Border Grid.Column="1" Background="{DynamicResource BgDark}">
         <Grid Margin="20">
+
+            <!-- Dedicated Quick Find page: result buttons only navigate to existing tools. -->
+            <Grid Name="pnlQuickFind" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Border Grid.Row="0" Style="{StaticResource CardStyle}" Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Text="Find Tools" Style="{StaticResource SectionHeader}" Margin="0,0,0,6"/>
+                        <TextBlock Name="lblQuickFindSummary" Text="Search for a tool using Quick Find."
+                                   FontSize="14" Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap"
+                                   Margin="0,0,0,6"/>
+                        <TextBlock Text="Select Go to tool to view the tool in its original section. Search results never run commands or change settings."
+                                   Foreground="{DynamicResource TextMuted}" FontSize="12" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Name="pnlQuickFindMatches" Margin="0,0,8,0"/>
+                </ScrollViewer>
+            </Grid>
 
             <!-- UPDATES PANEL -->
             <Grid Name="pnlUpdates" Visibility="Visible">
@@ -34298,7 +34318,7 @@ $iconDeferTimer.Start()
 # 5. LOGIC & EVENTS
 # ==========================================
 $TabButtons = @("btnTabUpdates", "btnTabTweaks", "btnTabHealth", "btnTabNetwork", "btnTabFirewall", "btnTabDrivers", "btnTabCleanup", "btnTabUtils", "btnTabMyDevice", "btnTabSupport")
-$Panels = @("pnlUpdates", "pnlCatalog", "pnlTweaks", "pnlHealth", "pnlNetwork", "pnlMyDevice", "pnlFirewall", "pnlDrivers", "pnlCleanup", "pnlUtils", "pnlSupport")
+$Panels = @("pnlQuickFind", "pnlUpdates", "pnlCatalog", "pnlTweaks", "pnlHealth", "pnlNetwork", "pnlMyDevice", "pnlFirewall", "pnlDrivers", "pnlCleanup", "pnlUtils", "pnlSupport")
 $script:WmtPanelControls = [System.Collections.ArrayList]::new()
 $script:WmtTabButtonControls = [System.Collections.ArrayList]::new()
 $script:WmtTabTargetByButton = @{}
@@ -36132,7 +36152,9 @@ $btnCreditChaython = Get-Ctrl "btnCreditChaython"
 $bdQuickFind = Get-Ctrl "bdQuickFind"
 $txtGlobalSearch = Get-Ctrl "txtGlobalSearch"
 $btnQuickFindClearSearch = Get-Ctrl "btnQuickFindClearSearch"
-$lstSearchResults = Get-Ctrl "lstSearchResults"
+$pnlQuickFind = Get-Ctrl "pnlQuickFind"
+$pnlQuickFindMatches = Get-Ctrl "pnlQuickFindMatches"
+$lblQuickFindSummary = Get-Ctrl "lblQuickFindSummary"
 $pnlNavButtons = Get-Ctrl "pnlNavButtons"
 $svLog = Get-Ctrl "svLog"
 $LogBox = Get-Ctrl "LogBox"
@@ -36141,7 +36163,7 @@ $script:LogSearchHighlightLayer = $LogSearchHighlightLayer
 $bdLogSearch = Get-Ctrl "bdLogSearch"
 $txtLogSearch = Get-Ctrl "txtLogSearch"
 $btnLogClearSearch = Get-Ctrl "btnLogClearSearch"
-foreach ($itemsControl in @($lstWinget, $lstAppxPackages, $lstFw, $lstCatalog, $lstSearchResults)) {
+foreach ($itemsControl in @($lstWinget, $lstAppxPackages, $lstFw, $lstCatalog)) {
 Enable-WmtWpfItemsVirtualization -Control $itemsControl
 }
 
@@ -37768,20 +37790,168 @@ $btnPowerUserSigDriver.Add_Click({
     })
 }
 
-# --- GLOBAL SEARCH ---
+# --- GLOBAL SEARCH: indexed entries are locations, never executable actions. ---
 $SearchIndex = @{}
-function Add-SearchIndexEntry { param($BtnName, $Desc, $ParentTab) $b = Get-Ctrl $BtnName; if ($b) { $SearchIndex[$Desc] = @{Button = $b; Tab = $ParentTab; Action = $null } } }
-function Add-SearchIndexAction { param($Desc, [scriptblock]$Action, $ParentTab) if ($Action) { $SearchIndex[$Desc] = @{Button = $null; Tab = $ParentTab; Action = $Action } } }
+$script:WmtQuickFindSections = @(
+    @{ Tab = "btnTabUpdates"; Label = "Updates & Software" },
+    @{ Tab = "btnTabTweaks"; Label = "Tweaks" },
+    @{ Tab = "btnTabHealth"; Label = "System Health" },
+    @{ Tab = "btnTabNetwork"; Label = "Network & DNS" },
+    @{ Tab = "btnTabFirewall"; Label = "Firewall" },
+    @{ Tab = "btnTabDrivers"; Label = "Drivers" },
+    @{ Tab = "btnTabCleanup"; Label = "Cleanup" },
+    @{ Tab = "btnTabUtils"; Label = "Utilities" },
+    @{ Tab = "btnTabMyDevice"; Label = "My Device" },
+    @{ Tab = "btnTabSupport"; Label = "Support & Settings" }
+)
+function Add-SearchIndexEntry {
+    param([string]$BtnName, [string]$Desc, [string]$ParentTab)
+    $control = Get-Ctrl $BtnName
+    if ($control) { $SearchIndex[$Desc] = @{ Button = $control; Tab = $ParentTab } }
+}
+function Add-SearchIndexNavigationEntry {
+    param([string]$Desc, [string]$BtnName, [string]$ParentTab)
+    Add-SearchIndexEntry $BtnName $Desc $ParentTab
+}
 function Update-WmtSearchIndexEntries {
-$entries = [System.Collections.ArrayList]::new()
-foreach ($entry in ($SearchIndex.GetEnumerator() | Sort-Object Key)) {
-    [void]$entries.Add([PSCustomObject]@{
+    $entries = [System.Collections.ArrayList]::new()
+    foreach ($entry in ($SearchIndex.GetEnumerator() | Sort-Object Key)) {
+        $item = $entry.Value
+        $tooltip = ""
+        try {
+            if ($item.Button -and $item.Button.ToolTip -is [string]) { $tooltip = [string]$item.Button.ToolTip }
+        } catch {}
+        [void]$entries.Add([PSCustomObject]@{
             Text = [string]$entry.Key
-            Item = $entry.Value
+            Item = $item
+            Description = $tooltip
+            SearchText = "$($entry.Key) $tooltip"
         })
+    }
+    $script:WmtSearchIndexEntries = $entries
+    if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindResults }
 }
-$script:WmtSearchIndexEntries = $entries
+function Show-WmtQuickFindPage {
+    if (-not $pnlQuickFind -or $pnlQuickFind.IsVisible) { return }
+    foreach ($panel in $script:WmtPanelControls) { $panel.Visibility = "Collapsed" }
+    $overlay = Get-Ctrl "tweaksLoadingOverlay"
+    if ($overlay) { $overlay.Visibility = "Collapsed" }
+    Reset-WmtLibraryToCatalog
+    foreach ($btn in $script:WmtTabButtonControls) {
+        $btn.ClearValue([System.Windows.Controls.Button]::BackgroundProperty)
+        $btn.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextSecondary")
+        $btn.FontWeight = "Normal"
+        $btn.Tag = "Collapsed"
+    }
+    $pnlQuickFind.Visibility = "Visible"
 }
+function Open-WmtQuickFindTarget {
+    param($Entry)
+    if (-not $Entry -or -not $Entry.Item) { return }
+    $nav = Get-Ctrl ([string]$Entry.Item.Tab)
+    if (-not $nav -or -not $nav.IsEnabled) { return }
+    # Navigation buttons retain normal page-loading behavior. No tool Click is raised.
+    $nav.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    $target = $Entry.Item.Button
+    if ($target -and $target.IsVisible) {
+        try { $target.BringIntoView() } catch {}
+    }
+}
+function Update-WmtQuickFindResults {
+    if (-not $pnlQuickFindMatches -or -not $lblQuickFindSummary -or -not $txtGlobalSearch) { return }
+    if (-not $pnlQuickFind.IsVisible) { return }
+    $pnlQuickFindMatches.Children.Clear()
+    $query = ([string]$txtGlobalSearch.Text).Trim()
+    if (-not $query -or $query -eq $script:QuickFindPlaceholder) {
+        $lblQuickFindSummary.Text = "Start typing in Quick Find to browse available tools."
+        return
+    }
+    if (-not $script:WmtSearchIndexEntries -or $script:WmtSearchIndexEntries.Count -eq 0) {
+        $lblQuickFindSummary.Text = "Loading the tool directory..."
+        return
+    }
+    $matches = [System.Collections.ArrayList]::new()
+    $seen = @{}
+    foreach ($entry in $script:WmtSearchIndexEntries) {
+        if (-not $entry -or $entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        # Avoid duplicate cards for synonyms pointing to the same tool.
+        $key = "$($entry.Item.Tab)/$($entry.Item.Button.Name)"
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        [void]$matches.Add($entry)
+    }
+    $limit = 80
+    $lblQuickFindSummary.Text = if ($matches.Count -eq 0) {
+        "No tools found for '$query'. Try another term."
+    } elseif ($matches.Count -gt $limit) {
+        "$($matches.Count) related tools found for '$query' (showing $limit). Refine your search."
+    } else { "$($matches.Count) related tools found for '$query'." }
+    $rendered = 0
+    foreach ($section in $script:WmtQuickFindSections) {
+        if ($rendered -ge $limit) { break }
+        $items = @($matches | Where-Object { $_.Item.Tab -eq $section.Tab })
+        if ($items.Count -eq 0) { continue }
+        $heading = [System.Windows.Controls.TextBlock]::new()
+        $heading.Text = [string]$section.Label
+        $heading.FontSize = 16
+        $heading.FontWeight = "SemiBold"
+        $heading.Margin = [System.Windows.Thickness]::new(0,10,0,10)
+        $heading.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextPrimary")
+        [void]$pnlQuickFindMatches.Children.Add($heading)
+        $wrap = [System.Windows.Controls.WrapPanel]::new()
+        foreach ($entry in $items) {
+            if ($rendered -ge $limit) { break }
+            $card = [System.Windows.Controls.Border]::new()
+            $card.Width = 310
+            $card.Padding = [System.Windows.Thickness]::new(14)
+            $card.Margin = [System.Windows.Thickness]::new(0,0,12,12)
+            $card.CornerRadius = [System.Windows.CornerRadius]::new(8)
+            $card.BorderThickness = [System.Windows.Thickness]::new(1)
+            $card.SetResourceReference([System.Windows.Controls.Border]::BackgroundProperty, "BgPanel")
+            $card.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "BorderBrush")
+            $body = [System.Windows.Controls.StackPanel]::new()
+            $title = [System.Windows.Controls.TextBlock]::new()
+            $title.Text = [string]$entry.Text
+            $title.FontSize = 14
+            $title.FontWeight = "SemiBold"
+            $title.TextWrapping = "Wrap"
+            $title.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextPrimary")
+            [void]$body.Children.Add($title)
+            if (-not [string]::IsNullOrWhiteSpace([string]$entry.Description)) {
+                $description = [System.Windows.Controls.TextBlock]::new()
+                $description.Text = [string]$entry.Description
+                $description.TextWrapping = "Wrap"
+                $description.MaxHeight = 44
+                $description.FontSize = 12
+                $description.Margin = [System.Windows.Thickness]::new(0,6,0,8)
+                $description.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
+                [void]$body.Children.Add($description)
+            }
+            $open = [System.Windows.Controls.Button]::new()
+            $open.Content = "Go to tool"
+            $open.Style = $window.FindResource("ActionBtn")
+            $open.HorizontalAlignment = "Left"
+            $open.Margin = [System.Windows.Thickness]::new(0,9,0,0)
+            $open.Tag = $entry
+            $open.ToolTip = "Navigate to the matching tool. This never runs it."
+            $open.Add_Click({
+                param($searchSender, $searchEventArgs)
+                Open-WmtQuickFindTarget -Entry $searchSender.Tag
+            })
+            [void]$body.Children.Add($open)
+            $card.Child = $body
+            [void]$wrap.Children.Add($card)
+            $rendered++
+        }
+        [void]$pnlQuickFindMatches.Children.Add($wrap)
+    }
+}
+$script:WmtQuickFindRenderTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:WmtQuickFindRenderTimer.Interval = [TimeSpan]::FromMilliseconds(130)
+$script:WmtQuickFindRenderTimer.Add_Tick({
+    $script:WmtQuickFindRenderTimer.Stop()
+    Update-WmtQuickFindResults
+})
 # --- GLOBAL SEARCH INDEX ---
 
 # 1. Updates
@@ -37878,22 +38048,22 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnSupportIssue"      "Report an Issue (GitHub)"        "btnTabSupport"
     Add-SearchIndexEntry "btnToggleTheme"       "Toggle Theme"                    "btnTabSupport"
     Add-SearchIndexEntry "btnDisableBgJobs"      "Background Jobs"                 "btnTabSupport"
-    Add-SearchIndexAction "Disable Background Jobs" { Set-WmtDisableBackgroundJobs -Enabled $true; Update-WmtDisableBgJobsButton; Write-GuiLog "Background jobs disabled." } "btnTabSupport"
-    Add-SearchIndexAction "Enable Background Jobs"  { Set-WmtDisableBackgroundJobs -Enabled $false; Update-WmtDisableBgJobsButton; Write-GuiLog "Background jobs enabled."; try { Start-WmtBackgroundJobsNow } catch {} } "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Disable Background Jobs" "btnDisableBgJobs" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Enable Background Jobs" "btnDisableBgJobs" "btnTabSupport"
     Add-SearchIndexEntry "btnDebugMode"          "Debug Logs"                      "btnTabSupport"
-    Add-SearchIndexAction "Enable Debug Logs"  { Set-WmtDebugMode -Enabled $true | Out-Null;  Update-WmtDebugModeButton; Write-GuiLog "Debug diagnostic logging enabled." } "btnTabSupport"
-    Add-SearchIndexAction "Disable Debug Logs" { Set-WmtDebugMode -Enabled $false | Out-Null; Update-WmtDebugModeButton; Write-GuiLog "Debug diagnostic logging disabled." } "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Enable Debug Logs" "btnDebugMode" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Disable Debug Logs" "btnDebugMode" "btnTabSupport"
     Add-SearchIndexEntry "btnDisableUpdateScans"  "Update Scans"                    "btnTabSupport"
-    Add-SearchIndexAction "Disable Update Scans" { Set-WmtUpdateScansDisabled -Enabled $true; Update-WmtUpdateScansButton; Write-GuiLog "Update scans disabled." } "btnTabSupport"
-    Add-SearchIndexAction "Enable Update Scans"  { Set-WmtUpdateScansDisabled -Enabled $false; Update-WmtUpdateScansButton; Write-GuiLog "Update scans enabled."; try { if (-not (Get-WmtDisableBackgroundJobs)) { Start-WmtUpdateAutoScanTimer } } catch {} } "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Disable Update Scans" "btnDisableUpdateScans" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Enable Update Scans" "btnDisableUpdateScans" "btnTabSupport"
     Add-SearchIndexEntry "btnStartWithWindows" "Start with Windows"              "btnTabSupport"
-    Add-SearchIndexAction "Enable Start with Windows"  { Set-WmtStartWithWindows -Enabled $true;  Update-WmtStartWithWindowsButton; Write-GuiLog "Start with Windows enabled." } "btnTabSupport"
-    Add-SearchIndexAction "Disable Start with Windows" { Set-WmtStartWithWindows -Enabled $false; Update-WmtStartWithWindowsButton; Write-GuiLog "Start with Windows disabled." } "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Enable Start with Windows" "btnStartWithWindows" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Disable Start with Windows" "btnStartWithWindows" "btnTabSupport"
     Add-SearchIndexEntry "btnLaunchMinimized" "Launch Minimized" "btnTabSupport"
-    Add-SearchIndexAction "Enable Launch Minimized"  { Set-WmtLaunchMinimized -Enabled $true;  Update-WmtLaunchMinimizedButton; Write-GuiLog "Launch Minimized enabled. WMT will start hidden in the system tray." } "btnTabSupport"
-    Add-SearchIndexAction "Disable Launch Minimized" { Set-WmtLaunchMinimized -Enabled $false; Update-WmtLaunchMinimizedButton; Write-GuiLog "Launch Minimized disabled. WMT will start with a visible window." } "btnTabSupport"
-    Add-SearchIndexAction "Light Mode" { Set-WmtThemePreference -Theme "light" } "btnTabSupport"
-    Add-SearchIndexAction "Dark Mode" { Set-WmtThemePreference -Theme "dark" }  "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Enable Launch Minimized" "btnLaunchMinimized" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Disable Launch Minimized" "btnLaunchMinimized" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Light Mode" "btnToggleTheme" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Dark Mode" "btnToggleTheme" "btnTabSupport"
 
     # 9. My Device
     Add-SearchIndexEntry "btnMyDeviceCleanRAM" "Clean RAM" "btnTabMyDevice"
@@ -37906,37 +38076,7 @@ $searchIndexDeferTimer.Add_Tick({
 
     # 10. Catalog & Providers
     Add-SearchIndexEntry "btnShowCatalog" "Software Catalog" "btnTabUpdates"
-    Add-SearchIndexAction "Your Game Library" {
-        # Open the Software Catalog page first, then switch to library view.
-        if ($btnShowCatalog) {
-            $pnlUpdates.Visibility = "Collapsed"
-            $pnlCatalog.Visibility = "Visible"
-            Add-WmtCatalogListItems -ListView $lstCatalog -Items $script:SoftwareCatalog
-        }
-        # Pre-load library scan if not already done.
-        if (-not $script:WmtLibraryScanResults -and -not $script:WmtLibraryScanRunspace) {
-            Start-WmtLibraryScan -Silent
-        }
-        # Switch to library view.
-        if ($brdCatalogList) { $brdCatalogList.Visibility = "Collapsed" }
-        if ($brdLibraryList) { $brdLibraryList.Visibility = "Visible" }
-        if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
-            if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
-        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
-        if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
-        # Display pre-loaded results if available.
-        if ($script:WmtLibraryScanResults -and $script:WmtLibraryScanResults.Count -gt 0 -and $lstLibrary) {
-            $lstLibrary.Items.Clear()
-            foreach ($item in $script:WmtLibraryScanResults) {
-                if (Test-WmtFabAssetHidden $item) { continue }
-                [void]$lstLibrary.Items.Add($item)
-            }
-            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library." }
-        }
-        elseif (-not $script:WmtLibraryScanRunspace) {
-            Start-WmtLibraryScan
-        }
-    } "btnTabUpdates"
+    Add-SearchIndexNavigationEntry "Your Game Library" "btnShowCatalog" "btnTabUpdates"
     Add-SearchIndexEntry "btnManageProviders" "Manage Package Providers" "btnTabUpdates"
 
     # 11. Common Tweaks
@@ -38135,44 +38275,18 @@ $searchIndexDeferTimer.Add_Tick({
 })
 $searchIndexDeferTimer.Start()
 
-if ($txtGlobalSearch) { $txtGlobalSearch.Add_TextChanged({
-    $q = $txtGlobalSearch.Text
-    if ($q.Length -gt 1 -and $q -ne $script:QuickFindPlaceholder) {
-        if ($pnlNavButtons) { $pnlNavButtons.Visibility = "Collapsed" }
-        if ($lstSearchResults) { $lstSearchResults.Visibility = "Visible"; $lstSearchResults.Items.Clear() }
-        foreach ($entry in $script:WmtSearchIndexEntries) {
-            if ($entry.Text.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                if ($lstSearchResults) { [void]$lstSearchResults.Items.Add($entry.Text) }
-            }
+if ($txtGlobalSearch) {
+    $txtGlobalSearch.Add_TextChanged({
+        $query = ([string]$txtGlobalSearch.Text).Trim()
+        $hasQuery = $query.Length -gt 0 -and $query -ne $script:QuickFindPlaceholder
+        if ($hasQuery) { Show-WmtQuickFindPage }
+        if ($hasQuery -or ($pnlQuickFind -and $pnlQuickFind.IsVisible)) {
+            $script:WmtQuickFindRenderTimer.Stop()
+            if ($hasQuery) { $script:WmtQuickFindRenderTimer.Start() }
+            else { Update-WmtQuickFindResults }
         }
-    }
-    else { if ($pnlNavButtons) { $pnlNavButtons.Visibility = "Visible" }; if ($lstSearchResults) { $lstSearchResults.Visibility = "Collapsed" } }
-}) }
-if ($lstSearchResults) { $lstSearchResults.Add_SelectionChanged({
-    if ($lstSearchResults.SelectedItem) {
-        $match = $SearchIndex[$lstSearchResults.SelectedItem]
-
-        # 1. Switch to the appropriate tab so the button is rendered and visible
-        if ($match.Tab) {
-            $tabBtn = Get-Ctrl $match.Tab
-            if ($tabBtn) {
-                $tabBtn.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
-            }
-        }
-
-        # 2. Fire the actual button's click event to launch the target function
-        if ($match.ContainsKey("Action") -and $match.Action -is [scriptblock]) {
-            & $match.Action
-        }
-        elseif ($match.Button) {
-            $match.Button.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
-        }
-
-        # Clear the search box after executing
-        $txtGlobalSearch.Text = ""
-        Set-WmtQuickFindForeground -TextBox $txtGlobalSearch
-    }
-}) }
+    })
+}
 
 # WINGET CONTEXT MENU (Right-Click)
 $ctxMenu = New-WmtContextMenu -Items @()
