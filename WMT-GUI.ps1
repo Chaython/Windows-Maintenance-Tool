@@ -27247,7 +27247,7 @@ $load = {
                     $stderrText = if (Test-Path -LiteralPath $state.ErrFile) {
                         [IO.File]::ReadAllText($state.ErrFile)
                     } else { "" }
-                    if ($exitCode -ne 0) {
+                    if ($null -ne $exitCode -and $exitCode -ne 0) {
                         $stdoutText = if (Test-Path -LiteralPath $state.OutFile) {
                             [IO.File]::ReadAllText($state.OutFile, [Text.Encoding]::UTF8)
                         } else { "" }
