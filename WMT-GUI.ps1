@@ -37892,12 +37892,12 @@ function Restore-WmtQuickFindButtons {
     foreach ($record in $pending) { [void]$script:WmtQuickFindMovedButtons.Add($record) }
 }
 function Add-WmtQuickFindOriginalButton {
-    param([System.Windows.Controls.Button]$Button, [System.Windows.Controls.Panel]$Host)
+    param([System.Windows.Controls.Button]$Button, [System.Windows.Controls.Panel]$DestinationPanel)
     # Reparenting can strip an inherited IsEnabled=false from a disabled parent.
-    if (-not $Button -or -not $Host -or -not $Button.IsEnabled -or
+    if (-not $Button -or -not $DestinationPanel -or -not $Button.IsEnabled -or
         $Button.Visibility -ne [System.Windows.Visibility]::Visible) { return $false }
     $originalParent = $Button.Parent
-    if ($originalParent -isnot [System.Windows.Controls.Panel] -or $originalParent -eq $Host) { return $false }
+    if ($originalParent -isnot [System.Windows.Controls.Panel] -or $originalParent -eq $DestinationPanel) { return $false }
     # The root tool page is collapsed while Quick Find is open. Nested collapsed
     # or disabled groups are different: their controls must remain unavailable.
     $pageNames = @("pnlUpdates", "pnlCatalog", "pnlTweaks", "pnlHealth", "pnlNetwork",
@@ -37924,7 +37924,7 @@ function Add-WmtQuickFindOriginalButton {
         [void]$originalParent.Children.Remove($Button)
         $originalParent.Children.Insert($index, $placeholder)
         if ($inheritedContext) { $Button.DataContext = $originalContext }
-        [void]$Host.Children.Add($Button)
+        [void]$DestinationPanel.Children.Add($Button)
         [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
             Button = $Button; Parent = $originalParent; Index = $index
             Placeholder = $placeholder; InheritedDataContext = $inheritedContext
@@ -37933,7 +37933,7 @@ function Add-WmtQuickFindOriginalButton {
     }
     catch {
         # A failed relocation must not leave the native page missing a control.
-        try { if ($Host.Children.Contains($Button)) { [void]$Host.Children.Remove($Button) } } catch {}
+        try { if ($DestinationPanel.Children.Contains($Button)) { [void]$DestinationPanel.Children.Remove($Button) } } catch {}
         try { if ($originalParent.Children.Contains($placeholder)) { [void]$originalParent.Children.Remove($placeholder) } } catch {}
         try {
             if (-not $originalParent.Children.Contains($Button)) {
@@ -38048,7 +38048,7 @@ function Update-WmtQuickFindResults {
             $canHost = ($original -is [System.Windows.Controls.Button]) -and
                        ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates"))
             $hosted = $false
-            if ($canHost) { $hosted = Add-WmtQuickFindOriginalButton -Button $original -Host $body }
+            if ($canHost) { $hosted = Add-WmtQuickFindOriginalButton -Button $original -DestinationPanel $body }
             if (-not $hosted) {
                 # Controls that depend on their page context (including the
                 # catalogue/library navigators and search fields) stay in place.
