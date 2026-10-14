@@ -37,6 +37,23 @@ If your antivirus reports WMT as a PUP or false positive, submit the file to the
 VirusTotal maintains a broader vendor contact directory here: https://docs.virustotal.com/docs/false-positive-contacts
 </details>
 
+## Verify release provenance (Sigstore / GitHub Attestations)
+
+Official EXE releases produced by the **Build PS2EXE Release** GitHub Actions workflow now include a `WindowsMaintenanceTool.exe.sigstore.json` attestation bundle and a SHA-256 checksum. The build workflow uses GitHub's public Sigstore integration to issue a short-lived signing certificate, attest the built executable, and verify its provenance before publishing. Existing releases built before this change do **not** have this attestation.
+
+Install the [GitHub CLI](https://cli.github.com/) and download both `WindowsMaintenanceTool.exe` and `WindowsMaintenanceTool.exe.sigstore.json` from the *same* new release. Then run this in PowerShell from the download directory:
+
+```powershell
+gh attestation verify .\WindowsMaintenanceTool.exe `
+  --repo Chaython/Windows-Maintenance-Tool `
+  --bundle .\WindowsMaintenanceTool.exe.sigstore.json `
+  --signer-workflow Chaython/Windows-Maintenance-Tool/.github/workflows/release-ps2exe.yml
+```
+
+Alternatively, with internet access, `gh attestation verify .\WindowsMaintenanceTool.exe --repo Chaython/Windows-Maintenance-Tool` retrieves the attestation from GitHub. Use the `--source-digest <commit-sha>` flag to pin verification to a specific expected source commit, which is required by the release workflow's own verification.
+
+**An attestation verifies the provenance and integrity of the downloaded bytes; it is not Authenticode code signing.** Windows SmartScreen and Defender do not treat it as a trusted EXE publisher signature, and it does not guarantee an antivirus detection will be cleared. Verify the source and download and review security warnings rather than bypassing them automatically.
+
 ## Highlights
 
 - Modern searchable GUI with persistent dark/light themes, tray support, start-with-Windows, and start-minimized controls.
