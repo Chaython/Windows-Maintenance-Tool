@@ -1,6 +1,6 @@
 # Windows Maintenance Tool
 
-![Version](https://img.shields.io/badge/version-v6.7-green)
+![Version](https://img.shields.io/badge/version-v6.8-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
@@ -87,6 +87,39 @@ Alternatively, with internet access, `gh attestation verify .\WindowsMaintenance
 <img width="1902" height="1024" alt="image" src="https://github.com/user-attachments/assets/4fbd8b16-b03f-45c5-a53e-48b9caf45376" />
 
 
+
+<details open>
+<summary><strong>What's new in v6.8 (October 2026)</strong></summary>
+
+v6.8 updates WMT's software catalogue, game import/recovery, system tweaks, driver maintenance, package logging, and background-operation safety. This is the **source version on `Main`**; the release executable and package-manager manifests are updated only when a new release is built and published.
+
+### Software catalogue and game libraries
+
+- Added **Locate / Import** for existing Steam, Epic/Legendary, and GOG/GOGDL games. Steam imports use registered libraries and existing manifests or Steam's own verification flow; WMT does not fabricate Steam manifests. Legendary verifies its imported install path, and GOGDL validates the game's manifest/app ID before WMT records an installed path.
+- Keep Locate / Import on the catalogue action bar, position it next to Install, and make the Updates navigation more direct. Library totals and the **Include Fab** toggle now sit in the catalogue header to free up the bottom toolbar.
+- Preserve installed-game and provider-cache state when refreshing catalogues, including local Legendary metadata fallback and GOG install-tracking recovery where supported.
+
+### Installer, catalogue, and import reliability
+
+- **Installer timeout safety:** preserve `TimedOut` and `TerminationFailed` fields on nonzero visible-installer results. Do not quietly normalize a failed installer into an ordinary exit-code-only result; stop follow-on package work when native termination cannot be confirmed.
+- **Bound background library work:** catalogue library scans now have a **2-minute** watchdog, library cache builds a **30-minute** watchdog, and Locate / Import a **121-minute** watchdog around the existing 120-minute provider-process limit.
+- Report timeout or worker-monitor failures in the UI and activity log, request asynchronous PowerShell cleanup, and avoid blocking the WPF dispatcher while stopping background work. Import controls stay guarded while an overdue worker is being stopped.
+- Added PowerShell CI regression checks for these timeout and error-handling paths.
+
+### Drivers and Windows tweaks
+
+- Restored the fast, local **disconnected/ghost-device scan** instead of the slower isolated child-process scanner that could remain stuck on "Starting disconnected device scan." Retained connected-device checks before removal and refreshed the full-width, themed review dialog.
+- Improved the layout of the old-driver cleanup, driver export, and driver backup/restore dialogs, including more consistent edge-to-edge lists and controls.
+- Added a **Windows pagefile** configuration tweak with detection of current settings, safe saved-state restoration, rollback/error handling, and handling for empty `REG_MULTI_SZ` values. Pagefile changes may require a restart before they take effect.
+
+### Logging, shortcuts, and release security
+
+- Improved package-install transcripts, including captured output from child processes launched by custom PowerShell/CMD installer commands and more readable CLIXML/UTF-16 error output.
+- Added lightweight **F5**, **Ctrl+F**, and **Ctrl+Shift+F** context-sensitive shortcuts, and restored the one-time update scan on launch without rescanning merely because the Updates tab is opened.
+- Prepared **GitHub/Sigstore artifact attestations** and release provenance verification. SignPath Authenticode signing is **not enabled** and still requires approval; an attestation does not remove SmartScreen or antivirus warnings.
+- Expanded Windows PowerShell syntax and smoke/regression checks around the ghost scanner, pagefile, driver dialogs, process output, and timeouts.
+
+</details>
 
 <details>
 <summary><strong>What's new in v6.7</strong></summary>
