@@ -16,7 +16,7 @@ param(
 # ==========================================
 # 1. SETUP
 # ==========================================
-$AppVersion = "6.7"
+$AppVersion = "6.8"
 $ErrorActionPreference = "SilentlyContinue"
 # Safe until the settings manager is initialized below; the persisted value is loaded there.
 $script:WmtDebug = $false
