@@ -31769,16 +31769,15 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
-                        <!-- Library status (left side, shows when in library view) -->
+                        <!-- Navigation on the left, library-only refresh beside it. -->
                         <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left">
-                            <Button Name="btnBackToCatalog" Content="Back to Catalog" Style="{StaticResource ActionBtn}" ToolTip="Return to the software catalog" Visibility="Collapsed"/>
-                            <Button Name="btnLibraryLocate" Content="Locate / Import" Style="{StaticResource ActionBtn}" ToolTip="Register a selected Steam, Epic or GOG game from an existing folder" Visibility="Collapsed"/>
-                             <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
-                        </StackPanel>
-                        <!-- Shared Catalog / Library actions -->
-                        <StackPanel Name="pnlCatalogActions" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button Name="btnBackToUpdates" Content="Back to Updates" Style="{StaticResource ActionBtn}" ToolTip="Return to the package updates view"/>
+                            <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
+                        </StackPanel>
+                        <!-- Install and Locate / Import together on the right. -->
+                        <StackPanel Name="pnlCatalogActions" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button Name="btnCatalogInstall" Content="Install Selected" Style="{StaticResource PositiveBtn}" ToolTip="Install all selected applications using winget. May take several minutes depending on app size."/>
+                            <Button Name="btnLibraryLocate" Content="Locate / Import" Style="{StaticResource ActionBtn}" ToolTip="Register a selected Steam, Epic or GOG game from an existing folder" Visibility="Collapsed"/>
                             <Button Name="btnCatalogSelectAll" Content="Select All" Style="{StaticResource ActionBtn}" ToolTip="Select all visible applications in the list"/>
                             <Button Name="btnCatalogClear" Content="Clear Selection" Style="{StaticResource ActionBtn}" ToolTip="Unselect all applications"/>
                         </StackPanel>
@@ -33979,7 +33978,6 @@ $iconDeferTimer.Add_Tick({
     Set-ButtonIcon "btnCatalogSelectAll" "M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3M19,19H5V5H19V19M10,17L5,12L6.41,10.59L10,14.17L17.59,6.58L19,8L10,17Z" "Select All" "Select all visible applications in the list" 16
     Set-ButtonIcon "btnCatalogClear" "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" "Clear Selection" "Unselect all applications" 16
     Set-ButtonIcon "btnBackToUpdates" "M20,11H7.83L13.42,5.41L12,4L4,12L12,20L13.41,18.59L7.83,13H20V11Z" "Back to Updates" "Return to the package updates view" 16
-    Set-ButtonIcon "btnBackToCatalog" "M20,11H7.83L13.42,5.41L12,4L4,12L12,20L13.41,18.59L7.83,13H20V11Z" "Back to Catalog" "Return to the software catalog" 16
     Set-ButtonIcon "btnLibraryLocate" "M4,4H10V6H6V10H4V4M14,4H20V10H18V6H14V4M4,14H6V18H10V20H4V14M18,14H20V20H14V18H18V14M12,8L9,11H11V16H13V11H15L12,8Z" "Locate / Import" "Locate existing game files" 16
     Set-ButtonIcon "btnLibraryRefresh" "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z" "Refresh Library" "Re-scan Steam manifests and refresh Legendary/GOGDL caches" 16
     Set-ButtonIcon "btnToggleFabAssets" "M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z" "Fab Assets: Hidden" "Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." 16
@@ -35787,7 +35785,6 @@ $miLibStorePage = Get-Ctrl "miLibStorePage"
 $miLibCopyId = Get-Ctrl "miLibCopyId"
 $miLibCopyRows = Get-Ctrl "miLibCopyRows"
 if ($lstLibrary -and $ctxLibrary) { $lstLibrary.ContextMenu = $ctxLibrary }
-$btnBackToCatalog = Get-Ctrl "btnBackToCatalog"
 $btnLibraryRefresh = Get-Ctrl "btnLibraryRefresh"
 $btnLibraryLocate = Get-Ctrl "btnLibraryLocate"
 $lblLibraryStatus = Get-Ctrl "lblLibraryStatus"
@@ -35965,7 +35962,6 @@ function Reset-WmtLibraryToCatalog {
     if ($brdLibraryList -and $brdLibraryList.Visibility -eq "Visible") {
         $brdLibraryList.Visibility = "Collapsed"
         if ($brdCatalogList) { $brdCatalogList.Visibility = "Visible" }
-        if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Collapsed" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
         if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Collapsed" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
@@ -37582,7 +37578,6 @@ $searchIndexDeferTimer.Add_Tick({
         # Switch to library view.
         if ($brdCatalogList) { $brdCatalogList.Visibility = "Collapsed" }
         if ($brdLibraryList) { $brdLibraryList.Visibility = "Visible" }
-        if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
             if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
@@ -57618,13 +57613,12 @@ Register-WmtUiPollOperation -Name "LibraryScan" -IntervalMs 500 -TestComplete { 
     } | Out-Null
 }
 
-if ($btnShowLibrary -and $btnBackToCatalog -and $btnLibraryRefresh -and $brdCatalogList -and $brdLibraryList -and $pnlCatalogActions -and $lstLibrary) {
+if ($btnShowLibrary -and $btnLibraryRefresh -and $brdCatalogList -and $brdLibraryList -and $pnlCatalogActions -and $lstLibrary) {
 $btnShowLibrary.Add_Click({
         try {
             # Switch to library view (keep all buttons visible).
             $brdCatalogList.Visibility = "Collapsed"
             $brdLibraryList.Visibility = "Visible"
-            if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
             if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
             if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
             if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
@@ -57657,23 +57651,6 @@ $btnShowLibrary.Add_Click({
             Write-WmtLastCrash -Context "Open library view failed" -Exception $_.Exception -ErrorRecord $_
             Write-GuiLog "ERROR: Could not open the library view: $($_.Exception.Message)"
         }
-    })
-
-$btnBackToCatalog.Add_Click({
-        # Switch back to catalog view.
-        $brdLibraryList.Visibility = "Collapsed"
-        $brdCatalogList.Visibility = "Visible"
-        if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Collapsed" }
-        if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
-        if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Collapsed" }
-        if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
-        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
-        if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install all selected applications using winget. May take several minutes depending on app size." }
-        if ($btnCatalogSelectAll) { $btnCatalogSelectAll.ToolTip = "Select all visible applications in the list" }
-        if ($btnCatalogClear) { $btnCatalogClear.ToolTip = "Unselect all applications" }
-
-        # Restore the Your Library button to ActionBtn style (gray).
-        if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
     })
 
 $btnLibraryRefresh.Add_Click({
