@@ -20,6 +20,7 @@ on:
         type: boolean
 
 permissions:
+  actions: read
   contents: write
   id-token: write
   attestations: write
@@ -28,7 +29,7 @@ permissions:
 jobs:
   build-release:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -49,12 +50,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           .\PS2EXE\Build-Exe.ps1 -InstallPS2EXE
 
-      - name: Read version and create checksum
+      # Determine the version before SignPath; the final hash must be calculated
+      # after signing because Authenticode changes the executable's bytes.
+      - name: Read release version
         id: version
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $source = Get-Content -LiteralPath ".\WMT-GUI.ps1" -Raw
+          $source = Get-Content -LiteralPath ".\\WMT-GUI.ps1" -Raw
           $match = [regex]::Match(
               $source,
               '(?im)^\s*(?:\$(?:script:|global:|private:)?AppVersion)\s*=\s*(["'']?)(v?\d+(?:\.\d+){0,3})\1\s*(?:$|[;#])'
@@ -64,22 +67,92 @@ jobs:
           }
 
           $version = $match.Groups[2].Value.TrimStart("v")
+          $parts = @($version.Split("."))
+          while ($parts.Count -lt 4) { $parts += "0" }
+          $fileVersion = ($parts[0..3] -join ".")
           $tag = "v$version"
-          $exe = ".\dist\WindowsMaintenanceTool.exe"
 
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "file_version=$fileVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release version: $version; PE version: $fileVersion"
+
+      # SignPath Foundation approval and its GitHub App/project configuration
+      # are prerequisites. Until explicitly enabled, releases remain unchanged.
+      - name: Validate SignPath configuration
+        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        shell: powershell
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @(
+              'SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID',
+              'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG'
+          )) {
+              if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+                  throw "SignPath is enabled but $name is not configured."
+              }
+          }
+
+      - name: Upload unsigned executable to SignPath
+        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        id: signpath_unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: wmt-signpath-unsigned
+          path: dist/WindowsMaintenanceTool.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Sign executable with SignPath
+        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.signpath_unsigned.outputs.artifact-id }}
+          parameters: |
+            wmtVersion: "${{ steps.version.outputs.file_version }}"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: "3600"
+          output-artifact-directory: signpath-signed
+
+      - name: Verify and adopt signed executable
+        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signed = ".\\signpath-signed\\WindowsMaintenanceTool.exe"
+          $release = ".\\dist\\WindowsMaintenanceTool.exe"
+          if (-not (Test-Path -LiteralPath $signed -PathType Leaf)) {
+              throw "SignPath did not return WindowsMaintenanceTool.exe at the expected path."
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $signed
+          if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate) {
+              throw "SignPath output has no valid, trusted Authenticode signature: $($signature.Status)"
+          }
+          Write-Host "Verified Authenticode publisher: $($signature.SignerCertificate.Subject)"
+          Copy-Item -LiteralPath $signed -Destination $release -Force
+
+      - name: Calculate final release SHA-256
+        id: checksum
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = ".\\dist\\WindowsMaintenanceTool.exe"
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
               throw "Expected build output was not created: $exe"
           }
-
           $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  WindowsMaintenanceTool.exe" | Set-Content -LiteralPath ".\dist\WindowsMaintenanceTool.exe.sha256" -Encoding ascii
-
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "$hash  WindowsMaintenanceTool.exe" | Set-Content -LiteralPath ".\\dist\\WindowsMaintenanceTool.exe.sha256" -Encoding ascii
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-          Write-Host "Release version: $version"
-          Write-Host "SHA256: $hash"
+          Write-Host "Final release SHA256: $hash"
 
       # Sigstore signs the provenance statement for the exact executable.
       # Artifact attestations do NOT provide Windows Authenticode signatures.
@@ -125,6 +198,7 @@ jobs:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
+          WMT_SIGNPATH_ENABLED: ${{ vars.WMT_SIGNPATH_ENABLED }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -157,6 +231,9 @@ jobs:
           }
 
           if ($releaseExists) {
+              if ($env:WMT_SIGNPATH_ENABLED -eq 'true') {
+                  throw "Cannot replace a published version with a newly signed EXE. Increase AppVersion and create a new release/tag to preserve existing WinGet hashes."
+              }
               Write-Host "Release $env:RELEASE_TAG already exists; replacing its generated assets."
               gh release upload $env:RELEASE_TAG @assets --clobber --repo $env:GITHUB_REPOSITORY
               if ($LASTEXITCODE -ne 0) { throw "Failed to upload release assets." }
@@ -221,7 +298,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_SHA256: ${{ steps.version.outputs.sha256 }}
+          RELEASE_SHA256: ${{ steps.checksum.outputs.sha256 }}
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
