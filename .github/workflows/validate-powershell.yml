@@ -85,7 +85,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
-          $match = [regex]::Match($source, "(?ms)^\$ghostScanScript\s*=\s*@'\r?\n(.*?)\r?\n'@")
+          $match = [regex]::Match($source, '(?ms)^\$ghostScanScript\s*=\s*@''\r?\n(.*?)\r?\n''@')
           if (-not $match.Success) { throw 'Ghost-device worker script was not found.' }
           $scanScript = $match.Groups[1].Value
 
