@@ -31650,10 +31650,21 @@ powercfg /S SCHEME_CURRENT | Out-Null
 
                 <!-- Header -->
                 <Border Grid.Row="0" Style="{StaticResource CardStyle}" Margin="0,0,0,12">
-                    <StackPanel>
-                        <TextBlock Text="Software Catalog" Style="{StaticResource SectionHeader}" Margin="0"/>
-                        <TextBlock Text="Curated selection of popular applications" Foreground="{DynamicResource TextSecondary}" FontSize="13"/>
-                    </StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="Software Catalog" Style="{StaticResource SectionHeader}" Margin="0"/>
+                            <TextBlock Text="Curated selection of popular applications" Foreground="{DynamicResource TextSecondary}" FontSize="13"/>
+                        </StackPanel>
+                        <!-- Library-only controls: keep the bottom action bar from overflowing. -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <TextBlock Name="lblLibraryStatus" Text="" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" FontStyle="Italic" Margin="0,0,12,0" TextTrimming="CharacterEllipsis" MaxWidth="320"/>
+                            <Button Name="btnToggleFabAssets" Content="Fab Assets: Hidden" Style="{StaticResource ActionBtn}" ToolTip="Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." Visibility="Collapsed"/>
+                        </StackPanel>
+                    </Grid>
                 </Border>
 
                 <!-- Category Filter + Your Library button -->
@@ -31763,8 +31774,6 @@ powercfg /S SCHEME_CURRENT | Out-Null
                             <Button Name="btnBackToCatalog" Content="Back to Catalog" Style="{StaticResource ActionBtn}" ToolTip="Return to the software catalog" Visibility="Collapsed"/>
                             <Button Name="btnLibraryLocate" Content="Locate / Import" Style="{StaticResource ActionBtn}" ToolTip="Register a selected Steam, Epic or GOG game from an existing folder" Visibility="Collapsed"/>
                              <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
-                            <Button Name="btnToggleFabAssets" Content="Fab Assets: Hidden" Style="{StaticResource ActionBtn}" ToolTip="Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." Visibility="Collapsed"/>
-                            <TextBlock Name="lblLibraryStatus" Text="" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" FontStyle="Italic" Margin="12,0,0,0"/>
                         </StackPanel>
                         <!-- Shared Catalog / Library actions -->
                         <StackPanel Name="pnlCatalogActions" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
