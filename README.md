@@ -175,7 +175,7 @@ F5 on Updates is an explicit package scan: merely visiting the Updates tab does 
 
 ### Quick Find
 
-Quick Find is in the left sidebar above the navigation buttons (without an extra Navigation heading). Typing a tool name or related description opens the **Find Tools** page in the main workspace. Matching tools are dynamically grouped by section and shown as cards with **Go to tool** buttons. These buttons only navigate to the existing tool location; they **never execute a tool action, change a setting, or run a command**. Once you reach the tool's original page, use its normal controls and confirmations to perform any action. Clearing the search displays a neutral empty state, and the sidebar navigation stays available while searching.
+Quick Find is in the left sidebar above the navigation buttons (without an extra Navigation heading). Typing a tool name or related description opens the **Find Tools** page in the main workspace. Related tools are dynamically grouped by section and presented using the **actual WPF buttons** from their existing pages, including current labels, icons, enabled states, and original click handlers. Clicking these buttons performs their normal action **immediately**, just as on the original page; review sensitive operations before clicking. The original control is restored to its exact place when the search changes, the user switches tabs, the window closes, or Quick Find is hidden. Controls that depend on their original page context (such as catalogue navigation or non-button search fields) instead offer **Open section**. Clearing the query removes the result cards; navigation stays available while searching.
 
 ## Core Features
 
