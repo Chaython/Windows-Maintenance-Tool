@@ -37854,59 +37854,93 @@ function Show-WmtQuickFindPage {
 $script:WmtQuickFindMovedButtons = [System.Collections.ArrayList]::new()
 $script:WmtQuickFindUpdating = $false
 function Restore-WmtQuickFindButtons {
-    if (-not $script:WmtQuickFindMovedButtons) { return }
+    if (-not $script:WmtQuickFindMovedButtons -or $script:WmtQuickFindMovedButtons.Count -eq 0) { return }
+    $pending = [System.Collections.ArrayList]::new()
     foreach ($record in @($script:WmtQuickFindMovedButtons)) {
         if (-not $record -or -not $record.Button -or -not $record.Parent) { continue }
         $button = $record.Button
         $parent = $record.Parent
         $placeholder = $record.Placeholder
+        $restored = $false
         try {
             if ($button.Parent -is [System.Windows.Controls.Panel] -and $button.Parent -ne $parent) {
-                $button.Parent.Children.Remove($button)
+                [void]$button.Parent.Children.Remove($button)
+            }
+            if ($button.Parent -ne $parent) {
+                $position = $parent.Children.IndexOf($placeholder)
+                if ($position -ge 0) { [void]$parent.Children.Remove($placeholder) }
+                else { $position = [Math]::Min([int]$record.Index, $parent.Children.Count) }
+                $parent.Children.Insert($position, $button)
             }
             if ($button.Parent -eq $parent) {
-                if ($parent.Children.Contains($placeholder)) { $parent.Children.Remove($placeholder) }
-                continue
+                if ($placeholder -and $parent.Children.Contains($placeholder)) {
+                    [void]$parent.Children.Remove($placeholder)
+                }
+                if ($record.InheritedDataContext) {
+                    $button.ClearValue([System.Windows.FrameworkElement]::DataContextProperty)
+                }
+                $restored = $true
             }
-            $position = $parent.Children.IndexOf($placeholder)
-            if ($position -ge 0) { $parent.Children.Remove($placeholder) }
-            else { $position = [Math]::Min([int]$record.Index, $parent.Children.Count) }
-            $parent.Children.Insert($position, $button)
         }
         catch {
             try { Write-GuiLog "[Quick Find] Could not restore '$($button.Name)': $($_.Exception.Message)" } catch {}
         }
+        # Retain unresolved restorations instead of silently losing the reference.
+        if (-not $restored) { [void]$pending.Add($record) }
     }
     $script:WmtQuickFindMovedButtons.Clear()
+    foreach ($record in $pending) { [void]$script:WmtQuickFindMovedButtons.Add($record) }
 }
 function Add-WmtQuickFindOriginalButton {
     param([System.Windows.Controls.Button]$Button, [System.Windows.Controls.Panel]$Host)
-    if (-not $Button -or -not $Host -or
+    # Reparenting can strip an inherited IsEnabled=false from a disabled parent.
+    if (-not $Button -or -not $Host -or -not $Button.IsEnabled -or
         $Button.Visibility -ne [System.Windows.Visibility]::Visible) { return $false }
     $originalParent = $Button.Parent
-    if ($originalParent -isnot [System.Windows.Controls.Panel]) { return $false }
-    if ($originalParent -eq $Host) { return $false }
+    if ($originalParent -isnot [System.Windows.Controls.Panel] -or $originalParent -eq $Host) { return $false }
+    # The root tool page is collapsed while Quick Find is open. Nested collapsed
+    # or disabled groups are different: their controls must remain unavailable.
+    $pageNames = @("pnlUpdates", "pnlCatalog", "pnlTweaks", "pnlHealth", "pnlNetwork",
+                   "pnlMyDevice", "pnlFirewall", "pnlDrivers", "pnlCleanup", "pnlUtils", "pnlSupport")
+    $ancestor = $originalParent
+    $foundPage = $false
+    for ($depth = 0; $ancestor -and $depth -lt 80; $depth++) {
+        if ($ancestor -is [System.Windows.FrameworkElement] -and -not $ancestor.IsEnabled) { return $false }
+        if ($ancestor.Name -in $pageNames) { $foundPage = $true; break }
+        if ($ancestor -is [System.Windows.FrameworkElement] -and
+            $ancestor.Visibility -ne [System.Windows.Visibility]::Visible) { return $false }
+        $ancestor = $ancestor.Parent
+    }
+    if (-not $foundPage) { return $false }
     $index = $originalParent.Children.IndexOf($Button)
     if ($index -lt 0) { return $false }
     $placeholder = [System.Windows.Controls.Border]::new()
     $placeholder.Visibility = [System.Windows.Visibility]::Collapsed
+    $inheritedContext = [object]::ReferenceEquals(
+        $Button.ReadLocalValue([System.Windows.FrameworkElement]::DataContextProperty),
+        [System.Windows.DependencyProperty]::UnsetValue)
+    $originalContext = $Button.DataContext
     try {
-        $originalParent.Children.Remove($Button)
+        [void]$originalParent.Children.Remove($Button)
         $originalParent.Children.Insert($index, $placeholder)
+        if ($inheritedContext) { $Button.DataContext = $originalContext }
         [void]$Host.Children.Add($Button)
         [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
-            Button = $Button; Parent = $originalParent
-            Index = $index; Placeholder = $placeholder
+            Button = $Button; Parent = $originalParent; Index = $index
+            Placeholder = $placeholder; InheritedDataContext = $inheritedContext
         })
         return $true
     }
     catch {
-        # A failed reparent must never leave the original section missing its button.
-        try { if ($Host.Children.Contains($Button)) { $Host.Children.Remove($Button) } } catch {}
-        try { if ($originalParent.Children.Contains($placeholder)) { $originalParent.Children.Remove($placeholder) } } catch {}
+        # A failed relocation must not leave the native page missing a control.
+        try { if ($Host.Children.Contains($Button)) { [void]$Host.Children.Remove($Button) } } catch {}
+        try { if ($originalParent.Children.Contains($placeholder)) { [void]$originalParent.Children.Remove($placeholder) } } catch {}
         try {
             if (-not $originalParent.Children.Contains($Button)) {
                 $originalParent.Children.Insert([Math]::Min($index, $originalParent.Children.Count), $Button)
+            }
+            if ($inheritedContext -and $Button.Parent -eq $originalParent) {
+                $Button.ClearValue([System.Windows.FrameworkElement]::DataContextProperty)
             }
         } catch {}
         try { Write-GuiLog "[Quick Find] Cannot host '$($Button.Name)': $($_.Exception.Message)" } catch {}
@@ -37921,6 +37955,15 @@ function Open-WmtQuickFindTarget {
     Restore-WmtQuickFindButtons
     $nav.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     $target = $Entry.Item.Button
+    if ($target -and $target.Name -in @("btnShowCatalog", "btnShowLibrary")) {
+        # The catalogue/library buttons navigate views rather than run a tool.
+        if ($btnShowCatalog -and $btnShowCatalog.IsEnabled) {
+            $btnShowCatalog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        }
+        if ($target.Name -eq "btnShowLibrary" -and $btnShowLibrary -and $btnShowLibrary.IsEnabled) {
+            $btnShowLibrary.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        }
+    }
     if ($target -and $target.IsVisible) {
         try { $target.BringIntoView() } catch {}
     }
@@ -37951,7 +37994,8 @@ function Update-WmtQuickFindResults {
         $seen[$key] = $true
         [void]$matches.Add($entry)
     }
-    $limit = 80
+    # Limit expensive WPF reparenting for very broad search terms.
+    $limit = 40
     $lblQuickFindSummary.Text = if ($matches.Count -eq 0) {
         "No tools found for '$query'. Try another term."
     } elseif ($matches.Count -gt $limit) {
@@ -38037,7 +38081,7 @@ function Update-WmtQuickFindResults {
     finally { $script:WmtQuickFindUpdating = $false }
 }
 $script:WmtQuickFindRenderTimer = [System.Windows.Threading.DispatcherTimer]::new()
-$script:WmtQuickFindRenderTimer.Interval = [TimeSpan]::FromMilliseconds(130)
+$script:WmtQuickFindRenderTimer.Interval = [TimeSpan]::FromMilliseconds(220)
 $script:WmtQuickFindRenderTimer.Add_Tick({
     $script:WmtQuickFindRenderTimer.Stop()
     Update-WmtQuickFindResults
@@ -38188,7 +38232,7 @@ $searchIndexDeferTimer.Add_Tick({
 
     # 10. Catalog & Providers
     Add-SearchIndexEntry "btnShowCatalog" "Software Catalog" "btnTabUpdates"
-    Add-SearchIndexNavigationEntry "Your Game Library" "btnShowCatalog" "btnTabUpdates"
+    Add-SearchIndexNavigationEntry "Your Game Library" "btnShowLibrary" "btnTabUpdates"
     Add-SearchIndexEntry "btnManageProviders" "Manage Package Providers" "btnTabUpdates"
 
     # 11. Common Tweaks
