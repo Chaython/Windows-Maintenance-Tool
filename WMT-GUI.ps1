@@ -4198,7 +4198,7 @@ function Get-WmtWpfResourceXaml {
     <Setter Property="Template">
         <Setter.Value>
             <ControlTemplate TargetType="{x:Type GridViewColumnHeader}">
-                <Grid>
+                <Grid Background="{DynamicResource BgPanel}">
                     <Border x:Name="HeaderBorder" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
                         <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
                     </Border>
@@ -4209,7 +4209,7 @@ function Get-WmtWpfResourceXaml {
                          no data column and must not look or act like one. -->
                     <Trigger Property="Role" Value="Padding">
                         <Setter TargetName="PART_HeaderGripper" Property="Visibility" Value="Collapsed"/>
-                        <Setter TargetName="HeaderBorder" Property="Background" Value="{DynamicResource BgPanel}"/>
+                        <Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>
                         <Setter Property="IsHitTestVisible" Value="False"/>
                     </Trigger>
                 </ControlTemplate.Triggers>
@@ -4253,7 +4253,7 @@ function Get-WmtWpfResourceXaml {
     <Setter Property="Template">
         <Setter.Value>
             <ControlTemplate TargetType="{x:Type DataGridColumnHeader}">
-                <Grid>
+                <Grid Background="{DynamicResource BgPanel}">
                     <Border x:Name="HeaderBorder" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
                         <Grid>
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -4277,7 +4277,7 @@ function Get-WmtWpfResourceXaml {
                     <!-- Column is assigned after template creation and does not
                          notify bindings; identify WPF's filler by its part name. -->
                     <Trigger Property="Name" Value="PART_FillerColumnHeader">
-                        <Setter TargetName="HeaderBorder" Property="Background" Value="{DynamicResource BgPanel}"/>
+                        <Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>
                         <Setter TargetName="PART_LeftHeaderGripper" Property="Visibility" Value="Collapsed"/>
                         <Setter TargetName="PART_RightHeaderGripper" Property="Visibility" Value="Collapsed"/>
                         <Setter Property="IsHitTestVisible" Value="False"/>
