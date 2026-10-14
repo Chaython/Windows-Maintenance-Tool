@@ -9611,6 +9611,7 @@ if (-not $script:WmtAppxLoadRunspace) {
 # Dynamic Quick Find cards are disposable while the results page is hidden.
 try {
     if ($pnlQuickFindMatches -and $pnlQuickFind -and -not $pnlQuickFind.IsVisible) {
+        Restore-WmtQuickFindButtons
         $pnlQuickFindMatches.Children.Clear()
     }
 } catch {}
@@ -31850,7 +31851,7 @@ catch { & $failed $_ }
                         <TextBlock Name="lblQuickFindSummary" Text="Search for a tool using Quick Find."
                                    FontSize="14" Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap"
                                    Margin="0,0,0,6"/>
-                        <TextBlock Text="Select Go to tool to view the tool in its original section. Search results never run commands or change settings."
+                        <TextBlock Text="Matching tools appear below with their original buttons and current state. Clicking a tool runs its normal action; review destructive tools before using them."
                                    Foreground="{DynamicResource TextMuted}" FontSize="12" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
@@ -36400,6 +36401,8 @@ $window.Add_PreviewKeyDown({
 foreach ($tabButton in $script:WmtTabButtonControls) {
 $tabButton.Add_Click({
         param($s, $e)
+        # Return moved Quick Find controls before exposing their native page.
+        Restore-WmtQuickFindButtons
         foreach ($panel in $script:WmtPanelControls) { $panel.Visibility = "Collapsed" }
         # Hide tweaks overlay when leaving tweaks tab
         $tweaksOverlay = Get-Ctrl "tweaksLoadingOverlay"
@@ -37845,12 +37848,77 @@ function Show-WmtQuickFindPage {
     }
     $pnlQuickFind.Visibility = "Visible"
 }
+# The real tool Button objects are temporarily hosted by Quick Find. Preserve
+# their original parent/index so they can be restored before page transitions,
+# filter changes, memory trimming, or window shutdown.
+$script:WmtQuickFindMovedButtons = [System.Collections.ArrayList]::new()
+$script:WmtQuickFindUpdating = $false
+function Restore-WmtQuickFindButtons {
+    if (-not $script:WmtQuickFindMovedButtons) { return }
+    foreach ($record in @($script:WmtQuickFindMovedButtons)) {
+        if (-not $record -or -not $record.Button -or -not $record.Parent) { continue }
+        $button = $record.Button
+        $parent = $record.Parent
+        $placeholder = $record.Placeholder
+        try {
+            if ($button.Parent -is [System.Windows.Controls.Panel] -and $button.Parent -ne $parent) {
+                $button.Parent.Children.Remove($button)
+            }
+            if ($button.Parent -eq $parent) {
+                if ($parent.Children.Contains($placeholder)) { $parent.Children.Remove($placeholder) }
+                continue
+            }
+            $position = $parent.Children.IndexOf($placeholder)
+            if ($position -ge 0) { $parent.Children.Remove($placeholder) }
+            else { $position = [Math]::Min([int]$record.Index, $parent.Children.Count) }
+            $parent.Children.Insert($position, $button)
+        }
+        catch {
+            try { Write-GuiLog "[Quick Find] Could not restore '$($button.Name)': $($_.Exception.Message)" } catch {}
+        }
+    }
+    $script:WmtQuickFindMovedButtons.Clear()
+}
+function Add-WmtQuickFindOriginalButton {
+    param([System.Windows.Controls.Button]$Button, [System.Windows.Controls.Panel]$Host)
+    if (-not $Button -or -not $Host -or
+        $Button.Visibility -ne [System.Windows.Visibility]::Visible) { return $false }
+    $originalParent = $Button.Parent
+    if ($originalParent -isnot [System.Windows.Controls.Panel]) { return $false }
+    if ($originalParent -eq $Host) { return $false }
+    $index = $originalParent.Children.IndexOf($Button)
+    if ($index -lt 0) { return $false }
+    $placeholder = [System.Windows.Controls.Border]::new()
+    $placeholder.Visibility = [System.Windows.Visibility]::Collapsed
+    try {
+        $originalParent.Children.Remove($Button)
+        $originalParent.Children.Insert($index, $placeholder)
+        [void]$Host.Children.Add($Button)
+        [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
+            Button = $Button; Parent = $originalParent
+            Index = $index; Placeholder = $placeholder
+        })
+        return $true
+    }
+    catch {
+        # A failed reparent must never leave the original section missing its button.
+        try { if ($Host.Children.Contains($Button)) { $Host.Children.Remove($Button) } } catch {}
+        try { if ($originalParent.Children.Contains($placeholder)) { $originalParent.Children.Remove($placeholder) } } catch {}
+        try {
+            if (-not $originalParent.Children.Contains($Button)) {
+                $originalParent.Children.Insert([Math]::Min($index, $originalParent.Children.Count), $Button)
+            }
+        } catch {}
+        try { Write-GuiLog "[Quick Find] Cannot host '$($Button.Name)': $($_.Exception.Message)" } catch {}
+        return $false
+    }
+}
 function Open-WmtQuickFindTarget {
     param($Entry)
     if (-not $Entry -or -not $Entry.Item) { return }
     $nav = Get-Ctrl ([string]$Entry.Item.Tab)
     if (-not $nav -or -not $nav.IsEnabled) { return }
-    # Navigation buttons retain normal page-loading behavior. No tool Click is raised.
+    Restore-WmtQuickFindButtons
     $nav.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     $target = $Entry.Item.Button
     if ($target -and $target.IsVisible) {
@@ -37859,7 +37927,10 @@ function Open-WmtQuickFindTarget {
 }
 function Update-WmtQuickFindResults {
     if (-not $pnlQuickFindMatches -or -not $lblQuickFindSummary -or -not $txtGlobalSearch) { return }
-    if (-not $pnlQuickFind.IsVisible) { return }
+    if (-not $pnlQuickFind.IsVisible -or $script:WmtQuickFindUpdating) { return }
+    $script:WmtQuickFindUpdating = $true
+    try {
+    Restore-WmtQuickFindButtons
     $pnlQuickFindMatches.Children.Clear()
     $query = ([string]$txtGlobalSearch.Text).Trim()
     if (-not $query -or $query -eq $script:QuickFindPlaceholder) {
@@ -37927,30 +37998,63 @@ function Update-WmtQuickFindResults {
                 $description.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 [void]$body.Children.Add($description)
             }
-            $open = [System.Windows.Controls.Button]::new()
-            $open.Content = "Go to tool"
-            $open.Style = $window.FindResource("ActionBtn")
-            $open.HorizontalAlignment = "Left"
-            $open.Margin = [System.Windows.Thickness]::new(0,9,0,0)
-            $open.Tag = $entry
-            $open.ToolTip = "Navigate to the matching tool. This never runs it."
-            $open.Add_Click({
-                param($searchSender, $searchEventArgs)
-                Open-WmtQuickFindTarget -Entry $searchSender.Tag
-            })
-            [void]$body.Children.Add($open)
+            # Reparent the actual original Button, retaining its existing handlers,
+            # state, styling, icon, and dynamic label. This is not a proxy/auto-click.
+            $original = $entry.Item.Button
+            $canHost = ($original -is [System.Windows.Controls.Button]) -and
+                       ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates"))
+            $hosted = $false
+            if ($canHost) { $hosted = Add-WmtQuickFindOriginalButton -Button $original -Host $body }
+            if (-not $hosted) {
+                # Controls that depend on their page context (including the
+                # catalogue/library navigators and search fields) stay in place.
+                $open = [System.Windows.Controls.Button]::new()
+                $open.Content = "Open section"
+                $open.Style = $window.FindResource("ActionBtn")
+                $open.HorizontalAlignment = "Left"
+                $open.Margin = [System.Windows.Thickness]::new(0,9,0,0)
+                $open.Tag = $entry
+                $open.ToolTip = "This control needs its original page; open the section without running a tool."
+                $open.Add_Click({
+                    param($searchSender, $searchEventArgs)
+                    Open-WmtQuickFindTarget -Entry $searchSender.Tag
+                })
+                [void]$body.Children.Add($open)
+            }
             $card.Child = $body
             [void]$wrap.Children.Add($card)
             $rendered++
         }
         [void]$pnlQuickFindMatches.Children.Add($wrap)
     }
+    }
+    catch {
+        Restore-WmtQuickFindButtons
+        try { $pnlQuickFindMatches.Children.Clear() } catch {}
+        try { $lblQuickFindSummary.Text = "Quick Find could not render this search. Please refine your query." } catch {}
+        try { Write-GuiLog "[Quick Find] Failed to render tool buttons: $($_.Exception.Message)" } catch {}
+    }
+    finally { $script:WmtQuickFindUpdating = $false }
 }
 $script:WmtQuickFindRenderTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:WmtQuickFindRenderTimer.Interval = [TimeSpan]::FromMilliseconds(130)
 $script:WmtQuickFindRenderTimer.Add_Tick({
     $script:WmtQuickFindRenderTimer.Stop()
     Update-WmtQuickFindResults
+})
+if ($pnlQuickFind) {
+    $pnlQuickFind.Add_IsVisibleChanged({
+        param($searchPage, $args)
+        if (-not $searchPage.IsVisible) {
+            $script:WmtQuickFindRenderTimer.Stop()
+            Restore-WmtQuickFindButtons
+            if ($pnlQuickFindMatches) { $pnlQuickFindMatches.Children.Clear() }
+        }
+    })
+}
+$window.Add_Closing({
+    $script:WmtQuickFindRenderTimer.Stop()
+    Restore-WmtQuickFindButtons
 })
 # --- GLOBAL SEARCH INDEX ---
 
