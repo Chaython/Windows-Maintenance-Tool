@@ -80,6 +80,82 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Smoke test Quick Find button hosting and safety
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+          $tokens = $null; $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path '.\\WMT-GUI.ps1').Path, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) { throw 'WMT must parse before Quick Find tests.' }
+          foreach ($name in @('Add-WmtQuickFindOriginalButton', 'Restore-WmtQuickFindButtons')) {
+              $functionAst = $ast.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $node.Name -eq $name
+              }, $true)
+              if (-not $functionAst) { throw "Missing Quick Find function: $name" }
+              Invoke-Expression $functionAst.Extent.Text
+          }
+          function Write-GuiLog { param([string]$Message) Write-Host $Message }
+          $script:WmtQuickFindMovedButtons = [System.Collections.ArrayList]::new()
+          $nativePage = [System.Windows.Controls.Grid]::new()
+          $nativePage.Name = 'pnlTweaks'
+          # Only the native page root can be collapsed while Quick Find is open.
+          $nativePage.Visibility = 'Collapsed'
+          $group = [System.Windows.Controls.WrapPanel]::new()
+          [void]$nativePage.Children.Add($group)
+          $originalContext = [PSCustomObject]@{ Value = 17 }
+          $nativePage.DataContext = $originalContext
+          $button = [System.Windows.Controls.Button]::new()
+          $button.Content = 'Safe tool'
+          [void]$group.Children.Add($button)
+          $host = [System.Windows.Controls.StackPanel]::new()
+          $script:quickFindSmokeClicks = 0
+          $button.Add_Click({ $script:quickFindSmokeClicks++ })
+          if (-not (Add-WmtQuickFindOriginalButton -Button $button -Host $host)) {
+              throw 'An enabled native tool could not be moved to Quick Find.'
+          }
+          if ($button.Parent -ne $host -or $script:WmtQuickFindMovedButtons.Count -ne 1) {
+              throw 'Quick Find failed to track the moved button.'
+          }
+          if ($button.DataContext -ne $originalContext) { throw 'Inherited DataContext was lost.' }
+          $button.RaiseEvent([System.Windows.RoutedEventArgs]::new(
+              [System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+          if ($script:quickFindSmokeClicks -ne 1) { throw 'Native click handler was lost.' }
+          Restore-WmtQuickFindButtons
+          if ($button.Parent -ne $group -or $script:WmtQuickFindMovedButtons.Count -ne 0) {
+              throw 'Quick Find did not restore the original control.'
+          }
+          if ($button.ReadLocalValue([System.Windows.FrameworkElement]::DataContextProperty) -ne
+              [System.Windows.DependencyProperty]::UnsetValue) {
+              throw 'Quick Find left a local DataContext override.'
+          }
+          $group.IsEnabled = $false
+          if (Add-WmtQuickFindOriginalButton -Button $button -Host $host) {
+              throw 'Disabled tool unexpectedly became movable/active.'
+          }
+          if ($button.Parent -ne $group) { throw 'Disabled tool was detached from its original location.' }
+          $group.IsEnabled = $true
+          $group.Visibility = 'Collapsed'
+          if (Add-WmtQuickFindOriginalButton -Button $button -Host $host) {
+              throw 'Hidden subsection tool escaped into Quick Find.'
+          }
+          $group.Visibility = 'Visible'
+          # A failed restore must retain its record so a later attempt can retry.
+          $faultyParent = [PSCustomObject]@{ Broken = $true }
+          [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
+              Button = $button; Parent = $faultyParent; Placeholder = $null
+              Index = 0; InheritedDataContext = $false
+          })
+          Restore-WmtQuickFindButtons
+          if ($script:WmtQuickFindMovedButtons.Count -ne 1) {
+              throw 'Unrecoverable original-parent failure discarded its pending restoration.'
+          }
+          $script:WmtQuickFindMovedButtons.Clear()
+          Write-Host 'Quick Find host/restore safety checks passed.'
+
       - name: Smoke test fast ghost-device scan and full-width dialog
         shell: powershell
         run: |
