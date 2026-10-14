@@ -111,13 +111,13 @@ jobs:
           $button = [System.Windows.Controls.Button]::new()
           $button.Content = 'Safe tool'
           [void]$group.Children.Add($button)
-          $host = [System.Windows.Controls.StackPanel]::new()
+          $quickFindHost = [System.Windows.Controls.StackPanel]::new()
           $script:quickFindSmokeClicks = 0
           $button.Add_Click({ $script:quickFindSmokeClicks++ })
-          if (-not (Add-WmtQuickFindOriginalButton -Button $button -Host $host)) {
+          if (-not (Add-WmtQuickFindOriginalButton -Button $button -DestinationPanel $quickFindHost)) {
               throw 'An enabled native tool could not be moved to Quick Find.'
           }
-          if ($button.Parent -ne $host -or $script:WmtQuickFindMovedButtons.Count -ne 1) {
+          if ($button.Parent -ne $quickFindHost -or $script:WmtQuickFindMovedButtons.Count -ne 1) {
               throw 'Quick Find failed to track the moved button.'
           }
           if ($button.DataContext -ne $originalContext) { throw 'Inherited DataContext was lost.' }
@@ -133,13 +133,13 @@ jobs:
               throw 'Quick Find left a local DataContext override.'
           }
           $group.IsEnabled = $false
-          if (Add-WmtQuickFindOriginalButton -Button $button -Host $host) {
+          if (Add-WmtQuickFindOriginalButton -Button $button -DestinationPanel $quickFindHost) {
               throw 'Disabled tool unexpectedly became movable/active.'
           }
           if ($button.Parent -ne $group) { throw 'Disabled tool was detached from its original location.' }
           $group.IsEnabled = $true
           $group.Visibility = 'Collapsed'
-          if (Add-WmtQuickFindOriginalButton -Button $button -Host $host) {
+          if (Add-WmtQuickFindOriginalButton -Button $button -DestinationPanel $quickFindHost) {
               throw 'Hidden subsection tool escaped into Quick Find.'
           }
           $group.Visibility = 'Visible'
