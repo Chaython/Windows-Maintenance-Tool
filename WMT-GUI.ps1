@@ -38046,9 +38046,17 @@ if ($pnlQuickFind) {
     $pnlQuickFind.Add_IsVisibleChanged({
         param($searchPage, $args)
         if (-not $searchPage.IsVisible) {
+            # Window-to-tray and navigation both release hosted buttons promptly.
             $script:WmtQuickFindRenderTimer.Stop()
             Restore-WmtQuickFindButtons
             if ($pnlQuickFindMatches) { $pnlQuickFindMatches.Children.Clear() }
+        }
+        elseif ($searchPage.IsVisible -and $txtGlobalSearch -and
+                -not [string]::IsNullOrWhiteSpace($txtGlobalSearch.Text) -and
+                $txtGlobalSearch.Text -ne $script:QuickFindPlaceholder) {
+            # Restore the result cards if the existing search page is shown from tray.
+            $script:WmtQuickFindRenderTimer.Stop()
+            $script:WmtQuickFindRenderTimer.Start()
         }
     })
 }
