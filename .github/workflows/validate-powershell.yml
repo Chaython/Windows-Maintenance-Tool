@@ -118,7 +118,7 @@ jobs:
                   $process.Kill()
                   throw 'Ghost-device scan child exceeded the 20-second test deadline.'
               }
-              if ($process.ExitCode -ne 0) {
+              if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
                   throw ('Ghost-device scan child failed (exit ' + $process.ExitCode + '): stdout=' +
                       [IO.File]::ReadAllText($out,[Text.Encoding]::UTF8) + ' stderr=' + [IO.File]::ReadAllText($err))
               }
