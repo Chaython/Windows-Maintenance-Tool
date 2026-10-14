@@ -173,6 +173,10 @@ The main WMT window supports a few familiar, context-sensitive shortcuts:
 
 F5 on Updates is an explicit package scan: merely visiting the Updates tab does **not** trigger a scan. Refresh shortcuts reuse the corresponding on-screen actions and respect disabled controls. Other pages do not run a refresh action on F5.
 
+### Quick Find
+
+Quick Find is in the left sidebar above the navigation buttons (without an extra Navigation heading). Typing a tool name or related description opens the **Find Tools** page in the main workspace. Matching tools are dynamically grouped by section and shown as cards with **Go to tool** buttons. These buttons only navigate to the existing tool location; they **never execute a tool action, change a setting, or run a command**. Once you reach the tool's original page, use its normal controls and confirmations to perform any action. Clearing the search displays a neutral empty state, and the sidebar navigation stays available while searching.
+
 ## Core Features
 
 <details>
