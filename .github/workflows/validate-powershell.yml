@@ -1851,6 +1851,45 @@ jobs:
           }
           if ($failures.Count) { throw ($failures -join [Environment]::NewLine) }
 
+      - name: Test pagefile configuration contracts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path (Get-Location) 'WMT-GUI.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          foreach ($name in @('ConvertTo-WmtPagefileConfiguration', 'Get-WmtPagefileConfiguredState', 'Write-WmtPagefileBackup', 'Read-WmtPagefileBackup')) {
+            $fn = $ast.Find({ param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+            }, $true)
+            if (-not $fn) { throw "Missing pagefile function $name" }
+            Invoke-Expression $fn.Extent.Text
+          }
+          $configuration = [pscustomobject]@{
+            Version = 1
+            AutomaticManagedPagefile = $false
+            PagingFilesPresent = $true
+            PagingFiles = [string[]]@('C:\pagefile.sys 1024 2048', 'D:\pagefile.sys 4096 8192')
+          }
+          if (-not (Get-WmtPagefileConfiguredState $configuration)) { throw 'Multiple paging files not detected' }
+          $disabled = [pscustomobject]@{ Version = 1; AutomaticManagedPagefile = $false; PagingFilesPresent = $true; PagingFiles = [string[]]@() }
+          if (Get-WmtPagefileConfiguredState $disabled) { throw 'Empty manual paging configuration reported enabled' }
+          $automatic = [pscustomobject]@{ Version = 1; AutomaticManagedPagefile = $true; PagingFilesPresent = $true; PagingFiles = [string[]]@() }
+          if (-not (Get-WmtPagefileConfiguredState $automatic)) { throw 'Automatic management reported disabled' }
+          $backup = Join-Path $env:RUNNER_TEMP ('wmt-pagefile-' + [guid]::NewGuid().ToString('N') + '.json')
+          try {
+            Write-WmtPagefileBackup -Configuration $configuration -BackupPath $backup
+            $restored = Read-WmtPagefileBackup -BackupPath $backup
+            if ($restored.PagingFiles.Count -ne 2 -or -not ($restored.PagingFiles[1] -eq 'D:\pagefile.sys 4096 8192')) { throw 'Multi-drive backup round-trip mismatch' }
+            [IO.File]::WriteAllText($backup, '{broken')
+            $rejected = $false
+            try { $null = Read-WmtPagefileBackup -BackupPath $backup } catch { $rejected = $true }
+            if (-not $rejected) { throw 'Corrupt backup was silently accepted' }
+            Write-Host 'Pagefile configuration and restore tests passed.'
+          }
+          finally { if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force } }
+
       - name: Smoke test settings persistence
         shell: powershell
         run: |
