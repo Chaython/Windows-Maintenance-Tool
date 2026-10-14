@@ -38048,7 +38048,9 @@ function Update-WmtQuickFindResults {
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
                 $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 $stateName = [string]$entry.Item.Button.Name
-                if ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName -and -not $script:OptionalFeaturesReady) {
+                if ($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($stateName)) {
+                    $stateLabel.Text = if ($script:OptionalFeatureStateCache[$stateName]) { "State: Enabled" } else { "State: Disabled" }
+                } elseif ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName -and -not $script:OptionalFeaturesReady) {
                     $stateLabel.Text = "State: Checking Windows feature..."
                 } elseif ($script:TweakStatesReady -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
                     $stateLabel.Text = if ($script:TweakCurrentStates[$stateName].On) { "State: Enabled" } else { "State: Disabled" }
@@ -62296,7 +62298,9 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
                     }
                 }
                 if ($results) {
+                    $script:OptionalFeatureStateCache = @{}
                     foreach ($btnName in $results.Keys) {
+                        $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
                         $btn = Get-Ctrl $btnName
                         if (-not $btn) { continue }
                         $isEnabled = $results[$btnName]
@@ -62315,8 +62319,9 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
             try { $script:FeaturesCheckPS.Dispose() } catch {}
             $script:FeaturesCheckAsync = $null
             $script:FeaturesCheckPS = $null
-            # Mark optional features as ready and coordinate overlay hide
-            $script:OptionalFeaturesReady = $true
+            # Only release the overlay when optional feature detection actually returned states.
+            $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
+            if (-not $script:OptionalFeaturesReady) { Write-GuiLog "[Optional Features] No valid feature states were returned. Tweaks remains blocked." }
             Sync-WmtTweakOverlayHide
             if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindResults }
         }
@@ -62371,7 +62376,9 @@ function Update-OptionalFeaturesSynchronously {
             try { Write-GuiLog "[Optional Features] DISM query failed: $($_.Exception.Message)" } catch {}
         }
     }
+    $script:OptionalFeatureStateCache = @{}
     foreach ($btnName in $results.Keys) {
+        $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
         $btn = Get-Ctrl $btnName
         if (-not $btn) { continue }
         if ($results[$btnName]) {
