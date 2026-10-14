@@ -57915,6 +57915,23 @@ Register-WmtUiPollOperation -Name "LibraryScan" -IntervalMs 500 -TestComplete { 
         
         Unregister-WmtUiPollOperation -Name "LibraryScan"
         $script:WmtLibraryScanTimer = $null
+    } -TimeoutMs 120000 -OnTimeout {
+        $oldPs = $script:WmtLibraryScanRunspace
+        $oldAsync = $script:WmtLibraryScanAsyncResult
+        $script:WmtLibraryScanRunspace = $null
+        $script:WmtLibraryScanAsyncResult = $null
+        Write-GuiLog "Library scan timed out after 2 minutes; stopping worker."
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library scan timed out. Refresh to retry." }
+        if ($oldPs) { Stop-WmtPowerShellInvocationAsync -PowerShell $oldPs -Invocation $oldAsync -Name "Library scan timeout" }
+    } -OnError {
+        param($operation, $errorRecord)
+        Write-GuiLog "Library scan monitor failed: $errorRecord"
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library scan failed. Refresh to retry." }
+        $oldPs = $script:WmtLibraryScanRunspace
+        $oldAsync = $script:WmtLibraryScanAsyncResult
+        $script:WmtLibraryScanRunspace = $null
+        $script:WmtLibraryScanAsyncResult = $null
+        if ($oldPs) { Stop-WmtPowerShellInvocationAsync -PowerShell $oldPs -Invocation $oldAsync -Name "Library scan monitor failure" }
     } | Out-Null
 }
 
@@ -58183,7 +58200,7 @@ try {
     if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Importing $name with $provider (file verification may take time)..." }
     Write-GuiLog "[Import] ${provider}: $name ($id) from $path"
 
-    Register-WmtUiPollOperation -Name "GameLibraryImport" -IntervalMs 500 -TestComplete { $false } -OnTick {
+    Register-WmtUiPollOperation -Name "GameLibraryImport" -IntervalMs 500 -TimeoutMs 7260000 -TestComplete { $false } -OnTick {
         if (-not $script:WmtGameImportAsync -or -not $script:WmtGameImportAsync.IsCompleted) { return }
         $context = $script:WmtGameImportContext
         try {
@@ -58228,15 +58245,45 @@ try {
             $script:WmtGameImportContext = $null
             if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
         }
+    } -OnTimeout {
+        Write-GuiLog "[Import] Import watchdog expired after 121 minutes. Cancelling..."
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Import timed out; cancelling worker..." }
+        $active = $script:WmtGameImportRunspace
+        $async = $script:WmtGameImportAsync
+        if ($active) { Stop-WmtPowerShellInvocationAsync -PowerShell $active -Invocation $async -Name "Game import timeout" }
+        # Preserve in-flight references to prevent a second import overlapping it.
+        Register-WmtUiPollOperation -Name "GameLibraryImportStop" -IntervalMs 500 -TestComplete {
+            $script:WmtGameImportAsync -and $script:WmtGameImportAsync.IsCompleted
+        } -OnComplete {
+            $script:WmtGameImportRunspace = $null
+            $script:WmtGameImportAsync = $null
+            $script:WmtGameImportContext = $null
+            if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Import cancelled. Refresh the library before retrying." }
+        } | Out-Null
+    } -OnError {
+        param($operation, $errorRecord)
+        Write-GuiLog "[Import] Import monitor failed: $errorRecord"
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Import monitor failed; restart WMT before importing again." }
+        if ($script:WmtGameImportRunspace) {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $script:WmtGameImportRunspace -Invocation $script:WmtGameImportAsync -Name "Game import monitor error"
+        }
     } | Out-Null
 }
 catch {
     Write-GuiLog "[Import] Cannot start import: $($_.Exception.Message)"
-    try { if ($ps) { $ps.Dispose() } } catch {}
-    $script:WmtGameImportRunspace = $null
-    $script:WmtGameImportAsync = $null
-    $script:WmtGameImportContext = $null
-    if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+    if ($script:WmtGameImportAsync) {
+        if ($script:WmtGameImportRunspace) {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $script:WmtGameImportRunspace -Invocation $script:WmtGameImportAsync -Name "Game import startup error"
+        }
+    }
+    else {
+        try { if ($ps) { $ps.Dispose() } } catch {}
+        $script:WmtGameImportRunspace = $null
+        $script:WmtGameImportAsync = $null
+        $script:WmtGameImportContext = $null
+        if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+    }
     Show-WmtMessageBox -Message $_.Exception.Message -Title "Import Error" -Image Warning | Out-Null
 }
 }
@@ -62979,7 +63026,7 @@ try {
 
     # Collect completion through the shared UI poller rather than allocating a
     # dedicated DispatcherTimer for this one background job.
-    Register-WmtUiPollOperation -Name "LibraryCacheBuilder" -IntervalMs 1000 `
+    Register-WmtUiPollOperation -Name "LibraryCacheBuilder" -IntervalMs 1000 -TimeoutMs 1800000 `
         -TestComplete { $script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult.IsCompleted } `
         -OnComplete {
             try {
@@ -63004,6 +63051,30 @@ try {
             # remains stale and opening Your Library later can keep showing zero
             # provider games until another manual refresh.
             try { Start-WmtLibraryScan -Silent } catch {}
+        } `
+        -OnTimeout {
+            Write-GuiLog "Library cache refresh timed out after 30 minutes; stopping worker."
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library cache refresh timed out; stopping..." }
+            $active = $script:WmtLibraryCacheRunspace
+            if ($active) {
+                Stop-WmtPowerShellInvocationAsync -PowerShell $active -Invocation $script:WmtLibraryCacheAsyncResult -Name "Library cache timeout"
+            }
+            # Keep the references until the invocation has actually stopped.
+            Register-WmtUiPollOperation -Name "LibraryCacheBuilderStop" -IntervalMs 1000 `
+                -TestComplete { $script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult.IsCompleted } `
+                -OnComplete {
+                    $script:WmtLibraryCacheRunspace = $null
+                    $script:WmtLibraryCacheAsyncResult = $null
+                    if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library cache refresh timed out. Retry Refresh." }
+                } | Out-Null
+        } `
+        -OnError {
+            param($operation, $errorRecord)
+            Write-GuiLog "Library cache watcher failed: $errorRecord"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library cache watcher failed. Restart WMT to retry." }
+            if ($script:WmtLibraryCacheRunspace) {
+                Stop-WmtPowerShellInvocationAsync -PowerShell $script:WmtLibraryCacheRunspace -Invocation $script:WmtLibraryCacheAsyncResult -Name "Library cache watcher failure"
+            }
         } | Out-Null
 }
 catch {
