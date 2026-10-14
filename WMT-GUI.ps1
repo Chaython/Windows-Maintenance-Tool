@@ -40715,7 +40715,8 @@ exit $exitCode
                 if ($TimeoutSeconds -gt 0 -and ($now - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
                     Write-Output "LOG:Visible installer exceeded the $TimeoutSeconds-second runtime limit. Stopping its process tree."
                     Stop-WmtChildProcessTree -Process $proc
-                    return [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = "visible installer runtime limit" }
+                    # Until descendants are verified stopped, do not start another installer.
+                    return [PSCustomObject]@{ ExitCode = 124; TimedOut = $true; TimeoutReason = "visible installer runtime limit"; TerminationFailed = $true }
                 }
                 if (($now - $lastHeartbeat).TotalSeconds -ge 30) {
                     Write-Output "LOG:Visible installer still running..."
@@ -42380,11 +42381,10 @@ exit /b %WMT_EXIT%
                     $visibleTranscriptPath = if ($isCustomUpdateCommand -or $srcKey -in @("winget", "legendary")) { "" } else { $providerTranscriptPath }
                     $p = Invoke-VisibleCmd $visibleCommand "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
-                    # Normalize a missing/failed visible process result. The final
-                    # result line below reports the failure once, without duplicate chatter.
-                    if ($null -eq $p -or $null -eq $p.ExitCode -or $p.ExitCode -ne 0) {
-                        $exitCode = if ($p -and $null -ne $p.ExitCode) { $p.ExitCode } else { 1 }
-                        $p = [PSCustomObject]@{ ExitCode = $exitCode }
+                    # Preserve TimedOut and TerminationFailed on failed installers.
+                    # Replacing every nonzero result discarded safety metadata.
+                    if ($null -eq $p -or $null -eq $p.ExitCode) {
+                        $p = [PSCustomObject]@{ ExitCode = 1; TimedOut = $false; TerminationFailed = $false }
                     }
                 }
                 catch {
@@ -42559,7 +42559,8 @@ exit /b %WMT_EXIT%
                 }
                 if ($p.PSObject.Properties["TimedOut"] -and $p.TimedOut) {
                     $timeoutReason = if ($p.PSObject.Properties["TimeoutReason"] -and -not [string]::IsNullOrWhiteSpace([string]$p.TimeoutReason)) { [string]$p.TimeoutReason } else { "timeout" }
-                    $terminationFailed = [bool]($p.PSObject.Properties["TerminationFailed"] -and $p.TerminationFailed)
+                    # Missing termination metadata is unknown, not successful cleanup.
+                    $terminationFailed = [bool](-not $p.PSObject.Properties["TerminationFailed"] -or $p.TerminationFailed)
                     if ($terminationFailed) {
                         Write-Output "LOG:[$act][$index/$total] FAILED: $name ($timeoutReason; Winget could not be confirmed terminated)"
                         Write-Output "RESULT:${index}:FAILED:$name"
