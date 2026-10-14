@@ -34290,6 +34290,7 @@ $btnMyDeviceHagsToggle = Get-Ctrl "btnMyDeviceHagsToggle"
 # Central tweak metadata table: button name -> @{ Description = "..."; RestartHint = "..." }
 # Used by Update-WmtTweakToggle to build rich tooltips.
 $script:TweakMetaData = @{
+"btnTogglePagefile" = @{ Description = "Disabling the pagefile reduces available committed memory and can prevent crash dumps. Keeping it enabled is recommended."; RestartHint = "Restart Windows after changing the pagefile." }
 # Performance & Power
 "btnToggleHibernate"          = @{ Description = "Hibernation saves your session to disk (hiberfil.sys) and powers off. Disabling it frees disk space equal to ~75% of your RAM but removes the hibernate power option."; RestartHint = "No restart needed." }
 "btnToggleSuperfetch"         = @{ Description = "Superfetch (SysMain) preloads frequently-used apps into RAM. Disabling it reduces background disk activity, which can help SSDs and older HDDs alike."; RestartHint = "Restart recommended." }
@@ -34726,6 +34727,9 @@ foreach ($name in $Names) {
     try {
         if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) { continue }
         switch ($name) {
+            "btnTogglePagefile" {
+                Update-WmtPagefileButtonState -Enabled (Get-WmtPagefileCachedState)
+            }
             "btnStartWithWindows" {
                 # Re-reads the scheduled task and records via Update-WmtTweakToggle
                 Update-WmtStartWithWindowsButton
@@ -37423,6 +37427,7 @@ $btnToggleSpatialAudio.Add_Click({
 }
 
 Register-WmtTweakButton "btnTogglePagefile" { Invoke-WmtPagefileButtonToggle }
+Update-WmtPagefileButtonState -Enabled (Get-WmtPagefileCachedState)
 Register-WmtTweakButton "btnSoundSettings" { Start-Process "ms-settings:sound" }
 
 # Display
