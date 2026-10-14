@@ -62118,30 +62118,18 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                 } else {
                     $typeInfo = if ($result) { $result.GetType().FullName } else { "null" }
                     try { Write-GuiLog "[Tweak States] Background preload returned unexpected type: $typeInfo" } catch {}
-                    # Cache was not populated — buttons will use live registry reads as fallback
+                    # Cache was not populated; keep the tweak overlay blocked until Retry
                     $script:TweakStatesReady = $false
                     Show-TweakStatesLoadError -Message "Tweak state cache returned invalid data (type: $typeInfo). Buttons will use live registry reads as fallback, which may be slow."
                 }
             }
             catch [System.Management.Automation.Runspaces.InvalidRunspacePoolStateException] {
-                # Pool was closed/disposed while job was queued — unrecoverable
-                try { Write-GuiLog "[Tweak States] Background load failed: Runspace pool was closed. Attempting synchronous fallback." } catch {}
-                $script:TweakStatesReady = $true
-                Sync-WmtTweakOverlayHide
-                try {
-                    Update-TweakButtonStates
-                }
-                catch {
-                    Show-TweakStatesLoadError -Message "Background job failed (pool closed) and fallback also failed: $($_.Exception.Message)"
-                }
+                $script:TweakStatesReady = $false
+                Show-TweakStatesLoadError -Message "The background runspace pool closed before tweak states could load. Click Retry."
             }
             catch [System.Management.Automation.Runspaces.InvalidRunspaceStateException] {
-                try { Write-GuiLog "[Tweak States] Background load failed: Runspace was disposed." } catch {}
-                $script:TweakStatesReady = $true
-                Sync-WmtTweakOverlayHide
-                try { Update-TweakButtonStates } catch {
-                    Show-TweakStatesLoadError -Message "Background job failed (runspace disposed) and fallback also failed: $($_.Exception.Message)"
-                }
+                $script:TweakStatesReady = $false
+                Show-TweakStatesLoadError -Message "The tweak-state runspace was disposed. Click Retry."
             }
             catch {
                 $errMsg = $_.Exception.Message
@@ -62157,8 +62145,8 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
     } | Out-Null
 
 # Timeout guard: if the runspace pool is starved (e.g. My Device jobs filling
-# all slots), the background job may never start. After 30 seconds, hide the
-# overlay so the Tweaks page is usable even without cached state data.
+# all slots), the background job may never start. After 30 seconds, keep
+# the overlay blocking toggles and offer a retry.
 $script:TweakStatesBgTimeout = New-Object System.Windows.Threading.DispatcherTimer
 $script:TweakStatesBgTimeout.Interval = [TimeSpan]::FromSeconds(30)
 $script:TweakStatesBgTimeout.Add_Tick({
