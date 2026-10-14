@@ -37953,6 +37953,10 @@ function Open-WmtQuickFindTarget {
     $nav = Get-Ctrl ([string]$Entry.Item.Tab)
     if (-not $nav -or -not $nav.IsEnabled) { return }
     Restore-WmtQuickFindButtons
+    if ($script:WmtQuickFindMovedButtons.Count -gt 0) {
+        Write-GuiLog "[Quick Find] Navigation cancelled because a tool button could not be restored."
+        return
+    }
     $nav.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     $target = $Entry.Item.Button
     if ($target -and $target.Name -in @("btnShowCatalog", "btnShowLibrary")) {
@@ -37974,6 +37978,10 @@ function Update-WmtQuickFindResults {
     $script:WmtQuickFindUpdating = $true
     try {
     Restore-WmtQuickFindButtons
+    if ($script:WmtQuickFindMovedButtons.Count -gt 0) {
+        $lblQuickFindSummary.Text = "Unable to restore a tool button. Search results were preserved; try changing sections again."
+        return
+    }
     $pnlQuickFindMatches.Children.Clear()
     $query = ([string]$txtGlobalSearch.Text).Trim()
     if (-not $query -or $query -eq $script:QuickFindPlaceholder) {
@@ -38095,7 +38103,9 @@ function Update-WmtQuickFindResults {
     }
     catch {
         Restore-WmtQuickFindButtons
-        try { $pnlQuickFindMatches.Children.Clear() } catch {}
+        if ($script:WmtQuickFindMovedButtons.Count -eq 0) {
+            try { $pnlQuickFindMatches.Children.Clear() } catch {}
+        }
         try { $lblQuickFindSummary.Text = "Quick Find could not render this search. Please refine your query." } catch {}
         try { Write-GuiLog "[Quick Find] Failed to render tool buttons: $($_.Exception.Message)" } catch {}
     }
@@ -38114,7 +38124,9 @@ if ($pnlQuickFind) {
             # Window-to-tray and navigation both release hosted buttons promptly.
             $script:WmtQuickFindRenderTimer.Stop()
             Restore-WmtQuickFindButtons
-            if ($pnlQuickFindMatches) { $pnlQuickFindMatches.Children.Clear() }
+            if ($pnlQuickFindMatches -and $script:WmtQuickFindMovedButtons.Count -eq 0) {
+                $pnlQuickFindMatches.Children.Clear()
+            }
         }
         elseif ($searchPage.IsVisible -and $txtGlobalSearch -and
                 -not [string]::IsNullOrWhiteSpace($txtGlobalSearch.Text) -and
