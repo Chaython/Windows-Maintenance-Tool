@@ -37867,9 +37867,10 @@ function Restore-WmtQuickFindButtons {
         $parent = $record.Parent
         $placeholder = $record.Placeholder
         $restored = $false
+        $quickFindHost = if ($button.Parent -is [System.Windows.Controls.Panel] -and $button.Parent -ne $parent) { $button.Parent } else { $null }
         try {
-            if ($button.Parent -is [System.Windows.Controls.Panel] -and $button.Parent -ne $parent) {
-                [void]$button.Parent.Children.Remove($button)
+            if ($quickFindHost) {
+                [void]$quickFindHost.Children.Remove($button)
             }
             if ($button.Parent -ne $parent) {
                 $position = $parent.Children.IndexOf($placeholder)
@@ -37889,6 +37890,11 @@ function Restore-WmtQuickFindButtons {
             }
         }
         catch {
+            # An insertion failure must not strand the live control without a
+            # parent. Reattach it to its search card so the next pass can retry.
+            if (-not $button.Parent -and $quickFindHost) {
+                try { [void]$quickFindHost.Children.Add($button) } catch {}
+            }
             try { Write-GuiLog "[Quick Find] Could not restore '$($button.Name)': $($_.Exception.Message)" } catch {}
         }
         # Retain unresolved restorations instead of silently losing the reference.
