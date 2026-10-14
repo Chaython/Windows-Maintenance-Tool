@@ -21,6 +21,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   build-release:
@@ -78,6 +81,44 @@ jobs:
           Write-Host "Release version: $version"
           Write-Host "SHA256: $hash"
 
+      # Sigstore signs the provenance statement for the exact executable.
+      # Artifact attestations do NOT provide Windows Authenticode signatures.
+      - name: Attest release executable
+        id: provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/WindowsMaintenanceTool.exe
+
+      - name: Verify provenance and prepare Sigstore bundle
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:ATTESTATION_BUNDLE) -or
+              -not (Test-Path -LiteralPath $env:ATTESTATION_BUNDLE -PathType Leaf)) {
+              throw "GitHub did not provide the Sigstore attestation bundle."
+          }
+
+          $binary = ".\\dist\\WindowsMaintenanceTool.exe"
+          $bundle = ".\\dist\\WindowsMaintenanceTool.exe.sigstore.json"
+          Copy-Item -LiteralPath $env:ATTESTATION_BUNDLE -Destination $bundle -Force
+
+          # Fail closed if the signature, artifact hash, workflow, or source
+          # commit does not match this release run.
+          $verificationArgs = @(
+              "attestation", "verify", $binary,
+              "--repo", $env:GITHUB_REPOSITORY,
+              "--bundle", $bundle,
+              "--signer-workflow", "$env:GITHUB_REPOSITORY/.github/workflows/release-ps2exe.yml",
+              "--source-digest", $env:GITHUB_SHA
+          )
+          & gh @verificationArgs
+          if ($LASTEXITCODE -ne 0) {
+              throw "Sigstore attestation verification failed; refusing to publish release."
+          }
+
       - name: Create or update GitHub release
         shell: powershell
         env:
@@ -89,7 +130,8 @@ jobs:
 
           $assets = @(
               ".\dist\WindowsMaintenanceTool.exe",
-              ".\dist\WindowsMaintenanceTool.exe.sha256"
+              ".\dist\WindowsMaintenanceTool.exe.sha256",
+              ".\dist\WindowsMaintenanceTool.exe.sigstore.json"
           )
 
           # Probe the Releases API instead of using "gh release view". On Windows
