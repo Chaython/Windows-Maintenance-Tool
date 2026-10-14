@@ -80,69 +80,54 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
-      - name: Smoke test isolated ghost-device scan
+      - name: Smoke test fast ghost-device scan and full-width dialog
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
-          $match = [regex]::Match($source, '(?ms)^\$ghostScanScript\s*=\s*@''\r?\n(.*?)\r?\n''@')
-          if (-not $match.Success) { throw 'Ghost-device worker script was not found.' }
-          $scanScript = $match.Groups[1].Value
-
-          # Replace only hardware discovery with a predictable fixture.
-          # Exercise the real child-process JSON pipeline without removing hardware.
-          $fakePnp = @'
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $fn = $ast.Find({
+              param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-WmtGhostDeviceCandidates'
+          }, $true)
+          if (-not $fn) { throw 'Fast ghost-device candidate helper is missing.' }
+          Invoke-Expression $fn.Extent.Text
           function Get-PnpDevice {
               [CmdletBinding()]
               param()
-              [PSCustomObject]@{ Status = 'Unknown'; InstanceId = 'USB\TEST_GHOST'; Class = 'USB'; FriendlyName = 'Disconnected test device' }
-              [PSCustomObject]@{ Status = 'OK'; InstanceId = 'USB\TEST_CONNECTED'; Class = 'USB'; FriendlyName = 'Connected test device' }
+              [PSCustomObject]@{ Status = 'Unknown'; InstanceId = 'USB\GHOST'; Class = 'USB'; FriendlyName = 'Unplugged test device' }
+              [PSCustomObject]@{ Status = 'OK'; InstanceId = 'USB\CONNECTED'; Class = 'USB'; FriendlyName = 'Present test device' }
+              [PSCustomObject]@{ Status = 'Unknown'; InstanceId = 'USB\GHOST'; Class = 'USB'; FriendlyName = 'Duplicate ghost' }
+              [PSCustomObject]@{ Status = 'Unknown'; InstanceId = ''; Class = 'USB'; FriendlyName = 'Invalid ghost' }
           }
-          '@
-          $scanScript = $scanScript.Replace('Import-Module PnpDevice -ErrorAction Stop', $fakePnp)
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scanScript))
-          $out = Join-Path $env:TEMP ('wmt-ghost-' + [guid]::NewGuid().ToString('N') + '.out')
-          $err = $out + '.err'
-          $process = $null
-          try {
-              $args = @{
-                  FilePath = (Join-Path $PSHOME 'powershell.exe')
-                  ArgumentList = @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
-                  PassThru = $true
-                  WindowStyle = 'Hidden'
-                  RedirectStandardOutput = $out
-                  RedirectStandardError = $err
-              }
-              $process = Start-Process @args
-              if (-not $process.WaitForExit(20000)) {
-                  $process.Kill()
-                  throw 'Ghost-device scan child exceeded the 20-second test deadline.'
-              }
-              if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
-                  throw ('Ghost-device scan child failed (exit ' + $process.ExitCode + '): stdout=' +
-                      [IO.File]::ReadAllText($out,[Text.Encoding]::UTF8) + ' stderr=' + [IO.File]::ReadAllText($err))
-              }
-              $json = [IO.File]::ReadAllText($out,[Text.Encoding]::UTF8)
-              $rows = @(ConvertFrom-Json -InputObject $json)
-              if ($rows.Count -ne 1 -or [string]$rows[0].InstanceId -ne 'USB\TEST_GHOST') {
-                  throw ('Ghost-device worker returned unexpected data: ' + $json)
-              }
-              $themedHeaderBands = [regex]::Matches($source,
-                  '<ControlTemplate TargetType="\{x:Type (?:GridViewColumnHeader|DataGridColumnHeader)\}">\s*<Grid Background="\{DynamicResource BgPanel\}">')
-              $transparentFillers = [regex]::Matches($source,
-                  '<Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>')
-              if ($themedHeaderBands.Count -ne 2 -or $transparentFillers.Count -lt 2) {
-                  throw 'The full-width header band must be themed while filler headers remain transparent and inert.'
-              }
-              Write-Host 'PASS: Ghost-device child returns only candidates; full-width themed header bands preserve inert fillers.'
+          $rows = @(Get-WmtGhostDeviceCandidates)
+          if ($rows.Count -ne 1 -or [string]$rows[0].InstanceId -ne 'USB\GHOST') {
+              throw ('Fast ghost candidate scan returned unexpected rows: ' + ($rows | ConvertTo-Json -Compress))
           }
-          finally {
-              if ($process) {
-                  try { if (-not $process.HasExited) { $process.Kill() } } catch {}
-                  $process.Dispose()
-              }
-              Remove-Item -LiteralPath $out,$err -Force -ErrorAction SilentlyContinue
+          $dialogText = [regex]::Match($source, '(?ms)^function Show-GhostDevicesDialog\s*\{(.*?)(?=^function Invoke-DriverUpdates)')
+          if (-not $dialogText.Success) { throw 'Ghost-device dialog definition missing.' }
+          if ($dialogText.Value -notmatch '(?s)\$content\s*=\s*@"\r?\n<Grid>\r?\n') {
+              throw 'Ghost-device dialog no longer has an edge-to-edge root grid.'
           }
+          if ($dialogText.Value -notmatch 'BorderThickness="0"' -or $dialogText.Value -notmatch 'BorderThickness="0,1,0,0"') {
+              throw 'Ghost-device full-width data grid/footer layout regressed.'
+          }
+          if ($dialogText.Value -match 'WmtGhostScan_|\$ghostScanScript|Starting disconnected.device scan') {
+              throw 'Broken child scanner was reintroduced in the ghost dialog.'
+          }
+          if ($dialogText.Value -notmatch 'Get-WmtGhostDeviceCandidates' -or $dialogText.Value -notmatch 'Get-PnpDevice -PresentOnly -ErrorAction Stop') {
+              throw 'Fast scanning or pre-removal connected-device verification missing.'
+          }
+          $themedHeaderBands = [regex]::Matches($source,
+              '<ControlTemplate TargetType="\{x:Type (?:GridViewColumnHeader|DataGridColumnHeader)\}">\s*<Grid Background="\{DynamicResource BgPanel\}">')
+          $transparentFillers = [regex]::Matches($source,
+              '<Setter TargetName="HeaderBorder" Property="Background" Value="Transparent"/>')
+          if ($themedHeaderBands.Count -ne 2 -or $transparentFillers.Count -lt 2) {
+              throw 'Full-width themed header bands or transparent fillers regressed.'
+          }
+          Write-Host 'PASS: fast ghost candidates, deduplication, edge-to-edge dialog, removal presence guard, and themed headers.'
 
       - name: Smoke test process timeouts and output capture
         shell: powershell

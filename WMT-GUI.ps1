@@ -27123,20 +27123,27 @@ $dialog.ShowDialog() | Out-Null
 
 function Show-GhostDevicesDialog {
 $content = @"
-<Grid Margin="16">
+<Grid>
     <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <DataGrid Name="dgGhost" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2" HorizontalAlignment="Stretch" HeadersVisibility="Column" ColumnWidth="*" />
-    <TextBlock Name="txtGhostStatus" Grid.Row="1" Margin="0,10,0,0" Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Text="Ready"/>
-    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
-        <Button Name="btnRefresh" Content="Refresh" Width="104" Margin="0,0,8,0" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
-        <Button Name="btnRemoveSel" Content="Remove Selected" MinWidth="132" Margin="0,0,8,0" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
-        <Button Name="btnRemoveAll" Content="Remove All" Width="108" Margin="0,0,8,0" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
-        <Button Name="btnClose" Content="Close" Width="90" IsCancel="True"/>
-    </StackPanel>
+    <DataGrid Name="dgGhost" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False" AlternationCount="2" BorderThickness="0" HorizontalAlignment="Stretch" HeadersVisibility="Column" ColumnWidth="*" />
+    <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="16,10">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Name="txtGhostStatus" Foreground="{DynamicResource TextSecondary}" TextWrapping="Wrap" Text="Ready"/>
+            <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+                <Button Name="btnRefresh" Content="Refresh" Width="104" Margin="0,0,8,0" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}"/>
+                <Button Name="btnRemoveSel" Content="Remove Selected" MinWidth="132" Margin="0,0,8,0" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
+                <Button Name="btnRemoveAll" Content="Remove All" Width="108" Margin="0,0,8,0" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}"/>
+                <Button Name="btnClose" Content="Close" Width="90" IsCancel="True"/>
+            </StackPanel>
+        </Grid>
+    </Border>
 </Grid>
 "@
 $dialog = New-WmtWindowFromXaml -Title "Ghost Devices" -ContentXaml $content -Width 840 -Height 520 -MinWidth 680 -MinHeight 420
@@ -27155,7 +27162,7 @@ Set-WmtDataGridColumns -DataGrid $dg -Columns @("InstanceId", "Class", "Friendly
 # GetNewClosure() (where $script: would otherwise point at the closure module).
 $driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script -ErrorAction SilentlyContinue
 $driverCacheLoadedAtState = Get-Variable -Name DriverCacheLoadedAt -Scope Script -ErrorAction SilentlyContinue
-$state = @{ Busy = $false; Generation = 0; Started = $false; Process = $null; Timer = $null; OutFile = ""; ErrFile = ""; Watch = $null }
+$state = @{ Busy = $false; Generation = 0; Started = $false }
 
 $setBusy = {
     param([bool]$Busy, [string]$Message)
@@ -27166,154 +27173,48 @@ $setBusy = {
     if ($btnRemoveAll) { $btnRemoveAll.IsEnabled = -not $Busy }
 }.GetNewClosure()
 
-# WPF must never execute Get-PnpDevice on the dispatcher thread. The earlier
-# GetNewClosure + shared-pool approach could strand the UI in the Busy state.
-# Use one dedicated, bounded child PowerShell process and a dialog-owned timer.
-$ghostScanScript = @'
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-try {
-    Import-Module PnpDevice -ErrorAction Stop
-    $found = [System.Collections.Generic.List[object]]::new()
-    foreach ($device in @(Get-PnpDevice -ErrorAction Stop)) {
-        if ([string]$device.Status -ne 'Unknown') { continue }
+# Restore the verified fast enumeration path from WMT-GUI(7).ps1.
+# The isolated process/JSON/timer pipeline could leave the dialog indefinitely at
+# "Starting disconnected-device scan..." before the list populated. Filtering
+# Status=Unknown is only a *candidate* scan; deletion rechecks actual presence.
+function Get-WmtGhostDeviceCandidates {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($device in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Unknown' })) {
         $id = [string]$device.InstanceId
-        if ([string]::IsNullOrWhiteSpace($id)) { continue }
-        [void]$found.Add([PSCustomObject]@{
+        if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) { continue }
+        [PSCustomObject]@{
             InstanceId = $id
             Class = [string]$device.Class
             FriendlyName = [string]$device.FriendlyName
-        })
-    }
-    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    ConvertTo-Json -InputObject ($found.ToArray()) -Compress -Depth 3
-}
-catch {
-    # Redirected WinPS stderr often contains only CLIXML progress noise.
-    # Emit a plain marker on stdout so the parent can expose the real error.
-    Write-Output ("WMT_GHOST_ERROR: " + $_.Exception.Message)
-    exit 1
-}
-'@
-
-$cleanupScan = {
-    param([bool]$Terminate)
-    if ($state.Timer) {
-        try { $state.Timer.Stop() } catch {}
-        $state.Timer = $null
-    }
-    if ($state.Process) {
-        $processRef = $state.Process
-        $state.Process = $null
-        try {
-            if ($Terminate -and -not $processRef.HasExited) { $processRef.Kill() }
-        }
-        catch {}
-        try { $processRef.Dispose() } catch {}
-    }
-    foreach ($path in @($state.OutFile, $state.ErrFile)) {
-        if (-not [string]::IsNullOrWhiteSpace($path)) {
-            try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {}
         }
     }
-    $state.OutFile = ""
-    $state.ErrFile = ""
-    $state.Watch = $null
-}.GetNewClosure()
+}
 
 $load = {
-    if ($state.Busy) { return }
-    $state.Generation++
-    & $setBusy $true "Starting disconnected-device scan..."
+    if ($state.Busy -or -not $dialog.IsLoaded) { return }
+    & $setBusy $true "Scanning Ghosted Devices..."
+    $items.Clear()
+    Set-WmtBusyCursor -Busy
     try {
-        $prefix = Join-Path ([System.IO.Path]::GetTempPath()) ("WmtGhostScan_" + [guid]::NewGuid().ToString('N'))
-        $state.OutFile = $prefix + ".out"
-        $state.ErrFile = $prefix + ".err"
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ghostScanScript))
-        $launch = @{
-            FilePath = (Join-Path $PSHOME 'powershell.exe')
-            ArgumentList = @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
-            WindowStyle = 'Hidden'
-            PassThru = $true
-            RedirectStandardOutput = $state.OutFile
-            RedirectStandardError = $state.ErrFile
-            ErrorAction = 'Stop'
+        foreach ($device in @(Get-WmtGhostDeviceCandidates)) {
+            [void]$items.Add($device)
         }
-        $state.Process = Start-Process @launch
-        if (-not $state.Process) { throw "The scanner process did not start." }
-
-        $state.Watch = [Diagnostics.Stopwatch]::StartNew()
-        $state.Timer = [System.Windows.Threading.DispatcherTimer]::new()
-        $state.Timer.Interval = [TimeSpan]::FromMilliseconds(250)
-        $state.Timer.Add_Tick({
-            if (-not $state.Busy -or -not $state.Process) { return }
-            try {
-                if ($state.Process.HasExited) {
-                    $exitCode = $state.Process.ExitCode
-                    $elapsed = $state.Watch.Elapsed.TotalSeconds
-                    $state.Timer.Stop()
-                    $stderrText = if (Test-Path -LiteralPath $state.ErrFile) {
-                        [IO.File]::ReadAllText($state.ErrFile)
-                    } else { "" }
-                    if ($null -ne $exitCode -and $exitCode -ne 0) {
-                        $stdoutText = if (Test-Path -LiteralPath $state.OutFile) {
-                            [IO.File]::ReadAllText($state.OutFile, [Text.Encoding]::UTF8)
-                        } else { "" }
-                        $reason = ($stdoutText -split '\r?\n' | Where-Object { $_ -like 'WMT_GHOST_ERROR:*' } | Select-Object -Last 1)
-                        if ([string]::IsNullOrWhiteSpace($reason)) {
-                            $reason = if ($stderrText -and $stderrText -notmatch '^#< CLIXML') {
-                                ($stderrText -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -Last 1)
-                            } else { "PowerShell exited with code $exitCode." }
-                        }
-                        throw ("Device enumeration failed: " + $reason)
-                    }
-                    if (-not (Test-Path -LiteralPath $state.OutFile)) {
-                        throw "Device enumeration completed without producing a result."
-                    }
-                    $json = [IO.File]::ReadAllText($state.OutFile, [Text.Encoding]::UTF8)
-                    if ([string]::IsNullOrWhiteSpace($json)) { throw "The scanner returned an empty result." }
-                    $candidates = @(ConvertFrom-Json -InputObject $json -ErrorAction Stop)
-                    $items.Clear()
-                    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-                    foreach ($candidate in $candidates) {
-                        if (-not $candidate) { continue }
-                        $id = [string]$candidate.InstanceId
-                        if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) { continue }
-                        [void]$items.Add([PSCustomObject]@{
-                            InstanceId = $id
-                            Class = [string]$candidate.Class
-                            FriendlyName = [string]$candidate.FriendlyName
-                        })
-                    }
-                    $message = if ($items.Count -eq 0) { "No potential ghost devices found." } else {
-                        ("Found {0} potential ghost device(s). Presence is checked before removal." -f $items.Count)
-                    }
-                    & $setBusy $false ("{0} Scan completed in {1:N1}s." -f $message, $elapsed)
-                    & $cleanupScan $false
-                    return
-                }
-                $seconds = $state.Watch.Elapsed.TotalSeconds
-                if ($seconds -ge 30) {
-                    & $cleanupScan $true
-                    & $setBusy $false "Device enumeration timed out after 30 seconds. Check Plug and Play / PnpDevice; no devices were removed."
-                    return
-                }
-                if ($txtStatus) {
-                    $txtStatus.Text = ("Scanning disconnected devices... {0}s / 30s (UI responsive)" -f [int][Math]::Floor($seconds))
-                }
-            }
-            catch {
-                $message = $_.Exception.Message
-                & $cleanupScan $true
-                & $setBusy $false ("Ghost-device scan failed: " + $message)
-            }
-        }.GetNewClosure())
-        $state.Timer.Start()
+        if ($items.Count -eq 0) {
+            Show-WmtMessageBox -Owner $dialog -Message "No hidden/ghost devices found." -Title "Ghost Devices" -Image Information | Out-Null
+        }
     }
     catch {
-        $message = $_.Exception.Message
-        & $cleanupScan $true
-        & $setBusy $false ("Could not start ghost-device scan: " + $message)
+        $detail = $_.Exception.Message
+        Write-GuiLog "[Drivers] Ghost-device scan failed: $detail"
+        if ($txtStatus) { $txtStatus.Text = "Ghost-device scan failed: $detail" }
+        return
+    }
+    finally {
+        Set-WmtBusyCursor
+        $message = if ($items.Count -eq 0) { "No potential ghost devices found." } else {
+            ("Found {0} potential ghost device(s). Presence is verified before removal." -f $items.Count)
+        }
+        & $setBusy $false $message
     }
 }.GetNewClosure()
 
@@ -27410,7 +27311,7 @@ $dialog.Add_ContentRendered({
     try { & $load }
     catch { & $setBusy $false ("Ghost-device dialog initialization failed: " + $_.Exception.Message) }
 }.GetNewClosure())
-$dialog.Add_Closed({ & $cleanupScan $true }.GetNewClosure())
+# No child scan process or timer requires cleanup when the dialog closes.
 $dialog.ShowDialog() | Out-Null
 }
 
