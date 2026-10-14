@@ -36463,7 +36463,7 @@ $tabButton.Add_Click({
                     $script:AppxListLoaded = $true
                     Start-AppxBackgroundLoad
                 }
-                if (-not $script:TweakStatesReady) { Set-TweakStatesLoadingOverlay -Visible $true }
+                Sync-WmtTweakOverlayHide
             }
             elseif (-not $script:TweakStatesReady) {
                 # Background jobs disabled — do a one-time synchronous load with error fallback
@@ -38041,6 +38041,21 @@ function Update-WmtQuickFindResults {
                 $description.Margin = [System.Windows.Thickness]::new(0,6,0,8)
                 $description.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 [void]$body.Children.Add($description)
+            }
+            if ($entry.Item.Tab -eq "btnTabTweaks") {
+                $stateLabel = [System.Windows.Controls.TextBlock]::new()
+                $stateLabel.FontSize = 12
+                $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
+                $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
+                $stateName = [string]$entry.Item.Button.Name
+                if ($script:TweakStatesReady -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
+                    $stateLabel.Text = if ($script:TweakCurrentStates[$stateName].On) { "State: Enabled" } else { "State: Disabled" }
+                } elseif (-not $script:TweakStatesReady) {
+                    $stateLabel.Text = "State: Checking..."
+                } else {
+                    $stateLabel.Text = "State: Unknown / not detected"
+                }
+                [void]$body.Children.Add($stateLabel)
             }
             # Reparent the actual original Button, retaining its existing handlers,
             # state, styling, icon, and dynamic label. This is not a proxy/auto-click.
@@ -61635,6 +61650,9 @@ if (-not $script:MyDeviceStatsStarted) {
 if (-not $script:FirewallRulesLoaded -and -not $script:FirewallLoadInProgress) {
     Start-FirewallRuleLoad -Preload
 }
+# One shared preload for Quickfind and Tweaks, independent of page navigation.
+if (-not $script:TweakStatesReady -and -not $script:TweakStatesBgStarted) { Start-TweakButtonStatesBackgroundUpdate }
+if (-not $script:OptionalFeaturesReady -and -not $script:OptionalFeaturesCheckStarted) { Start-OptionalFeaturesBackgroundCheck }
 
 $script:WmtStartupPreloadTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:WmtStartupPreloadTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
@@ -61711,7 +61729,7 @@ try {
             $script:TweakNonRegDataCache = $null
             $script:TweakSupportChecksCache = $null
             $script:TweakButtonStatesPathChecks = $null
-            Set-TweakStatesLoadingOverlay -Visible $false
+            Set-TweakStatesLoadingOverlay -Visible $true
             # Re-trigger background load
             if (-not (Get-WmtDisableBackgroundJobs)) {
                 Start-TweakButtonStatesBackgroundUpdate
@@ -61724,7 +61742,7 @@ try {
                 }
                 catch {
                     try { Write-GuiLog "[Tweak States] Retry also failed: $($_.Exception.Message)" } catch {}
-                    $script:TweakStatesReady = $true
+                    $script:TweakStatesReady = $false
                     Show-TweakStatesLoadError -Message "Retry failed: $($_.Exception.Message). The Tweaks page is still usable but toggle states may be inaccurate."
                 }
             }
@@ -61732,13 +61750,7 @@ try {
     }
     # Auto-hide error overlay after 8 seconds so the page remains usable
     if ($script:TweakOverlayAutoHideTimer) { try { $script:TweakOverlayAutoHideTimer.Stop() } catch {} }
-    $script:TweakOverlayAutoHideTimer = New-Object System.Windows.Threading.DispatcherTimer
-    $script:TweakOverlayAutoHideTimer.Interval = [TimeSpan]::FromSeconds(8)
-    $script:TweakOverlayAutoHideTimer.Add_Tick({
-        $script:TweakOverlayAutoHideTimer.Stop()
-        Set-TweakStatesLoadingOverlay -Visible $false
-    })
-    $script:TweakOverlayAutoHideTimer.Start()
+    # Keep the blocker visible until a successful retry.
 } catch {}
 }
 
@@ -61789,8 +61801,8 @@ try {
 }
 catch {
     try { Write-GuiLog "[Tweak States] Could not create background worker: $($_.Exception.Message). Falling back to synchronous load." } catch {}
-    $script:TweakStatesReady = $true
-    try { Update-TweakButtonStates } catch {
+    $script:TweakStatesReady = $false
+    try { Update-TweakButtonStates; $script:TweakStatesReady = $true } catch {
         try { Write-GuiLog "[Tweak States] Fallback synchronous load also failed: $($_.Exception.Message)" } catch {}
         Show-TweakStatesLoadError -Message "Background worker could not be created and fallback also failed. Toggle states may be inaccurate. Error: $($_.Exception.Message)"
     }
@@ -62058,9 +62070,10 @@ catch {
 # BeginInvoke throws on start failure; a null result is also treated as failure.
 if ($null -eq $async) {
     try { $ps.Dispose() } catch {}
-    $script:TweakStatesReady = $true
+    $script:TweakStatesReady = $false
     try {
         Update-TweakButtonStates
+        $script:TweakStatesReady = $true
     }
     catch {
         try { Write-GuiLog "[Tweak States] Fallback synchronous load also failed: $($_.Exception.Message)" } catch {}
@@ -62099,13 +62112,13 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                     Update-TweakButtonStates
                     # Cache is ready — coordinate overlay hide with optional features check
                     $script:TweakStatesReady = $true
+                    if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindResults }
                     Sync-WmtTweakOverlayHide
                 } else {
                     $typeInfo = if ($result) { $result.GetType().FullName } else { "null" }
                     try { Write-GuiLog "[Tweak States] Background preload returned unexpected type: $typeInfo" } catch {}
                     # Cache was not populated — buttons will use live registry reads as fallback
-                    $script:TweakStatesReady = $true
-                    Sync-WmtTweakOverlayHide
+                    $script:TweakStatesReady = $false
                     Show-TweakStatesLoadError -Message "Tweak state cache returned invalid data (type: $typeInfo). Buttons will use live registry reads as fallback, which may be slow."
                 }
             }
@@ -62132,7 +62145,7 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
             catch {
                 $errMsg = $_.Exception.Message
                 try { Write-GuiLog "[Tweak States] Background load failed: $errMsg" } catch {}
-                $script:TweakStatesReady = $true
+                $script:TweakStatesReady = $false
                 Sync-WmtTweakOverlayHide
                 Show-TweakStatesLoadError -Message "Background tweak state load failed: $errMsg. Buttons will use live registry reads."
             }
@@ -62150,7 +62163,7 @@ $script:TweakStatesBgTimeout.Interval = [TimeSpan]::FromSeconds(30)
 $script:TweakStatesBgTimeout.Add_Tick({
         $script:TweakStatesBgTimeout.Stop()
         if (-not $script:TweakStatesReady) {
-            try { Write-GuiLog "[Tweak States] Background preload timed out (pool may be busy). Showing buttons with default state." } catch {}
+            try { Write-GuiLog "[Tweak States] Background preload timed out; Tweaks remains blocked until retry." } catch {}
             $timedOutTweakPs = $script:TweakStatesBgPS
             $timedOutTweakAsync = $script:TweakStatesBgAsync
             $script:TweakStatesBgAsync = $null
@@ -62161,21 +62174,10 @@ $script:TweakStatesBgTimeout.Add_Tick({
                     try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutTweakPs -Invocation $timedOutTweakAsync -Name "Tweak state preload timeout" } catch {}
                 }
             }
-            # Stop polling timer too
-            # Apply whatever cache we have (may be empty) so buttons aren't stuck
-            try {
-                Update-TweakButtonStates
-                $script:TweakStatesReady = $true
-                Sync-WmtTweakOverlayHide
-                Show-TweakStatesLoadError -Message "Tweak state loading timed out after 30 seconds (background job pool may be busy). Buttons may show default/incorrect states. Click Retry to try again."
-            }
-            catch {
-                $errMsg = $_.Exception.Message
-                try { Write-GuiLog "[Tweak States] Timeout fallback also failed: $errMsg" } catch {}
-                $script:TweakStatesReady = $true
-                Sync-WmtTweakOverlayHide
-                Show-TweakStatesLoadError -Message "Tweak state loading timed out and fallback failed: $errMsg. The page is still usable but toggle states may be inaccurate."
-            }
+            $script:TweakStatesBgStarted = $false
+            $script:TweakStatesReady = $false
+            Show-TweakStatesLoadError -Message "Tweak state detection timed out. The Tweaks page remains blocked until states load. Click Retry."
+
         }
     })
 $script:TweakStatesBgTimeout.Start()
