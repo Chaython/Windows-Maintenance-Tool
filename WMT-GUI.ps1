@@ -27181,8 +27181,8 @@ $load = {
                     })
                 }
             }
-            if ($items.Count -eq 0) { & $setBusy $false "No disconnected/ghost devices found." }
-            else { & $setBusy $false ("Found {0} disconnected/ghost device(s)." -f $items.Count) }
+            if ($items.Count -eq 0) { & $setBusy $false "No possible ghost devices found." }
+            else { & $setBusy $false ("Found {0} potential ghost device(s). Connection status is verified before removal." -f $items.Count) }
         }
         catch {
             & $setBusy $false "Ghost-device scan failed."
@@ -27198,36 +27198,33 @@ $load = {
         Write-GuiLog "[Drivers] Ghost-device scan failed: $msg"
     }.GetNewClosure()
 
-    Invoke-WmtUiBackgroundCommand -Name ("GhostDeviceScan_" + [guid]::NewGuid().ToString("N")) -Msg "Scanning disconnected devices..." -SuppressResultLog -TimeoutMs 60000 -Sb {
-        # Explicitly load PnpDevice in the pooled runspace. Never silently
-        # treat a failed present-device query as an empty set: that would
-        # incorrectly classify every installed device as safe to remove.
-        Import-Module PnpDevice -ErrorAction Stop
-        $allDevices = @(Get-PnpDevice -ErrorAction Stop)
-        if ($allDevices.Count -eq 0) {
-            throw "Get-PnpDevice returned no devices. Check Plug and Play/CIM services."
-        }
-        $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction Stop)
-        if ($presentDevices.Count -eq 0) {
-            throw "Present-device enumeration returned no devices. Refusing an unsafe ghost-device scan."
-        }
-        $presentIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($p in $presentDevices) {
-            if ($p.InstanceId) { [void]$presentIds.Add([string]$p.InstanceId) }
-        }
-        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # v6.6 enumerated PnP devices in the window's own runspace and returned
+    # quickly. Running a second CIM enumeration through the shared runspace pool
+    # could leave this dialog showing "Scanning..." with no observable result.
+    # Restore the proven single-query scan, while continuing to verify that
+    # a device is absent in the removal worker before pnputil can remove it.
+    $scanTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
         $ghosts = [System.Collections.Generic.List[object]]::new()
-        foreach ($d in $allDevices) {
-            $id = [string]$d.InstanceId
-            if ([string]::IsNullOrWhiteSpace($id) -or $presentIds.Contains($id) -or -not $seen.Add($id)) { continue }
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($device in @(Get-PnpDevice -ErrorAction Stop)) {
+            if ([string]$device.Status -ne "Unknown") { continue }
+            $id = [string]$device.InstanceId
+            if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) { continue }
             [void]$ghosts.Add([PSCustomObject]@{
                 InstanceId   = $id
-                Class        = [string]$d.Class
-                FriendlyName = [string]$d.FriendlyName
+                Class        = [string]$device.Class
+                FriendlyName = [string]$device.FriendlyName
             })
         }
-        [PSCustomObject]@{ Items = $ghosts.ToArray() }
-    } -PoolKind UiSupport -OnComplete $done -OnError $failed | Out-Null
+        $scanTimer.Stop()
+        Write-GuiLog ("[Drivers] Ghost scan listed {0} candidate(s) in {1} ms (v6.6 single-query path)." -f $ghosts.Count, $scanTimer.ElapsedMilliseconds)
+        & $done @([PSCustomObject]@{ Items = $ghosts.ToArray() })
+    }
+    catch {
+        $scanTimer.Stop()
+        & $failed $_
+    }
 }.GetNewClosure()
 
 $removeRows = {
@@ -27315,9 +27312,9 @@ $btnRefresh.Add_Click({ & $load }.GetNewClosure())
 $btnRemoveSel.Add_Click({ & $removeRows -Rows @($dg.SelectedItems) }.GetNewClosure())
 $btnRemoveAll.Add_Click({ & $removeRows -Rows @($items) }.GetNewClosure())
 $btnClose.Add_Click({ $state.Generation++; $dialog.Close() }.GetNewClosure())
-# Loaded reliably fires as the dialog is shown; ContentRendered can be
-# delayed by expensive layout work. Only launch the first scan once.
-$dialog.Add_Loaded({ if (-not $state.Started) { $state.Started = $true; & $load } }.GetNewClosure())
+# Match v6.6: do the first scan after the dialog is visibly rendered.
+# Keep the guard so repeated ContentRendered events never trigger a second scan.
+$dialog.Add_ContentRendered({ if (-not $state.Started) { $state.Started = $true; & $load } }.GetNewClosure())
 $dialog.ShowDialog() | Out-Null
 }
 
