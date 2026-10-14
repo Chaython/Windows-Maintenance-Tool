@@ -37859,7 +37859,10 @@ function Restore-WmtQuickFindButtons {
     if (-not $script:WmtQuickFindMovedButtons -or $script:WmtQuickFindMovedButtons.Count -eq 0) { return }
     $pending = [System.Collections.ArrayList]::new()
     foreach ($record in @($script:WmtQuickFindMovedButtons)) {
-        if (-not $record -or -not $record.Button -or -not $record.Parent) { continue }
+        if (-not $record -or -not $record.Button -or -not $record.Parent) {
+            if ($record) { [void]$pending.Add($record) }
+            continue
+        }
         $button = $record.Button
         $parent = $record.Parent
         $placeholder = $record.Placeholder
@@ -37870,8 +37873,9 @@ function Restore-WmtQuickFindButtons {
             }
             if ($button.Parent -ne $parent) {
                 $position = $parent.Children.IndexOf($placeholder)
-                if ($position -ge 0) { [void]$parent.Children.Remove($placeholder) }
-                else { $position = [Math]::Min([int]$record.Index, $parent.Children.Count) }
+                if ($position -lt 0) { $position = [Math]::Min([int]$record.Index, $parent.Children.Count) }
+                # Keep the placeholder until the original button has been
+                # inserted successfully. A failed insert must remain recoverable.
                 $parent.Children.Insert($position, $button)
             }
             if ($button.Parent -eq $parent) {
@@ -38112,12 +38116,8 @@ function Update-WmtQuickFindResults {
                     $stateLabel.Text = "State: Checking..."
                 } elseif ($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($stateName)) {
                     $stateLabel.Text = if ($script:OptionalFeatureStateCache[$stateName]) { "State: Enabled" } else { "State: Disabled" }
-                } elseif ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName -and -not $script:OptionalFeaturesReady) {
-                    $stateLabel.Text = "State: Checking Windows feature..."
-                } elseif ($script:TweakStatesReady -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
+                } elseif ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
                     $stateLabel.Text = if ($script:TweakCurrentStates[$stateName].On) { "State: Enabled" } else { "State: Disabled" }
-                } elseif (-not $script:TweakStatesReady) {
-                    $stateLabel.Text = "State: Checking..."
                 } else {
                     $stateLabel.Text = "State: Unknown / not detected"
                 }
