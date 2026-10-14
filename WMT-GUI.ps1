@@ -37922,6 +37922,16 @@ function Add-WmtQuickFindOriginalButton {
         $Button.ReadLocalValue([System.Windows.FrameworkElement]::DataContextProperty),
         [System.Windows.DependencyProperty]::UnsetValue)
     $originalContext = $Button.DataContext
+    # A button whose command relies on a binding or an inherited context
+    # cannot safely be moved across visual/logical trees.
+    foreach ($property in @(
+        [System.Windows.Controls.Primitives.ButtonBase]::CommandProperty,
+        [System.Windows.Controls.Primitives.ButtonBase]::CommandParameterProperty,
+        [System.Windows.Controls.Control]::IsEnabledProperty
+    )) {
+        if ([System.Windows.Data.BindingOperations]::IsDataBound($Button, $property)) { return $false }
+    }
+    if ($Button.Command -and $inheritedContext) { return $false }
     try {
         [void]$originalParent.Children.Remove($Button)
         $originalParent.Children.Insert($index, $placeholder)
@@ -37998,6 +38008,14 @@ function Update-WmtQuickFindResults {
     $seen = @{}
     foreach ($entry in $script:WmtSearchIndexEntries) {
         if (-not $entry -or $entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        # Dynamic pages can replace controls after the index was built. Resolve
+        # the current named instance instead of hosting a detached stale button.
+        $name = [string]$entry.Item.Button.Name
+        $current = Get-Ctrl $name
+        if (-not $current -or $current -isnot [System.Windows.Controls.Button]) { continue }
+        if (-not [object]::ReferenceEquals($current, $entry.Item.Button)) {
+            $entry.Item.Button = $current
+        }
         # Avoid duplicate cards for synonyms pointing to the same tool.
         $key = "$($entry.Item.Tab)/$($entry.Item.Button.Name)"
         if ($seen.ContainsKey($key)) { continue }
@@ -38005,7 +38023,7 @@ function Update-WmtQuickFindResults {
         [void]$matches.Add($entry)
     }
     # Limit expensive WPF reparenting for very broad search terms.
-    $limit = 40
+    $limit = 16
     $lblQuickFindSummary.Text = if ($matches.Count -eq 0) {
         "No tools found for '$query'. Try another term."
     } elseif ($matches.Count -gt $limit) {
@@ -38074,9 +38092,20 @@ function Update-WmtQuickFindResults {
             # Reparent the actual original Button, retaining its existing handlers,
             # state, styling, icon, and dynamic label. This is not a proxy/auto-click.
             $original = $entry.Item.Button
+            $tweakReady = $true
+            if ($entry.Item.Tab -eq "btnTabTweaks") {
+                $tweakReady = $script:TweakStatesReady -and $script:OptionalFeaturesReady
+                if ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $original.Name) {
+                    $tweakReady = $tweakReady -and $script:OptionalFeatureStateCache -and
+                        $script:OptionalFeatureStateCache.ContainsKey($original.Name)
+                } else {
+                    $tweakReady = $tweakReady -and $script:TweakCurrentStates -and
+                        $script:TweakCurrentStates.Contains($original.Name)
+                }
+            }
             $canHost = ($original -is [System.Windows.Controls.Button]) -and
                        ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates")) -and
-                       ($entry.Item.Tab -ne "btnTabTweaks" -or ($script:TweakStatesReady -and $script:OptionalFeaturesReady))
+                       $tweakReady
             $hosted = $false
             if ($canHost) { $hosted = Add-WmtQuickFindOriginalButton -Button $original -DestinationPanel $body }
             if (-not $hosted) {
@@ -38084,7 +38113,7 @@ function Update-WmtQuickFindResults {
                 # catalogue/library navigators and search fields) stay in place.
                 $open = [System.Windows.Controls.Button]::new()
                 $open.Content = if ($entry.Item.Tab -eq "btnTabTweaks" -and
-                    (-not $script:TweakStatesReady -or -not $script:OptionalFeaturesReady)) { "Open Tweaks (loading)" } else { "Open section" }
+                    (-not $tweakReady)) { "Open Tweaks (loading)" } else { "Open section" }
                 $open.Style = $window.FindResource("ActionBtn")
                 $open.HorizontalAlignment = "Left"
                 $open.Margin = [System.Windows.Thickness]::new(0,9,0,0)
