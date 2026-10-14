@@ -31728,6 +31728,7 @@ powercfg /S SCHEME_CURRENT | Out-Null
                                 <ContextMenu Name="ctxLibrary">
                                     <MenuItem Name="miLibLaunch" Header="Launch / Play" ToolTip="Launch the game if it is installed"/>
                                     <MenuItem Name="miLibInstall" Header="Install" ToolTip="Download and install this game"/>
+                                     <MenuItem Name="miLibLocate" Header="Locate / Import Existing Game" ToolTip="Register existing Steam, Epic or GOG files"/>
                                     <MenuItem Name="miLibUninstall" Header="Uninstall / Delete" ToolTip="Remove the game from your system"/>
                                     <MenuItem Name="miLibRepair" Header="Repair" ToolTip="Verify game files and repair installation"/>
                                     <Separator/>
@@ -31760,7 +31761,8 @@ powercfg /S SCHEME_CURRENT | Out-Null
                         <!-- Library status (left side, shows when in library view) -->
                         <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left">
                             <Button Name="btnBackToCatalog" Content="Back to Catalog" Style="{StaticResource ActionBtn}" ToolTip="Return to the software catalog" Visibility="Collapsed"/>
-                            <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
+                            <Button Name="btnLibraryLocate" Content="Locate / Import" Style="{StaticResource ActionBtn}" ToolTip="Register a selected Steam, Epic or GOG game from an existing folder" Visibility="Collapsed"/>
+                             <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
                             <Button Name="btnToggleFabAssets" Content="Fab Assets: Hidden" Style="{StaticResource ActionBtn}" ToolTip="Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." Visibility="Collapsed"/>
                             <TextBlock Name="lblLibraryStatus" Text="" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" FontStyle="Italic" Margin="12,0,0,0"/>
                         </StackPanel>
@@ -33969,6 +33971,7 @@ $iconDeferTimer.Add_Tick({
     Set-ButtonIcon "btnCatalogClear" "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" "Clear Selection" "Unselect all applications" 16
     Set-ButtonIcon "btnBackToUpdates" "M20,11H7.83L13.42,5.41L12,4L4,12L12,20L13.41,18.59L7.83,13H20V11Z" "Back to Updates" "Return to the package updates view" 16
     Set-ButtonIcon "btnBackToCatalog" "M20,11H7.83L13.42,5.41L12,4L4,12L12,20L13.41,18.59L7.83,13H20V11Z" "Back to Catalog" "Return to the software catalog" 16
+    Set-ButtonIcon "btnLibraryLocate" "M4,4H10V6H6V10H4V4M14,4H20V10H18V6H14V4M4,14H6V18H10V20H4V14M18,14H20V20H14V18H18V14M12,8L9,11H11V16H13V11H15L12,8Z" "Locate / Import" "Locate existing game files" 16
     Set-ButtonIcon "btnLibraryRefresh" "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z" "Refresh Library" "Re-scan Steam manifests and refresh Legendary/GOGDL caches" 16
     Set-ButtonIcon "btnToggleFabAssets" "M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z" "Fab Assets: Hidden" "Show or hide Unreal Engine / Fab marketplace assets in Your Library. They are still scanned for updates either way." 16
     try { Set-WmtFabAssetsButtonLabel } catch {}
@@ -35767,6 +35770,7 @@ $ctxLibrary = Get-Ctrl "ctxLibrary"
 try { Set-WmtContextMenuChrome -ContextMenu $ctxLibrary } catch {}
 $miLibLaunch = Get-Ctrl "miLibLaunch"
 $miLibInstall = Get-Ctrl "miLibInstall"
+$miLibLocate = Get-Ctrl "miLibLocate"
 $miLibUninstall = Get-Ctrl "miLibUninstall"
 $miLibRepair = Get-Ctrl "miLibRepair"
 $miLibGoToDir = Get-Ctrl "miLibGoToDir"
@@ -35776,6 +35780,7 @@ $miLibCopyRows = Get-Ctrl "miLibCopyRows"
 if ($lstLibrary -and $ctxLibrary) { $lstLibrary.ContextMenu = $ctxLibrary }
 $btnBackToCatalog = Get-Ctrl "btnBackToCatalog"
 $btnLibraryRefresh = Get-Ctrl "btnLibraryRefresh"
+$btnLibraryLocate = Get-Ctrl "btnLibraryLocate"
 $lblLibraryStatus = Get-Ctrl "lblLibraryStatus"
 
 $btnShowCatalog = Get-Ctrl "btnShowCatalog"
@@ -35953,6 +35958,7 @@ function Reset-WmtLibraryToCatalog {
         if ($brdCatalogList) { $brdCatalogList.Visibility = "Visible" }
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Collapsed" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
+        if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Collapsed" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
         if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install all selected applications using winget. May take several minutes depending on app size." }
@@ -37569,6 +37575,7 @@ $searchIndexDeferTimer.Add_Tick({
         if ($brdLibraryList) { $brdLibraryList.Visibility = "Visible" }
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+            if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
         if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
         # Display pre-loaded results if available.
@@ -57610,6 +57617,7 @@ $btnShowLibrary.Add_Click({
             $brdLibraryList.Visibility = "Visible"
             if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Visible" }
             if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+            if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
             if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
             if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install the selected uninstalled game(s) using their library provider." }
             if ($btnCatalogSelectAll) { $btnCatalogSelectAll.ToolTip = "Select all visible games in Your Library." }
@@ -57648,6 +57656,7 @@ $btnBackToCatalog.Add_Click({
         $brdCatalogList.Visibility = "Visible"
         if ($btnBackToCatalog) { $btnBackToCatalog.Visibility = "Collapsed" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
+        if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Collapsed" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
         if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install all selected applications using winget. May take several minutes depending on app size." }
@@ -57698,6 +57707,258 @@ $btnToggleFabAssets.Add_Click({
         }
         Write-GuiLog ("Unreal Engine / Fab assets are now " + $(if ($global:WmtHideUeAssets) { "hidden" } else { "shown" }) + " in Your Library. Update checks are unaffected.")
     })
+}
+
+
+# Locate / Import: provider registrations are intentionally distinct.
+# Steam is never marked installed without a matching appmanifest in an active Steam library.
+$script:WmtGameImportRunspace = $null
+$script:WmtGameImportAsync = $null
+$script:WmtGameImportContext = $null
+
+function Update-WmtLegendaryImportedGameCache {
+param([string]$Id, [string]$Name, [string]$InstallPath, [string]$Version)
+$cacheFile = Join-Path (Get-DataPath) "legendary_library.json"
+$rows = @()
+if (Test-Path -LiteralPath $cacheFile -PathType Leaf) {
+    $rows = @([System.IO.File]::ReadAllText($cacheFile) | ConvertFrom-Json -ErrorAction Stop)
+}
+$found = $false
+foreach ($row in $rows) {
+    if (([string]$row.Id) -ine $Id) { continue }
+    $found = $true
+    $row | Add-Member -NotePropertyName IsInstalled -NotePropertyValue $true -Force
+    $row | Add-Member -NotePropertyName InstallPath -NotePropertyValue $InstallPath -Force
+    $row | Add-Member -NotePropertyName InstalledVersion -NotePropertyValue $Version -Force
+}
+if (-not $found) {
+    $rows += [PSCustomObject]@{
+        Provider="legendary"; Source="legendary"; Kind="Library";
+        Title=$Name; Id=$Id; Version=$Version; InstalledVersion=$Version;
+        IsInstalled=$true; InstallPath=$InstallPath; IsUe=$false
+    }
+}
+Set-WmtJsonCacheFile -Path $cacheFile -InputObject $rows -Depth 5
+$script:WmtLegendaryLibraryCache = $null
+}
+
+function Invoke-WmtLibraryLocateImport {
+param($Item)
+if (-not $Item) {
+    Show-WmtMessageBox -Message "Select one game from Your Library." -Title "Locate / Import" -Image Information | Out-Null
+    return
+}
+$source = ([string]$Item.Source).Trim().ToLowerInvariant()
+$id = ([string]$Item.Id).Trim()
+$name = ([string]$Item.Name).Trim()
+if ($source -notin @("steam", "epic", "legendary", "gog", "gogdl") -or [string]::IsNullOrWhiteSpace($id) -or $id.Contains('"')) {
+    Show-WmtMessageBox -Message "Locate / Import is supported for Steam, Epic/Legendary, and GOG/GOGDL." -Title "Unsupported Source" -Image Information | Out-Null
+    return
+}
+if ($script:WmtGameImportRunspace) {
+    Show-WmtMessageBox -Message "Another game import is already running." -Title "Import in Progress" -Image Information | Out-Null
+    return
+}
+$initial = ""
+try { $initial = Get-WmtLibraryItemInstallDir -Item $Item } catch {}
+if (-not $initial -and $script:WmtLastGameLocatePath -and (Test-Path -LiteralPath $script:WmtLastGameLocatePath -PathType Container)) {
+    $initial = [string]$script:WmtLastGameLocatePath
+}
+if (-not $initial) { $initial = [string]$env:USERPROFILE }
+$path = Select-WmtExplorerFolder -Description "Locate existing files for $name ($source)" -InitialDirectory $initial -Owner $window
+if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Container)) { return }
+$path = [System.IO.Path]::GetFullPath([string]$path)
+$script:WmtLastGameLocatePath = $path
+
+if ($source -eq "steam") {
+    if ($id -notmatch '^\d+$') {
+        Show-WmtMessageBox -Message "This entry has an invalid Steam app ID." -Title "Steam Import" -Image Warning | Out-Null
+        return
+    }
+    foreach ($m in @(Get-WmtSteamInstalledManifests)) {
+        if (([string]$m.Id) -ne $id) { continue }
+        $actual = Join-Path (Join-Path ([string]$m.LibraryRoot) "steamapps\common") ([string]$m.InstallDir)
+        if ([string]::Equals(([System.IO.Path]::GetFullPath($actual)).TrimEnd('\'), $path.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-GuiLog "Steam game already registered: $name ($id) at $path"
+            Show-WmtMessageBox -Message "Steam has the matching appmanifest in a registered library. WMT will refresh the library cache." -Title "Steam Game Located" -Image Information | Out-Null
+            Start-WmtLibraryCacheBuilder -Force
+            return
+        }
+    }
+    $folderInfo = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    $commonDir = if ($folderInfo) { $folderInfo.Parent } else { $null }
+    $steamappsDir = if ($commonDir) { $commonDir.Parent } else { $null }
+    $properLayout = ($commonDir -and $steamappsDir -and $commonDir.Name -ieq "common" -and $steamappsDir.Name -ieq "steamapps")
+    $localManifest = if ($properLayout) { Join-Path $steamappsDir.FullName "appmanifest_$id.acf" } else { "" }
+    if ($properLayout -and (Test-Path -LiteralPath $localManifest -PathType Leaf)) {
+        $manifestText = Get-Content -LiteralPath $localManifest -Raw -ErrorAction SilentlyContinue
+        $manifestId = Get-WmtSteamManifestValue -Text $manifestText -Key "appid"
+        $manifestDir = Get-WmtSteamManifestValue -Text $manifestText -Key "installdir"
+        if ($manifestId -eq $id -and $manifestDir -ieq $folderInfo.Name) {
+            $line = [Environment]::NewLine
+            Show-WmtMessageBox -Message ("Matching Steam manifest found, but the library is not registered with Steam:" + $line + $steamappsDir.Parent.FullName + $line + $line + "Add this library root in Steam > Settings > Storage, then refresh WMT. Nothing has been marked installed.") -Title "Add Steam Library" -Image Information | Out-Null
+            return
+        }
+        Show-WmtMessageBox -Message "The local Steam appmanifest does not match this app ID or directory. WMT will not adopt incorrect metadata." -Title "Steam Manifest Mismatch" -Image Warning | Out-Null
+        return
+    }
+    $steamNote = if ($properLayout) { "A matching Steam appmanifest is missing." } else { "This folder is outside the usual steamapps\common layout." }
+    $prompt = $steamNote + [Environment]::NewLine + [Environment]::NewLine + "Add or move the files into a registered Steam library, then let Steam discover and verify them. Open Steam's install flow for this app? Steam may download missing or outdated files."
+    if ((Show-WmtMessageBox -Message $prompt -Title "Steam Locate" -Button YesNo -Image Question) -eq [System.Windows.MessageBoxResult]::Yes) {
+        try { Start-Process "steam://install/$id" | Out-Null }
+        catch { Show-WmtMessageBox -Message $_.Exception.Message -Title "Cannot Open Steam" -Image Warning | Out-Null }
+    }
+    return
+}
+if ($source -in @("gog", "gogdl")) {
+    if ($id -notmatch '^\d+$') {
+        Show-WmtMessageBox -Message "Invalid GOG app ID." -Title "GOG Import" -Image Warning | Out-Null
+        return
+    }
+    $matching = $false
+    foreach ($f in @(Get-ChildItem -LiteralPath $path -Filter "goggame-*.info" -File -ErrorAction SilentlyContinue)) {
+        try {
+            $info = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$info.rootGameId -eq $id) { $matching = $true; break }
+        } catch {}
+    }
+    if (-not $matching) {
+        Show-WmtMessageBox -Message "No goggame-*.info file matches the selected GOG title. Select the game root directory. Nothing was registered." -Title "GOG Metadata Missing" -Image Warning | Out-Null
+        return
+    }
+    $exe = Get-WmtGogdlResolvedExePath
+    $provider = "GOG"
+    $args = 'import "' + $path.Replace('"', '') + '"'
+} else {
+    $exe = Get-WmtLegendaryExePath
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        try {
+            $command = Get-Command legendary -ErrorAction SilentlyContinue
+            if ($command -and $command.Source) { $exe = [string]$command.Source }
+        } catch {}
+    }
+    $provider = "Legendary"
+    # Verify game content; skip potentially interactive DLC questions.
+    $args = 'import "' + $id + '" "' + $path.Replace('"', '') + '"'
+}
+if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+    Show-WmtMessageBox -Message "$provider executable was not found. Enable/install its provider first." -Title "Provider Missing" -Image Warning | Out-Null
+    return
+}
+if (@(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Select-Object -First 1).Count -eq 0) {
+    Show-WmtMessageBox -Message "The selected directory is empty." -Title "No Game Files" -Image Warning | Out-Null
+    return
+}
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell
+    $script:WmtGameImportContext = [PSCustomObject]@{ Provider=$provider; Id=$id; Name=$name; Path=$path }
+    [void]$ps.AddScript({
+        param($binary, $cmdArgs, $kind, $appId)
+        $run = Invoke-WmtProcess -FilePath $binary -Arguments $cmdArgs -TimeoutMs 7200000 -Encoding UTF8 -KillTree
+        $detectedId = ""
+        $registeredPath = ""
+        $registeredVersion = ""
+        $warning = ""
+        if ($kind -eq "GOG" -and $run.ExitCode -eq 0 -and -not $run.TimedOut) {
+            try {
+                $metadata = ([string]$run.StdOut).Trim() | ConvertFrom-Json -ErrorAction Stop
+                $detectedId = ([string]$metadata.appName).Trim()
+            } catch { $warning = "GOGDL import returned invalid JSON: $($_.Exception.Message)" }
+        }
+        elseif ($kind -eq "Legendary" -and $run.ExitCode -eq 0 -and -not $run.TimedOut) {
+            $installed = Invoke-WmtLegendaryInstalledData -LegendaryExe $binary -TimeoutMs 30000
+            if ($installed.ExitCode -eq 0) {
+                foreach ($game in @($installed.Rows)) {
+                    if (([string]$game.'App name') -ine $appId) { continue }
+                    $registeredPath = ([string]$game.'Install path').Trim()
+                    $registeredVersion = ([string]$game.'Installed version').Trim()
+                    break
+                }
+            } else {
+                $warning = "Legendary import exited successfully, but its local installed-game database could not be checked."
+            }
+        }
+        [PSCustomObject]@{
+            ExitCode=[int]$run.ExitCode; TimedOut=[bool]$run.TimedOut;
+            TerminationFailed=[bool]$run.TerminationFailed; Error=[string]$run.Error;
+            StdErr=[string]$run.StdErr; DetectedId=$detectedId;
+            RegisteredPath=$registeredPath; RegisteredVersion=$registeredVersion; Warning=$warning
+        }
+    }).AddArgument($exe).AddArgument($args).AddArgument($provider).AddArgument($id)
+    $script:WmtGameImportRunspace = $ps
+    $script:WmtGameImportAsync = $ps.BeginInvoke()
+    if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $false }
+    if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Importing $name with $provider (file verification may take time)..." }
+    Write-GuiLog "[Import] $provider: $name ($id) from $path"
+
+    Register-WmtUiPollOperation -Name "GameLibraryImport" -IntervalMs 500 -TestComplete { $false } -OnTick {
+        if (-not $script:WmtGameImportAsync -or -not $script:WmtGameImportAsync.IsCompleted) { return }
+        $context = $script:WmtGameImportContext
+        try {
+            $records = @($script:WmtGameImportRunspace.EndInvoke($script:WmtGameImportAsync))
+            $record = @($records | Where-Object { $_ -and $_.PSObject.Properties["ExitCode"] } | Select-Object -Last 1)[0]
+            if (-not $record) { throw "Import returned no status." }
+            if ($record.TimedOut -or $record.TerminationFailed -or [int]$record.ExitCode -ne 0 -or $record.Error) {
+                $detail = ([string]$record.Error).Trim()
+                if (-not $detail) { $detail = ([string]$record.StdErr).Trim() }
+                if ($detail.Length -gt 500) { $detail = $detail.Substring($detail.Length - 500) }
+                throw "Import failed (exit $($record.ExitCode); timeout=$($record.TimedOut)). $detail"
+            }
+            if ([string]$context.Provider -eq "GOG") {
+                if (([string]$record.DetectedId) -ne ([string]$context.Id)) {
+                    throw "GOGDL detected app ID '$($record.DetectedId)' instead of '$($context.Id)'. No game was registered."
+                }
+                Set-WmtGogdlTrackedInstall -Id ([string]$context.Id) -Name ([string]$context.Name) -RootPath ([string]$context.Path) -InstallPath ([string]$context.Path) -Status Installed
+            } else {
+                $regPath = ([string]$record.RegisteredPath).Trim()
+                if (-not $regPath -or -not [string]::Equals(
+                    ([System.IO.Path]::GetFullPath($regPath)).TrimEnd('\'),
+                    ([System.IO.Path]::GetFullPath([string]$context.Path)).TrimEnd('\'),
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Legendary did not confirm the selected installation path after import. WMT's cache was not updated. $($record.Warning)"
+                }
+                Update-WmtLegendaryImportedGameCache -Id ([string]$context.Id) -Name ([string]$context.Name) -InstallPath $regPath -Version ([string]$record.RegisteredVersion)
+            }
+            Write-GuiLog "[Import] Registered $($context.Provider): $($context.Name) ($($context.Id)) -> $($context.Path)"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Imported $($context.Name) successfully." }
+            Start-WmtLibraryScan -Silent
+        }
+        catch {
+            Write-GuiLog "[Import] $($context.Provider) import failed: $($_.Exception.Message)"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Could not import $($context.Name)." }
+            Show-WmtMessageBox -Message ([string]$_.Exception.Message) -Title "Game Import Failed" -Image Warning | Out-Null
+        }
+        finally {
+            try { Unregister-WmtUiPollOperation -Name "GameLibraryImport" } catch {}
+            try { if ($script:WmtGameImportRunspace) { $script:WmtGameImportRunspace.Dispose() } } catch {}
+            $script:WmtGameImportRunspace = $null
+            $script:WmtGameImportAsync = $null
+            $script:WmtGameImportContext = $null
+            if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+        }
+    } | Out-Null
+}
+catch {
+    Write-GuiLog "[Import] Cannot start import: $($_.Exception.Message)"
+    try { if ($ps) { $ps.Dispose() } } catch {}
+    $script:WmtGameImportRunspace = $null
+    $script:WmtGameImportAsync = $null
+    $script:WmtGameImportContext = $null
+    if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+    Show-WmtMessageBox -Message $_.Exception.Message -Title "Import Error" -Image Warning | Out-Null
+}
+}
+
+if ($btnLibraryLocate) {
+    $btnLibraryLocate.Add_Click({
+        $selected = @($lstLibrary.SelectedItems | Where-Object { $null -ne $_ })
+        if ($selected.Count -ne 1) {
+            Show-WmtMessageBox -Message "Select exactly one Steam, Epic, or GOG game, then choose its installation folder." -Title "Locate / Import" -Image Information | Out-Null
+            return
+        }
+        Invoke-WmtLibraryLocateImport -Item $selected[0]
+    }.GetNewClosure())
 }
 
 # --- Library context menu ---
@@ -60227,6 +60488,7 @@ if ($ctxLibrary -and $lstLibrary) {
 
             # Show Install only if NOT installed and not already downloading.
             if ($miLibInstall) { $miLibInstall.Visibility = if (-not $isInstalled -and -not $isPending) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            if ($miLibLocate) { $miLibLocate.Visibility = if (([string]$item.Source).Trim().ToLowerInvariant() -in @("steam", "epic", "legendary", "gog", "gogdl") -and -not $isPending) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
 
             # Store page + Copy ID + Copy Row Data always visible.
             if ($miLibStorePage) { $miLibStorePage.Visibility = [System.Windows.Visibility]::Visible }
@@ -60248,6 +60510,9 @@ if ($ctxLibrary -and $lstLibrary) {
             }.GetNewClosure())
     }
 
+    if ($miLibLocate) {
+        $miLibLocate.Add_Click({ Invoke-WmtLibraryLocateImport -Item (Get-WmtSelectedLibraryItem) }.GetNewClosure())
+    }
     if ($miLibUninstall) {
         $miLibUninstall.Add_Click({
                 $item = Get-WmtSelectedLibraryItem
