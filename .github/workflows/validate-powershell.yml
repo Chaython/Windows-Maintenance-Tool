@@ -2069,7 +2069,7 @@ jobs:
               '$finalizeCleanupForFirstPass = $finalizeCleanup',
               '$finalizeCleanupCallback = $finalizeCleanupForFirstPass',
               '& $finalizeCleanupCallback @($deletedBeforeForce + $forcedDeleted)',
-              '& $finalizeCleanupCallback $deletedBeforeForce $forceItemCount'
+              '& $finalizeCleanupCallback $deletedBeforeForce ($unresolvedFirstPassCount + $forceItemCount)'
           )
           foreach ($guard in $driverCleanupClosureGuards) {
               if (-not $source.Contains($guard)) {
