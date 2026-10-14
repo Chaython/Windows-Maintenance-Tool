@@ -57828,7 +57828,7 @@ if ($source -in @("gog", "gogdl")) {
     }
     $exe = Get-WmtGogdlResolvedExePath
     $provider = "GOG"
-    $args = 'import "' + $path.Replace('"', '') + '"'
+    $a = 'import "' + $path.Replace('"', '') + '"'
 } else {
     $exe = Get-WmtLegendaryExePath
     if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
@@ -57839,7 +57839,7 @@ if ($source -in @("gog", "gogdl")) {
     }
     $provider = "Legendary"
     # Verify game content; skip potentially interactive DLC questions.
-    $args = 'import "' + $id + '" "' + $path.Replace('"', '') + '"'
+    $a = 'import "' + $id + '" "' + $path.Replace('"', '') + '"'
 }
 if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     Show-WmtMessageBox -Message "$provider executable was not found. Enable/install its provider first." -Title "Provider Missing" -Image Warning | Out-Null
@@ -57885,12 +57885,12 @@ try {
             StdErr=[string]$run.StdErr; DetectedId=$detectedId;
             RegisteredPath=$registeredPath; RegisteredVersion=$registeredVersion; Warning=$warning
         }
-    }).AddArgument($exe).AddArgument($args).AddArgument($provider).AddArgument($id)
+    }).AddArgument($exe).AddArgument($a).AddArgument($provider).AddArgument($id)
     $script:WmtGameImportRunspace = $ps
     $script:WmtGameImportAsync = $ps.BeginInvoke()
     if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $false }
     if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Importing $name with $provider (file verification may take time)..." }
-    Write-GuiLog "[Import] $provider: $name ($id) from $path"
+    Write-GuiLog "[Import] ${provider}: $name ($id) from $path"
 
     Register-WmtUiPollOperation -Name "GameLibraryImport" -IntervalMs 500 -TestComplete { $false } -OnTick {
         if (-not $script:WmtGameImportAsync -or -not $script:WmtGameImportAsync.IsCompleted) { return }
