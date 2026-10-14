@@ -27121,6 +27121,19 @@ Invoke-WmtUiBackgroundCommand -Msg "Loading third-party drivers..." -SuppressRes
 $dialog.ShowDialog() | Out-Null
 }
 
+function Get-WmtGhostDeviceCandidates {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($device in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Unknown' })) {
+        $id = [string]$device.InstanceId
+        if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) { continue }
+        [PSCustomObject]@{
+            InstanceId = $id
+            Class = [string]$device.Class
+            FriendlyName = [string]$device.FriendlyName
+        }
+    }
+}
+
 function Show-GhostDevicesDialog {
 $content = @"
 <Grid>
@@ -27175,26 +27188,14 @@ $setBusy = {
 
 # Restore the verified fast enumeration path from WMT-GUI(7).ps1.
 # The isolated process/JSON/timer pipeline could leave the dialog indefinitely at
-# "Starting disconnected-device scan..." before the list populated. Filtering
+# the initial startup status before the list populated. Filtering
 # Status=Unknown is only a *candidate* scan; deletion rechecks actual presence.
-function Get-WmtGhostDeviceCandidates {
-    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($device in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Unknown' })) {
-        $id = [string]$device.InstanceId
-        if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) { continue }
-        [PSCustomObject]@{
-            InstanceId = $id
-            Class = [string]$device.Class
-            FriendlyName = [string]$device.FriendlyName
-        }
-    }
-}
-
 $load = {
     if ($state.Busy -or -not $dialog.IsLoaded) { return }
     & $setBusy $true "Scanning Ghosted Devices..."
     $items.Clear()
     Set-WmtBusyCursor -Busy
+    $errorMessage = ""
     try {
         foreach ($device in @(Get-WmtGhostDeviceCandidates)) {
             [void]$items.Add($device)
@@ -27204,16 +27205,14 @@ $load = {
         }
     }
     catch {
-        $detail = $_.Exception.Message
-        Write-GuiLog "[Drivers] Ghost-device scan failed: $detail"
-        if ($txtStatus) { $txtStatus.Text = "Ghost-device scan failed: $detail" }
-        return
+        $errorMessage = $_.Exception.Message
+        Write-GuiLog "[Drivers] Ghost-device scan failed: $errorMessage"
     }
     finally {
         Set-WmtBusyCursor
-        $message = if ($items.Count -eq 0) { "No potential ghost devices found." } else {
-            ("Found {0} potential ghost device(s). Presence is verified before removal." -f $items.Count)
-        }
+        $message = if ($errorMessage) { "Ghost-device scan failed: $errorMessage" }
+            elseif ($items.Count -eq 0) { "No potential ghost devices found." }
+            else { "Found $($items.Count) potential ghost device(s). Presence is verified before removal." }
         & $setBusy $false $message
     }
 }.GetNewClosure()
