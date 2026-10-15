@@ -27257,29 +27257,47 @@ $setBusy = {
 # Status=Unknown is only a *candidate* scan; deletion rechecks actual presence.
 $load = {
     if ($state.Busy -or -not $dialog.IsLoaded) { return }
-    & $setBusy $true "Scanning Ghosted Devices..."
+    & $setBusy $true "Scanning disconnected devices in background..."
     $items.Clear()
-    Set-WmtBusyCursor -Busy
-    $errorMessage = ""
-    try {
-        foreach ($device in @(Get-WmtGhostDeviceCandidates)) {
-            [void]$items.Add($device)
+    $scanItems = $items
+    $scanDialog = $dialog
+    $scanState = $state
+    $setScanBusy = $setBusy
+    $onDone = {
+        param($results)
+        if (-not $scanDialog.IsLoaded) { return }
+        $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["Candidates"] } | Select-Object -Last 1)
+        if ($payload.Count -eq 0) {
+            & $setScanBusy $false "Ghost-device scan returned no data. Click Refresh."
+            return
         }
-        if ($items.Count -eq 0) {
-            Show-WmtMessageBox -Owner $dialog -Message "No hidden/ghost devices found." -Title "Ghost Devices" -Image Information | Out-Null
+        foreach ($device in @($payload[0].Candidates)) {
+            if ($device -and $device.InstanceId) { [void]$scanItems.Add($device) }
         }
-    }
-    catch {
-        $errorMessage = $_.Exception.Message
-        Write-GuiLog "[Drivers] Ghost-device scan failed: $errorMessage"
-    }
-    finally {
-        Set-WmtBusyCursor
-        $message = if ($errorMessage) { "Ghost-device scan failed: $errorMessage" }
-            elseif ($items.Count -eq 0) { "No potential ghost devices found." }
-            else { "Found $($items.Count) potential ghost device(s). Presence is verified before removal." }
-        & $setBusy $false $message
-    }
+        & $setScanBusy $false $(if ($scanItems.Count -eq 0) { "No potential ghost devices found." } else { "Found $($scanItems.Count) potential ghost device(s). Presence is verified before removal." })
+    }.GetNewClosure()
+    $onError = {
+        param($err)
+        if (-not $scanDialog.IsLoaded) { return }
+        $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+        Write-GuiLog "[Drivers] Ghost-device scan failed: $message"
+        & $setScanBusy $false "Ghost-device scan failed. Click Refresh."
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name ("GhostDeviceScan_" + [guid]::NewGuid().ToString("N")) -Msg "Scanning disconnected devices..." -SuppressResultLog -TimeoutMs 60000 -Sb {
+        Import-Module PnpDevice -ErrorAction Stop
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $rows = [System.Collections.Generic.List[object]]::new()
+        foreach ($device in @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.Status -eq 'Unknown' })) {
+            $id = [string]$device.InstanceId
+            if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) { continue }
+            [void]$rows.Add([PSCustomObject]@{
+                InstanceId = $id
+                Class = [string]$device.Class
+                FriendlyName = [string]$device.FriendlyName
+            })
+        }
+        [PSCustomObject]@{ Candidates = @($rows.ToArray()) }
+    } -OnComplete $onDone -OnError $onError | Out-Null
 }.GetNewClosure()
 
 $removeRows = {

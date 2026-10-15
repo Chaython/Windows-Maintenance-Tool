@@ -354,6 +354,13 @@ jobs:
               throw 'Driver inventory preloading, cache reuse or fail-closed usage scanning regressed.'
           }
           Write-Host 'PASS: driver inventory preloading and verified cache reuse.'
+          $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
+          if ($ghostDialog -notmatch 'GhostDeviceScan_' -or
+              $ghostDialog -notmatch 'Invoke-WmtUiBackgroundCommand' -or
+              $ghostDialog -match '(?m)^\s*foreach\s*\(\$device\s+in\s+@\(Get-WmtGhostDeviceCandidates\)') {
+              throw 'Ghost device enumeration returned to synchronous WPF scanning.'
+          }
+          Write-Host 'PASS: ghost-device candidates enumerate off the WPF dispatcher.'
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
