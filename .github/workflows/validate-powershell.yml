@@ -156,6 +156,56 @@ jobs:
           $script:WmtQuickFindMovedButtons.Clear()
           Write-Host 'Quick Find host/restore safety checks passed.'
 
+      - name: Smoke test optional feature startup and fail-closed safety
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          if ($source -match '; Update-SingleFeatureButtonState "btnFeat') {
+              throw 'Startup again invokes individual optional-feature queries.'
+          }
+          function Find-FunctionText([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node.Extent.Text
+          }
+          $single = Find-FunctionText 'Update-SingleFeatureButtonState'
+          if ($single -match 'Get-WindowsOptionalFeature|Invoke-WmtCliText|Get-WindowsCapability') {
+              throw 'Single-feature UI callback contains a blocking Windows component query.'
+          }
+          $toggle = Find-FunctionText 'Switch-WindowsFeature'
+          if ([regex]::Matches($toggle, 'Cannot verify the current state of').Count -ne 2) {
+              throw 'DISM feature fallback no longer rejects unknown current states.'
+          }
+          if ($toggle -match '(?s)\$done\s*=\s*\{.*?\}\.GetNewClosure\(\)') {
+              throw 'Feature refresh callback uses GetNewClosure and loses main script scope.'
+          }
+          $sync = Find-FunctionText 'Update-OptionalFeaturesSynchronously'
+          $background = Find-FunctionText 'Start-OptionalFeaturesBackgroundCheck'
+          foreach ($value in @($sync, $background)) {
+              if ($value -notmatch 'currentFeature' -or $value -notmatch 'ContainsKey\(\$currentFeature\)') {
+                  throw 'Feature scanning no longer tracks the current DISM feature block.'
+              }
+              if ($value -match '\(\?s\)Feature Name') {
+                  throw 'Feature scan can again jump across DISM feature blocks.'
+              }
+          }
+          $tweak = Find-FunctionText 'Start-TweakButtonStatesBackgroundUpdate'
+          if ($tweak -match 'Falling back to synchronous load') {
+              throw 'Tweak worker startup can still trigger UI-thread registry fallback.'
+          }
+          if ($source -notmatch 'function Sync-WmtOptionalFeatureButtons' -or
+              $background -notmatch 'Sync-WmtOptionalFeatureButtons') {
+              throw 'Unknown optional features may become actionable.'
+          }
+          Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
+
       - name: Smoke test fast ghost-device scan and full-width dialog
         shell: powershell
         run: |
