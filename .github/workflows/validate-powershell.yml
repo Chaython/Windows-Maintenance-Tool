@@ -353,12 +353,13 @@ jobs:
               $preload -notmatch 'Start-DriverListLoad') {
               throw 'Driver inventory preloading, cache reuse or fail-closed usage scanning regressed.'
           }
-          if ($cleanup -notmatch 'DriverServiceMap.Keys' -or
+          if ($cleanup -notmatch '\$protectedInfs' -or
+              $cleanup -notmatch 'DriverServiceMap.Keys' -or
               $cleanup -notmatch 'if \(-not \$script:DriverLoadInProgress\) \{ Start-DriverListLoad \}' -or
               (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Start-DriverUsageLoad -Infs \$usageInfs') {
-              throw 'Clean Old Drivers lost service-only protection or shared inventory reuse.'
+              throw 'Cleanup lost service-only protection or shared inventory usage-phase reuse.'
           }
-          Write-Host 'PASS: verified driver inventory and service-only cleanup safety.'
+          Write-Host 'PASS: shared driver cache, service-only driver safety and usage-phase reuse.'
           $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
           if ($ghostDialog -notmatch 'GhostDeviceScan_' -or
               $ghostDialog -notmatch 'Invoke-WmtUiBackgroundCommand' -or
