@@ -371,6 +371,7 @@ jobs:
           if ($driverStatuses -notmatch 'DriverServiceMap' -or
               $cacheRemoval -match 'DriverCacheLoaded = \$false' -or
               $cacheRemoval -notmatch 'DriverCacheLoaded = \$true' -or
+              $cacheRemoval -match 'DriverCacheLoadedAt\s*=\s*Get-Date' -or
               $ghostDialog -notmatch 'driverUsageLoadedState' -or
               $ghostDialog -notmatch 'Start-DriverListLoad' -or
               $ghostDialog -notmatch 'driverCacheLoadedState' -or

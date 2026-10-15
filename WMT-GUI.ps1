@@ -54240,7 +54240,9 @@ Set-DriverPackageRows -Rows @($kept)
 # Keep the authoritative in-memory inventory valid rather than forcing a
 # second full /enum-drivers scan on the next Drivers tab activation.
 $script:DriverCacheLoaded = $true
-$script:DriverCacheLoadedAt = Get-Date
+# Removal updates the staged package inventory, but does not revalidate
+# device/service usage. Preserve its original timestamp and expiration.
+# Otherwise frequent deletions could keep unsafe, stale status data "fresh".
 
 # Drop the packages from the cached device/service maps too, so tooltips,
 # details dialogs and live-status recomputation don't reference ghost rows.
