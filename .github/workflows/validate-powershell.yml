@@ -365,7 +365,17 @@ jobs:
               (Find-FunctionText 'Start-DriverUsageLoad') -notmatch 'Schedule-DriverPoolRetry') {
               throw 'Worker pool initialization can silently prevent driver loading.'
           }
-          Write-Host 'PASS: shared driver inventory, service safety and nonblocking pool retry.'
+          $driverStatuses = Find-FunctionText 'Set-DriverStatusFlags'
+          $cacheRemoval = Find-FunctionText 'Remove-DriverRowsFromCache'
+          $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
+          if ($driverStatuses -notmatch 'DriverServiceMap' -or
+              $cacheRemoval -match 'DriverCacheLoaded = \$false' -or
+              $cacheRemoval -notmatch 'DriverCacheLoaded = \$true' -or
+              $ghostDialog -notmatch 'driverUsageLoadedState' -or
+              $ghostDialog -notmatch 'Start-DriverListLoad') {
+              throw 'Driver status or post-removal cache invalidation triggers redundant full scans.'
+          }
+          Write-Host 'PASS: post-removal cache retention and service-only driver status safety.'
           $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
           if ($ghostDialog -notmatch 'GhostDeviceScan_' -or
               $ghostDialog -notmatch 'Invoke-WmtUiBackgroundCommand' -or

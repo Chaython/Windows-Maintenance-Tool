@@ -27238,8 +27238,7 @@ Set-WmtDataGridColumns -DataGrid $dg -Columns @("InstanceId", "Class", "Friendly
 
 # Keep cache invalidation working even though the callbacks below use
 # GetNewClosure() (where $script: would otherwise point at the closure module).
-$driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script -ErrorAction SilentlyContinue
-$driverCacheLoadedAtState = Get-Variable -Name DriverCacheLoadedAt -Scope Script -ErrorAction SilentlyContinue
+$driverUsageLoadedState = Get-Variable -Name DriverUsageLoaded -Scope Script -ErrorAction SilentlyContinue
 $state = @{ Busy = $false; Generation = 0; Started = $false }
 
 $setBusy = {
@@ -27320,8 +27319,9 @@ $removeRows = {
             Write-GuiLog "[Drivers] Could not remove ghost device $($failure.InstanceId): exit $($failure.ExitCode) $($failure.Output)"
         }
         if ($removed -gt 0) {
-            if ($driverCacheLoadedState) { $driverCacheLoadedState.Value = $false }
-            if ($driverCacheLoadedAtState) { $driverCacheLoadedAtState.Value = [DateTime]::MinValue }
+            # Removing a ghost device changes bindings but not the staged
+            # Driver Store package list. Refresh phase-two usage only.
+            if ($driverUsageLoadedState) { $driverUsageLoadedState.Value = $false }
         }
         & $setBusy $false ("Removed {0} device(s); rescanning..." -f $removed)
         & $load
@@ -27395,6 +27395,11 @@ $dialog.Add_ContentRendered({
 }.GetNewClosure())
 # No child scan process or timer requires cleanup when the dialog closes.
 $dialog.ShowDialog() | Out-Null
+# Recheck the binding/usage map only if a device was removed. The already
+# enumerated driver packages can be reused without another pnputil scan.
+if ($script:DriverCacheLoaded -and -not $script:DriverUsageLoaded) {
+    Start-DriverListLoad
+}
 }
 
 function Invoke-DriverUpdates {
@@ -53141,6 +53146,13 @@ $boundInfs = @{}
 foreach ($entry in @($script:DriverDeviceMap.Keys)) {
     if ($script:DriverDeviceMap[$entry] -and @($script:DriverDeviceMap[$entry]).Count -gt 0) { $boundInfs[$entry] = $true }
 }
+# Driver services (AV filters, audio effects and bus drivers) may have no PnP
+# device binding; they are nonetheless protected from an "Old" designation.
+if ($script:DriverServiceMap) {
+    foreach ($entry in @($script:DriverServiceMap.Keys)) {
+        if (@($script:DriverServiceMap[$entry]).Count -gt 0) { $boundInfs[$entry] = $true }
+    }
+}
 
 # Old = not bound to any device, and the same original driver name has a
 # better copy staged. Ranking mirrors Clean Old Drivers: bound copy first,
@@ -54184,8 +54196,11 @@ if ($removedCount -eq 0) {
     return
 }
 Set-DriverPackageRows -Rows @($kept)
-$script:DriverCacheLoaded = $false
-$script:DriverCacheLoadedAt = [DateTime]::MinValue
+# The successful pnputil result already identifies every removed package.
+# Keep the authoritative in-memory inventory valid rather than forcing a
+# second full /enum-drivers scan on the next Drivers tab activation.
+$script:DriverCacheLoaded = $true
+$script:DriverCacheLoadedAt = Get-Date
 
 # Drop the packages from the cached device/service maps too, so tooltips,
 # details dialogs and live-status recomputation don't reference ghost rows.
