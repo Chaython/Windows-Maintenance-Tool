@@ -35209,8 +35209,7 @@ try {
 
     # Load pre-fetched non-registry data (services, fsutil, powercfg, etc.)
     # so the UI thread makes ZERO blocking calls — everything is cached.
-    # If the background preload hasn't completed yet, these will be empty
-    # and the fallback live-call paths below will handle it.
+    # Missing values remain unknown: do not perform live system probes on WPF.
     $nrd = @{}
     if ($script:TweakNonRegDataCache) { $nrd = $script:TweakNonRegDataCache }
     $sc = @{}
@@ -35251,8 +35250,11 @@ try {
     }
 
     $h = & $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode"
-    $hagsOn = ($h -ne 2); Update-WmtTweakToggle $btnToggleHags $hagsOn "Disable HAGS" "Enable HAGS"
-    Update-WmtTweakToggle $btnMyDeviceHagsToggle $hagsOn "Disable HAGS" "Enable HAGS"
+    if ($null -ne $h) {
+        $hagsOn = ($h -ne 2)
+        Update-WmtTweakToggle $btnToggleHags $hagsOn "Disable HAGS" "Enable HAGS"
+        Update-WmtTweakToggle $btnMyDeviceHagsToggle $hagsOn "Disable HAGS" "Enable HAGS"
+    }
 
     $smStartType = $nrd["SysMainStartType"]
 
@@ -35268,10 +35270,8 @@ try {
         Update-WmtTweakToggle $btnMyDeviceHibernateToggle $hibernateOff "Enable Hibernation" "Disable Hibernation"
     }
 
+    # Get-MMAgent is a slow CIM operation; only consume the worker snapshot.
     $mmaEnabled = $nrd["MMAgentMemoryCompression"]
-    if ($null -eq $mmaEnabled) {
-        try { if (Get-Command Get-MMAgent -ErrorAction Ignore) { $mmaLive = Get-MMAgent -ErrorAction Ignore; if ($mmaLive -and $null -ne $mmaLive.MemoryCompression) { $mmaEnabled = [bool]$mmaLive.MemoryCompression } } } catch {}
-    }
     if ($null -ne $mmaEnabled) {
         Update-WmtTweakToggle $btnToggleMemCompress $mmaEnabled "Disable Mem Compression" "Enable Mem Compression"
         Update-WmtTweakToggle $btnMyDeviceMemCompressToggle $mmaEnabled "Disable Mem Compression" "Enable Mem Compression"
@@ -62095,7 +62095,6 @@ catch {
             "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters",
             "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config",
             "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config",
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy",
             "HKCU:\Software\Policies\Microsoft\Windows\CloudContent",
@@ -62146,31 +62145,32 @@ catch {
         }
 
         $regCache = @{}
-        # Use .NET RegistryKey for faster reads (~10x faster than Get-ItemProperty)
+        # Close each handle even when a registry read fails.
         foreach ($path in $paths) {
+            $baseKey = $null
+            $key = $null
             try {
                 $parts = Convert-WmtRegistryPath -Path $path
                 if (-not $parts) {
                     $regCache[$path] = $null
                     continue
                 }
-
                 $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
-                $key = $baseKey.OpenSubKey($parts.SubPath)
+                $key = $baseKey.OpenSubKey($parts.SubPath, $false)
                 if ($key) {
                     $values = @{}
                     foreach ($valName in $key.GetValueNames()) {
                         $values[$valName] = $key.GetValue($valName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                     }
-                    $key.Close()
                     $regCache[$path] = [PSCustomObject]$values
-                }
-                else {
+                } else {
                     $regCache[$path] = $null
                 }
             }
-            catch {
-                $regCache[$path] = $null
+            catch { $regCache[$path] = $null }
+            finally {
+                if ($key) { $key.Dispose() }
+                if ($baseKey) { $baseKey.Dispose() }
             }
         }
 
@@ -62291,7 +62291,9 @@ catch {
         try { $supportChecks["CEIP"] = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" } catch { $supportChecks["CEIP"] = $true }
         try { $supportChecks["Speech"] = ($null -ne (Get-ItemProperty "HKCU:\Software\Microsoft\Speech_OneSet" -Name "AcceptPrivacyNotice" -ErrorAction SilentlyContinue)) } catch { $supportChecks["Speech"] = $true }
 
-        return @{ RegCache = $regCache; PathChecks = $pathChecks; NonRegData = $nonRegData; SupportChecks = $supportChecks }
+        # Counts let the UI callback reject truncated snapshots.
+        return @{ RegCache = $regCache; PathChecks = $pathChecks; NonRegData = $nonRegData;
+                  SupportChecks = $supportChecks; ExpectedRegPaths = $paths.Count }
     })
 
 $async = $null
@@ -62331,7 +62333,16 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                 if ($result -is [System.Management.Automation.PSDataCollection[psobject]] -or $result -is [System.Collections.ObjectModel.Collection[PSObject]]) {
                     if ($result.Count -gt 0) { $result = $result[$result.Count - 1] }
                 }
-                if ($result -and $result -is [hashtable]) {
+                if ($result -and $result -is [hashtable] -and
+                    $result.RegCache -is [System.Collections.IDictionary] -and
+                    $result.PathChecks -is [System.Collections.IDictionary] -and
+                    $result.NonRegData -is [System.Collections.IDictionary] -and
+                    $result.SupportChecks -is [System.Collections.IDictionary] -and
+                    $result.ExpectedRegPaths -gt 0 -and
+                    $result.RegCache.Count -eq $result.ExpectedRegPaths -and
+                    $result.PathChecks.Count -eq 7 -and
+                    $result.SupportChecks.Count -eq 6 -and
+                    $result.NonRegData.Contains("MMAgentMemoryCompression")) {
                     # Store the pre-loaded regCache, path checks, non-registry data, and support checks
                     $script:TweakButtonStatesCache = $result.RegCache
                     $script:TweakButtonStatesPathChecks = $result.PathChecks
