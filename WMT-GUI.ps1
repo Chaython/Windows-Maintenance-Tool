@@ -2813,7 +2813,25 @@ if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool = $null } else { $scri
 function Initialize-WmtRunspacePool {
 param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
 $existing = if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool } else { $script:WmtBackgroundPool }
-if ($existing -is [System.Management.Automation.Runspaces.RunspacePool]) { return $existing }
+if ($existing -is [System.Management.Automation.Runspaces.RunspacePool]) {
+    if ($script:WmtPoolOpenAsync -and $script:WmtPoolOpenAsync.ContainsKey($PoolKind)) {
+        $opening = $script:WmtPoolOpenAsync[$PoolKind]
+        if (-not $opening.IsCompleted) { return $null }
+        try { $existing.EndOpen($opening) }
+        catch {
+            $script:WmtPoolOpenAsync.Remove($PoolKind)
+            if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool = $null }
+            else { $script:WmtBackgroundPool = $null }
+            try { $existing.Dispose() } catch {}
+            throw
+        }
+        $script:WmtPoolOpenAsync.Remove($PoolKind)
+    }
+    if ($existing.RunspacePoolStateInfo.State -ne [System.Management.Automation.Runspaces.RunspacePoolState]::Opened) {
+        return $null
+    }
+    return $existing
+}
 if ($existing) { Reset-WmtRunspacePool -PoolKind $PoolKind }
 
 $iss = New-WmtRunspaceInitialState
@@ -2821,19 +2839,28 @@ $maxWorkers = if ($PoolKind -eq "UiSupport") { 3 } else { 6 }
 $pool = [runspacefactory]::CreateRunspacePool(1, $maxWorkers, $iss, $Host)
 $pool.ApartmentState = "STA"
 $pool.ThreadOptions = "ReuseThread"
-$pool.Open()
+# BeginOpen avoids blocking the WPF dispatcher while runspace threads start.
+# Do not call EndOpen until IsCompleted, which is checked on subsequent polls.
+try {
+    $opening = $pool.BeginOpen($null, $null)
+    if (-not $opening) { throw "Runspace pool BeginOpen returned no handle." }
+    if (-not $script:WmtPoolOpenAsync) { $script:WmtPoolOpenAsync = @{} }
+    $script:WmtPoolOpenAsync[$PoolKind] = $opening
+}
+catch {
+    try { $pool.Dispose() } catch {}
+    throw
+}
 if ($PoolKind -eq "UiSupport") { $script:WmtUiSupportPool = $pool } else { $script:WmtBackgroundPool = $pool }
-return $pool
+return $null
 }
 
 function Initialize-WmtBackgroundRunspacePool { return (Initialize-WmtRunspacePool -PoolKind Background) }
 function Get-WmtBackgroundRunspacePool {
-if (-not $script:WmtBackgroundPool) { $null = Initialize-WmtRunspacePool -PoolKind Background }
-return $script:WmtBackgroundPool
+return (Initialize-WmtRunspacePool -PoolKind Background)
 }
 function Get-WmtUiSupportRunspacePool {
-if (-not $script:WmtUiSupportPool) { $null = Initialize-WmtRunspacePool -PoolKind UiSupport }
-return $script:WmtUiSupportPool
+return (Initialize-WmtRunspacePool -PoolKind UiSupport)
 }
 function Stop-WmtBackgroundRunspacePool {
 Reset-WmtRunspacePool -PoolKind Background
@@ -2848,6 +2875,9 @@ for ($attempt = 1; $attempt -le 2; $attempt++) {
     try {
         $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
         if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
+            if ($null -eq $pool) {
+                throw "Runspace pool is initializing; retry shortly."
+            }
             throw "Runspace pool initialization did not return a valid RunspacePool."
         }
 
@@ -2865,6 +2895,7 @@ for ($attempt = 1; $attempt -le 2; $attempt++) {
     catch {
         $lastError = $_.Exception
         try { Write-GuiLog "[RunspacePool:$PoolKind] Worker creation attempt $attempt failed: $($lastError.Message)" } catch {}
+        if ($lastError.Message -like '*pool is initializing*') { break }
         # A failed worker allocation does not imply the shared pool is idle.
         # Retry allocation without closing other operations' runspaces.
         if ($attempt -lt 2) {
@@ -62041,6 +62072,21 @@ catch {
     # A failed worker must not fall back to expensive UI-thread registry scans.
     $script:TweakStatesBgStarted = $false
     $script:TweakStatesReady = $false
+    if ($_.Exception.Message -like '*pool is initializing*') {
+        if (-not $script:TweakPoolRetryTimer) {
+            $script:TweakPoolRetryTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $script:TweakPoolRetryTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+            $script:TweakPoolRetryTimer.Add_Tick({
+                $script:TweakPoolRetryTimer.Stop()
+                $script:TweakPoolRetryTimer = $null
+                if (-not $script:TweakStatesReady -and -not $script:TweakStatesBgStarted) {
+                    Start-TweakButtonStatesBackgroundUpdate
+                }
+            })
+            $script:TweakPoolRetryTimer.Start()
+        }
+        return
+    }
     Show-TweakStatesLoadError -Message "Could not start background tweak-state detection: $($_.Exception.Message). Click Retry."
     Sync-WmtTweakOverlayHide
     return
@@ -62491,6 +62537,21 @@ try { $ps = New-WmtPooledPowerShell -PoolKind UiSupport }
 catch {
     $script:OptionalFeaturesCheckStarted = $false
     $script:OptionalFeaturesReady = $false
+    if ($_.Exception.Message -like '*pool is initializing*') {
+        if (-not $script:FeaturesPoolRetryTimer) {
+            $script:FeaturesPoolRetryTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $script:FeaturesPoolRetryTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+            $script:FeaturesPoolRetryTimer.Add_Tick({
+                $script:FeaturesPoolRetryTimer.Stop()
+                $script:FeaturesPoolRetryTimer = $null
+                if (-not $script:OptionalFeaturesReady -and -not $script:OptionalFeaturesCheckStarted) {
+                    Start-OptionalFeaturesBackgroundCheck
+                }
+            })
+            $script:FeaturesPoolRetryTimer.Start()
+        }
+        return
+    }
     Show-TweakStatesLoadError -Message "Could not start optional-feature background worker: $($_.Exception.Message). Click Retry."
     Sync-WmtTweakOverlayHide
     return
@@ -62742,8 +62803,12 @@ if ($settings.WindowState -eq "Maximized") {
 # 1. Click the Updates tab by default.
 (Get-Ctrl "btnTabUpdates").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
 
-# 1b. Create the runspace pools lazily. Building InitialSessionState and
-# opening worker threads during first paint delays startup unnecessarily.
+# 1b. Start opening the runspace pools asynchronously after first paint.
+# Keep launch-minimized + Reduce RAM behavior lazy.
+if (-not ((Get-WmtLaunchMinimized) -and (Get-WmtReduceRamInTray))) {
+    try { $null = Initialize-WmtRunspacePool -PoolKind UiSupport } catch { Write-GuiLog "[Pool] UI-support startup: $($_.Exception.Message)" }
+    try { $null = Initialize-WmtRunspacePool -PoolKind Background } catch { Write-GuiLog "[Pool] Background startup: $($_.Exception.Message)" }
+}
 
 # 2. Warm hidden pages in the background (deferred 1s so UI paints first).
 $script:preloadDeferTimer = New-Object System.Windows.Threading.DispatcherTimer
