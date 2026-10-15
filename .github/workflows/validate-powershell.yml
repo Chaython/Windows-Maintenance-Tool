@@ -516,6 +516,42 @@ jobs:
               throw 'Incomplete service inventory was accepted as verified.'
           }
           Write-Host 'PASS: background driver usage rejects incomplete service inventory.'
+          # The same worker must keep unparseable AddService identities UNKNOWN,
+          # not silently treat them as zero registered services (or fail all INFs).
+          function Get-CimInstance {
+              [CmdletBinding()]
+              param([string]$ClassName, [string[]]$Property)
+          }
+          function Test-Path {
+              [CmdletBinding()]
+              param([string]$LiteralPath, [string]$PathType)
+              return $true
+          }
+          function Get-Item {
+              [CmdletBinding()]
+              param([string]$LiteralPath)
+              [PSCustomObject]@{ LastWriteTimeUtc = [DateTime]::UtcNow }
+          }
+          function Get-Content {
+              [CmdletBinding()]
+              param([string]$LiteralPath)
+              'AddService = %UnresolvedSvc%, 0x2, ServiceSection'
+          }
+          $uncertain = & $worker @('oem5.inf') @{}
+          if (-not $uncertain.Success -or
+              -not $uncertain.Services.ContainsKey('oem5.inf') -or
+              -not @($uncertain.Services['oem5.inf'])[0].Unverified -or
+              @($uncertain.Services['oem5.inf'])[0].Running) {
+              throw 'Unparseable AddService identity did not remain explicitly unverified.'
+          }
+          # Verify cached parse-confidence survives a repeat read.
+          $cache = $uncertain.InfServiceCache
+          $uncertainAgain = & $worker @('oem5.inf') $cache
+          if (-not $uncertainAgain.Success -or
+              -not @($uncertainAgain.Services['oem5.inf'])[0].Unverified) {
+              throw 'Service parse cache incorrectly marked unverified INF as safe.'
+          }
+          Write-Host 'PASS: unknown AddService names remain protected on fresh and cached scans.'
 
       - name: Smoke test fast ghost-device scan and full-width dialog
         shell: powershell
