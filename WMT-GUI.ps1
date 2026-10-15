@@ -57103,7 +57103,7 @@ $done = {
     Start-OptionalFeaturesBackgroundCheck
     Sync-WmtTweakOverlayHide
     Sync-WmtQuickFindStateAvailability
-}.GetNewClosure()
+}
 Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $DisplayName..." -Sb {
     param($fn, $dn)
     if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
@@ -62035,12 +62035,10 @@ try {
     $ps = New-WmtPooledPowerShell -PoolKind UiSupport
 }
 catch {
-    try { Write-GuiLog "[Tweak States] Could not create background worker: $($_.Exception.Message). Falling back to synchronous load." } catch {}
+    # A failed worker must not fall back to expensive UI-thread registry scans.
+    $script:TweakStatesBgStarted = $false
     $script:TweakStatesReady = $false
-    try { Update-TweakButtonStates; $script:TweakStatesReady = $true } catch {
-        try { Write-GuiLog "[Tweak States] Fallback synchronous load also failed: $($_.Exception.Message)" } catch {}
-        Show-TweakStatesLoadError -Message "Background worker could not be created and fallback also failed. Toggle states may be inaccurate. Error: $($_.Exception.Message)"
-    }
+    Show-TweakStatesLoadError -Message "Could not start background tweak-state detection: $($_.Exception.Message). Click Retry."
     Sync-WmtTweakOverlayHide
     return
 }
@@ -62299,21 +62297,15 @@ try {
     $async = $ps.BeginInvoke()
 }
 catch {
-    try { Write-GuiLog "[Tweak States] BeginInvoke failed: $($_.Exception.Message). Falling back to synchronous load." } catch {}
+    try { Write-GuiLog "[Tweak States] BeginInvoke failed: $($_.Exception.Message)." } catch {}
 }
 
 # BeginInvoke throws on start failure; a null result is also treated as failure.
 if ($null -eq $async) {
     try { $ps.Dispose() } catch {}
+    $script:TweakStatesBgStarted = $false
     $script:TweakStatesReady = $false
-    try {
-        Update-TweakButtonStates
-        $script:TweakStatesReady = $true
-    }
-    catch {
-        try { Write-GuiLog "[Tweak States] Fallback synchronous load also failed: $($_.Exception.Message)" } catch {}
-        Show-TweakStatesLoadError -Message "Background job failed to start and fallback also failed. Toggle states may be inaccurate. Error: $($_.Exception.Message)"
-    }
+    Show-TweakStatesLoadError -Message "Tweak-state background job did not start. The Tweaks page remains blocked; click Retry."
     Sync-WmtTweakOverlayHide
     return
 }
