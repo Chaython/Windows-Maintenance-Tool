@@ -27240,6 +27240,8 @@ Set-WmtDataGridColumns -DataGrid $dg -Columns @("InstanceId", "Class", "Friendly
 # GetNewClosure() (where $script: would otherwise point at the closure module).
 $driverUsageLoadedState = Get-Variable -Name DriverUsageLoaded -Scope Script -ErrorAction SilentlyContinue
 $driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script -ErrorAction SilentlyContinue
+$driverLoadPhaseState = Get-Variable -Name DriverLoadPhase -Scope Script -ErrorAction SilentlyContinue
+$driverLoadInProgressState = Get-Variable -Name DriverLoadInProgress -Scope Script -ErrorAction SilentlyContinue
 $state = @{ Busy = $false; Generation = 0; Started = $false; Closed = $false }
 # IsLoaded is not an adequate lifetime guard for an already closed WPF Window.
 $dialog.Add_Closed({ $state.Closed = $true; $state.Generation++ }.GetNewClosure())
@@ -27328,6 +27330,13 @@ $removeRows = {
             # The package inventory is unchanged. Refresh only the cached
             # device/service usage phase now, even while this dialog is open.
             if ($driverCacheLoadedState -and [bool]$driverCacheLoadedState.Value) {
+                # A pre-removal usage scan may still be running. Cancel its
+                # monitor asynchronously before it can publish stale bindings,
+                # then reuse the unchanged package list for a fresh usage pass.
+                if ($driverLoadInProgressState -and [bool]$driverLoadInProgressState.Value -and
+                    $driverLoadPhaseState -and [string]$driverLoadPhaseState.Value -eq "Usage") {
+                    try { Stop-DriverLoad } catch { Write-GuiLog "[Drivers] Could not supersede stale usage scan: $($_.Exception.Message)" }
+                }
                 try { Start-DriverListLoad } catch { Write-GuiLog "[Drivers] Usage refresh after ghost removal failed: $($_.Exception.Message)" }
             }
         }

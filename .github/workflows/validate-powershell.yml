@@ -373,7 +373,10 @@ jobs:
               $cacheRemoval -notmatch 'DriverCacheLoaded = \$true' -or
               $ghostDialog -notmatch 'driverUsageLoadedState' -or
               $ghostDialog -notmatch 'Start-DriverListLoad' -or
-              $ghostDialog -notmatch 'driverCacheLoadedState') {
+              $ghostDialog -notmatch 'driverCacheLoadedState' -or
+              $ghostDialog -notmatch 'driverLoadInProgressState' -or
+              $ghostDialog -notmatch 'driverLoadPhaseState' -or
+              $ghostDialog -notmatch 'Stop-DriverLoad') {
               throw 'Driver status or post-removal cache invalidation triggers redundant full scans.'
           }
           $startup = Find-FunctionText 'Start-WmtStartupBackgroundPreload'
