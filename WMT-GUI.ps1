@@ -62095,7 +62095,7 @@ catch {
             "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters",
             "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config",
             "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config",
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\``$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy",
             "HKCU:\Software\Policies\Microsoft\Windows\CloudContent",
@@ -62104,7 +62104,7 @@ catch {
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent",
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
         )
 
         # Local copy of Convert-WmtRegistryPath: this scriptblock runs on the pooled
