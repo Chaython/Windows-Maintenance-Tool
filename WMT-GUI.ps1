@@ -37925,11 +37925,12 @@ function Restore-WmtQuickFindButtons {
                 $parent.Children.Insert($position, $button)
             }
             if ($button.Parent -eq $parent) {
-                if ($placeholder -and $parent.Children.Contains($placeholder)) {
-                    [void]$parent.Children.Remove($placeholder)
-                }
+                # Restore inherited bindings before discarding the recovery slot.
                 if ($record.InheritedDataContext) {
                     $button.ClearValue([System.Windows.FrameworkElement]::DataContextProperty)
+                }
+                if ($placeholder -and $parent.Children.Contains($placeholder)) {
+                    [void]$parent.Children.Remove($placeholder)
                 }
                 $restored = $true
             }
@@ -37939,6 +37940,13 @@ function Restore-WmtQuickFindButtons {
             # parent. Reattach it to its search card so the next pass can retry.
             if (-not $button.Parent -and $quickFindHost) {
                 try { [void]$quickFindHost.Children.Add($button) } catch {}
+            }
+            if (-not $button.Parent) {
+                # The original parent is preferable to leaving a detached live tool.
+                try {
+                    $position = [Math]::Min([Math]::Max(0, [int]$record.Index), $parent.Children.Count)
+                    $parent.Children.Insert($position, $button)
+                } catch {}
             }
             try { Write-GuiLog "[Quick Find] Could not restore '$($button.Name)': $($_.Exception.Message)" } catch {}
         }
@@ -38094,7 +38102,7 @@ function Update-WmtQuickFindResults {
     try {
     Restore-WmtQuickFindButtons
     if ($script:WmtQuickFindMovedButtons.Count -gt 0) {
-        $lblQuickFindSummary.Text = "Unable to restore a tool button. Search results were preserved; try changing sections again."
+        $lblQuickFindSummary.Text = "A tool could not be restored to its original page. Results are preserved; reopen Quick Find or restart WMT if the problem persists."
         return
     }
     $pnlQuickFindMatches.Children.Clear()
@@ -38258,6 +38266,8 @@ function Update-WmtQuickFindResults {
         Restore-WmtQuickFindButtons
         if ($script:WmtQuickFindMovedButtons.Count -eq 0) {
             try { $pnlQuickFindMatches.Children.Clear() } catch {}
+            $script:WmtQuickFindStateLabels.Clear()
+            $script:WmtQuickFindRenderedReadiness.Clear()
         }
         try { $lblQuickFindSummary.Text = "Quick Find could not render this search. Please refine your query." } catch {}
         try { Write-GuiLog "[Quick Find] Failed to render tool buttons: $($_.Exception.Message)" } catch {}
