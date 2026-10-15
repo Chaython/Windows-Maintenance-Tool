@@ -37856,6 +37856,7 @@ function Show-WmtQuickFindPage {
 $script:WmtQuickFindMovedButtons = [System.Collections.ArrayList]::new()
 $script:WmtQuickFindUpdating = $false
 $script:WmtQuickFindStateLabels = @{}
+$script:WmtQuickFindRenderedReadiness = @{}
 function Refresh-WmtQuickFindStateLabels {
     if (-not $pnlQuickFind -or -not $pnlQuickFind.IsVisible) { return }
     foreach ($name in @($script:WmtQuickFindStateLabels.Keys)) {
@@ -37873,6 +37874,26 @@ function Refresh-WmtQuickFindStateLabels {
             $label.Text = "State: Unknown / not detected"
         }
     }
+}
+function Sync-WmtQuickFindStateAvailability {
+    if (-not $pnlQuickFind -or -not $pnlQuickFind.IsVisible) { return }
+    $requiresRebuild = $false
+    foreach ($name in @($script:WmtQuickFindRenderedReadiness.Keys)) {
+        $optional = [bool]($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $name)
+        $ready = if ($optional) {
+            [bool]($script:OptionalFeaturesReady -and $script:OptionalFeatureStateCache -and
+                $script:OptionalFeatureStateCache.ContainsKey($name))
+        } else {
+            [bool]($script:TweakStatesReady -and $script:TweakCurrentStates -and
+                $script:TweakCurrentStates.Contains($name))
+        }
+        if ($ready -ne $script:WmtQuickFindRenderedReadiness[$name]) {
+            $requiresRebuild = $true
+            break
+        }
+    }
+    if ($requiresRebuild) { Update-WmtQuickFindResults }
+    else { Refresh-WmtQuickFindStateLabels }
 }
 function Restore-WmtQuickFindButtons {
     if (-not $script:WmtQuickFindMovedButtons -or $script:WmtQuickFindMovedButtons.Count -eq 0) { return }
@@ -38007,6 +38028,17 @@ function Add-WmtQuickFindOriginalButton {
                 $Button.ClearValue([System.Windows.FrameworkElement]::DataContextProperty)
             }
         } catch {}
+        # An unsuccessful rollback must remain tracked for a later restoration
+        # attempt, rather than silently losing the live control.
+        if ($Button.Parent -ne $originalParent) {
+            if (-not @($script:WmtQuickFindMovedButtons | Where-Object { [object]::ReferenceEquals($_.Button, $Button) }).Count) {
+                [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
+                    Button = $Button; Parent = $originalParent; Index = $index
+                    Placeholder = $placeholder; InheritedDataContext = $inheritedContext
+                    OriginalEnabled = $originalEnabled
+                })
+            }
+        }
         try { Write-GuiLog "[Quick Find] Cannot host '$($Button.Name)': $($_.Exception.Message)" } catch {}
         return $false
     }
@@ -38067,6 +38099,7 @@ function Update-WmtQuickFindResults {
     }
     $pnlQuickFindMatches.Children.Clear()
     $script:WmtQuickFindStateLabels.Clear()
+    $script:WmtQuickFindRenderedReadiness.Clear()
     $query = ([string]$txtGlobalSearch.Text).Trim()
     if (-not $query -or $query -eq $script:QuickFindPlaceholder) {
         $lblQuickFindSummary.Text = "Start typing in Quick Find to browse available tools."
@@ -38188,6 +38221,9 @@ function Update-WmtQuickFindResults {
                         $script:TweakCurrentStates.Contains($original.Name)
                 }
             }
+            if ($entry.Item.Tab -eq "btnTabTweaks") {
+                $script:WmtQuickFindRenderedReadiness[[string]$original.Name] = [bool]$tweakReady
+            }
             $canHost = ($original -is [System.Windows.Controls.Button]) -and
                        ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates")) -and
                        $tweakReady
@@ -38250,6 +38286,7 @@ if ($pnlQuickFind) {
             if ($pnlQuickFindMatches -and $script:WmtQuickFindMovedButtons.Count -eq 0) {
                 $pnlQuickFindMatches.Children.Clear()
                 $script:WmtQuickFindStateLabels.Clear()
+                $script:WmtQuickFindRenderedReadiness.Clear()
             }
         }
         elseif ($searchPage.IsVisible -and $txtGlobalSearch -and
@@ -62254,7 +62291,7 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                     Update-TweakButtonStates
                     # Cache is ready — coordinate overlay hide with optional features check
                     $script:TweakStatesReady = $true
-                    if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindResults }
+                    if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Sync-WmtQuickFindStateAvailability }
                     Sync-WmtTweakOverlayHide
                 } else {
                     $typeInfo = if ($result) { $result.GetType().FullName } else { "null" }
@@ -62459,7 +62496,7 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
             $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
             if (-not $script:OptionalFeaturesReady) { Write-GuiLog "[Optional Features] No valid feature states were returned. Tweaks remains blocked." }
             Sync-WmtTweakOverlayHide
-            if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindResults }
+            if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Sync-WmtQuickFindStateAvailability }
         }
     } | Out-Null
 }
