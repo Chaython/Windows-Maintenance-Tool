@@ -372,7 +372,8 @@ jobs:
               $cacheRemoval -match 'DriverCacheLoaded = \$false' -or
               $cacheRemoval -notmatch 'DriverCacheLoaded = \$true' -or
               $ghostDialog -notmatch 'driverUsageLoadedState' -or
-              $ghostDialog -notmatch 'Start-DriverListLoad') {
+              $ghostDialog -notmatch 'Start-DriverListLoad' -or
+              $ghostDialog -notmatch 'driverCacheLoadedState') {
               throw 'Driver status or post-removal cache invalidation triggers redundant full scans.'
           }
           $startup = Find-FunctionText 'Start-WmtStartupBackgroundPreload'
@@ -399,6 +400,18 @@ jobs:
               $ghostDialog -match '(?m)^\s*foreach\s*\(\$device\s+in\s+@\(Get-WmtGhostDeviceCandidates\)') {
               throw 'Ghost device enumeration returned to synchronous WPF scanning.'
           }
+          if ($ghostDialog -notmatch 'Closed = \$false' -or
+              $ghostDialog -notmatch 'Add_Closed' -or
+              $ghostDialog -notmatch '\$scanState.Closed' -or
+              $ghostDialog -notmatch 'Generation\+\+') {
+              throw 'Ghost-device completion callbacks can mutate a closed dialog.'
+          }
+          if ($driverStatuses -notmatch '\$_.PublishedName -match' -or
+              $driverStatuses -notmatch '\$_.OriginalName -match' -or
+              $driverStatuses -notmatch '\$_.Provider -notmatch') {
+              throw 'Drivers page marks metadata-ambiguous packages as old even though cleanup cannot verify them.'
+          }
+          Write-Host 'PASS: ghost callbacks respect dialog lifetime and Old status matches cleanup.'
           Write-Host 'PASS: ghost-device candidates enumerate off the WPF dispatcher.'
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'

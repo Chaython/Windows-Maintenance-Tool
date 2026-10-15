@@ -27239,7 +27239,10 @@ Set-WmtDataGridColumns -DataGrid $dg -Columns @("InstanceId", "Class", "Friendly
 # Keep cache invalidation working even though the callbacks below use
 # GetNewClosure() (where $script: would otherwise point at the closure module).
 $driverUsageLoadedState = Get-Variable -Name DriverUsageLoaded -Scope Script -ErrorAction SilentlyContinue
-$state = @{ Busy = $false; Generation = 0; Started = $false }
+$driverCacheLoadedState = Get-Variable -Name DriverCacheLoaded -Scope Script -ErrorAction SilentlyContinue
+$state = @{ Busy = $false; Generation = 0; Started = $false; Closed = $false }
+# IsLoaded is not an adequate lifetime guard for an already closed WPF Window.
+$dialog.Add_Closed({ $state.Closed = $true; $state.Generation++ }.GetNewClosure())
 
 $setBusy = {
     param([bool]$Busy, [string]$Message)
@@ -27255,7 +27258,7 @@ $setBusy = {
 # the initial startup status before the list populated. Filtering
 # Status=Unknown is only a *candidate* scan; deletion rechecks actual presence.
 $load = {
-    if ($state.Busy -or -not $dialog.IsLoaded) { return }
+    if ($state.Busy -or $state.Closed -or -not $dialog.IsLoaded) { return }
     & $setBusy $true "Scanning disconnected devices in background..."
     $items.Clear()
     $scanItems = $items
@@ -27264,7 +27267,7 @@ $load = {
     $setScanBusy = $setBusy
     $onDone = {
         param($results)
-        if (-not $scanDialog.IsLoaded) { return }
+        if ($scanState.Closed -or -not $scanDialog.IsLoaded) { return }
         $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["Candidates"] } | Select-Object -Last 1)
         if ($payload.Count -eq 0) {
             & $setScanBusy $false "Ghost-device scan returned no data. Click Refresh."
@@ -27277,7 +27280,7 @@ $load = {
     }.GetNewClosure()
     $onError = {
         param($err)
-        if (-not $scanDialog.IsLoaded) { return }
+        if ($scanState.Closed -or -not $scanDialog.IsLoaded) { return }
         $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
         Write-GuiLog "[Drivers] Ghost-device scan failed: $message"
         & $setScanBusy $false "Ghost-device scan failed. Click Refresh."
@@ -27301,7 +27304,7 @@ $load = {
 
 $removeRows = {
     param([object[]]$Rows)
-    if ($state.Busy) { return }
+    if ($state.Busy -or $state.Closed) { return }
     $ids = @($Rows | ForEach-Object { [string]$_.InstanceId } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     if ($ids.Count -eq 0) { return }
 
@@ -27311,7 +27314,7 @@ $removeRows = {
 
     $done = {
         param($results)
-        if ($generation -ne [int]$state.Generation) { return }
+        if ($state.Closed -or $generation -ne [int]$state.Generation) { return }
         $records = @($results | Where-Object { $_ -and $_.PSObject.Properties["InstanceId"] })
         $removed = @($records | Where-Object { $_.Success }).Count
         $failedRows = @($records | Where-Object { -not $_.Success })
@@ -27322,6 +27325,11 @@ $removeRows = {
             # Removing a ghost device changes bindings but not the staged
             # Driver Store package list. Refresh phase-two usage only.
             if ($driverUsageLoadedState) { $driverUsageLoadedState.Value = $false }
+            # The package inventory is unchanged. Refresh only the cached
+            # device/service usage phase now, even while this dialog is open.
+            if ($driverCacheLoadedState -and [bool]$driverCacheLoadedState.Value) {
+                try { Start-DriverListLoad } catch { Write-GuiLog "[Drivers] Usage refresh after ghost removal failed: $($_.Exception.Message)" }
+            }
         }
         & $setBusy $false ("Removed {0} device(s); rescanning..." -f $removed)
         & $load
@@ -27329,7 +27337,7 @@ $removeRows = {
 
     $failed = {
         param($err)
-        if ($generation -ne [int]$state.Generation) { return }
+        if ($state.Closed -or $generation -ne [int]$state.Generation) { return }
         & $setBusy $false "Ghost-device removal failed or timed out."
         $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
         Write-GuiLog "[Drivers] Ghost-device removal failed: $msg"
@@ -53170,7 +53178,15 @@ if ($script:DriverServiceMap) {
 # with older dates, so version must win).
 # Use exactly the same original INF/provider/class identity as cleanup preview.
 foreach ($group in @($script:DriverPackages | Where-Object {
-    $_.OriginalName -and $_.Provider -and $_.Class
+    # Match Clean Old Drivers' exact identity requirements: incomplete or
+    # tokenized INF metadata cannot establish that two packages supersede.
+    $_.PublishedName -match '^oem\d+\.inf$' -and
+    $_.OriginalName -match '^[^\\/:*?"<>|%]+\.inf$' -and
+    -not [string]::IsNullOrWhiteSpace([string]$_.Provider) -and
+    -not [string]::IsNullOrWhiteSpace([string]$_.Class) -and
+    $_.OriginalName -notmatch '^(Unknown|N/A)$|%' -and
+    $_.Provider -notmatch '^(Unknown|N/A)$|%' -and
+    $_.Class -notmatch '^(Unknown|N/A)$|%'
 } | Group-Object -Property OriginalName, Provider, Class)) {
     if ($group.Count -lt 2) { continue }
 
