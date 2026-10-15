@@ -402,6 +402,13 @@ jobs:
               $driverUsage -notmatch 'Test-Path -LiteralPath \("HKLM:') {
               throw 'Driver service inventory could be partial yet marked complete.'
           }
+          if ($driverUsage -notmatch 'hasUnresolvedService' -or
+              $driverUsage -notmatch 'Unverified = \$true' -or
+              $driverUsage -notmatch "ContainsKey\('Verified'\)" -or
+              $driverStatuses -notmatch '\$_.Unverified') {
+              throw 'Unresolved AddService syntax can silently appear Unattached or Old.'
+          }
+          Write-Host 'PASS: unresolved driver service identities remain protected and display Unknown.'
           Write-Host 'PASS: driver service/INF scan fails closed on incomplete data.'
           Write-Host 'PASS: cleanup uses fresh inventory and rechecks installed services.'
           Write-Host 'PASS: driver preloading follows optional-feature dispatch on the normal startup path.'

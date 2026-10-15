@@ -53256,6 +53256,15 @@ foreach ($row in $script:DriverPackages) {
         $svcRows = $null
         if ($script:DriverServiceMap -and $script:DriverServiceMap.ContainsKey($inf)) { $svcRows = @($script:DriverServiceMap[$inf]) }
         if ($svcRows.Count -gt 0) {
+            if (@($svcRows | Where-Object { $_.Unverified }).Count -gt 0) {
+                Set-DriverRowProperty -Row $row -Name "Status" -Value "Unknown"
+                Set-DriverRowProperty -Row $row -Name "StatusSort" -Value "4"
+                Set-DriverRowProperty -Row $row -Name "StatusTooltip" -Value "This INF has an unresolved AddService directive. It remains protected from old-driver cleanup until service usage can be verified."
+                Set-DriverRowProperty -Row $row -Name "DevicesText" -Value "?"
+                Set-DriverRowProperty -Row $row -Name "DevicesSort" -Value 0
+                Set-DriverRowProperty -Row $row -Name "DevicesTooltip" -Value "Driver-service identity is unverified."
+                continue
+            }
             $svcNames = (@($svcRows | ForEach-Object { [string]$_.Name }) -join ", ")
             $runningCount = @($svcRows | Where-Object { $_.Running }).Count
             Set-DriverRowProperty -Row $row -Name "Status" -Value "In Use"
@@ -53431,15 +53440,27 @@ try {
         try { $stamp = (Get-Item -LiteralPath $infPath -ErrorAction Stop).LastWriteTimeUtc.Ticks.ToString() } catch {}
 
         $svcNames = $null
+        $hasUnresolvedService = $false
         if ($stamp -and $svcCache.ContainsKey($infLower) -and $svcCache[$infLower].Stamp -eq $stamp) {
-            $svcNames = @($svcCache[$infLower].Names)
+            $cached = $svcCache[$infLower]
+            # Older caches lacked parse confidence; do not trust their empty lists.
+            if ($cached.ContainsKey('Verified')) {
+                $svcNames = @($cached.Names)
+                $hasUnresolvedService = -not [bool]$cached.Verified
+            }
         }
         if ($null -eq $svcNames) {
             $svcNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             try {
                 foreach ($line in @(Get-Content -LiteralPath $infPath -ErrorAction Stop)) {
+                    if ($line -notmatch '(?i)^\s*AddService\s*=') { continue }
                     if ($line -match '(?i)^\s*AddService\s*=\s*"?([A-Za-z0-9_\.\-]+)"?\s*(,|$)') {
                         [void]$svcNames.Add($matches[1])
+                    }
+                    else {
+                        # Unresolved %tokens% and unknown AddService syntax are
+                        # NOT proof of an unused driver; mark only this INF unknown.
+                        $hasUnresolvedService = $true
                     }
                 }
             }
@@ -53447,7 +53468,11 @@ try {
                 throw "Cannot verify driver service bindings for $infName : $($_.Exception.Message)"
             }
         }
-        if ($stamp) { $newSvcCache[$infLower] = @{ Stamp = $stamp; Names = @($svcNames) } }
+        if ($stamp) { $newSvcCache[$infLower] = @{ Stamp = $stamp; Names = @($svcNames); Verified = (-not $hasUnresolvedService) } }
+        if ($hasUnresolvedService) {
+            $svcInfo[$infLower] = @([PSCustomObject]@{ Name = 'Unresolved AddService identity'; Running = $false; Unverified = $true })
+            continue
+        }
         if (@($svcNames).Count -eq 0) { continue }
 
         $present = @()
