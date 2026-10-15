@@ -375,7 +375,12 @@ jobs:
               $ghostDialog -notmatch 'Start-DriverListLoad') {
               throw 'Driver status or post-removal cache invalidation triggers redundant full scans.'
           }
-          Write-Host 'PASS: post-removal cache retention and service-only driver status safety.'
+          $startup = Find-FunctionText 'Start-WmtStartupBackgroundPreload'
+          if ($startup -notmatch 'Start-OptionalFeaturesBackgroundCheck\s+\# The timer stops in this branch' -or
+              $startup -notmatch '(?s)Start-OptionalFeaturesBackgroundCheck.*?Start-DriverListLoad') {
+              throw 'Startup feature timer can stop without ever starting the driver preload.'
+          }
+          Write-Host 'PASS: driver preloading follows optional-feature dispatch on the normal startup path.'
           $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
           if ($ghostDialog -notmatch 'GhostDeviceScan_' -or
               $ghostDialog -notmatch 'Invoke-WmtUiBackgroundCommand' -or

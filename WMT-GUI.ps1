@@ -62063,6 +62063,12 @@ $script:WmtStartupPreloadTimer.Add_Tick({
         if ((-not (Test-WmtMyDevicePreloadBusy) -and -not $script:FirewallLoadInProgress) -or $elapsed -ge 8) {
             Stop-WmtStartupBackgroundPreload
             Start-OptionalFeaturesBackgroundCheck
+            # The timer stops in this branch. Start the driver worker here as
+            # well: otherwise its preload only runs when optional features had
+            # already been started by another code path before this tick.
+            if (-not $script:DriverCacheLoaded -and -not $script:DriverLoadInProgress) {
+                try { Start-DriverListLoad } catch { Write-GuiLog "[Drivers] Startup preload failed: $($_.Exception.Message)" }
+            }
         }
     })
 $script:WmtStartupPreloadTimer.Start()
