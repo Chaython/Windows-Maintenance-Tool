@@ -408,8 +408,8 @@ jobs:
               throw 'Broken child scanner was reintroduced in the ghost dialog.'
           }
           if ($dialogText.Value -notmatch 'Get-PnpDevice -ErrorAction Stop' -or
-    $dialogText.Value -notmatch 'GhostDeviceScan_' -or
-    $dialogText.Value -notmatch 'Get-PnpDevice -PresentOnly -ErrorAction Stop') {
+              $dialogText.Value -notmatch 'GhostDeviceScan_' -or
+              $dialogText.Value -notmatch 'Get-PnpDevice -PresentOnly -ErrorAction Stop') {
               throw 'Fast scanning or pre-removal connected-device verification missing.'
           }
           $themedHeaderBands = [regex]::Matches($source,
