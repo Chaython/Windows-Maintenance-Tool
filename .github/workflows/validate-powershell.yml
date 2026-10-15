@@ -254,6 +254,47 @@ jobs:
               $source -notmatch 'WmtStartupFeaturePreloadStartedAt') {
               throw 'Eager startup pool allocation or unprioritized feature preload returned.'
           }
+          # Exercise the actual registry snapshot mapper against a temporary HKCU key.
+          # The unnamed default value formerly caused [PSCustomObject]$values to
+          # throw and left the entire Tweaks page blocked.
+          Invoke-Expression (Find-FunctionText 'ConvertTo-WmtRegistrySnapshotValues')
+          Invoke-Expression (Find-FunctionText 'Get-WmtRegistrySnapshotValue')
+          $smokePath = 'Software\\WMT-Snapshot-Test-' + [Guid]::NewGuid().ToString('N')
+          $testKey = $null
+          try {
+              $testKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($smokePath)
+              if (-not $testKey) { throw 'Unable to create temporary registry test key.' }
+              $testKey.SetValue('', '.default', [Microsoft.Win32.RegistryValueKind]::String)
+              $testKey.SetValue('System.IsPinnedToNameSpaceTree', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+              $testKey.SetValue('Data', [byte[]]@(1, 2, 3), [Microsoft.Win32.RegistryValueKind]::Binary)
+              $snapshot = ConvertTo-WmtRegistrySnapshotValues -RegistryKey $testKey
+              if ($snapshot -isnot [System.Collections.IDictionary] -or
+                  -not $snapshot.Contains('') -or
+                  (Get-WmtRegistrySnapshotValue -Item $snapshot -Name '(Default)' -Default 'MISSING') -ne '.default' -or
+                  (Get-WmtRegistrySnapshotValue -Item $snapshot -Name 'System.IsPinnedToNameSpaceTree' -Default -1) -ne 0 -or
+                  (Get-WmtRegistrySnapshotValue -Item $snapshot -Name 'missing' -Default 17) -ne 17 -or
+                  @(Get-WmtRegistrySnapshotValue -Item $snapshot -Name 'Data').Count -ne 3) {
+                  throw 'Registry snapshot lost unnamed, named, or binary values.'
+              }
+              $testKey.SetValue('', '', [Microsoft.Win32.RegistryValueKind]::String)
+              $emptySnapshot = ConvertTo-WmtRegistrySnapshotValues -RegistryKey $testKey
+              if ((Get-WmtRegistrySnapshotValue -Item $emptySnapshot -Name '(Default)' -Default 'MISSING') -ne '') {
+                  throw 'Empty unnamed registry value was confused with a missing value.'
+              }
+              $legacy = [pscustomobject]@{ Existing = 'value' }
+              if ((Get-WmtRegistrySnapshotValue -Item $legacy -Name 'Existing') -ne 'value') {
+                  throw 'Legacy registry PSObject lookup regressed.'
+              }
+          }
+          finally {
+              if ($testKey) { $testKey.Dispose() }
+              [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($smokePath, $false)
+          }
+          if ($source -match '\\$regCache\\[\\$path\\]\\s*=\\s*\\[PSCustomObject\\]\\$values') {
+              throw 'Registry snapshot once again casts unnamed values to PSCustomObject.'
+          }
+          Write-Host 'PASS: registry snapshots retain unnamed defaults, named data and legacy object values.'
+
           # Exercise the actual My Device queue with an unavailable pool.
           # A failed attempt must retain the section and throttle UI-thread retries.
           Invoke-Expression (Find-FunctionText 'Start-MyDeviceSectionJob')
