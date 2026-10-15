@@ -37855,6 +37855,25 @@ function Show-WmtQuickFindPage {
 # filter changes, memory trimming, or window shutdown.
 $script:WmtQuickFindMovedButtons = [System.Collections.ArrayList]::new()
 $script:WmtQuickFindUpdating = $false
+$script:WmtQuickFindStateLabels = @{}
+function Refresh-WmtQuickFindStateLabels {
+    if (-not $pnlQuickFind -or -not $pnlQuickFind.IsVisible) { return }
+    foreach ($name in @($script:WmtQuickFindStateLabels.Keys)) {
+        $label = $script:WmtQuickFindStateLabels[$name]
+        if (-not $label) { continue }
+        $optional = [bool]($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $name)
+        if (($optional -and -not $script:OptionalFeaturesReady) -or
+            (-not $optional -and -not $script:TweakStatesReady)) {
+            $label.Text = "State: Checking..."
+        } elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
+            $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
+        } elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
+            $label.Text = if ($script:TweakCurrentStates[$name].On) { "State: Enabled" } else { "State: Disabled" }
+        } else {
+            $label.Text = "State: Unknown / not detected"
+        }
+    }
+}
 function Restore-WmtQuickFindButtons {
     if (-not $script:WmtQuickFindMovedButtons -or $script:WmtQuickFindMovedButtons.Count -eq 0) { return }
     $pending = [System.Collections.ArrayList]::new()
@@ -38047,6 +38066,7 @@ function Update-WmtQuickFindResults {
         return
     }
     $pnlQuickFindMatches.Children.Clear()
+    $script:WmtQuickFindStateLabels.Clear()
     $query = ([string]$txtGlobalSearch.Text).Trim()
     if (-not $query -or $query -eq $script:QuickFindPlaceholder) {
         $lblQuickFindSummary.Text = "Start typing in Quick Find to browse available tools."
@@ -38150,17 +38170,7 @@ function Update-WmtQuickFindResults {
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
                 $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 $stateName = [string]$entry.Item.Button.Name
-                $isOptional = ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName)
-                if (($isOptional -and -not $script:OptionalFeaturesReady) -or
-                    (-not $isOptional -and -not $script:TweakStatesReady)) {
-                    $stateLabel.Text = "State: Checking..."
-                } elseif ($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($stateName)) {
-                    $stateLabel.Text = if ($script:OptionalFeatureStateCache[$stateName]) { "State: Enabled" } else { "State: Disabled" }
-                } elseif ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($stateName)) {
-                    $stateLabel.Text = if ($script:TweakCurrentStates[$stateName].On) { "State: Enabled" } else { "State: Disabled" }
-                } else {
-                    $stateLabel.Text = "State: Unknown / not detected"
-                }
+                $script:WmtQuickFindStateLabels[$stateName] = $stateLabel
                 [void]$body.Children.Add($stateLabel)
             }
             # Reparent the actual original Button, retaining its existing handlers,
@@ -38206,6 +38216,7 @@ function Update-WmtQuickFindResults {
         }
         [void]$pnlQuickFindMatches.Children.Add($wrap)
     }
+    Refresh-WmtQuickFindStateLabels
     }
     catch {
         Restore-WmtQuickFindButtons
@@ -38238,6 +38249,7 @@ if ($pnlQuickFind) {
             Restore-WmtQuickFindButtons
             if ($pnlQuickFindMatches -and $script:WmtQuickFindMovedButtons.Count -eq 0) {
                 $pnlQuickFindMatches.Children.Clear()
+                $script:WmtQuickFindStateLabels.Clear()
             }
         }
         elseif ($searchPage.IsVisible -and $txtGlobalSearch -and
