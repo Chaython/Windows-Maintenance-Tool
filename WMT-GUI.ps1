@@ -2063,7 +2063,7 @@ if ($script:MyDeviceWorkerRetryAfterUtc -and
     [DateTime]::UtcNow -lt $script:MyDeviceWorkerRetryAfterUtc) { return }
 
 if (-not $script:MyDeviceStatsMaxConcurrent -or $script:MyDeviceStatsMaxConcurrent -lt 1) {
-    $script:MyDeviceStatsMaxConcurrent = 4
+    $script:MyDeviceStatsMaxConcurrent = 3
 }
 
 while ($script:MyDeviceSectionJobs.Count -lt $script:MyDeviceStatsMaxConcurrent -and $script:MyDevicePendingSections.Count -gt 0) {
@@ -3397,8 +3397,10 @@ param(
 )
 $ps = $null
 try {
-$ps = New-WmtPooledPowerShell -PoolKind UiSupport
+$ps = New-WmtPooledPowerShell -PoolKind Background
 
+# Use the Background pool for hardware scans; leave UiSupport available for
+# Tweaks and other foreground state queries.
 # Bulletproof fix: Inject the helper functions directly into the script block.
 # This completely bypasses the fragile regex parser that was failing to load them.
 $fullScript = $script:MyDeviceCommonHelpers + "`n" + $Body
@@ -3430,7 +3432,7 @@ $script:MyDeviceStatsStarted = $true
 $script:MyDeviceStatsLastDisabled = [bool](Get-WmtDisableBackgroundJobs)
 $script:StatsStartedAt = Get-Date
 $script:MyDeviceStatsPreloadMode = [bool]$Preload
-$script:MyDeviceStatsMaxConcurrent = 4
+$script:MyDeviceStatsMaxConcurrent = 3
 Stop-MyDeviceSectionJobs
 $script:MyDeviceWorkerRetryAfterUtc = $null
 $script:MyDevicePendingSections = [System.Collections.ArrayList]::new()
@@ -36465,7 +36467,7 @@ $tabButton.Add_Click({
                 }
                 elseif ($script:MyDeviceStatsPreloadMode) {
                     $script:MyDeviceStatsPreloadMode = $false
-                    $script:MyDeviceStatsMaxConcurrent = 4
+                    $script:MyDeviceStatsMaxConcurrent = 3
                     Start-MyDeviceQueuedSections
                 }
             }
@@ -62164,6 +62166,8 @@ catch {
         }
 
         $regCache = @{}
+        # Distinguish missing registry keys from exceptions while reading them.
+        $registryReadErrors = [System.Collections.Generic.List[string]]::new()
         # Close each handle even when a registry read fails.
         foreach ($path in $paths) {
             $baseKey = $null
@@ -62186,7 +62190,10 @@ catch {
                     $regCache[$path] = $null
                 }
             }
-            catch { $regCache[$path] = $null }
+            catch {
+                [void]$registryReadErrors.Add(("{0}: {1}" -f $path, $_.Exception.Message))
+                $regCache[$path] = $null
+            }
             finally {
                 if ($key) { $key.Dispose() }
                 if ($baseKey) { $baseKey.Dispose() }
@@ -62199,21 +62206,23 @@ catch {
 
             if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
 
+            $baseKey = $null
+            $key = $null
             try {
                 $parts = Convert-WmtRegistryPath -Path $Path
-                if (-not $parts) { return $false }
-
+                if (-not $parts) { throw "Unsupported registry path: $Path" }
                 $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
-                # OpenSubKey default wildcardsAllowed=$false — literal '*'/'?' in
-                # subkey names are NOT expanded as globs. Prevents 0xCFFFFFFF hangs.
+                # Literal subkeys (including '*') are not expanded as patterns.
                 $key = $baseKey.OpenSubKey($parts.SubPath, $false)
-                $exists = $null -ne $key
-                if ($key) { $key.Close() }
-                if ($baseKey) { $baseKey.Close() }
-                return $exists
+                return ($null -ne $key)
             }
             catch {
-                return $false
+                [void]$registryReadErrors.Add(("{0}: {1}" -f $Path, $_.Exception.Message))
+                return $null
+            }
+            finally {
+                if ($key) { $key.Dispose() }
+                if ($baseKey) { $baseKey.Dispose() }
             }
         }
 
@@ -62310,9 +62319,10 @@ catch {
         try { $supportChecks["CEIP"] = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" } catch { $supportChecks["CEIP"] = $true }
         try { $supportChecks["Speech"] = ($null -ne (Get-ItemProperty "HKCU:\Software\Microsoft\Speech_OneSet" -Name "AcceptPrivacyNotice" -ErrorAction SilentlyContinue)) } catch { $supportChecks["Speech"] = $true }
 
-        # Counts let the UI callback reject truncated snapshots.
+        # Missing paths are normal; exceptions invalidate the cached snapshot.
         return @{ RegCache = $regCache; PathChecks = $pathChecks; NonRegData = $nonRegData;
-                  SupportChecks = $supportChecks; ExpectedRegPaths = $paths.Count }
+                  SupportChecks = $supportChecks; ExpectedRegPaths = $paths.Count;
+                  RegistryReadErrors = @($registryReadErrors.ToArray()) }
     })
 
 $async = $null
@@ -62358,6 +62368,8 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                     $result.NonRegData -is [System.Collections.IDictionary] -and
                     $result.SupportChecks -is [System.Collections.IDictionary] -and
                     $result.ExpectedRegPaths -gt 0 -and
+                    $null -ne $result.RegistryReadErrors -and
+                    @($result.RegistryReadErrors).Count -eq 0 -and
                     $result.RegCache.Count -eq $result.ExpectedRegPaths -and
                     $result.PathChecks.Count -eq 7 -and
                     $result.SupportChecks.Count -eq 6 -and
@@ -62376,9 +62388,17 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                 } else {
                     $typeInfo = if ($result) { $result.GetType().FullName } else { "null" }
                     try { Write-GuiLog "[Tweak States] Background preload returned unexpected type: $typeInfo" } catch {}
-                    # Cache was not populated; keep the tweak overlay blocked until Retry
+                    # Unreadable paths are not equivalent to disabled settings.
                     $script:TweakStatesReady = $false
-                    Show-TweakStatesLoadError -Message "Tweak state cache returned invalid data (type: $typeInfo). Buttons will use live registry reads as fallback, which may be slow."
+                    $failureDetails = if ($result -is [hashtable] -and @($result.RegistryReadErrors).Count -gt 0) {
+                        "Registry snapshot had $(@($result.RegistryReadErrors).Count) unreadable paths; see activity log."
+                    } else { "Snapshot validation failed (type: $typeInfo)." }
+                    if ($result -is [hashtable]) {
+                        foreach ($readError in @($result.RegistryReadErrors) | Select-Object -First 10) {
+                            try { Write-GuiLog "[Tweak States] Registry read failure: $readError" } catch {}
+                        }
+                    }
+                    Show-TweakStatesLoadError -Message "$failureDetails Tweaks remain blocked. Click Retry."
                 }
             }
             catch [System.Management.Automation.Runspaces.InvalidRunspacePoolStateException] {
@@ -62394,7 +62414,7 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                 try { Write-GuiLog "[Tweak States] Background load failed: $errMsg" } catch {}
                 $script:TweakStatesReady = $false
                 Sync-WmtTweakOverlayHide
-                Show-TweakStatesLoadError -Message "Background tweak state load failed: $errMsg. Buttons will use live registry reads."
+                Show-TweakStatesLoadError -Message "Background tweak state load failed: $errMsg. Tweaks remain blocked; click Retry."
             }
             if ($script:TweakStatesBgTimeout) { try { $script:TweakStatesBgTimeout.Stop() } catch {}; $script:TweakStatesBgTimeout = $null }
             if (-not $script:TweakStatesReady) { $script:TweakStatesBgStarted = $false }
