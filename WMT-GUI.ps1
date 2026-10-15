@@ -27658,7 +27658,40 @@ $inUse = @(
     Where-Object { $_.InfName -match '^oem\d+\.inf$' } |
     Select-Object -ExpandProperty InfName -Unique
 )
-return [PSCustomObject]@{ Succeeded = $true; InUseInfs = [string[]]$inUse }
+# Signed-device bindings miss filter, antivirus, audio and bus-driver services.
+# On targeted deletion, verify the installed INF against registered services.
+# Runs in the background cleanup worker, never during WPF rendering.
+$registeredServices = [System.Collections.Generic.List[string]]::new()
+if ($PublishedName) {
+    $infPath = Join-Path $env:SystemRoot ('INF\' + $PublishedName)
+    if (-not (Test-Path -LiteralPath $infPath -PathType Leaf)) {
+        throw "Cannot verify driver services: $PublishedName is missing from the Windows INF store."
+    }
+    $serviceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in @(Get-Content -LiteralPath $infPath -ErrorAction Stop)) {
+        if ($line -notmatch '(?i)^\s*AddService\s*=') { continue }
+        if ($line -notmatch '(?i)^\s*AddService\s*=\s*"?(?<Service>[A-Za-z0-9_.-]+)"?\s*(?:,|;|$)') {
+            # Do not guess at unresolved service-name macros or unknown INF forms.
+            throw "Cannot verify service identity in $PublishedName (AddService directive)."
+        }
+        [void]$serviceNames.Add([string]$Matches.Service)
+    }
+    foreach ($serviceName in $serviceNames) {
+        $key = $null
+        try {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                ('SYSTEM\CurrentControlSet\Services\' + $serviceName), $false
+            )
+            if ($key) { [void]$registeredServices.Add($serviceName) }
+        }
+        finally { if ($key) { $key.Dispose() } }
+    }
+}
+return [PSCustomObject]@{
+    Succeeded = $true
+    InUseInfs = [string[]]$inUse
+    RegisteredServices = [string[]]$registeredServices.ToArray()
+}
 }
 
 function Invoke-WmtDriverCleanupBatch {
@@ -27723,6 +27756,9 @@ foreach ($item in @($Items)) {
             throw $stopReason
         }
         if ($freshUsage.InUseInfs -contains $name) { throw 'This driver package is now in use by a device.' }
+        if (@($freshUsage.RegisteredServices).Count -gt 0) {
+            throw ("Driver package still installs a registered service: " + (@($freshUsage.RegisteredServices) -join ', '))
+        }
         if ($CleanupProgress -and $CleanupProgress.Cancelled) { throw 'Driver cleanup was cancelled when the dialog closed.' }
         $stage = 'Deletion'
         if ($CleanupProgress) { $CleanupProgress.Stage = if ($Mode -eq 'Force') { 'Force removing' } else { 'Removing' } }
@@ -27780,7 +27816,13 @@ param(
 if ($null -eq $DriverOutput -and $null -eq $DriverPackages) {
     # Reuse completed, verified driver inventory. The deletion worker still
     # rechecks usage immediately before every delete (including force retries).
-    if ($script:DriverCacheLoaded -and $script:DriverUsageLoaded -and -not $script:DriverLoadInProgress) {
+    # Trust the inventory until its TTL expires; stale previews must refresh.
+    $cacheFresh = $false
+    if ($script:DriverCacheLoaded -and $script:DriverCacheLoadedAt -and
+        $script:DriverCacheLoadedAt -ne [DateTime]::MinValue) {
+        $cacheFresh = (((Get-Date) - $script:DriverCacheLoadedAt).TotalSeconds -lt $script:DriverCacheTtlSeconds)
+    }
+    if ($cacheFresh -and $script:DriverUsageLoaded -and -not $script:DriverLoadInProgress) {
         $DriverPackages = @($script:DriverPackages)
         # Service-backed/filter driver packages can lack PnP device bindings.
         # Protect both registered services and bound device driver packages.
@@ -27801,38 +27843,6 @@ if ($null -eq $DriverOutput -and $null -eq $DriverPackages) {
         return
     }
 }
-if ($null -eq $DriverOutput -and $null -eq $DriverPackages) {
-    $scanComplete = {
-        param($results)
-        $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["DriverOutput"] } | Select-Object -Last 1)
-        if ($payload.Count -eq 0) {
-            Show-WmtMessageBox -Message "Driver store scan returned no result." -Title "Clean Old Drivers" -Image Warning | Out-Null
-            return
-        }
-        if (-not [bool]$payload[0].UsageScanSucceeded) {
-            Show-WmtMessageBox -Message "Driver usage could not be verified. Cleanup was stopped." -Title "Clean Old Drivers" -Image Warning | Out-Null
-            return
-        }
-        Show-DriverCleanupDialog -DriverOutput @($payload[0].DriverOutput) -InUseInfs @($payload[0].InUseInfs) -UsageScanSucceeded
-    }.GetNewClosure()
-    $scanError = {
-        param($err)
-        $message = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
-        Show-WmtMessageBox -Message ("Could not scan the driver store. " + $message) -Title "Clean Old Drivers" -Image Warning | Out-Null
-    }.GetNewClosure()
-
-    Invoke-WmtUiBackgroundCommand -Name "DriverCleanupScan" -Msg "Scanning driver store..." -TimeoutMs 120000 -SuppressResultLog -Sb {
-        $driverOutput = @(pnputil.exe /enum-drivers 2>&1 | ForEach-Object { [string]$_ })
-        $usage = Get-WmtDriverCleanupUsage
-        [PSCustomObject]@{
-            DriverOutput = $driverOutput
-            InUseInfs    = [string[]]$usage.InUseInfs
-            UsageScanSucceeded = [bool]$usage.Succeeded
-        }
-    } -OnComplete $scanComplete -OnError $scanError | Out-Null
-    return
-}
-
 if (-not $UsageScanSucceeded -or $null -eq $InUseInfs) {
     Show-WmtMessageBox -Message "Driver usage is unknown. Scan again before removing driver packages." -Title "Clean Old Drivers" -Image Warning | Out-Null
     return
