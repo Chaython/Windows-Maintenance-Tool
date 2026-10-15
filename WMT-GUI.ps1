@@ -57018,9 +57018,20 @@ if ($btnAppxRemoveSel) { $btnAppxRemoveSel.Add_Click({
 }) }
 
 if ($btnAppxRemoveAll) { $btnAppxRemoveAll.Add_Click({
-    if ((Show-WmtMessageBox -Message "Remove ALL listed apps? This cannot be undone easily." -Title "Confirm" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
-        $btnAppxRemoveSel.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+    # The original handler only forwarded the currently selected rows, so
+    # "Remove All" silently behaved as "Remove Selected" (or did nothing).
+    if (-not $lstAppxPackages -or $lstAppxPackages.Items.Count -eq 0) {
+        Write-GuiLog "[AppX] No removable applications are loaded."
+        return
     }
+    $total = [int]$lstAppxPackages.Items.Count
+    if ((Show-WmtMessageBox -Message "Remove ALL $total listed applications? This cannot be undone easily." -Title "Confirm Remove All" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) {
+        return
+    }
+    # SelectionMode=Multiple permits SelectAll(); the existing guarded
+    # removal path still owns the actual async removal and result refresh.
+    $lstAppxPackages.SelectAll()
+    $btnAppxRemoveSel.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
 }) }
 
 # --- WINDOWS FEATURES TOGGLE ---
