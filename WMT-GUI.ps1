@@ -37918,6 +37918,8 @@ function Add-WmtQuickFindOriginalButton {
     $foundPage = $false
     for ($depth = 0; $ancestor -and $depth -lt 80; $depth++) {
         if ($ancestor -is [System.Windows.FrameworkElement] -and -not $ancestor.IsEnabled) { return $false }
+        if ($ancestor -is [System.Windows.UIElement] -and
+            [System.Windows.Data.BindingOperations]::IsDataBound($ancestor, [System.Windows.UIElement]::IsEnabledProperty)) { return $false }
         if ($ancestor.Name -in $pageNames) { $foundPage = $true; break }
         if ($ancestor -is [System.Windows.FrameworkElement] -and
             $ancestor.Visibility -ne [System.Windows.Visibility]::Visible) { return $false }
@@ -37932,6 +37934,7 @@ function Add-WmtQuickFindOriginalButton {
         $Button.ReadLocalValue([System.Windows.FrameworkElement]::DataContextProperty),
         [System.Windows.DependencyProperty]::UnsetValue)
     $originalContext = $Button.DataContext
+    $originalEnabled = $Button.IsEnabled
     # A button whose command relies on a binding or an inherited context
     # cannot safely be moved across visual/logical trees.
     foreach ($property in @(
@@ -37960,6 +37963,7 @@ function Add-WmtQuickFindOriginalButton {
         [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
             Button = $Button; Parent = $originalParent; Index = $index
             Placeholder = $placeholder; InheritedDataContext = $inheritedContext
+            OriginalEnabled = $originalEnabled
         })
         return $true
     }
@@ -38043,7 +38047,12 @@ function Update-WmtQuickFindResults {
     $matches = [System.Collections.ArrayList]::new()
     $seen = @{}
     foreach ($entry in $script:WmtSearchIndexEntries) {
-        if (-not $entry -or $entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        if (-not $entry) { continue }
+        $liveTooltip = ""
+        try { if ($entry.Item.Button.ToolTip -is [string]) { $liveTooltip = [string]$entry.Item.Button.ToolTip } } catch {}
+        $entry.Description = $liveTooltip
+        $entry.SearchText = "$($entry.Text) $liveTooltip"
+        if ($entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         # Dynamic pages can replace controls after the index was built. Resolve
         # the current named instance instead of hosting a detached stale button.
         $name = [string]$entry.Item.Button.Name
@@ -38064,6 +38073,13 @@ function Update-WmtQuickFindResults {
         $seen[$key] = $true
         [void]$matches.Add($entry)
     }
+    $matches = @($matches | Sort-Object @{ Expression = {
+        $label = [string]$_.Text
+        if ($label.Equals($query, [System.StringComparison]::OrdinalIgnoreCase)) { 0 }
+        elseif ($label.StartsWith($query, [System.StringComparison]::OrdinalIgnoreCase)) { 1 }
+        elseif ($label.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { 2 }
+        else { 3 }
+    } }, @{ Expression = { [string]$_.Text } })
     # Limit expensive WPF reparenting for very broad search terms.
     $limit = 16
     $lblQuickFindSummary.Text = if ($matches.Count -eq 0) {
@@ -38087,7 +38103,8 @@ function Update-WmtQuickFindResults {
         foreach ($entry in $items) {
             if ($rendered -ge $limit) { break }
             $card = [System.Windows.Controls.Border]::new()
-            $card.Width = 310
+            $card.MinWidth = 240
+            $card.MaxWidth = 380
             $card.Padding = [System.Windows.Thickness]::new(14)
             $card.Margin = [System.Windows.Thickness]::new(0,0,12,12)
             $card.CornerRadius = [System.Windows.CornerRadius]::new(8)
@@ -38118,7 +38135,9 @@ function Update-WmtQuickFindResults {
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
                 $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 $stateName = [string]$entry.Item.Button.Name
-                if (-not $script:TweakStatesReady -or -not $script:OptionalFeaturesReady) {
+                $isOptional = ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $stateName)
+                if (($isOptional -and -not $script:OptionalFeaturesReady) -or
+                    (-not $isOptional -and -not $script:TweakStatesReady)) {
                     $stateLabel.Text = "State: Checking..."
                 } elseif ($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($stateName)) {
                     $stateLabel.Text = if ($script:OptionalFeatureStateCache[$stateName]) { "State: Enabled" } else { "State: Disabled" }
@@ -38134,8 +38153,9 @@ function Update-WmtQuickFindResults {
             $original = $entry.Item.Button
             $tweakReady = $true
             if ($entry.Item.Tab -eq "btnTabTweaks") {
-                $tweakReady = $script:TweakStatesReady -and $script:OptionalFeaturesReady
-                if ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $original.Name) {
+                $isOptional = ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $original.Name)
+                $tweakReady = if ($isOptional) { $script:OptionalFeaturesReady } else { $script:TweakStatesReady }
+                if ($isOptional) {
                     $tweakReady = $tweakReady -and $script:OptionalFeatureStateCache -and
                         $script:OptionalFeatureStateCache.ContainsKey($original.Name)
                 } else {
