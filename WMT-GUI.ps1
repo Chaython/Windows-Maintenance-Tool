@@ -36458,60 +36458,17 @@ $tabButton.Add_Click({
         }
         if ($s.Name -eq "btnTabTweaks") {
             Update-TweaksResponsiveLayout
-            if (-not (Get-WmtDisableBackgroundJobs)) {
-                # Start Tweak States background load on first Tweaks tab visit
-                Start-TweakButtonStatesBackgroundUpdate
-                Start-OptionalFeaturesBackgroundCheck
-                # Auto-load AppX bloatware list on first visit (background, no busy cursor)
-                if (-not $script:AppxListLoaded) {
-                    $script:AppxListLoaded = $true
-                    Start-AppxBackgroundLoad
-                }
-                Sync-WmtTweakOverlayHide
+            # A manual Tweaks visit must always use async detection, even when
+            # automatic background preloading is disabled in Settings.
+            # Never perform feature/DISM or live registry scans on the WPF thread.
+            Set-TweakStatesLoadingOverlay -Visible $true
+            if (-not $script:TweakStatesReady) { Start-TweakButtonStatesBackgroundUpdate }
+            if (-not $script:OptionalFeaturesReady) { Start-OptionalFeaturesBackgroundCheck }
+            if (-not (Get-WmtDisableBackgroundJobs) -and -not $script:AppxListLoaded) {
+                $script:AppxListLoaded = $true
+                Start-AppxBackgroundLoad
             }
-            elseif (-not $script:TweakStatesReady) {
-                # Background jobs disabled — do a one-time synchronous load with error fallback
-                Set-TweakStatesLoadingOverlay -Visible $true
-                                # Explicitly set the initial state of the two loads
-                                $script:OptionalFeaturesReady = $false
-                $script:TweakStatesReady = $false
-                                # Allows the UI to render the overlay before the heavy work begins
-                                $window.Dispatcher.Invoke(
-                    [System.Action]{},
-                    [System.Windows.Threading.DispatcherPriority]::Render
-                )
-                $optionalFeaturesLoaded = $false
-                $tweakStatesLoaded = $false
-                try {
-                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                    Update-OptionalFeaturesSynchronously                                        
-                    $optionalFeaturesLoaded = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
-                    $script:OptionalFeaturesReady = $optionalFeaturesLoaded
-                    if (-not $optionalFeaturesLoaded) { throw "Optional-feature scan returned no verified states." }
-                    # Update the overlay immediately after the first load
-                    Sync-WmtTweakOverlayHide                                    
-                    Update-TweakButtonStates
-                    $tweakStatesLoaded = $true
-                    $script:TweakStatesReady = $true                                    
-                                        # Update the overlay immediately after the second load
-                    Sync-WmtTweakOverlayHide
-                    $sw.Stop()
-                    if ($sw.ElapsedMilliseconds -gt 3000) {
-                        try { Write-GuiLog "[Tweak States] Synchronous load completed slowly ($($sw.ElapsedMilliseconds)ms). Consider enabling background jobs in Settings." } catch {}
-                    }
-                }
-                catch {
-                    $errMsg = $_.Exception.Message
-                    try { Write-GuiLog "[Tweak States] ERROR: Failed to load tweak states: $errMsg" } catch {}
-                    # Show error on overlay briefly before hiding
-                    Show-TweakStatesLoadError -Message "Failed to load tweak states. Toggle buttons may show incorrect states. Click Retry or switch tabs and back. Error: $errMsg"
-                }
-                finally {
-                    $script:OptionalFeaturesReady = $optionalFeaturesLoaded
-                    $script:TweakStatesReady = $tweakStatesLoaded
-                    Sync-WmtTweakOverlayHide
-                }
-            }
+            Sync-WmtTweakOverlayHide
         }
     })
 }
@@ -37869,6 +37826,8 @@ function Refresh-WmtQuickFindStateLabels {
         if (($optional -and -not $script:OptionalFeaturesReady) -or
             (-not $optional -and -not $script:TweakStatesReady)) {
             $label.Text = "State: Checking..."
+        } elseif ($optional -and $script:OptionalFeatureUnavailableCache -and $script:OptionalFeatureUnavailableCache.ContainsKey($name)) {
+            $label.Text = "State: $($script:OptionalFeatureUnavailableCache[$name])"
         } elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
             $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
         } elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
@@ -57065,14 +57024,18 @@ Write-GuiLog "Display scale set to $Scale% (log off / restart to apply)."
 
 function Update-SingleFeatureButtonState {
 param([string]$ButtonName, [string]$FeatureName)
-# Only cached background detection may enable this control; no UI-thread DISM.
+# Only verified states may make a feature control actionable.
 $btn = Get-Ctrl $ButtonName
 if (-not $btn) { return }
 $known = [bool]($script:OptionalFeaturesReady -and $script:OptionalFeatureStateCache -and
     $script:OptionalFeatureStateCache.ContainsKey($ButtonName))
 $btn.IsEnabled = $known
 if (-not $known) {
-    $btn.ToolTip = "Feature state not verified or unsupported on this Windows version."
+    $reason = if ($script:OptionalFeatureUnavailableCache -and
+        $script:OptionalFeatureUnavailableCache.ContainsKey($ButtonName)) {
+        [string]$script:OptionalFeatureUnavailableCache[$ButtonName]
+    } else { "Not verified (scan pending or failed)" }
+    $btn.ToolTip = "Feature unavailable: $reason. No changes can be made."
     return
 }
 $isEnabled = [bool]$script:OptionalFeatureStateCache[$ButtonName]
@@ -57084,82 +57047,90 @@ $btn.ToolTip = if ($isEnabled) {
 }
 }
 function Switch-WindowsFeature($FeatureName, $DisplayName) {
-$buttonName = switch ($FeatureName) {
-    "Microsoft-Hyper-V-All" { "btnFeatHyperV" }
-    "Microsoft-Windows-Subsystem-Linux" { "btnFeatWSL" }
-    "Containers-DisposableClientVM" { "btnFeatSandbox" }
-    "NetFx3" { "btnFeatDotNet35" }
-    "ServicesForNFS-ClientOnly" { "btnFeatNFS" }
-    "TelnetClient" { "btnFeatTelnet" }
-    "IIS-WebServerRole" { "btnFeatIIS" }
-    "WindowsMediaPlayer" { "btnFeatLegacy" }
-    "VirtualMachinePlatform" { "btnFeatVMP" }
-    "HypervisorPlatform" { "btnFeatWHP" }
-    "OpenSSH.Client" { "btnFeatSSHClient" }
-    "OpenSSH.Server" { "btnFeatSSHServer" }
-    "Windows-Defender-ApplicationGuard" { "btnFeatAppGuard" }
-    "WirelessDisplay" { "btnFeatMiracast" }
-    "QuickAssist" { "btnFeatQuickAssist" }
-    "XpsViewer" { "btnFeatXPS" }
-    "TIFFIFilter" { "btnFeatTIFF" }
-    default { "" }
+$buttonName = [string]$script:OptionalFeaturesMap[$FeatureName]
+if (-not $buttonName -or -not $script:OptionalFeaturesReady -or
+    -not $script:OptionalFeatureStateCache -or
+    -not $script:OptionalFeatureStateCache.ContainsKey($buttonName) -or
+    -not $script:OptionalFeatureProviderCache -or
+    -not $script:OptionalFeatureProviderCache.ContainsKey($buttonName)) {
+    Write-GuiLog "[Optional Features] Refusing to toggle $DisplayName: current state/provider not verified."
+    return
+}
+$provider = $script:OptionalFeatureProviderCache[$buttonName]
+$kind = [string]$provider.Type
+$targetName = [string]$provider.Name
+if ($kind -notin @("Feature", "Capability") -or -not $targetName) {
+    Write-GuiLog "[Optional Features] Refusing to toggle $DisplayName: invalid feature provider."
+    return
 }
 $done = {
     param($results)
-    # Never query DISM synchronously in an action completion callback.
+    # Clear stale states immediately and verify the result asynchronously.
     $script:OptionalFeaturesReady = $false
     $script:OptionalFeaturesCheckStarted = $false
     $script:OptionalFeatureStateCache = @{}
+    $script:OptionalFeatureUnavailableCache = @{}
+    $script:OptionalFeatureProviderCache = @{}
     Sync-WmtOptionalFeatureButtons
     Start-OptionalFeaturesBackgroundCheck
     Sync-WmtTweakOverlayHide
     Sync-WmtQuickFindStateAvailability
 }
 Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $DisplayName..." -Sb {
-    param($fn, $dn)
-    if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
-        Write-Output "PowerShell feature cmdlets unavailable; trying DISM fallback..."
-        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn" -TimeoutMs 30000
-        if ($featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
-            throw "Cannot verify the current state of $dn; no changes were made."
-        }
-        if ($Matches[1] -eq 'Enabled') {
-            dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
-        }
-        else {
-            dism /Online /Enable-Feature /FeatureName:$fn /All /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-Output "Enabled: $dn (DISM)" } else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
-        }
-        return
-    }
-    $feature = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction SilentlyContinue
-    if (-not $feature) {
-        if ($fn -ne "NetFx3") { throw "Feature name $fn is unknown." }
-        Write-Output "$dn not detected via PowerShell; trying DISM fallback..."
-        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn" -TimeoutMs 30000
-        if ($featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
-            throw "Cannot verify the current state of $dn; no changes were made."
-        }
-        if ($Matches[1] -eq 'Enabled') {
-            dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
-        }
-        else {
-            dism /Online /Enable-Feature /FeatureName:$fn /All /NoRestart | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-Output "Enabled: $dn (DISM)" } else { throw "DISM failed to enable $dn (code $LASTEXITCODE). Windows source files may be required." }
+    param($fn, $dn, $providerType, $providerName)
+    # Re-query before changing anything: the state can change outside WMT.
+    if ($providerType -eq "Capability") {
+        $cap = Get-WindowsCapability -Online -Name $providerName -ErrorAction Stop |
+            Where-Object { $_.Name -eq $providerName } | Select-Object -First 1
+        if (-not $cap) { throw "Cannot verify installed capability $dn; no changes were made." }
+        switch ([string]$cap.State) {
+            "Installed" {
+                Remove-WindowsCapability -Online -Name $providerName -ErrorAction Stop | Out-Null
+                Write-Output "Removed: $dn"
+            }
+            "NotPresent" {
+                Add-WindowsCapability -Online -Name $providerName -ErrorAction Stop | Out-Null
+                Write-Output "Installed: $dn"
+            }
+            "Staged" {
+                Add-WindowsCapability -Online -Name $providerName -ErrorAction Stop | Out-Null
+                Write-Output "Installed: $dn"
+            }
+            default { throw "Unrecognized capability state '$($cap.State)' for $dn; no changes were made." }
         }
         return
     }
-    if ($feature.State -eq "Enabled") {
-        Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
-        Write-Output "Disabled: $dn"
+    if ($providerType -ne "Feature") { throw "Unsupported feature provider for $dn." }
+    $state = $null
+    if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+        try {
+            $feature = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction Stop
+            if ($feature) { $state = [string]$feature.State }
+        }
+        catch { Write-Output "PowerShell state lookup failed; checking DISM before any change." }
     }
-    else {
-        Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
-        Write-Output "Enabled: $dn"
+    if (-not $state) {
+        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn" -TimeoutMs 30000
+        if ($global:LASTEXITCODE -ne 0 -or
+            $featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
+            throw "Cannot verify the current state of $dn using DISM; no changes were made."
+        }
+        $state = [string]$Matches[1]
     }
-} -ArgumentList $FeatureName, $DisplayName -OnComplete $done | Out-Null
+    switch -Regex ($state) {
+        '^Enabled$' {
+            Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
+            Write-Output "Disabled: $dn"
+            break
+        }
+        '^(Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)$' {
+            Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
+            Write-Output "Enabled: $dn"
+            break
+        }
+        default { throw "Unrecognized feature state '$state' for $dn; no changes were made." }
+    }
+} -ArgumentList $FeatureName, $DisplayName, $kind, $targetName -OnComplete $done | Out-Null
 }
 
 # --- SERVICES MANAGEMENT ---
@@ -61941,17 +61912,7 @@ try {
                 $script:TweakNonRegDataCache = $null
                 $script:TweakSupportChecksCache = $null
                 $script:TweakButtonStatesPathChecks = $null
-                if (-not (Get-WmtDisableBackgroundJobs)) {
-                    Start-TweakButtonStatesBackgroundUpdate
-                } else {
-                    try {
-                        Update-TweakButtonStates
-                        $script:TweakStatesReady = $true
-                    } catch {
-                        $script:TweakStatesReady = $false
-                        Show-TweakStatesLoadError -Message "Retry failed to load tweak states: $($_.Exception.Message)"
-                    }
-                }
+                Start-TweakButtonStatesBackgroundUpdate
             }
             if ($retryFeatures) {
                 if ($script:FeaturesCheckTimeout) {
@@ -61971,18 +61932,10 @@ try {
                 $script:OptionalFeaturesCheckStarted = $false
                 $script:OptionalFeatureStateCache = @{}
                 Sync-WmtOptionalFeatureButtons
-                if (-not (Get-WmtDisableBackgroundJobs)) {
-                    Start-OptionalFeaturesBackgroundCheck
-                } else {
-                    try {
-                        Update-OptionalFeaturesSynchronously
-                        $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
-                        if (-not $script:OptionalFeaturesReady) { throw "No feature states were detected." }
-                    } catch {
-                        $script:OptionalFeaturesReady = $false
-                        Show-TweakStatesLoadError -Message "Retry failed to load optional features: $($_.Exception.Message)"
-                    }
-                }
+                $script:OptionalFeaturesReady = $false
+                $script:OptionalFeatureUnavailableCache = @{}
+                $script:OptionalFeatureProviderCache = @{}
+                Start-OptionalFeaturesBackgroundCheck
             }
             Sync-WmtQuickFindStateAvailability
             Sync-WmtTweakOverlayHide
@@ -62440,135 +62393,203 @@ function Sync-WmtOptionalFeatureButtons {
 Sync-WmtOptionalFeatureButtons
 
 function Start-OptionalFeaturesBackgroundCheck {
-# Check all optional features in a SINGLE query (not 17 separate calls).
-# Runs only ONCE, deferred until the user first visits the Tweaks tab
-# (not on startup) so it doesn't compete with My Device page stats.
-if ($script:OptionalFeaturesCheckStarted) { return }
+# One bulk feature query and (where available) one bulk capability query.
+# Neither the scan nor its retry ever executes OS queries on the WPF thread.
+if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted) { return }
 $script:OptionalFeaturesCheckStarted = $true
-
-# Map feature names to button names
 $featureMap = $script:OptionalFeaturesMap
-
-# Run in a background runspace (shared pool)
 $ps = $null
-try {
-    $ps = New-WmtPooledPowerShell -PoolKind UiSupport
-}
+try { $ps = New-WmtPooledPowerShell -PoolKind UiSupport }
 catch {
     $script:OptionalFeaturesCheckStarted = $false
     $script:OptionalFeaturesReady = $false
     Show-TweakStatesLoadError -Message "Could not start optional-feature background worker: $($_.Exception.Message). Click Retry."
+    Sync-WmtTweakOverlayHide
     return
 }
 [void]$ps.AddScript({
-        param($map)
-        $results = @{}
+    param($map)
+    $states = @{}
+    $providers = @{}
+    $unavailable = @{}
+    $featureStates = @{}
+    $featuresEnumerated = $false
 
-        # Method 1: Try Get-WindowsOptionalFeature -Online (returns ALL features in one call)
-        $useCmdlet = $false
-        try { if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) { $useCmdlet = $true } } catch {}
-
-        if ($useCmdlet) {
-            try {
-                # Single call gets ALL features - much faster than 17 individual calls
-                $allFeatures = Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue
-                if ($allFeatures) {
-                    foreach ($feat in $allFeatures) {
-                        $btnName = $map[$feat.FeatureName]
-                        if ($btnName) {
-                            $results[$btnName] = ($feat.State -eq "Enabled")
-                        }
-                    }
-                    if ($results.Count -gt 0) { return $results }
-                }
-            }
-            catch {}
-        }
-
-        # Method 2: Fallback - single DISM call that lists ALL features
+    # Complete successful enumeration is required before absent items can be
+    # classified as unsupported. Unknown/pending states must never become false.
+    if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
         try {
-            $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-Features" -TimeoutMs 120000
-            $currentFeature = $null
-            foreach ($line in ([string]$output -split "\r?\n")) {
-                if ($line -match '^\s*Feature Name\s*:\s*(.*?)\s*$') {
-                    $currentFeature = [string]$Matches[1].Trim()
-                }
-                elseif ($currentFeature -and $line -match '^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
-                    if ($map.ContainsKey($currentFeature)) {
-                        $results[$map[$currentFeature]] = ($Matches[1] -eq 'Enabled')
+            $allFeatures = @(Get-WindowsOptionalFeature -Online -ErrorAction Stop)
+            if ($allFeatures.Count -gt 0) {
+                foreach ($feat in $allFeatures) {
+                    $name = [string]$feat.FeatureName
+                    if ($map.ContainsKey($name)) {
+                        $featureStates[$name] = [string]$feat.State
                     }
-                    $currentFeature = $null
                 }
+                $featuresEnumerated = $true
             }
         }
-        catch {}
+        catch { $featuresEnumerated = $false; $featureStates = @{} }
+    }
+    if (-not $featuresEnumerated) {
+        $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-Features" -TimeoutMs 120000
+        if ($global:LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
+            throw "Bulk Windows feature enumeration failed (DISM exit: $global:LASTEXITCODE)."
+        }
+        $currentFeature = $null
+        foreach ($line in ([string]$output -split "\r?\n")) {
+            if ($line -match '^\s*Feature Name\s*:\s*(.*?)\s*$') {
+                $currentFeature = [string]$Matches[1].Trim()
+            }
+            elseif ($currentFeature -and $line -match '^\s*State\s*:\s*(.*?)\s*$') {
+                if ($map.ContainsKey($currentFeature)) {
+                    $featureStates[$currentFeature] = [string]$Matches[1].Trim()
+                }
+                $currentFeature = $null
+            }
+        }
+        if ($featureStates.Count -eq 0) {
+            throw "DISM output did not provide any recognized optional-feature states."
+        }
+        $featuresEnumerated = $true
+    }
 
-        return $results
-    })
+    foreach ($name in $featureStates.Keys) {
+        $button = [string]$map[$name]
+        $state = [string]$featureStates[$name]
+        switch -Regex ($state) {
+            '^Enabled$' { $states[$button] = $true; break }
+            '^(Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)$' {
+                $states[$button] = $false; break
+            }
+            default { throw "Unrecognized state '$state' returned for $name; scan cannot be trusted." }
+        }
+        $providers[$button] = @{ Type = "Feature"; Name = $name }
+    }
+
+    # OpenSSH and several Windows accessories are capabilities, not DISM
+    # optional features, on current Windows builds. Enumerate once, not per item.
+    $capabilityPrefixes = @{
+        "OpenSSH.Client" = "OpenSSH.Client~~~~"
+        "OpenSSH.Server" = "OpenSSH.Server~~~~"
+        "WirelessDisplay" = "App.WirelessDisplay.Connect~~~~"
+        "QuickAssist" = "App.Support.QuickAssist~~~~"
+        "XpsViewer" = "XPS.Viewer~~~~"
+    }
+    $needCapabilities = @($capabilityPrefixes.Keys | Where-Object { -not $states.ContainsKey([string]$map[$_]) })
+    if ($needCapabilities.Count -gt 0) {
+        if (-not (Get-Command Get-WindowsCapability -ErrorAction SilentlyContinue)) {
+            throw "Cannot enumerate Windows capabilities for $($needCapabilities -join ', ')."
+        }
+        $allCapabilities = @(Get-WindowsCapability -Online -ErrorAction Stop)
+        if ($allCapabilities.Count -eq 0) { throw "Windows capability enumeration returned no results." }
+        foreach ($name in $needCapabilities) {
+            $prefix = [string]$capabilityPrefixes[$name]
+            $cap = $allCapabilities | Where-Object { ([string]$_.Name).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+                Select-Object -First 1
+            if (-not $cap) { continue }
+            $btn = [string]$map[$name]
+            switch ([string]$cap.State) {
+                "Installed" { $states[$btn] = $true }
+                "NotPresent" { $states[$btn] = $false }
+                "Staged" { $states[$btn] = $false }
+                default { throw "Unrecognized capability state '$($cap.State)' for $name." }
+            }
+            $providers[$btn] = @{ Type = "Capability"; Name = [string]$cap.Name }
+        }
+    }
+
+    # A successful *complete* enumeration can establish that a feature is not
+    # present on this OS. It is not a disabled state and cannot be toggled.
+    foreach ($name in $map.Keys) {
+        $button = [string]$map[$name]
+        if (-not $states.ContainsKey($button)) {
+            $unavailable[$button] = "Unsupported / not present on this Windows build"
+        }
+    }
+    if (($states.Count + $unavailable.Count) -ne $map.Count -or
+        $providers.Count -ne $states.Count) {
+        throw "Optional-feature scan incomplete: $($states.Count) states, $($unavailable.Count) unsupported of $($map.Count)."
+    }
+    return @{ States = $states; Providers = $providers; Unavailable = $unavailable }
+})
 [void]$ps.AddArgument($featureMap)
 $async = $null
-try {
-    $async = $ps.BeginInvoke()
-}
-catch {
-    Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message)."
-}
+try { $async = $ps.BeginInvoke() }
+catch { try { Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message)." } catch {} }
 if ($null -eq $async) {
     try { $ps.Dispose() } catch {}
     $script:OptionalFeaturesCheckStarted = $false
     $script:OptionalFeaturesReady = $false
     Show-TweakStatesLoadError -Message "Optional-feature scan could not start. Click Retry."
+    Sync-WmtTweakOverlayHide
     return
 }
-
-# Store in script scope so the timer tick can access them
 $script:FeaturesCheckAsync = $async
 $script:FeaturesCheckPS = $ps
 $script:FeaturesCheckTimer = $null
 Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -TestComplete { $false } -OnTick {
-        if ($script:FeaturesCheckAsync -and $script:FeaturesCheckAsync.IsCompleted) {
-            Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck"
+    if ($script:FeaturesCheckAsync -and $script:FeaturesCheckAsync.IsCompleted) {
+        Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck"
+        $script:OptionalFeaturesReady = $false
+        $script:OptionalFeatureStateCache = @{}
+        $script:OptionalFeatureUnavailableCache = @{}
+        $script:OptionalFeatureProviderCache = @{}
+        $scanError = ""
+        try {
+            $raw = $script:FeaturesCheckPS.EndInvoke($script:FeaturesCheckAsync)
+            if (-not $raw -or $raw.Count -ne 1) { throw "Scan returned no complete result." }
+            $result = $raw[0]
+            if ($result -isnot [System.Collections.IDictionary] -or
+                $result.States -isnot [System.Collections.IDictionary] -or
+                $result.Unavailable -isnot [System.Collections.IDictionary] -or
+                $result.Providers -isnot [System.Collections.IDictionary]) {
+                throw "Scan result type is invalid."
+            }
+            $valid = @($script:OptionalFeaturesMap.Values)
+            foreach ($button in $result.States.Keys) {
+                if ($button -notin $valid -or $result.Providers.ContainsKey($button) -eq $false) {
+                    throw "Scan returned an unrecognized or providerless feature."
+                }
+            }
+            foreach ($button in $result.Unavailable.Keys) {
+                if ($button -notin $valid -or $result.States.ContainsKey($button)) {
+                    throw "Scan returned contradictory or unknown feature data."
+                }
+            }
+            if (($result.States.Count + $result.Unavailable.Count) -ne $valid.Count -or
+                $result.Providers.Count -ne $result.States.Count) {
+                throw "Only $($result.States.Count + $result.Unavailable.Count) / $($valid.Count) features were classified."
+            }
+            $script:OptionalFeatureStateCache = $result.States
+            $script:OptionalFeatureUnavailableCache = $result.Unavailable
+            $script:OptionalFeatureProviderCache = $result.Providers
+            $script:OptionalFeaturesReady = $true
             try {
-                $raw = $script:FeaturesCheckPS.EndInvoke($script:FeaturesCheckAsync)
-                $results = $null
-                if ($raw -and $raw.Count -gt 0) {
-                    $candidate = $raw[0]
-                    # EndInvoke returns PSDataCollection[PSObject]; unwrap to the hashtable
-                    if ($candidate -is [System.Collections.IDictionary]) {
-                        $results = $candidate
-                    }
-                }
-                if ($results) {
-                    $script:OptionalFeatureStateCache = @{}
-                    foreach ($btnName in $results.Keys) {
-                        if ($btnName -in $script:OptionalFeaturesMap.Values) {
-                            $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
-                        }
-                    }
-                }
-            }
-            catch {
-                try { Write-GuiLog "[Optional Features] Background scan failed: $($_.Exception.Message)" } catch {}
-            }
-            if ($script:FeaturesCheckTimeout) {
-                try { $script:FeaturesCheckTimeout.Stop() } catch {}
-                $script:FeaturesCheckTimeout = $null
-            }
-            try { $script:FeaturesCheckPS.Dispose() } catch {}
-            $script:FeaturesCheckAsync = $null
-            $script:FeaturesCheckPS = $null
-            # Only release the overlay when optional feature detection actually returned states.
-            $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
-            Sync-WmtOptionalFeatureButtons
-            if (-not $script:OptionalFeaturesReady) {
-                $script:OptionalFeaturesCheckStarted = $false
-                Show-TweakStatesLoadError -Message "No verified optional-feature states were returned. Tweaks remains blocked; click Retry."
-            }
-            Sync-WmtTweakOverlayHide
-            if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Sync-WmtQuickFindStateAvailability }
+                Write-GuiLog "[Optional Features] Verified $($result.States.Count) states; $($result.Unavailable.Count) not available on this Windows build."
+            } catch {}
         }
-    } | Out-Null
-# DISM can take 120 seconds; allow additional dispatch time, then fail closed.
+        catch {
+            $scanError = $_.Exception.Message
+            try { Write-GuiLog "[Optional Features] Background scan failed: $scanError" } catch {}
+        }
+        if ($script:FeaturesCheckTimeout) {
+            try { $script:FeaturesCheckTimeout.Stop() } catch {}
+            $script:FeaturesCheckTimeout = $null
+        }
+        try { $script:FeaturesCheckPS.Dispose() } catch {}
+        $script:FeaturesCheckAsync = $null
+        $script:FeaturesCheckPS = $null
+        Sync-WmtOptionalFeatureButtons
+        if (-not $script:OptionalFeaturesReady) {
+            $script:OptionalFeaturesCheckStarted = $false
+            Show-TweakStatesLoadError -Message "Optional-feature verification failed: $scanError. Tweaks remains blocked; click Retry."
+        }
+        Sync-WmtTweakOverlayHide
+        Sync-WmtQuickFindStateAvailability
+    }
+} | Out-Null
 $script:FeaturesCheckTimeout = [System.Windows.Threading.DispatcherTimer]::new()
 $script:FeaturesCheckTimeout.Interval = [TimeSpan]::FromSeconds(150)
 $script:FeaturesCheckTimeout.Add_Tick({
@@ -62583,6 +62604,8 @@ $script:FeaturesCheckTimeout.Add_Tick({
     $script:OptionalFeaturesCheckStarted = $false
     $script:OptionalFeaturesReady = $false
     $script:OptionalFeatureStateCache = @{}
+    $script:OptionalFeatureUnavailableCache = @{}
+    $script:OptionalFeatureProviderCache = @{}
     Sync-WmtOptionalFeatureButtons
     try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {
         try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {}
@@ -62591,69 +62614,6 @@ $script:FeaturesCheckTimeout.Add_Tick({
     Sync-WmtQuickFindStateAvailability
 })
 $script:FeaturesCheckTimeout.Start()
-}
-
-function Update-OptionalFeaturesSynchronously {
-    $featureMap = $script:OptionalFeaturesMap
-    $results = @{}
-    $useCmdlet = $false
-    try {
-        if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
-            $useCmdlet = $true
-        }
-    }
-    catch {}
-    if ($useCmdlet) {
-        try {
-            Write-GuiLog "[Optional Features] Querying all features with PowerShell..."
-            $allFeatures = Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue
-            if ($allFeatures) {
-                foreach ($feat in $allFeatures) {
-                    $btnName = $featureMap[$feat.FeatureName]
-                    if ($btnName) {
-                        $results[$btnName] = ($feat.State -eq "Enabled")
-                    }
-                }
-            }
-        }
-        catch {
-            try { Write-GuiLog "[Optional Features] PowerShell query failed: $($_.Exception.Message)" } catch {}
-        }
-    }
-    if ($results.Count -eq 0) {
-        try {
-            Write-GuiLog "[Optional Features] Querying all features with DISM..."
-            $output = Invoke-WmtCliText `
-                -FilePath "dism" `
-                -Arguments "/Online /Get-Features" `
-                -TimeoutMs 120000
-            $currentFeature = $null
-            foreach ($line in ([string]$output -split "\r?\n")) {
-                if ($line -match '^\s*Feature Name\s*:\s*(.*?)\s*$') {
-                    $currentFeature = [string]$Matches[1].Trim()
-                }
-                elseif ($currentFeature -and $line -match '^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
-                    if ($featureMap.ContainsKey($currentFeature)) {
-                        $results[$featureMap[$currentFeature]] = ($Matches[1] -eq 'Enabled')
-                    }
-                    $currentFeature = $null
-                }
-            }
-        }
-        catch {
-            try { Write-GuiLog "[Optional Features] DISM query failed: $($_.Exception.Message)" } catch {}
-        }
-    }
-    $script:OptionalFeatureStateCache = @{}
-    foreach ($btnName in $results.Keys) {
-        if ($btnName -in $script:OptionalFeaturesMap.Values) {
-            $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
-        }
-    }
-    $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
-    Sync-WmtOptionalFeatureButtons
-    Sync-WmtQuickFindStateAvailability
-    Write-GuiLog "[Optional Features] Synchronous detection completed. Buttons updated: $($results.Count)"
 }
 
 $onMainWindowContentRendered = {
