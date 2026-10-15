@@ -57024,23 +57024,23 @@ if ($btnAppxRemoveAll) { $btnAppxRemoveAll.Add_Click({
 }) }
 
 # --- WINDOWS FEATURES TOGGLE ---
-if ($btnFeatHyperV) { $btnFeatHyperV.Add_Click({ Switch-WindowsFeature "Microsoft-Hyper-V-All" "Hyper-V" }) } ; Update-SingleFeatureButtonState "btnFeatHyperV" "Microsoft-Hyper-V-All"
-if ($btnFeatWSL) { $btnFeatWSL.Add_Click({ Switch-WindowsFeature "Microsoft-Windows-Subsystem-Linux" "WSL" }) } ; Update-SingleFeatureButtonState "btnFeatWSL" "Microsoft-Windows-Subsystem-Linux"
-if ($btnFeatSandbox) { $btnFeatSandbox.Add_Click({ Switch-WindowsFeature "Containers-DisposableClientVM" "Windows Sandbox" }) } ; Update-SingleFeatureButtonState "btnFeatSandbox" "Containers-DisposableClientVM"
-if ($btnFeatDotNet35) { $btnFeatDotNet35.Add_Click({ Switch-WindowsFeature "NetFx3" ".NET Framework 3.5" }) } ; Update-SingleFeatureButtonState "btnFeatDotNet35" "NetFx3"
-if ($btnFeatNFS) { $btnFeatNFS.Add_Click({ Switch-WindowsFeature "ServicesForNFS-ClientOnly" "NFS Client" }) } ; Update-SingleFeatureButtonState "btnFeatNFS" "ServicesForNFS-ClientOnly"
-if ($btnFeatTelnet) { $btnFeatTelnet.Add_Click({ Switch-WindowsFeature "TelnetClient" "Telnet Client" }) } ; Update-SingleFeatureButtonState "btnFeatTelnet" "TelnetClient"
-if ($btnFeatIIS) { $btnFeatIIS.Add_Click({ Switch-WindowsFeature "IIS-WebServerRole" "IIS Web Server" }) } ; Update-SingleFeatureButtonState "btnFeatIIS" "IIS-WebServerRole"
-if ($btnFeatLegacy) { $btnFeatLegacy.Add_Click({ Switch-WindowsFeature "WindowsMediaPlayer" "Legacy Media" }) } ; Update-SingleFeatureButtonState "btnFeatLegacy" "WindowsMediaPlayer"
-if ($btnFeatVMP) { $btnFeatVMP.Add_Click({ Switch-WindowsFeature "VirtualMachinePlatform" "Virtual Machine Platform" }) } ; Update-SingleFeatureButtonState "btnFeatVMP" "VirtualMachinePlatform"
-if ($btnFeatWHP) { $btnFeatWHP.Add_Click({ Switch-WindowsFeature "HypervisorPlatform" "Windows Hypervisor Platform" }) } ; Update-SingleFeatureButtonState "btnFeatWHP" "HypervisorPlatform"
-if ($btnFeatSSHClient) { $btnFeatSSHClient.Add_Click({ Switch-WindowsFeature "OpenSSH.Client" "OpenSSH Client" }) } ; Update-SingleFeatureButtonState "btnFeatSSHClient" "OpenSSH.Client"
-if ($btnFeatSSHServer) { $btnFeatSSHServer.Add_Click({ Switch-WindowsFeature "OpenSSH.Server" "OpenSSH Server" }) } ; Update-SingleFeatureButtonState "btnFeatSSHServer" "OpenSSH.Server"
-if ($btnFeatAppGuard) { $btnFeatAppGuard.Add_Click({ Switch-WindowsFeature "Windows-Defender-ApplicationGuard" "Microsoft Defender Application Guard" }) } ; Update-SingleFeatureButtonState "btnFeatAppGuard" "Windows-Defender-ApplicationGuard"
-if ($btnFeatMiracast) { $btnFeatMiracast.Add_Click({ Switch-WindowsFeature "WirelessDisplay" "Wireless Display" }) } ; Update-SingleFeatureButtonState "btnFeatMiracast" "WirelessDisplay"
-if ($btnFeatQuickAssist) { $btnFeatQuickAssist.Add_Click({ Switch-WindowsFeature "QuickAssist" "Quick Assist" }) } ; Update-SingleFeatureButtonState "btnFeatQuickAssist" "QuickAssist"
-if ($btnFeatXPS) { $btnFeatXPS.Add_Click({ Switch-WindowsFeature "XpsViewer" "XPS Viewer" }) } ; Update-SingleFeatureButtonState "btnFeatXPS" "XpsViewer"
-if ($btnFeatTIFF) { $btnFeatTIFF.Add_Click({ Switch-WindowsFeature "TIFFIFilter" "Windows TIFF IFilter" }) } ; Update-SingleFeatureButtonState "btnFeatTIFF" "TIFFIFilter"
+if ($btnFeatHyperV) { $btnFeatHyperV.Add_Click({ Switch-WindowsFeature "Microsoft-Hyper-V-All" "Hyper-V" }) }
+if ($btnFeatWSL) { $btnFeatWSL.Add_Click({ Switch-WindowsFeature "Microsoft-Windows-Subsystem-Linux" "WSL" }) }
+if ($btnFeatSandbox) { $btnFeatSandbox.Add_Click({ Switch-WindowsFeature "Containers-DisposableClientVM" "Windows Sandbox" }) }
+if ($btnFeatDotNet35) { $btnFeatDotNet35.Add_Click({ Switch-WindowsFeature "NetFx3" ".NET Framework 3.5" }) }
+if ($btnFeatNFS) { $btnFeatNFS.Add_Click({ Switch-WindowsFeature "ServicesForNFS-ClientOnly" "NFS Client" }) }
+if ($btnFeatTelnet) { $btnFeatTelnet.Add_Click({ Switch-WindowsFeature "TelnetClient" "Telnet Client" }) }
+if ($btnFeatIIS) { $btnFeatIIS.Add_Click({ Switch-WindowsFeature "IIS-WebServerRole" "IIS Web Server" }) }
+if ($btnFeatLegacy) { $btnFeatLegacy.Add_Click({ Switch-WindowsFeature "WindowsMediaPlayer" "Legacy Media" }) }
+if ($btnFeatVMP) { $btnFeatVMP.Add_Click({ Switch-WindowsFeature "VirtualMachinePlatform" "Virtual Machine Platform" }) }
+if ($btnFeatWHP) { $btnFeatWHP.Add_Click({ Switch-WindowsFeature "HypervisorPlatform" "Windows Hypervisor Platform" }) }
+if ($btnFeatSSHClient) { $btnFeatSSHClient.Add_Click({ Switch-WindowsFeature "OpenSSH.Client" "OpenSSH Client" }) }
+if ($btnFeatSSHServer) { $btnFeatSSHServer.Add_Click({ Switch-WindowsFeature "OpenSSH.Server" "OpenSSH Server" }) }
+if ($btnFeatAppGuard) { $btnFeatAppGuard.Add_Click({ Switch-WindowsFeature "Windows-Defender-ApplicationGuard" "Microsoft Defender Application Guard" }) }
+if ($btnFeatMiracast) { $btnFeatMiracast.Add_Click({ Switch-WindowsFeature "WirelessDisplay" "Wireless Display" }) }
+if ($btnFeatQuickAssist) { $btnFeatQuickAssist.Add_Click({ Switch-WindowsFeature "QuickAssist" "Quick Assist" }) }
+if ($btnFeatXPS) { $btnFeatXPS.Add_Click({ Switch-WindowsFeature "XpsViewer" "XPS Viewer" }) }
+if ($btnFeatTIFF) { $btnFeatTIFF.Add_Click({ Switch-WindowsFeature "TIFFIFilter" "Windows TIFF IFilter" }) }
 
 function Set-WmtDisplayScale {
 param([int]$Scale)
@@ -57054,31 +57054,24 @@ Write-GuiLog "Display scale set to $Scale% (log off / restart to apply)."
 
 function Update-SingleFeatureButtonState {
 param([string]$ButtonName, [string]$FeatureName)
-# Check a single feature and update its button color (runs on UI thread, but only 1 DISM call)
+# Only cached background detection may enable this control; no UI-thread DISM.
 $btn = Get-Ctrl $ButtonName
 if (-not $btn) { return }
-$isEnabled = $false
-try {
-    if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
-        $feat = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction SilentlyContinue
-        if ($feat -and $feat.State -eq "Enabled") { $isEnabled = $true }
-    }
-    else {
-        $info = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$FeatureName"
-        if ($info -match "State\s*:\s*Enabled") { $isEnabled = $true }
-    }
+$known = [bool]($script:OptionalFeaturesReady -and $script:OptionalFeatureStateCache -and
+    $script:OptionalFeatureStateCache.ContainsKey($ButtonName))
+$btn.IsEnabled = $known
+if (-not $known) {
+    $btn.ToolTip = "Feature state not verified or unsupported on this Windows version."
+    return
 }
-catch {}
-if ($isEnabled) {
-    $btn.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style])
-    $btn.ToolTip = "Current state: Enabled (Blue = installed/active)`nClick to uninstall this feature (Gray).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
-}
-else {
-    $btn.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style])
-    $btn.ToolTip = "Current state: Disabled (Gray = not installed)`nClick to install this feature (Blue).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
+$isEnabled = [bool]$script:OptionalFeatureStateCache[$ButtonName]
+$btn.Style = ($window.FindResource($(if ($isEnabled) { "AccentBtn" } else { "ActionBtn" })) -as [System.Windows.Style])
+$btn.ToolTip = if ($isEnabled) {
+    "Current state: Enabled. Click to disable; restart may be required."
+} else {
+    "Current state: Disabled. Click to enable; restart may be required."
 }
 }
-
 function Switch-WindowsFeature($FeatureName, $DisplayName) {
 $buttonName = switch ($FeatureName) {
     "Microsoft-Hyper-V-All" { "btnFeatHyperV" }
@@ -57102,16 +57095,24 @@ $buttonName = switch ($FeatureName) {
 }
 $done = {
     param($results)
-    if (-not [string]::IsNullOrWhiteSpace($buttonName)) {
-        Update-SingleFeatureButtonState -ButtonName $buttonName -FeatureName $FeatureName
-    }
+    # Never query DISM synchronously in an action completion callback.
+    $script:OptionalFeaturesReady = $false
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeatureStateCache = @{}
+    Sync-WmtOptionalFeatureButtons
+    Start-OptionalFeaturesBackgroundCheck
+    Sync-WmtTweakOverlayHide
+    Sync-WmtQuickFindStateAvailability
 }.GetNewClosure()
 Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $DisplayName..." -Sb {
     param($fn, $dn)
     if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
         Write-Output "PowerShell feature cmdlets unavailable; trying DISM fallback..."
-        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn"
-        if ($featureInfo -match 'State\s*:\s*Enabled') {
+        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn" -TimeoutMs 30000
+        if ($featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
+            throw "Cannot verify the current state of $dn; no changes were made."
+        }
+        if ($Matches[1] -eq 'Enabled') {
             dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
             if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
         }
@@ -57125,8 +57126,11 @@ Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $
     if (-not $feature) {
         if ($fn -ne "NetFx3") { throw "Feature name $fn is unknown." }
         Write-Output "$dn not detected via PowerShell; trying DISM fallback..."
-        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn"
-        if ($featureInfo -match 'State\s*:\s*Enabled') {
+        $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn" -TimeoutMs 30000
+        if ($featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
+            throw "Cannot verify the current state of $dn; no changes were made."
+        }
+        if ($Matches[1] -eq 'Enabled') {
             dism /Online /Disable-Feature /FeatureName:$fn /NoRestart | Out-Null
             if ($LASTEXITCODE -eq 0) { Write-Output "Disabled: $dn (DISM)" } else { throw "DISM failed to disable $dn (code $LASTEXITCODE)." }
         }
@@ -61955,6 +61959,7 @@ try {
                 }
                 $script:OptionalFeaturesCheckStarted = $false
                 $script:OptionalFeatureStateCache = @{}
+                Sync-WmtOptionalFeatureButtons
                 if (-not (Get-WmtDisableBackgroundJobs)) {
                     Start-OptionalFeaturesBackgroundCheck
                 } else {
@@ -62423,6 +62428,14 @@ $script:OptionalFeaturesMap = @{
     "TIFFIFilter"                        = "btnFeatTIFF"
 }
 
+function Sync-WmtOptionalFeatureButtons {
+    foreach ($btnName in $script:OptionalFeaturesMap.Values) {
+        Update-SingleFeatureButtonState -ButtonName $btnName -FeatureName ""
+    }
+}
+# Prevent toggles before feature states are known.
+Sync-WmtOptionalFeatureButtons
+
 function Start-OptionalFeaturesBackgroundCheck {
 # Check all optional features in a SINGLE query (not 17 separate calls).
 # Runs only ONCE, deferred until the user first visits the Tweaks tab
@@ -62472,14 +62485,16 @@ catch {
         # Method 2: Fallback - single DISM call that lists ALL features
         try {
             $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-Features" -TimeoutMs 120000
-            foreach ($featureName in $map.Keys) {
-                $btnName = $map[$featureName]
-                # Match pattern: "Feature Name : <name>" followed by "State : Enabled"
-                if ($output -match "(?s)Feature Name :\s*$([regex]::Escape($featureName))\s*\r?\n.*?State\s*:\s*Enabled") {
-                    $results[$btnName] = $true
+            $currentFeature = $null
+            foreach ($line in ([string]$output -split "\r?\n")) {
+                if ($line -match '^\s*Feature Name\s*:\s*(.*?)\s*$') {
+                    $currentFeature = [string]$Matches[1].Trim()
                 }
-                else {
-                    $results[$btnName] = $false
+                elseif ($currentFeature -and $line -match '^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
+                    if ($map.ContainsKey($currentFeature)) {
+                        $results[$map[$currentFeature]] = ($Matches[1] -eq 'Enabled')
+                    }
+                    $currentFeature = $null
                 }
             }
         }
@@ -62523,17 +62538,8 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
                 if ($results) {
                     $script:OptionalFeatureStateCache = @{}
                     foreach ($btnName in $results.Keys) {
-                        $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
-                        $btn = Get-Ctrl $btnName
-                        if (-not $btn) { continue }
-                        $isEnabled = $results[$btnName]
-                        if ($isEnabled) {
-                            $btn.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style])
-                            $btn.ToolTip = "Current state: Enabled (Blue = installed/active)`nClick to uninstall this feature (Gray).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
-                        }
-                        else {
-                            $btn.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style])
-                            $btn.ToolTip = "Current state: Disabled (Gray = not installed)`nClick to install this feature (Blue).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
+                        if ($btnName -in $script:OptionalFeaturesMap.Values) {
+                            $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
                         }
                     }
                 }
@@ -62550,6 +62556,7 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
             $script:FeaturesCheckPS = $null
             # Only release the overlay when optional feature detection actually returned states.
             $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
+            Sync-WmtOptionalFeatureButtons
             if (-not $script:OptionalFeaturesReady) {
                 $script:OptionalFeaturesCheckStarted = $false
                 Show-TweakStatesLoadError -Message "No verified optional-feature states were returned. Tweaks remains blocked; click Retry."
@@ -62572,6 +62579,8 @@ $script:FeaturesCheckTimeout.Add_Tick({
     $script:FeaturesCheckAsync = $null
     $script:OptionalFeaturesCheckStarted = $false
     $script:OptionalFeaturesReady = $false
+    $script:OptionalFeatureStateCache = @{}
+    Sync-WmtOptionalFeatureButtons
     try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {
         try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {}
     }
@@ -62615,13 +62624,16 @@ function Update-OptionalFeaturesSynchronously {
                 -FilePath "dism" `
                 -Arguments "/Online /Get-Features" `
                 -TimeoutMs 120000
-            foreach ($featureName in $featureMap.Keys) {
-                $btnName = $featureMap[$featureName]
-                if ($output -match "(?s)Feature Name :\s*$([regex]::Escape($featureName))\s*\r?\n.*?State\s*:\s*Enabled") {
-                    $results[$btnName] = $true
+            $currentFeature = $null
+            foreach ($line in ([string]$output -split "\r?\n")) {
+                if ($line -match '^\s*Feature Name\s*:\s*(.*?)\s*$') {
+                    $currentFeature = [string]$Matches[1].Trim()
                 }
-                else {
-                    $results[$btnName] = $false
+                elseif ($currentFeature -and $line -match '^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
+                    if ($featureMap.ContainsKey($currentFeature)) {
+                        $results[$featureMap[$currentFeature]] = ($Matches[1] -eq 'Enabled')
+                    }
+                    $currentFeature = $null
                 }
             }
         }
@@ -62631,19 +62643,12 @@ function Update-OptionalFeaturesSynchronously {
     }
     $script:OptionalFeatureStateCache = @{}
     foreach ($btnName in $results.Keys) {
-        $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
-        $btn = Get-Ctrl $btnName
-        if (-not $btn) { continue }
-        if ($results[$btnName]) {
-            $btn.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style])
-            $btn.ToolTip = "Current state: Enabled (Blue = installed/active)`nClick to uninstall this feature (Gray).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
-        }
-        else {
-            $btn.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style])
-            $btn.ToolTip = "Current state: Disabled (Gray = not installed)`nClick to install this feature (Blue).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
+        if ($btnName -in $script:OptionalFeaturesMap.Values) {
+            $script:OptionalFeatureStateCache[$btnName] = [bool]$results[$btnName]
         }
     }
     $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
+    Sync-WmtOptionalFeatureButtons
     Sync-WmtQuickFindStateAvailability
     Write-GuiLog "[Optional Features] Synchronous detection completed. Buttons updated: $($results.Count)"
 }
