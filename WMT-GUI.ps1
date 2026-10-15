@@ -56638,10 +56638,8 @@ try {
     }
 
     # Tweak states + optional features background loads (each has a one-shot guard)
-    if (-not $script:TweakStatesReady) {
-        Start-TweakButtonStatesBackgroundUpdate
-        Start-OptionalFeaturesBackgroundCheck
-    }
+    if (-not $script:TweakStatesReady) { Start-TweakButtonStatesBackgroundUpdate }
+    if (-not $script:OptionalFeaturesReady) { Start-OptionalFeaturesBackgroundCheck }
 
     # AppX bloatware list (normally triggered on first Tweaks tab visit)
     if (-not $script:AppxListLoaded) {
@@ -61837,16 +61835,27 @@ if (-not $script:MyDeviceStatsStarted) {
 if (-not $script:FirewallRulesLoaded -and -not $script:FirewallLoadInProgress) {
     Start-FirewallRuleLoad -Preload
 }
-# One shared preload for Quickfind and Tweaks, independent of page navigation.
+# Refresh Quick Find's tweak registry snapshot first, but stage the more
+# expensive DISM/capability enumeration so it doesn't compete with initial
+# device and firewall data collection. Opening Tweaks always starts immediately.
 if (-not $script:TweakStatesReady -and -not $script:TweakStatesBgStarted) { Start-TweakButtonStatesBackgroundUpdate }
-if (-not $script:OptionalFeaturesReady -and -not $script:OptionalFeaturesCheckStarted) { Start-OptionalFeaturesBackgroundCheck }
-
+$script:WmtStartupFeaturePreloadStartedAt = [DateTime]::UtcNow
 $script:WmtStartupPreloadTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:WmtStartupPreloadTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
 $script:WmtStartupPreloadTimer.Add_Tick({
-        if (Test-WmtMyDevicePreloadBusy) { return }
-        if ($script:FirewallLoadInProgress) { return }
-        Stop-WmtStartupBackgroundPreload
+        if (Test-WmtAggressiveTrayMemoryMode -or (Get-WmtDisableBackgroundJobs)) {
+            Stop-WmtStartupBackgroundPreload
+            return
+        }
+        if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted) {
+            Stop-WmtStartupBackgroundPreload
+            return
+        }
+        $elapsed = ([DateTime]::UtcNow - $script:WmtStartupFeaturePreloadStartedAt).TotalSeconds
+        if ((-not (Test-WmtMyDevicePreloadBusy) -and -not $script:FirewallLoadInProgress) -or $elapsed -ge 8) {
+            Stop-WmtStartupBackgroundPreload
+            Start-OptionalFeaturesBackgroundCheck
+        }
     })
 $script:WmtStartupPreloadTimer.Start()
 }
@@ -62239,38 +62248,35 @@ catch {
         } catch { $nonRegData["ExecutionPolicy"] = $null }
 
         # Get-WmtPowerSettingIndex — powercfg calls (4 unique settings × up to 2 attempts each)
-        function Get-PowerSettingIdx {
-            param(
-                [string]$SubGroup,
-                [string]$Setting,
-                [string]$Mode = "AC"
-            )
-            try {
-                $output = powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>$null
-                $label = if ($Mode -eq "DC") { "Current DC Power Setting Index" } else { "Current AC Power Setting Index" }
-                $pattern = [regex]::Escape($label) + "\s*:\s*0x([0-9a-fA-F]+)"
-                foreach ($line in $output) {
-                    if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
-                }
-                $output = powercfg /qh SCHEME_CURRENT $SubGroup $Setting 2>$null
-                foreach ($line in $output) {
-                    if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
-                }
-            } catch {}
-            return $null
+        # One invocation per setting retrieves both AC and DC indices. Only
+        # retry with /qh if the first query omitted a required value.
+        function Get-PowerSettingIndexes {
+            param([string]$SubGroup, [string]$Setting)
+            $values = @{ AC = $null; DC = $null }
+            foreach ($mode in @("query", "qh")) {
+                try {
+                    $output = & powercfg "/$mode" SCHEME_CURRENT $SubGroup $Setting 2>$null
+                    foreach ($line in $output) {
+                        if ($line -match '(?i)Current\s+(AC|DC)\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-fA-F]+)') {
+                            $values[$Matches[1].ToUpperInvariant()] = [Convert]::ToInt32($Matches[2],16)
+                        }
+                    }
+                } catch {}
+                if ($null -ne $values.AC -and $null -ne $values.DC) { break }
+            }
+            return $values
         }
 
-        $nonRegData["BatterySaverThreshold"] = Get-PowerSettingIdx "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" "DC"
+        $batteryPower = Get-PowerSettingIndexes "SUB_ENERGYSAVER" "ESBATTTHRESHOLD"
+        $nonRegData["BatterySaverThreshold"] = $batteryPower.DC
 
-        $usbSub = "2a737441-1930-4402-8d77-b2bebba308a3"
-        $usbSetting = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
-        $nonRegData["UsbSuspendAC"] = Get-PowerSettingIdx $usbSub $usbSetting "AC"
-        $nonRegData["UsbSuspendDC"] = Get-PowerSettingIdx $usbSub $usbSetting "DC"
+        $usbPower = Get-PowerSettingIndexes "2a737441-1930-4402-8d77-b2bebba308a3" "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+        $nonRegData["UsbSuspendAC"] = $usbPower.AC
+        $nonRegData["UsbSuspendDC"] = $usbPower.DC
 
-        $pcieSub = "501a4d13-42af-4429-9fd1-a8218c268e20"
-        $pcieSetting = "ee12f906-d277-404b-b6da-e5fa1a576df5"
-        $nonRegData["PcieASPMAc"] = Get-PowerSettingIdx $pcieSub $pcieSetting "AC"
-        $nonRegData["PcieASPMDc"] = Get-PowerSettingIdx $pcieSub $pcieSetting "DC"
+        $pciePower = Get-PowerSettingIndexes "501a4d13-42af-4429-9fd1-a8218c268e20" "ee12f906-d277-404b-b6da-e5fa1a576df5"
+        $nonRegData["PcieASPMAc"] = $pciePower.AC
+        $nonRegData["PcieASPMDc"] = $pciePower.DC
 
         # Direct registry reads not in the 54-path list
         try { $nonRegData["DrvMetadata"] = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata" -Name "PreventDeviceMetadataFromNetwork" -ErrorAction SilentlyContinue).PreventDeviceMetadataFromNetwork } catch { $nonRegData["DrvMetadata"] = $null }
@@ -62686,11 +62692,8 @@ if ($settings.WindowState -eq "Maximized") {
 # 1. Click the Updates tab by default.
 (Get-Ctrl "btnTabUpdates").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
 
-# 1b. Initialize the shared RunspacePool early for an interactive launch.
-# Launch-minimized + Reduce RAM leaves it unallocated until real work requests it.
-if (-not ((Get-WmtLaunchMinimized) -and (Get-WmtReduceRamInTray))) {
-    Initialize-WmtBackgroundRunspacePool
-}
+# 1b. Create the runspace pools lazily. Building InitialSessionState and
+# opening worker threads during first paint delays startup unnecessarily.
 
 # 2. Warm hidden pages in the background (deferred 1s so UI paints first).
 $script:preloadDeferTimer = New-Object System.Windows.Threading.DispatcherTimer
