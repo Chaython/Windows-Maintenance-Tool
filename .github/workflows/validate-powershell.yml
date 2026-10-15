@@ -217,8 +217,19 @@ jobs:
           $rendererStatements = (($renderer -split '\r?\n') |
               Where-Object { $_ -notmatch '^\s*#' }) -join [Environment]::NewLine
           if ($tweak -match 'Falling back to synchronous load' -or
-              $rendererStatements -match 'Get-WmtRegistryKeyValuesCached|Get-Service\s|Get-ItemProperty\s|Get-WmtRegistryPathExists\s|Get-WmtRegValue\s') {
+              $rendererStatements -match 'Get-WmtRegistryKeyValuesCached|Get-Service\s|Get-ItemProperty\s|Get-WmtRegistryPathExists\s|Get-WmtRegValue\s|Get-MMAgent\s') {
               throw 'Tweak state application still reads OS state synchronously.'
+          }
+          if ($tweak -notmatch 'ExpectedRegPaths' -or
+              $tweak -notmatch 'if \(\$key\) \{ \$key\.Dispose\(\) \}' -or
+              $tweak -notmatch 'if \(\$baseKey\) \{ \$baseKey\.Dispose\(\) \}') {
+              throw 'Tweak preload no longer verifies snapshot size or disposes registry handles.'
+          }
+          $cloudRegistryPreloads = @(($tweak -split '\r?\n') |
+              Where-Object { $_ -match '^\s*"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore' -and
+                  $_ -match 'bluelightreductionstate' })
+          if ($cloudRegistryPreloads.Count -ne 1) {
+              throw 'Night Light registry key is missing or loaded more than once.'
           }
           if ($renderer -match '(?m)^\s*(?:&\s*)?fsutil\s') {
               throw 'Tweak state application still launches fsutil on the WPF thread.'
