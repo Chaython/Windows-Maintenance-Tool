@@ -2058,6 +2058,9 @@ if ($oldStatsRunspace) {
 
 function Start-MyDeviceQueuedSections {
 if (-not $script:MyDevicePendingSections -or $script:MyDevicePendingSections.Count -eq 0) { return }
+# Avoid repeatedly opening a failed runspace pool from the 200ms UI poller.
+if ($script:MyDeviceWorkerRetryAfterUtc -and
+    [DateTime]::UtcNow -lt $script:MyDeviceWorkerRetryAfterUtc) { return }
 
 if (-not $script:MyDeviceStatsMaxConcurrent -or $script:MyDeviceStatsMaxConcurrent -lt 1) {
     $script:MyDeviceStatsMaxConcurrent = 4
@@ -2066,7 +2069,12 @@ if (-not $script:MyDeviceStatsMaxConcurrent -or $script:MyDeviceStatsMaxConcurre
 while ($script:MyDeviceSectionJobs.Count -lt $script:MyDeviceStatsMaxConcurrent -and $script:MyDevicePendingSections.Count -gt 0) {
     $section = $script:MyDevicePendingSections[0]
     $script:MyDevicePendingSections.RemoveAt(0)
-    Start-MyDeviceSectionJob -Name $section.Name -Body $section.Body
+    if (-not (Start-MyDeviceSectionJob -Name $section.Name -Body $section.Body)) {
+        [void]$script:MyDevicePendingSections.Insert(0, $section)
+        $script:MyDeviceWorkerRetryAfterUtc = [DateTime]::UtcNow.AddSeconds(5)
+        break
+    }
+    $script:MyDeviceWorkerRetryAfterUtc = $null
 }
 }
 
@@ -3387,6 +3395,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Name,
     [Parameter(Mandatory = $true)][string]$Body
 )
+$ps = $null
+try {
 $ps = New-WmtPooledPowerShell -PoolKind UiSupport
 
 # Bulletproof fix: Inject the helper functions directly into the script block.
@@ -3395,11 +3405,19 @@ $fullScript = $script:MyDeviceCommonHelpers + "`n" + $Body
 [void]$ps.AddScript($fullScript)
 
 $async = $ps.BeginInvoke()
+if (-not $async) { throw 'My Device BeginInvoke returned no invocation.' }
 $script:MyDeviceSectionJobs[$Name] = [pscustomobject]@{
     Name       = $Name
     PowerShell = $ps
     Async      = $async
     StartedAt  = Get-Date
+}
+return $true
+}
+catch {
+    try { if ($ps) { $ps.Dispose() } } catch {}
+    try { Write-GuiLog "[My Device] Worker for ${Name} could not start: $($_.Exception.Message)" } catch {}
+    return $false
 }
 }
 
@@ -3414,6 +3432,7 @@ $script:StatsStartedAt = Get-Date
 $script:MyDeviceStatsPreloadMode = [bool]$Preload
 $script:MyDeviceStatsMaxConcurrent = 4
 Stop-MyDeviceSectionJobs
+$script:MyDeviceWorkerRetryAfterUtc = $null
 $script:MyDevicePendingSections = [System.Collections.ArrayList]::new()
 Set-MyDeviceUiPlaceholders
 
