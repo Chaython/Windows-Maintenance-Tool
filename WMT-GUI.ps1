@@ -53400,10 +53400,10 @@ try {
     # A package can be in use without a PnP binding (filter/audio/AV/bus
     # drivers). Cache only AddService parsing; service state is always fresh.
     $svcState = @{}
-    foreach ($s in @(Get-CimInstance -ClassName Win32_SystemDriver -Property Name,State -ErrorAction SilentlyContinue)) {
+    foreach ($s in @(Get-CimInstance -ClassName Win32_SystemDriver -Property Name,State -ErrorAction Stop)) {
         if ($s.Name) { $svcState[[string]$s.Name] = [string]$s.State }
     }
-    foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Property Name,State -ErrorAction SilentlyContinue)) {
+    foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Property Name,State -ErrorAction Stop)) {
         if ($s.Name) { $svcState[[string]$s.Name] = [string]$s.State }
     }
 
@@ -53413,7 +53413,10 @@ try {
     foreach ($infName in @($infs)) {
         if ([string]::IsNullOrWhiteSpace([string]$infName)) { continue }
         $infPath = Join-Path $env:SystemRoot ("INF\" + $infName)
-        if (-not (Test-Path -LiteralPath $infPath)) { continue }
+        # An unreadable/missing staged INF makes its service bindings unverified.
+        if (-not (Test-Path -LiteralPath $infPath -PathType Leaf -ErrorAction Stop)) {
+            throw "Cannot verify driver service bindings for $infName : INF is missing."
+        }
         $infLower = [string]$infName.ToLowerInvariant()
         $stamp = ""
         try { $stamp = (Get-Item -LiteralPath $infPath -ErrorAction Stop).LastWriteTimeUtc.Ticks.ToString() } catch {}
@@ -53431,14 +53434,16 @@ try {
                     }
                 }
             }
-            catch {}
+            catch {
+                throw "Cannot verify driver service bindings for $infName : $($_.Exception.Message)"
+            }
         }
         if ($stamp) { $newSvcCache[$infLower] = @{ Stamp = $stamp; Names = @($svcNames) } }
         if (@($svcNames).Count -eq 0) { continue }
 
         $present = @()
         foreach ($svcName in @($svcNames)) {
-            $installed = $svcState.ContainsKey($svcName) -or (Test-Path -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svcName))
+            $installed = $svcState.ContainsKey($svcName) -or (Test-Path -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svcName) -ErrorAction Stop)
             if (-not $installed) { continue }
             $isRunning = ($svcState.ContainsKey($svcName) -and $svcState[$svcName] -eq "Running")
             $present += [PSCustomObject]@{ Name = $svcName; Running = $isRunning }

@@ -392,6 +392,13 @@ jobs:
               $cleanup -notmatch '\$cacheFresh') {
               throw 'Cleanup may re-enumerate unnecessarily or remove an INF with a registered service.'
           }
+          if ($driverUsage -notmatch 'Win32_SystemDriver.*-ErrorAction Stop' -or
+              $driverUsage -notmatch 'Win32_Service.*-ErrorAction Stop' -or
+              $driverUsage -notmatch 'Cannot verify driver service bindings' -or
+              $driverUsage -notmatch 'Test-Path -LiteralPath \("HKLM:') {
+              throw 'Driver service inventory could be partial yet marked complete.'
+          }
+          Write-Host 'PASS: driver service/INF scan fails closed on incomplete data.'
           Write-Host 'PASS: cleanup uses fresh inventory and rechecks installed services.'
           Write-Host 'PASS: driver preloading follows optional-feature dispatch on the normal startup path.'
           $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
@@ -471,6 +478,33 @@ jobs:
           try { $null = Get-WmtDriverCleanupUsage -PublishedName 'oem17.inf' } catch { $rejected = $true }
           if (-not $rejected) { throw 'A missing INF was treated as safe.' }
           Write-Host 'PASS: active driver services protected; unresolved and missing INF identities fail closed.'
+
+      - name: Smoke test driver usage worker fails on incomplete service inventory
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $fn = $ast.Find({
+              param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-DriverUsageLoad'
+          }, $true)
+          if (-not $fn) { throw 'Driver usage loader is missing.' }
+          $workerMatch = [regex]::Match($fn.Extent.Text, '(?s)\$usageWorker\s*=\s*@''\r?\n(.*?)\r?\n''@')
+          if (-not $workerMatch.Success) { throw 'Could not extract driver usage worker.' }
+          $worker = [scriptblock]::Create($workerMatch.Groups[1].Value)
+          function Get-CimInstance {
+              [CmdletBinding()]
+              param([string]$ClassName, [string[]]$Property)
+              if ($ClassName -eq 'Win32_SystemDriver') { throw 'Simulated service inventory failure' }
+          }
+          $result = & $worker @('oem5.inf') @{}
+          if (-not $result -or $result.Success -or $result.Error -notmatch 'Simulated service inventory failure') {
+              throw 'Incomplete service inventory was accepted as verified.'
+          }
+          Write-Host 'PASS: background driver usage rejects incomplete service inventory.'
 
       - name: Smoke test fast ghost-device scan and full-width dialog
         shell: powershell
