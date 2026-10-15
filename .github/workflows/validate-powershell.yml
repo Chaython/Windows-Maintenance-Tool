@@ -254,6 +254,30 @@ jobs:
               $source -notmatch 'WmtStartupFeaturePreloadStartedAt') {
               throw 'Eager startup pool allocation or unprioritized feature preload returned.'
           }
+          # Exercise the actual My Device queue with an unavailable pool.
+          # A failed attempt must retain the section and throttle UI-thread retries.
+          Invoke-Expression (Find-FunctionText 'Start-MyDeviceSectionJob')
+          Invoke-Expression (Find-FunctionText 'Start-MyDeviceQueuedSections')
+          function New-WmtPooledPowerShell { param($PoolKind) throw 'Simulated unavailable worker pool' }
+          function Write-GuiLog { param($Message) }
+          $script:MyDeviceSectionJobs = @{}
+          $script:MyDevicePendingSections = [System.Collections.ArrayList]::new()
+          [void]$script:MyDevicePendingSections.Add([pscustomobject]@{ Name = 'Core'; Body = '1' })
+          $script:MyDeviceWorkerRetryAfterUtc = $null
+          $script:MyDeviceStatsMaxConcurrent = 4
+          Start-MyDeviceQueuedSections
+          if ($script:MyDevicePendingSections.Count -ne 1 -or
+              $script:MyDevicePendingSections[0].Name -ne 'Core' -or
+              -not $script:MyDeviceWorkerRetryAfterUtc -or
+              $script:MyDeviceWorkerRetryAfterUtc -le [DateTime]::UtcNow) {
+              throw 'My Device worker start failure discarded a queued section or failed to back off.'
+          }
+          $retryAt = $script:MyDeviceWorkerRetryAfterUtc
+          Start-MyDeviceQueuedSections
+          if ($script:MyDeviceWorkerRetryAfterUtc -ne $retryAt) {
+              throw 'My Device retried before its backoff elapsed.'
+          }
+          Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
       - name: Smoke test fast ghost-device scan and full-width dialog
