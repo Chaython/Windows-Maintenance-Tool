@@ -27750,10 +27750,25 @@ function Show-DriverCleanupDialog {
 param(
     [object[]]$DriverOutput = $null,
     [string[]]$InUseInfs = $null,
-    [switch]$UsageScanSucceeded
+    [switch]$UsageScanSucceeded,
+    [object[]]$DriverPackages = $null
 )
 
-if ($null -eq $DriverOutput) {
+if ($null -eq $DriverOutput -and $null -eq $DriverPackages) {
+    # Reuse completed, verified driver inventory. The deletion worker still
+    # rechecks usage immediately before every delete (including force retries).
+    if ($script:DriverCacheLoaded -and $script:DriverUsageLoaded -and -not $script:DriverLoadInProgress) {
+        $DriverPackages = @($script:DriverPackages)
+        $InUseInfs = [string[]]@($script:DriverDeviceMap.Keys)
+        $UsageScanSucceeded = $true
+    }
+    elseif ($script:DriverLoadInProgress) {
+        $script:DriverCleanupPendingOpen = $true
+        Set-DriverStatus "Finishing background driver inventory for cleanup preview..." -Visible $true
+        return
+    }
+}
+if ($null -eq $DriverOutput -and $null -eq $DriverPackages) {
     $scanComplete = {
         param($results)
         $payload = @($results | Where-Object { $_ -and $_.PSObject.Properties["DriverOutput"] } | Select-Object -Last 1)
@@ -27789,7 +27804,7 @@ if (-not $UsageScanSucceeded -or $null -eq $InUseInfs) {
     Show-WmtMessageBox -Message "Driver usage is unknown. Scan again before removing driver packages." -Title "Clean Old Drivers" -Image Warning | Out-Null
     return
 }
-$drivers = Get-WmtDriverStorePackages -RawOutput $DriverOutput
+$drivers = if ($null -ne $DriverPackages) { @($DriverPackages) } else { @(Get-WmtDriverStorePackages -RawOutput $DriverOutput) }
 $inUseInfs = @($InUseInfs)
 
 $toDelete = @()
@@ -34754,7 +34769,7 @@ foreach ($path in $Paths) {
             foreach ($valName in $key.GetValueNames()) {
                 $values[$valName] = $key.GetValue($valName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
             }
-            $result[$path] = [PSCustomObject]$values
+            $result[$path] = $values
         }
         else {
             $result[$path] = $null
@@ -35124,16 +35139,8 @@ if ($script:TweakButtonStatesCache -and $script:TweakButtonStatesCache.ContainsK
     return $script:TweakButtonStatesCache[$Path]
 }
 
-try {
-    $result = Read-WmtRegValuesFast -Paths @($Path)
-    if ($result.ContainsKey($Path)) {
-        if (-not $script:TweakButtonStatesCache) { $script:TweakButtonStatesCache = @{} }
-        $script:TweakButtonStatesCache[$Path] = $result[$Path]
-        return $result[$Path]
-    }
-}
-catch {
-}
+# Rendering and QuickFind must not perform synchronous registry I/O on cache misses.
+# A missing worker snapshot stays unknown until the next background refresh.
 return $null
 }
 
@@ -52855,6 +52862,7 @@ $script:DriverUsageLoaded = $false
 $script:DriverCacheLoaded = $false
 $script:DriverCacheLoadedAt = [DateTime]::MinValue
 $script:DriverCacheTtlSeconds = 600
+$script:DriverCleanupPendingOpen = $false
 $script:DriverLoadInProgress = $false
 $script:DriverLoadPhase = ""
 $script:DriverLoadRunspace = $null
@@ -53234,6 +53242,20 @@ $script:DriverLoadTimer = $null
 $script:DriverLoadPhase = ""
 $script:DriverLoadInProgress = $false
 if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
+if ($script:DriverCleanupPendingOpen) {
+    $script:DriverCleanupPendingOpen = $false
+    # Schedule after EndInvoke and cleanup of the worker, not during the poll callback.
+    $null = [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+        [System.Windows.Threading.DispatcherPriority]::Background,
+        [Action] {
+            if ($script:DriverCacheLoaded -and $script:DriverUsageLoaded) {
+                Show-DriverCleanupDialog
+            } else {
+                Show-WmtMessageBox -Message "Driver usage verification did not finish. Click Reload and retry Clean Old Drivers." -Title "Clean Old Drivers" -Image Warning | Out-Null
+            }
+        }
+    )
+}
 }
 
 function Test-DriverResultShouldBeDiscarded {
@@ -53251,7 +53273,7 @@ param($infs, $infSvcCache)
 $result = [PSCustomObject]@{ Success = $false; Usage = $null; Services = $null; InfServiceCache = $null; Error = "" }
 try {
     $entityState = @{}
-    foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -Property DeviceID,Name,Status,ConfigManagerErrorCode -ErrorAction SilentlyContinue)) {
+    foreach ($e in @(Get-CimInstance -ClassName Win32_PnPEntity -Property DeviceID,Name,Status,ConfigManagerErrorCode -ErrorAction Stop)) {
         if (-not $e.DeviceID) { continue }
         $code = -1
         try { $code = [int]$e.ConfigManagerErrorCode } catch {}
@@ -53259,7 +53281,7 @@ try {
     }
 
     $map = @{}
-    foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -Property InfName,DeviceID,DeviceName -ErrorAction SilentlyContinue)) {
+    foreach ($d in @(Get-CimInstance -ClassName Win32_PnPSignedDriver -Property InfName,DeviceID,DeviceName -ErrorAction Stop)) {
         $inf = ([string]$d.InfName).ToLowerInvariant()
         if ($inf -notmatch '^oem\d+\.inf$') { continue }
         if (-not $map.ContainsKey($inf)) { $map[$inf] = [System.Collections.Generic.List[object]]::new() }
@@ -56723,6 +56745,11 @@ try {
     # manually opening/refreshing Firewall remains available when Bg Jobs are off.
     if (-not $script:FirewallRulesLoaded -and -not $script:FirewallLoadInProgress) {
         try { Start-FirewallRuleLoad -Preload } catch {}
+    }
+
+    # Also preload drivers when Background Jobs are turned on at runtime.
+    if (-not $script:DriverCacheLoaded -and -not $script:DriverLoadInProgress) {
+        try { Start-DriverListLoad } catch { Write-GuiLog "[Drivers] Background preload failed: $($_.Exception.Message)" }
     }
 
     # Legendary/GOG library cache for the Updates search box (self-guarding,
@@ -61921,6 +61948,11 @@ $script:WmtStartupPreloadTimer.Add_Tick({
         }
         if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted) {
             Stop-WmtStartupBackgroundPreload
+            # Start a single background driver inventory before the Drivers tab opens.
+            # The startup device/firewall/feature jobs have already been prioritized.
+            if (-not $script:DriverCacheLoaded -and -not $script:DriverLoadInProgress) {
+                try { Start-DriverListLoad } catch { Write-GuiLog "[Drivers] Startup preload failed: $($_.Exception.Message)" }
+            }
             return
         }
         $elapsed = ([DateTime]::UtcNow - $script:WmtStartupFeaturePreloadStartedAt).TotalSeconds

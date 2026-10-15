@@ -293,7 +293,11 @@ jobs:
           if ($source -match '\\$regCache\\[\\$path\\]\\s*=\\s*\\[PSCustomObject\\]\\$values') {
               throw 'Registry snapshot once again casts unnamed values to PSCustomObject.'
           }
-          Write-Host 'PASS: registry snapshots retain unnamed defaults, named data and legacy object values.'
+          if ($source -match '\$result\[\$path\]\s*=\s*\[PSCustomObject\]\$values' -or
+              (Find-FunctionText 'Get-WmtRegistryKeyValuesCached') -match 'Read-WmtRegValuesFast|OpenSubKey|Get-ItemProperty') {
+              throw 'Registry cache fallback can block on WPF or lose unnamed registry values.'
+          }
+          Write-Host 'PASS: registry snapshots and UI cache lookups are safe.'
 
           # Exercise the actual My Device queue with an unavailable pool.
           # A failed attempt must retain the section and throttle UI-thread retries.
@@ -338,6 +342,18 @@ jobs:
               throw 'My Device jobs still compete with interactive runspace capacity.'
           }
           Write-Host 'PASS: unreadable registry state rejected, pool opening deferred, My Device isolated.'
+          $cleanup = Find-FunctionText 'Show-DriverCleanupDialog'
+          $driverComplete = Find-FunctionText 'Complete-DriverLoadState'
+          $driverUsage = Find-FunctionText 'Start-DriverUsageLoad'
+          $preload = Find-FunctionText 'Start-WmtStartupBackgroundPreload'
+          if ($cleanup -notmatch '\$script:DriverUsageLoaded' -or
+              $cleanup -notmatch '\$DriverPackages = @\(\$script:DriverPackages\)' -or
+              $driverComplete -notmatch 'DriverCleanupPendingOpen' -or
+              $driverUsage -notmatch 'Win32_PnPSignedDriver.*-ErrorAction Stop' -or
+              $preload -notmatch 'Start-DriverListLoad') {
+              throw 'Driver inventory preloading, cache reuse or fail-closed usage scanning regressed.'
+          }
+          Write-Host 'PASS: driver inventory preloading and verified cache reuse.'
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
