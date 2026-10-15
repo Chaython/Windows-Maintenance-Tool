@@ -57117,19 +57117,6764 @@ Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $
         }
         $state = [string]$Matches[1]
     }
-    switch -Regex ($state) {
-        '^Enabled$' {
-            Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
-            Write-Output "Disabled: $dn"
-            break
-        }
-        '^(Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)$' {
-            Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
-            Write-Output "Enabled: $dn"
-            break
-        }
-        default { throw "Unrecognized feature state '$state' for $dn; no changes were made." }
+    if ($state -notmatch '^(Enabled|Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)
+} -ArgumentList $FeatureName, $DisplayName, $kind, $targetName -OnComplete $done | Out-Null
+}
+
+# --- SERVICES MANAGEMENT ---
+if ($btnSvcOptimize) { $btnSvcOptimize.Add_Click({ $btnPerfServicesManual.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))) }) }
+if ($btnSvcRestore) { $btnSvcRestore.Add_Click({ $btnPerfServicesRevert.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))) }) }
+
+if ($btnSvcView) { $btnSvcView.Add_Click({ Show-StartupManager -DefaultTab "Services" }) }
+
+# --- SCHEDULED TASKS WITH REVERT ---
+$script:TelemetryTasks = @(
+"\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
+"\Microsoft\Windows\Application Experience\ProgramDataUpdater",
+"\Microsoft\Windows\Autochk\Proxy",
+"\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+"\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
+"\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector",
+"\Microsoft\Windows\Feedback\Siuf\DmClient",
+"\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload",
+"\Microsoft\Windows\Windows Error Reporting\QueueReporting"
+)
+
+# Live enumeration folders for the View Tasks dialog: every task the Task
+# Scheduler actually has under these folders is listed (merged with the
+# canonical list above), so the grid shows what THIS machine registered
+# instead of a fixed name list. The Office folder is name-filtered at read
+# time because it also holds non-telemetry servicing tasks.
+$script:WmtTelemetryTaskFolders = @(
+    "\Microsoft\Windows\Application Experience",
+    "\Microsoft\Windows\Customer Experience Improvement Program",
+    "\Microsoft\Windows\Autochk",
+    "\Microsoft\Windows\DiskDiagnostic",
+    "\Microsoft\Windows\Feedback\Siuf",
+    "\Microsoft\Windows\Windows Error Reporting",
+    "\Microsoft\Windows\NetTrace",
+    "\Microsoft\Windows\PI",
+    "\Microsoft\Windows\Device Information",
+    "\Microsoft\Office"
+)
+
+if ($btnTasksDisableTelemetry) { $btnTasksDisableTelemetry.Add_Click({
+    # Runs off the UI thread (the old Invoke-UiCommand version froze the whole
+    # window while every task did its own slow CIM lookup).
+    try {
+        Start-WmtScheduledTaskBatchAction -Action Disable -FullPaths $script:TelemetryTasks -StartMessage "Disabling telemetry tasks..." -DoneMessage "Telemetry tasks disabled!"
     }
+    catch {
+        Write-WmtLastCrash -Context "Disable telemetry tasks failed" -Exception $_.Exception -ErrorRecord $_
+        Write-GuiLog "ERROR: Disable telemetry tasks failed: $($_.Exception.Message)"
+    }
+}) }
+
+if ($btnTasksRestore) { $btnTasksRestore.Add_Click({
+    # Runs off the UI thread (the old Invoke-UiCommand version froze the whole
+    # window while every task did its own slow CIM lookup).
+    try {
+        Start-WmtScheduledTaskBatchAction -Action Enable -FullPaths $script:TelemetryTasks -StartMessage "Restoring telemetry tasks..." -DoneMessage "Telemetry tasks restored!"
+    }
+    catch {
+        Write-WmtLastCrash -Context "Restore telemetry tasks failed" -Exception $_.Exception -ErrorRecord $_
+        Write-GuiLog "ERROR: Restore telemetry tasks failed: $($_.Exception.Message)"
+    }
+}) }
+
+if ($btnTasksView) { $btnTasksView.Add_Click({
+    # Fully instrumented: if anything inside the dialog ever throws again, the
+    # exact PowerShell position and call stack land in last-crash.txt instead
+    # of an anonymous "Unhandled WPF dispatcher exception" line.
+    try {
+        Show-WmtScheduledTasksDialog -Title "Telemetry Tasks" -FullPaths $script:TelemetryTasks -TelemetryFolders $script:WmtTelemetryTaskFolders
+    }
+    catch {
+        Write-WmtLastCrash -Context "Telemetry tasks view failed" -Exception $_.Exception -ErrorRecord $_
+        Write-GuiLog "ERROR: Telemetry tasks view failed: $($_.Exception.Message)"
+    }
+}) }
+
+# --- WINDOWS UPDATE PRESETS ---
+if ($btnWUDefault) { $btnWUDefault.Add_Click({
+    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate"
+    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates"
+    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferQualityUpdates"
+    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDefault" -Msg "Applying default Windows Update settings..." -Sb {
+        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        Write-Output "Windows Update set to Default."
+    } | Out-Null
+}) }
+
+if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
+    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates" 1
+    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdatesPeriodInDays" 365
+    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 0
+    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateSecurityOnly" -Msg "Applying security-only update settings..." -Sb {
+        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
+        Write-Output "Windows Update set to Security Only (deferring features)."
+    } | Out-Null
+}) }
+
+if ($btnWUDisable) { $btnWUDisable.Add_Click({
+    if ((Show-WmtMessageBox -Message "Disable ALL Windows Updates? This is not recommended for security." -Title "Warning" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
+        Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 1
+        Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDisable" -Msg "Disabling Windows Update..." -Sb {
+            Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
+            Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+            Write-Output "Windows Update DISABLED."
+        } | Out-Null
+    }
+}) }
+
+# --- Taskbar & Clock Tweaks Logic ---
+$btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"
+$btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"
+$btnToggleClockSecs = Get-Ctrl "btnToggleClockSecs"
+$btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"
+$btnToggleWidgets = Get-Ctrl "btnToggleWidgets"
+$btnToggleTaskView = Get-Ctrl "btnToggleTaskView"
+$btnToggleChat = Get-Ctrl "btnToggleChat"
+$btnMouseSettings = Get-Ctrl "btnMouseSettings"
+$btnSearchIndexRebuild = Get-Ctrl "btnSearchIndexRebuild"
+$btnMouseSpeedSlow = Get-Ctrl "btnMouseSpeedSlow"
+$btnMouseSpeedDefault = Get-Ctrl "btnMouseSpeedDefault"
+$btnMouseSpeedFast = Get-Ctrl "btnMouseSpeedFast"
+$btnToggleCombine = Get-Ctrl "btnToggleCombine"
+
+# --- Mouse & Explorer Tweak Click Handlers (registered once at startup) ---
+if ($btnMouseSpeedSlow) {
+$btnMouseSpeedSlow.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 6; Write-GuiLog "Mouse pointer speed set to 6 (slow)." } "Setting mouse speed slow..." ; Clear-WmtRegCache @("HKCU:\Control Panel\Mouse"); $s = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\Mouse" "MouseSensitivity" 10) 0); if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($s -ne 6) }; if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($s -ne 10) }; if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($s -ne 15) } })
+}
+if ($btnMouseSpeedDefault) {
+$btnMouseSpeedDefault.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 10; Write-GuiLog "Mouse pointer speed set to 10 (default)." } "Setting mouse speed default..." ; Clear-WmtRegCache @("HKCU:\Control Panel\Mouse"); $s = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\Mouse" "MouseSensitivity" 10) 0); if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($s -ne 6) }; if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($s -ne 10) }; if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($s -ne 15) } })
+}
+if ($btnMouseSpeedFast) {
+$btnMouseSpeedFast.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 15; Write-GuiLog "Mouse pointer speed set to 15 (fast)." } "Setting mouse speed fast..." ; Clear-WmtRegCache @("HKCU:\Control Panel\Mouse"); $s = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\Mouse" "MouseSensitivity" 10) 0); if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($s -ne 6) }; if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($s -ne 10) }; if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($s -ne 15) } })
+}
+if ($btnMouseSettings) { $btnMouseSettings.Add_Click({ Start-Process "main.cpl" }) }
+if ($btnSearchIndexRebuild) {
+$btnSearchIndexRebuild.Add_Click({
+        Invoke-WmtUiBackgroundCommand -Name "SearchIndexRebuild" -Msg "Rebuilding search index..." -Sb {
+            $svc = Get-Service WSearch -ErrorAction SilentlyContinue
+            if ($svc) {
+                Stop-Service WSearch -Force -ErrorAction SilentlyContinue
+                try { $svc.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(20)) } catch {}
+                Start-Service WSearch -ErrorAction SilentlyContinue
+            }
+            Write-Output "Search index rebuild started."
+        } | Out-Null
+    })
+}
+
+$btnToggleExtensions = Get-Ctrl "btnToggleExtensions"
+if ($btnToggleExtensions) {
+$btnToggleExtensions.Add_Click({
+        $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $ap "HideFileExt" 1) 0) -ne 0)
+        if ($currentlyHidden) {
+            Invoke-UiCommand { Set-WmtRegDword $ap "HideFileExt" 0; Write-GuiLog "File extensions shown." } "Showing file extensions..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $ap "HideFileExt" 1; Write-GuiLog "File extensions hidden." } "Hiding file extensions..."
+        }
+        Update-WmtTweakToggle $btnToggleExtensions (-not $currentlyHidden) "Show Extensions" "Hide Extensions"
+    })
+}
+
+$btnToggleHiddenFiles = Get-Ctrl "btnToggleHiddenFiles"
+if ($btnToggleHiddenFiles) {
+$btnToggleHiddenFiles.Add_Click({
+        $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $ap "Hidden" 2) 0) -eq 2)
+        if ($currentlyHidden) {
+            Invoke-UiCommand { Set-WmtRegDword $ap "Hidden" 1; Write-GuiLog "Hidden files shown." } "Showing hidden files..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $ap "Hidden" 2; Write-GuiLog "Hidden files hidden." } "Hiding hidden files..."
+        }
+        Update-WmtTweakToggle $btnToggleHiddenFiles (-not $currentlyHidden) "Show Hidden Files" "Hide Hidden Files"
+    })
+}
+
+$btnToggleExplorerLaunch = Get-Ctrl "btnToggleExplorerLaunch"
+if ($btnToggleExplorerLaunch) {
+$btnToggleExplorerLaunch.Add_Click({
+        $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyThisPc = ((ConvertTo-Int (Get-WmtRegValue $ap "LaunchTo" 2) 0) -eq 1)
+        if ($currentlyThisPc) {
+            Invoke-UiCommand { Set-WmtRegDword $ap "LaunchTo" 2; Write-GuiLog "Explorer opens to Quick Access." } "Setting Quick Access..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $ap "LaunchTo" 1; Write-GuiLog "Explorer opens to This PC." } "Setting This PC..."
+        }
+        Update-WmtTweakToggle $btnToggleExplorerLaunch (-not $currentlyThisPc) "Open to This PC" "Open to Quick Access"
+    })
+}
+
+$btnToggleFullPath = Get-Ctrl "btnToggleFullPath"
+if ($btnToggleFullPath) {
+$btnToggleFullPath.Add_Click({
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState")
+        $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p "FullPath" 0) 0) -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword $p "FullPath" 0; Write-GuiLog "Full path in title bar disabled." } "Disabling full path..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p "FullPath" 1; Write-GuiLog "Full path in title bar enabled." } "Enabling full path..."
+        }
+        Update-WmtTweakToggle $btnToggleFullPath (-not $currentlyOn) "Full Path On" "Full Path Off"
+    })
+}
+
+$btnToggleRecents = Get-Ctrl "btnToggleRecents"
+if ($btnToggleRecents) {
+$btnToggleRecents.Add_Click({
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $p "ShowRecent" 1) 0) -eq 0 -and (ConvertTo-Int (Get-WmtRegValue $p "ShowFrequent" 1) 0) -eq 0)
+        if ($currentlyHidden) {
+            Invoke-UiCommand { Set-WmtRegDword $p "ShowRecent" 1; Set-WmtRegDword $p "ShowFrequent" 1; Write-GuiLog "Recent files shown." } "Showing recents..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p "ShowRecent" 0; Set-WmtRegDword $p "ShowFrequent" 0; Write-GuiLog "Recent files hidden." } "Hiding recents..."
+        }
+        Update-WmtTweakToggle $btnToggleRecents (-not $currentlyHidden) "Show Recents" "Hide Recents"
+    })
+}
+
+$btnToggleMouseAccel = Get-Ctrl "btnToggleMouseAccel"
+if ($btnToggleMouseAccel) {
+$btnToggleMouseAccel.Add_Click({
+        $p = "HKCU:\Control Panel\Mouse"
+        Clear-WmtRegCache @($p)
+        $accelSpeed = ConvertTo-Str (Get-WmtRegValue $p "MouseSpeed" "1") ""
+        $accelT1 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold1" "0") ""
+        $accelT2 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold2" "0") ""
+        $currentlyOn = ($accelSpeed -eq "1" -and $accelT1 -ne "0" -and $accelT2 -ne "0")
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtMouseAcceleration $false; Write-GuiLog "Mouse acceleration disabled." } "Disabling mouse acceleration..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtMouseAcceleration $true; Write-GuiLog "Mouse acceleration enabled." } "Enabling mouse acceleration..."
+        }
+        Update-WmtTweakToggle $btnToggleMouseAccel (-not $currentlyOn) "Acceleration On" "Acceleration Off"
+    })
+}
+
+$btnToggleClickMode = Get-Ctrl "btnToggleClickMode"
+if ($btnToggleClickMode) {
+$btnToggleClickMode.Add_Click({
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
+        $shellState = Get-WmtRegValue $p "ShellState"
+        $singleClick = ($shellState -and $shellState.Length -gt 4 -and [int]$shellState[4] -eq 0x1E)
+        if ($singleClick) {
+            Invoke-UiCommand { Set-WmtExplorerClickMode $false; Write-GuiLog "Double-click folder opening restored." } "Restoring double-click..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtExplorerClickMode $true; Write-GuiLog "Single-click folder opening enabled." } "Enabling single-click..."
+        }
+        Update-WmtTweakToggle $btnToggleClickMode (-not $singleClick) "Single-Click Folders" "Double-Click Folders"
+    })
+}
+
+$btnToggleCtxMenu = Get-Ctrl "btnToggleCtxMenu"
+if ($btnToggleCtxMenu) {
+$btnToggleCtxMenu.Add_Click({
+        $clsidKey = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+        $inprocKey = "$clsidKey\InprocServer32"
+        $classicInstalled = Get-WmtRegistryPathExists -Path $inprocKey
+        if ($classicInstalled) {
+            Invoke-UiCommand {
+                Remove-WmtRegKeyTree $clsidKey
+                Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
+                Write-GuiLog "Modern context menu restored."
+            } "Restoring modern menu..."
+        }
+        else {
+            Invoke-UiCommand {
+                New-WmtRegKey $inprocKey
+                Set-WmtRegDefaultValue $inprocKey ""
+                Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
+                Write-GuiLog "Classic context menu enabled."
+            } "Enabling classic menu..."
+        }
+        Update-WmtTweakToggle $btnToggleCtxMenu (-not $classicInstalled) "Classic Right-Click" "Modern Right-Click"
+    })
+}
+
+$btnToggleTakeOwnership = Get-Ctrl "btnToggleTakeOwnership"
+if ($btnToggleTakeOwnership) {
+$btnToggleTakeOwnership.Add_Click({
+        $installed = Get-WmtRegistryPathExists -Path "HKCR:\Directory\shell\WMT_TakeOwnership"
+        if ($installed) {
+            Invoke-UiCommand {
+                Remove-WmtRegKeyTree "HKCR:\*\shell\WMT_TakeOwnership"
+                Remove-WmtRegKeyTree "HKCR:\Directory\shell\WMT_TakeOwnership"
+                Remove-WmtRegKeyTree "HKCR:\Drive\shell\WMT_TakeOwnership"
+                Write-GuiLog "Take Ownership context menu removed."
+            } "Removing Take Ownership..."
+        }
+        else {
+            Invoke-UiCommand {
+                $cmds = [ordered]@{
+                    "HKCR:\*\shell\WMT_TakeOwnership"         = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /a && icacls ""%1"" /grant *S-1-5-32-544:F /c && pause''"'
+                    "HKCR:\Directory\shell\WMT_TakeOwnership" = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /r /d y /a && icacls ""%1"" /grant *S-1-5-32-544:F /t /c && pause''"'
+                    "HKCR:\Drive\shell\WMT_TakeOwnership"     = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /r /d y /a && icacls ""%1"" /grant *S-1-5-32-544:F /t /c && pause''"'
+                }
+                foreach ($hivePath in $cmds.Keys) {
+                    New-WmtRegKey $hivePath
+                    Set-WmtRegDefaultValue $hivePath "Take Ownership"
+                    New-WmtRegKey "$hivePath\command"
+                    Set-WmtRegDefaultValue "$hivePath\command" $cmds[$hivePath]
+                }
+                Write-GuiLog "Take Ownership context menu added (files, folders, drives)."
+            } "Adding Take Ownership..."
+        }
+        Update-WmtTweakToggle $btnToggleTakeOwnership (-not $installed) "Remove Take Ownership" "Add Take Ownership"
+    })
+}
+
+$btnTogglePsHere = Get-Ctrl "btnTogglePsHere"
+if ($btnTogglePsHere) {
+$btnTogglePsHere.Add_Click({
+        $regPath = "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
+        $installed = Get-WmtRegistryPathExists -Path $regPath
+        if ($installed) {
+            Invoke-UiCommand {
+                Remove-WmtRegKeyTree $regPath
+                Write-GuiLog "PowerShell Here context menu removed."
+            } "Removing PowerShell Here..."
+        }
+        else {
+            Invoke-UiCommand {
+                New-WmtRegKey "$regPath\command"
+                Set-WmtRegDefaultValue $regPath "Open PowerShell Here"
+                Set-WmtRegString $regPath "Icon" "powershell.exe"
+                Set-WmtRegDefaultValue "$regPath\command" 'powershell.exe -NoExit -Command "Set-Location -LiteralPath ''%V''"'
+                Write-GuiLog "PowerShell Here context menu added."
+            } "Adding PowerShell Here..."
+        }
+        Update-WmtTweakToggle $btnTogglePsHere (-not $installed) "Remove PowerShell Here" "Add PowerShell Here"
+    })
+}
+
+$btnToggleAds = Get-Ctrl "btnToggleAds"
+if ($btnToggleAds) {
+$btnToggleAds.Add_Click({
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo")
+        $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p "Enabled" 1) 0) -ne 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Advertising ID disabled." } "Disabling advertising ID..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 1; Write-GuiLog "Advertising ID enabled." } "Enabling advertising ID..."
+        }
+        Update-WmtTweakToggle $btnToggleAds (-not $currentlyOn) "Ad ID Off" "Ad ID On"
+    })
+}
+
+$btnToggleSuggested = Get-Ctrl "btnToggleSuggested"
+if ($btnToggleSuggested) {
+$btnToggleSuggested.Add_Click({
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+        $names = @("ContentDeliveryAllowed", "FeatureManagementEnabled", "OemPreInstalledAppsEnabled", "PreInstalledAppsEnabled", "PreInstalledAppsEverEnabled", "SilentInstalledAppsEnabled", "SoftLandingEnabled", "SubscribedContent-310093Enabled", "SubscribedContent-338388Enabled", "SubscribedContent-338389Enabled", "SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled", "SystemPaneSuggestionsEnabled")
+        $anyOn = $false
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
+        foreach ($n in $names) { if ((ConvertTo-Int (Get-WmtRegValue $p $n 1) 0) -ne 0) { $anyOn = $true; break } }
+        if ($anyOn) {
+            Invoke-UiCommand { foreach ($n in $names) { Set-WmtRegDword $p $n 0 }; Write-GuiLog "Suggested content disabled." } "Disabling suggestions..."
+        }
+        else {
+            Invoke-UiCommand { foreach ($n in $names) { Set-WmtRegDword $p $n 1 }; Write-GuiLog "Suggested content enabled." } "Enabling suggestions..."
+        }
+        Update-WmtTweakToggle $btnToggleSuggested (-not $anyOn) "Suggestions Off" "Suggestions On"
+    })
+}
+
+$btnToggleTailored = Get-Ctrl "btnToggleTailored"
+if ($btnToggleTailored) {
+$btnToggleTailored.Add_Click({
+        $p1 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy"
+        $p2 = "HKCU:\Software\Policies\Microsoft\Windows\CloudContent"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy", "HKCU:\Software\Policies\Microsoft\Windows\CloudContent")
+        $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p1 "TailoredExperiencesWithDiagnosticDataEnabled" 1) 0) -ne 0 -and (ConvertTo-Int (Get-WmtRegValue $p2 "DisableTailoredExperiencesWithDiagnosticData" 0) 0) -ne 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword $p1 "TailoredExperiencesWithDiagnosticDataEnabled" 0; Set-WmtRegDword $p2 "DisableTailoredExperiencesWithDiagnosticData" 1; Write-GuiLog "Tailored experiences disabled." } "Disabling tailored experiences..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p1 "TailoredExperiencesWithDiagnosticDataEnabled" 1; Set-WmtRegDword $p2 "DisableTailoredExperiencesWithDiagnosticData" 0; Write-GuiLog "Tailored experiences enabled." } "Enabling tailored experiences..."
+        }
+        Update-WmtTweakToggle $btnToggleTailored (-not $currentlyOn) "Tailored Off" "Tailored On"
+    })
+}
+
+$btnToggleActivity = Get-Ctrl "btnToggleActivity"
+if ($btnToggleActivity) {
+$btnToggleActivity.Add_Click({
+        if (-not $btnToggleActivity.IsEnabled) { return }
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
+        Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\System")
+        $currentlyOff = ((ConvertTo-Int (Get-WmtRegValue $p "EnableActivityFeed" 1) 0) -eq 0 -and (ConvertTo-Int (Get-WmtRegValue $p "PublishUserActivities" 1) 0) -eq 0 -and (ConvertTo-Int (Get-WmtRegValue $p "UploadUserActivities" 1) 0) -eq 0)
+        if ($currentlyOff) {
+            Invoke-UiCommand { Set-WmtRegDword $p "EnableActivityFeed" 1; Set-WmtRegDword $p "PublishUserActivities" 1; Set-WmtRegDword $p "UploadUserActivities" 1; Write-GuiLog "Activity history enabled." } "Enabling activity history..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p "EnableActivityFeed" 0; Set-WmtRegDword $p "PublishUserActivities" 0; Set-WmtRegDword $p "UploadUserActivities" 0; Write-GuiLog "Activity history disabled." } "Disabling activity history..."
+        }
+        Update-WmtTweakToggle $btnToggleActivity (-not $currentlyOff) "Activity History Off" "Activity History On"
+    })
+}
+
+$btnToggleAppLaunch = Get-Ctrl "btnToggleAppLaunch"
+if ($btnToggleAppLaunch) {
+$btnToggleAppLaunch.Add_Click({
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p "Start_TrackProgs" 1) 0) -ne 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 0; Write-GuiLog "App launch tracking disabled." } "Disabling app launch tracking..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 1; Write-GuiLog "App launch tracking enabled." } "Enabling app launch tracking..."
+        }
+        Update-WmtTweakToggle $btnToggleAppLaunch (-not $currentlyOn) "Launch Tracking Off" "Launch Tracking On"
+    })
+}
+
+$btnToggleWebSearch = Get-Ctrl "btnToggleWebSearch"
+if ($btnToggleWebSearch) {
+$btnToggleWebSearch.Add_Click({
+        $p1 = "HKCU:\Software\Policies\Microsoft\Windows\Explorer"
+        $p2 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search", "HKCU:\Software\Policies\Microsoft\Windows\Explorer")
+        $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p1 "DisableSearchBoxSuggestions" 0) 0) -ne 1 -and (ConvertTo-Int (Get-WmtRegValue $p2 "BingSearchEnabled" 1) 0) -ne 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword $p1 "DisableSearchBoxSuggestions" 1; Set-WmtRegDword $p2 "BingSearchEnabled" 0; Write-GuiLog "Web search in Start Menu disabled." } "Disabling web search..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword $p1 "DisableSearchBoxSuggestions" 0; Set-WmtRegDword $p2 "BingSearchEnabled" 1; Write-GuiLog "Web search in Start Menu enabled." } "Enabling web search..."
+        }
+        Update-WmtTweakToggle $btnToggleWebSearch (-not $currentlyOn) "Web Search Off" "Web Search On"
+    })
+}
+
+$btnToggleSearchIndex = Get-Ctrl "btnToggleSearchIndex"
+if ($btnToggleSearchIndex) {
+$btnToggleSearchIndex.Add_Click({
+        $svc = Get-Service "WSearch" -ErrorAction SilentlyContinue
+        $currentlyOn = [bool]($svc -and $svc.StartType -eq "Automatic")
+        if (-not $currentlyOn) {
+            Invoke-WmtUiBackgroundCommand -Name "EnableSearchIndex" -Msg "Enabling search index..." -Sb { Set-Service -Name WSearch -StartupType Automatic; Start-Service -Name WSearch -ErrorAction SilentlyContinue; Write-Output "Search index set to Automatic." } | Out-Null
+        }
+        else {
+            Invoke-WmtUiBackgroundCommand -Name "ReduceSearchIndex" -Msg "Reducing search index..." -Sb { Set-Service -Name WSearch -StartupType Manual; Write-Output "Search index set to Manual." } | Out-Null
+        }
+        Update-WmtTweakToggle $btnToggleSearchIndex (-not $currentlyOn) "Reduce Indexing" "Default Indexing"
+    })
+}
+
+Register-WmtTweakButton "btnSearchIndexOptions" { Start-Process "control.exe" "srchadmin.dll" }
+
+$btnToggleGameMode = Get-Ctrl "btnToggleGameMode"
+if ($btnToggleGameMode) {
+$btnToggleGameMode.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\GameBar")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" 0) 0)) -eq 1 -or ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 0) 0)) -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 0
+                Set-WmtRegDword "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" 0
+                Write-GuiLog "Game Mode disabled."
+            } "Disabling Game Mode..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 1
+                Set-WmtRegDword "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" 1
+                Write-GuiLog "Game Mode enabled."
+            } "Enabling Game Mode..."
+        }
+        Update-WmtTweakToggle $btnToggleGameMode (-not $currentlyOn) "Game Mode On" "Game Mode Off"
+    })
+}
+$btnToggleGameBar = Get-Ctrl "btnToggleGameBar"
+if ($btnToggleGameBar) {
+$btnToggleGameBar.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR", "HKCU:\System\GameConfigStore")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 1) 0)) -ne 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1) 0)) -ne 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+                Set-WmtRegDword "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+                Set-WmtRegDword "HKCU:\Software\Microsoft\GameBar" "UseNexusForGameBarEnabled" 0
+                Write-GuiLog "Xbox Game Bar disabled."
+            } "Disabling Xbox Game Bar..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 1
+                Set-WmtRegDword "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1
+                Set-WmtRegDword "HKCU:\Software\Microsoft\GameBar" "UseNexusForGameBarEnabled" 1
+                Write-GuiLog "Xbox Game Bar restored."
+            } "Restoring Xbox Game Bar..."
+        }
+        Update-WmtTweakToggle $btnToggleGameBar (-not $currentlyOn) "Game Bar On" "Game Bar Off"
+    })
+}
+$btnToggleGameCapture = Get-Ctrl "btnToggleGameCapture"
+if ($btnToggleGameCapture) {
+$btnToggleGameCapture.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 1) 0)) -eq 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 1; Write-GuiLog "Background capture restored." } "Restoring background capture..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 0; Write-GuiLog "Background capture disabled." } "Disabling background capture..."
+        }
+        Update-WmtTweakToggle $btnToggleGameCapture (-not $currentlyOn) "Capture Off" "Capture On"
+    })
+}
+$btnToggleFso = Get-Ctrl "btnToggleFso"
+if ($btnToggleFso) {
+$btnToggleFso.Add_Click({
+        $fsoPath = "HKCU:\System\GameConfigStore"
+        Clear-WmtRegCache @("HKCU:\System\GameConfigStore")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $fsoPath "GameDVR_FSEBehaviorMode" 0) 0)) -eq 2 -and ((ConvertTo-Int (Get-WmtRegValue $fsoPath "GameDVR_HonorUserFSEBehaviorMode" 0) 0)) -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                $path = "HKCU:\System\GameConfigStore"
+                Set-WmtRegDword $path "GameDVR_FSEBehaviorMode" 0
+                Set-WmtRegDword $path "GameDVR_HonorUserFSEBehaviorMode" 0
+                Set-WmtRegDword $path "GameDVR_DXGIHonorFSEWindowsCompatible" 0
+                Set-WmtRegDword $path "GameDVR_EFSEFeatureFlags" 0
+                Write-GuiLog "Fullscreen optimization defaults restored."
+            } "Restoring fullscreen optimizations..."
+        }
+        else {
+            Invoke-UiCommand {
+                $path = "HKCU:\System\GameConfigStore"
+                Set-WmtRegDword $path "GameDVR_FSEBehaviorMode" 2
+                Set-WmtRegDword $path "GameDVR_HonorUserFSEBehaviorMode" 1
+                Set-WmtRegDword $path "GameDVR_DXGIHonorFSEWindowsCompatible" 1
+                Set-WmtRegDword $path "GameDVR_EFSEFeatureFlags" 0
+                Write-GuiLog "Fullscreen optimizations disabled globally."
+            } "Disabling fullscreen optimizations..."
+        }
+        Update-WmtTweakToggle $btnToggleFso (-not $currentlyOn) "Disable FS Optimizations" "Default FS Optimizations"
+    })
+}
+
+Register-WmtTweakButton "btnVisualBestAppearance" { Invoke-UiCommand { Set-WmtVisualPreset "Appearance"; Write-GuiLog "Visual effects set to best appearance." } "Applying best appearance..." }
+Register-WmtTweakButton "btnVisualBestPerformance" { Invoke-UiCommand { Set-WmtVisualPreset "Performance"; Write-GuiLog "Visual effects set to best performance." } "Applying best performance..." }
+Register-WmtTweakButton "btnVisualSnappy" { Invoke-UiCommand { Set-WmtVisualPreset "Snappy"; Write-GuiLog "Snappy desktop visual preset applied." } "Applying snappy desktop preset..." }
+
+Register-WmtTweakButton "btnNotifyFocusSettings" { Start-Process "ms-settings:notifications" }
+$btnToggleTips = Get-Ctrl "btnToggleTips"
+if ($btnToggleTips) {
+$btnToggleTips.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SoftLandingEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338389Enabled" 1) 0)) -eq 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtContentDeliveryValues @("SoftLandingEnabled", "SubscribedContent-338389Enabled", "SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled") 1
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1
+                Write-GuiLog "Windows tips and suggestions restored."
+            } "Restoring notification tips..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtContentDeliveryValues @("SoftLandingEnabled", "SubscribedContent-338389Enabled", "SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled") 0
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+                Write-GuiLog "Windows tips and suggestions disabled."
+            } "Disabling notification tips..."
+        }
+        Update-WmtTweakToggle $btnToggleTips (-not $currentlyOn) "Tips Off" "Tips On"
+    })
+}
+$btnToggleSetupPrompts = Get-Ctrl "btnToggleSetupPrompts"
+if ($btnToggleSetupPrompts) {
+$btnToggleSetupPrompts.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement")
+        $setupOff = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1) 0) -eq 0)
+        if ($setupOff) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1; Write-GuiLog "Finish setup prompts restored." } "Restoring setup prompts..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0; Write-GuiLog "Finish setup prompts disabled." } "Disabling setup prompts..."
+        }
+        Update-WmtTweakToggle $btnToggleSetupPrompts (-not $setupOff) "Setup Prompts On" "Setup Prompts Off"
+    })
+}
+$btnToggleLockFacts = Get-Ctrl "btnToggleLockFacts"
+if ($btnToggleLockFacts) {
+$btnToggleLockFacts.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1
+                Write-GuiLog "Lock screen fun facts restored."
+            } "Restoring lock screen fun facts..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 0
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 0
+                Write-GuiLog "Lock screen fun facts disabled."
+            } "Disabling lock screen fun facts..."
+        }
+        Update-WmtTweakToggle $btnToggleLockFacts (-not $currentlyOn) "Lock Facts Off" "Lock Facts On"
+    })
+}
+$btnToggleLockSpotlight = Get-Ctrl "btnToggleLockSpotlight"
+if ($btnToggleLockSpotlight) {
+$btnToggleLockSpotlight.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1
+                Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures"
+                Write-GuiLog "Lock screen Spotlight restored."
+            } "Restoring lock screen Spotlight..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 0
+                Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 1
+                Write-GuiLog "Lock screen Spotlight disabled."
+            } "Disabling lock screen Spotlight..."
+        }
+        Update-WmtTweakToggle $btnToggleLockSpotlight (-not $currentlyOn) "Spotlight Off" "Spotlight On"
+    })
+}
+$btnToggleLockScreen = Get-Ctrl "btnToggleLockScreen"
+if ($btnToggleLockScreen) {
+$btnToggleLockScreen.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
+        $lockFactsOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
+        $spotlightOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
+        $currentlyOn = ($lockFactsOff -and $spotlightOff)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1
+                Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures"
+                Write-GuiLog "Default lock screen content restored."
+            } "Restoring lock screen defaults..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 0
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 0
+                Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 0
+                Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 1
+                Write-GuiLog "Plain lock screen preset applied."
+            } "Applying plain lock screen..."
+        }
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
+        $lfOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
+        if ($btnToggleLockFacts) { Update-WmtTweakToggle $btnToggleLockFacts $lfOff "Lock Facts Off" "Lock Facts On" }
+        $spOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
+        if ($btnToggleLockSpotlight) { Update-WmtTweakToggle $btnToggleLockSpotlight $spOff "Spotlight Off" "Spotlight On" }
+    })
+}
+
+$btnToggleFastStartup = Get-Ctrl "btnToggleFastStartup"
+if ($btnToggleFastStartup) {
+$btnToggleFastStartup.Add_Click({
+        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1) 0)) -eq 0)
+        if ($currentlyOn) {
+            Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
+            Invoke-WmtUiBackgroundCommand -Name "EnableFastStartupHibernate" -Msg "Enabling Fast Startup..." -Sb {
+                powercfg /hibernate on | Out-Null
+                Write-Output "Fast Startup enabled. Hibernation was enabled because Fast Startup depends on it."
+            } | Out-Null
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0; Write-GuiLog "Fast Startup disabled." } "Disabling Fast Startup..."
+        }
+        Update-WmtTweakToggle $btnToggleFastStartup (-not $currentlyOn) "Fast Startup Off" "Fast Startup On"
+    })
+}
+$btnToggleRestoreFolders = Get-Ctrl "btnToggleRestoreFolders"
+if ($btnToggleRestoreFolders) {
+$btnToggleRestoreFolders.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "PersistBrowsers" 0) 0)) -ne 0)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "PersistBrowsers" 0; Write-GuiLog "Previous folder windows will not restore at logon." } "Disabling folder restore at logon..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "PersistBrowsers" 1; Write-GuiLog "Previous folder windows will restore at logon." } "Enabling folder restore at logon..."
+        }
+        Update-WmtTweakToggle $btnToggleRestoreFolders (-not $currentlyOn) "Restore Folders On" "Restore Folders Off"
+    })
+}
+
+Register-WmtTweakButton "btnSecurityUacOpen" { Start-Process "UserAccountControlSettings.exe" }
+$btnSecurityUacStatus = Get-Ctrl "btnSecurityUacStatus"
+if ($btnSecurityUacStatus) {
+$btnSecurityUacStatus.Add_Click({
+        $systemPolicy = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System")
+        Write-GuiLog "UAC EnableLUA: $(Get-WmtRegValue $systemPolicy "EnableLUA" "Unknown")"
+        Write-GuiLog "UAC ConsentPromptBehaviorAdmin: $(Get-WmtRegValue $systemPolicy "ConsentPromptBehaviorAdmin" "Unknown")"
+        Write-GuiLog "UAC PromptOnSecureDesktop: $(Get-WmtRegValue $systemPolicy "PromptOnSecureDesktop" "Unknown")"
+    })
+}
+Register-WmtTweakButton "btnSecuritySmartScreenOpen" {
+try { Start-Process "windowsdefender://AppAndBrowser" } catch { Start-Process "ms-settings:windowsdefender" }
+}
+$btnSecuritySmartScreenStatus = Get-Ctrl "btnSecuritySmartScreenStatus"
+if ($btnSecuritySmartScreenStatus) {
+$btnSecuritySmartScreenStatus.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AppHost", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer")
+        Write-GuiLog "Explorer SmartScreen: $(Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "SmartScreenEnabled" "Unknown")"
+        Write-GuiLog "AppHost Web Content Evaluation: $(Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AppHost" "EnableWebContentEvaluation" "Unknown")"
+        if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
+            $mp = Get-MpPreference -ErrorAction SilentlyContinue
+            if ($mp) { Write-GuiLog "Defender PUA protection: $($mp.PUAProtection)" }
+        }
+    })
+}
+Register-WmtTweakButton "btnSecurityCfaOpen" {
+try { Start-Process "windowsdefender://RansomwareProtection" } catch { Start-Process "ms-settings:windowsdefender" }
+}
+
+Register-WmtTweakButton "btnPowerBatterySaverOff" { Invoke-UiCommand { Set-WmtPowerSettingIndex "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" 0 -DCOnly; Write-GuiLog "Battery saver threshold set to 0%." } "Setting battery saver threshold..." }
+Register-WmtTweakButton "btnPowerBatterySaver20" { Invoke-UiCommand { Set-WmtPowerSettingIndex "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" 20 -DCOnly; Write-GuiLog "Battery saver threshold set to 20%." } "Setting battery saver threshold..." }
+Register-WmtTweakButton "btnPowerBatterySaver50" { Invoke-UiCommand { Set-WmtPowerSettingIndex "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" 50 -DCOnly; Write-GuiLog "Battery saver threshold set to 50%." } "Setting battery saver threshold..." }
+$btnToggleUsbSuspend = Get-Ctrl "btnToggleUsbSuspend"
+if ($btnToggleUsbSuspend) {
+$btnToggleUsbSuspend.Add_Click({
+        $usbSub = "2a737441-1930-4402-8d77-b2bebba308a3"; $usbSetting = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+        $usbAc = Get-WmtPowerSettingIndex $usbSub $usbSetting "AC"; $usbDc = Get-WmtPowerSettingIndex $usbSub $usbSetting "DC"
+        $currentlyOn = ($usbAc -eq 1 -and $usbDc -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtPowerSettingIndex "2a737441-1930-4402-8d77-b2bebba308a3" "48e6b7a6-50f5-4782-a5d4-53bb8f07e226" 0; Write-GuiLog "USB selective suspend disabled." } "Disabling USB selective suspend..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtPowerSettingIndex "2a737441-1930-4402-8d77-b2bebba308a3" "48e6b7a6-50f5-4782-a5d4-53bb8f07e226" 1; Write-GuiLog "USB selective suspend enabled." } "Enabling USB selective suspend..."
+        }
+        Update-WmtTweakToggle $btnToggleUsbSuspend (-not $currentlyOn) "USB Suspend On" "USB Suspend Off"
+    })
+}
+$btnTogglePcie = Get-Ctrl "btnTogglePcie"
+if ($btnTogglePcie) {
+$btnTogglePcie.Add_Click({
+        $pcieSub = "501a4d13-42af-4429-9fd1-a8218c268e20"; $pcieSetting = "ee12f906-d277-404b-b6da-e5fa1a576df5"
+        $pcieAc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "AC"; $pcieDc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "DC"
+        $currentlyOn = ($pcieAc -eq 1 -and $pcieDc -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtPowerSettingIndex "501a4d13-42af-4429-9fd1-a8218c268e20" "ee12f906-d277-404b-b6da-e5fa1a576df5" 0; Write-GuiLog "PCI Express link state savings disabled." } "Disabling PCIe link state savings..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtPowerSettingIndex "501a4d13-42af-4429-9fd1-a8218c268e20" "ee12f906-d277-404b-b6da-e5fa1a576df5" 1; Write-GuiLog "PCI Express link state set to moderate savings." } "Setting PCIe link state savings..."
+        }
+        Update-WmtTweakToggle $btnTogglePcie (-not $currentlyOn) "PCIe Savings" "PCIe Savings Off"
+    })
+}
+
+$btnToggleLongPaths = Get-Ctrl "btnToggleLongPaths"
+if ($btnToggleLongPaths) {
+$btnToggleLongPaths.Add_Click({
+        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled" 0) 0)) -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled" 0; Write-GuiLog "Win32 long paths disabled." } "Disabling long paths..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled" 1; Write-GuiLog "Win32 long paths enabled." } "Enabling long paths..."
+        }
+        Update-WmtTweakToggle $btnToggleLongPaths (-not $currentlyOn) "Long Paths On" "Long Paths Off"
+    })
+}
+$btnToggleDevMode = Get-Ctrl "btnToggleDevMode"
+if ($btnToggleDevMode) {
+$btnToggleDevMode.Add_Click({
+        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock")
+        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" "AllowDevelopmentWithoutDevLicense" 0) 0)) -eq 1)
+        if ($currentlyOn) {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" "AllowDevelopmentWithoutDevLicense" 0
+                Set-WmtRegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" "AllowAllTrustedApps" 0
+                Write-GuiLog "Developer Mode policies disabled."
+            } "Disabling Developer Mode..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" "AllowDevelopmentWithoutDevLicense" 1
+                Set-WmtRegDword "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" "AllowAllTrustedApps" 1
+                Write-GuiLog "Developer Mode policies enabled."
+            } "Enabling Developer Mode..."
+        }
+        Update-WmtTweakToggle $btnToggleDevMode (-not $currentlyOn) "Developer Mode On" "Developer Mode Off"
+    })
+}
+Register-WmtTweakButton "btnDevSettings" { Start-Process "ms-settings:developers" }
+
+# --- SOFTWARE CATALOG ---
+$script:SoftwareCatalog = @(
+[PSCustomObject]@{Category = "Browsers"; Name = "Google Chrome"; Description = "Fast, secure web browser"; Source = "winget"; Id = "Google.Chrome" },
+[PSCustomObject]@{Category = "Browsers"; Name = "Mozilla Firefox"; Description = "Privacy-focused browser"; Source = "winget"; Id = "Mozilla.Firefox" },
+[PSCustomObject]@{Category = "Browsers"; Name = "Microsoft Edge"; Description = "Chromium-based browser"; Source = "winget"; Id = "Microsoft.Edge" },
+[PSCustomObject]@{Category = "Browsers"; Name = "Brave"; Description = "Privacy-focused Chromium browser"; Source = "winget"; Id = "Brave.Brave" },
+[PSCustomObject]@{Category = "Development"; Name = "Visual Studio Code"; Description = "Popular code editor"; Source = "winget"; Id = "Microsoft.VisualStudioCode" },
+[PSCustomObject]@{Category = "Development"; Name = "Git"; Description = "Version control system"; Source = "winget"; Id = "Git.Git" },
+[PSCustomObject]@{Category = "Development"; Name = "Node.js"; Description = "JavaScript runtime"; Source = "winget"; Id = "OpenJS.NodeJS" },
+[PSCustomObject]@{Category = "Development"; Name = "Python"; Description = "Programming language"; Source = "winget"; Id = "Python.Python.3" },
+[PSCustomObject]@{Category = "Development"; Name = "Notepad++"; Description = "Advanced text editor"; Source = "winget"; Id = "Notepad++.Notepad++" },
+[PSCustomObject]@{Category = "Utilities"; Name = "7-Zip"; Description = "File archiver"; Source = "winget"; Id = "7zip.7zip" },
+[PSCustomObject]@{Category = "Utilities"; Name = "WinRAR"; Description = "Archive manager"; Source = "winget"; Id = "RARLab.WinRAR" },
+[PSCustomObject]@{Category = "Utilities"; Name = "Everything"; Description = "Fast file search"; Source = "winget"; Id = "voidtools.Everything" },
+[PSCustomObject]@{Category = "Utilities"; Name = "PowerToys"; Description = "Microsoft productivity tools"; Source = "winget"; Id = "Microsoft.PowerToys" },
+[PSCustomObject]@{Category = "Utilities"; Name = "HWiNFO"; Description = "Hardware monitoring"; Source = "winget"; Id = "REALiX.HWiNFO" },
+[PSCustomObject]@{Category = "Multimedia"; Name = "VLC Media Player"; Description = "Universal media player"; Source = "winget"; Id = "VideoLAN.VLC" },
+[PSCustomObject]@{Category = "Multimedia"; Name = "Spotify"; Description = "Music streaming"; Source = "winget"; Id = "Spotify.Spotify" },
+[PSCustomObject]@{Category = "Multimedia"; Name = "OBS Studio"; Description = "Streaming/recording software"; Source = "winget"; Id = "OBSProject.OBSStudio" },
+[PSCustomObject]@{Category = "Multimedia"; Name = "GIMP"; Description = "Image editor"; Source = "winget"; Id = "GIMP.GIMP" },
+[PSCustomObject]@{Category = "Gaming"; Name = "Steam"; Description = "Game platform"; Source = "winget"; Id = "Valve.Steam" },
+[PSCustomObject]@{Category = "Gaming"; Name = "Discord"; Description = "Chat for gamers"; Source = "winget"; Id = "Discord.Discord" },
+[PSCustomObject]@{Category = "Gaming"; Name = "Epic Games Launcher"; Description = "Epic game store"; Source = "winget"; Id = "EpicGames.EpicGamesLauncher" },
+[PSCustomObject]@{Category = "Security"; Name = "Malwarebytes"; Description = "Anti-malware"; Source = "winget"; Id = "Malwarebytes.Malwarebytes" },
+[PSCustomObject]@{Category = "Security"; Name = "Bitwarden"; Description = "Password manager"; Source = "winget"; Id = "Bitwarden.Bitwarden" }
+)
+
+function Add-WmtCatalogListItems {
+param(
+    [System.Windows.Controls.ListView]$ListView,
+    [System.Collections.IEnumerable]$Items
+)
+
+if (-not $ListView) { return }
+$ListView.Items.Clear()
+foreach ($item in $Items) {
+    if ($item) { [void]$ListView.Items.Add($item) }
+}
+}
+
+function Get-WmtCatalogItemsBySearch {
+param([string]$Query)
+
+$results = [System.Collections.Generic.List[object]]::new()
+$queryText = ([string]$Query).Trim()
+foreach ($item in $script:SoftwareCatalog) {
+    if ([string]::IsNullOrWhiteSpace($queryText) -or
+        ([string]$item.Name).IndexOf($queryText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        ([string]$item.Description).IndexOf($queryText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        [void]$results.Add($item)
+    }
+}
+return $results.ToArray()
+}
+
+function Get-WmtCatalogItemsByCategory {
+param([string]$Category)
+
+$results = [System.Collections.Generic.List[object]]::new()
+foreach ($item in $script:SoftwareCatalog) {
+    if ([string]::Equals([string]$item.Category, $Category, [System.StringComparison]::OrdinalIgnoreCase)) {
+        [void]$results.Add($item)
+    }
+}
+return $results.ToArray()
+}
+
+if ($btnShowCatalog -and $btnBackToUpdates -and $btnCatalogInstall -and $btnCatalogSelectAll -and $btnCatalogClear -and $btnCatAll -and $btnCatBrowsers -and $btnCatDev -and $btnCatUtils -and $btnCatMedia -and $btnCatGames -and $btnCatSecurity -and $pnlCatalog -and $lstCatalog) {
+
+$btnShowCatalog.Add_Click({
+        $pnlUpdates.Visibility = "Collapsed"
+        $pnlCatalog.Visibility = "Visible"
+        Reset-WmtLibraryToCatalog
+        Add-WmtCatalogListItems -ListView $lstCatalog -Items $script:SoftwareCatalog
+        # Pre-load library scan in the background so "Your Library"
+        # results are ready when the user clicks the button.
+        if (-not $script:WmtLibraryScanResults -and -not $script:WmtLibraryScanRunspace) {
+            Start-WmtLibraryScan -Silent
+        }
+    })
+
+$btnBackToUpdates.Add_Click({
+        $pnlCatalog.Visibility = "Collapsed"
+        $pnlUpdates.Visibility = "Visible"
+    })
+
+$btnCatAll.Add_Click({ Reset-WmtLibraryToCatalog; Add-WmtCatalogListItems -ListView $lstCatalog -Items $script:SoftwareCatalog })
+
+$btnCatBrowsers.Add_Click({ Reset-WmtLibraryToCatalog; Get-CatalogByCategory "Browsers" })
+$btnCatDev.Add_Click({ Reset-WmtLibraryToCatalog; Get-CatalogByCategory "Development" })
+$btnCatUtils.Add_Click({ Reset-WmtLibraryToCatalog; Get-CatalogByCategory "Utilities" })
+$btnCatMedia.Add_Click({ Reset-WmtLibraryToCatalog; Get-CatalogByCategory "Multimedia" })
+$btnCatGames.Add_Click({ Reset-WmtLibraryToCatalog; Get-CatalogByCategory "Gaming" })
+$btnCatSecurity.Add_Click({ Reset-WmtLibraryToCatalog; Get-CatalogByCategory "Security" })
+}
+
+function Get-CatalogByCategory($Category) {
+Add-WmtCatalogListItems -ListView $lstCatalog -Items (Get-WmtCatalogItemsByCategory -Category $Category)
+}
+
+if ($btnCatalogInstall -and $btnCatalogSelectAll -and $btnCatalogClear -and $lstCatalog) {
+$btnCatalogInstall.Add_Click({
+        # These controls are shared by Software Catalog and Your Library.
+        # Route the action to whichever list is actually visible.
+        if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+            $selected = @($lstLibrary.SelectedItems | Where-Object { $null -ne $_ })
+            if ($selected.Count -eq 0 -and $lstLibrary.SelectedItem) { $selected = @($lstLibrary.SelectedItem) }
+            if ($selected.Count -eq 0) { return }
+
+            foreach ($item in $selected) {
+                $isInstalled = $false
+                try {
+                    if ($item.PSObject.Properties["IsInstalled"]) {
+                        $isInstalled = [bool]$item.IsInstalled
+                    }
+                }
+                catch {}
+
+                # A GOGDL install can become tracked before the visible library
+                # row is refreshed, so do the same tracked-path check used by
+                # the context menu before offering another install.
+                $isPending = $false
+                if (([string]$item.Source) -eq "GOG") {
+                    try {
+                        if (-not $isInstalled) {
+                            $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
+                            $isInstalled = -not [string]::IsNullOrWhiteSpace($trackedGogPath)
+                        }
+                        if (-not $isInstalled) {
+                            $isPending = Test-WmtGogdlInstallPending -Id ([string]$item.Id)
+                        }
+                    }
+                    catch {}
+                }
+
+                if (-not $isInstalled -and -not $isPending) {
+                    Invoke-WmtLibraryInstall -Item $item
+                }
+            }
+            return
+        }
+
+        $selected = @($lstCatalog.SelectedItems)
+        if ($selected.Count -eq 0) { return }
+        Invoke-WmtSelectedPackageInstalls -Items $selected
+    })
+
+$btnCatalogSelectAll.Add_Click({
+        if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+            $lstLibrary.SelectAll()
+            return
+        }
+        $lstCatalog.SelectAll()
+    })
+
+$btnCatalogClear.Add_Click({
+        if ($brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible -and $lstLibrary) {
+            $lstLibrary.SelectedItems.Clear()
+            return
+        }
+        $lstCatalog.SelectedItems.Clear()
+    })
+}
+
+# --- YOUR LIBRARY ---
+# Shows owned games from Steam (local manifests), Epic (Legendary cache),
+# and GOG (GOGDL cache). The Steam scan runs in a background runspace
+# because reading manifests can be slow; Legendary/GOGDL read from cache
+# files that are populated by the boot-time library cache builder.
+
+$script:WmtLibraryScanRunspace = $null
+$script:WmtLibraryScanAsyncResult = $null
+
+function Get-WmtSteamInstalledGames {
+$result = [System.Collections.Generic.List[object]]::new()
+foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+    [void]$result.Add([PSCustomObject]@{
+        Source="Steam"; Name=[string]$manifest.Name; Id=[string]$manifest.Id;
+        Version=if (-not [string]::IsNullOrWhiteSpace([string]$manifest.BuildId) -and [string]$manifest.BuildId -ne "0") { "Build $($manifest.BuildId)" } else { "Installed" };
+        Available="-"
+    })
+}
+return $result.ToArray()
+}
+
+function Start-WmtLibraryScan {
+param([switch]$Silent)
+
+# This function intentionally replaces an earlier library scan. Reconcile the
+# old shared-poller entry before disposing/replacing the worker references so
+# duplicate-name protection cannot leave the new scan unmonitored.
+try { Unregister-WmtUiPollOperation -Name "LibraryScan" } catch {}
+
+$oldLibraryScanPs = $script:WmtLibraryScanRunspace
+$oldLibraryScanAsync = $script:WmtLibraryScanAsyncResult
+$script:WmtLibraryScanRunspace = $null
+$script:WmtLibraryScanAsyncResult = $null
+if ($oldLibraryScanPs) {
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldLibraryScanPs -Invocation $oldLibraryScanAsync -Name "Library scan replacement" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldLibraryScanPs -Invocation $oldLibraryScanAsync -Name "Library scan replacement" } catch {}
+    }
+}
+
+if (-not $Silent) {
+    if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Scanning libraries..." }
+}
+
+# Resolve cache file paths in main scope.
+$dataPath = Get-DataPath
+$legCacheFile = Join-Path $dataPath "legendary_library.json"
+$gogCacheFile = Join-Path $dataPath "gog_library.json"
+$steamCacheFile = Join-Path $dataPath "steam_library.json"
+
+$gogInstalledIds = [System.Collections.Generic.List[string]]::new()
+$gogPendingIds = [System.Collections.Generic.List[string]]::new()
+try {
+    $trackedGog = Get-WmtGogdlInstallMap
+    foreach ($trackedId in @($trackedGog.Keys)) {
+        $idText = [string]$trackedId
+        if ([string]::IsNullOrWhiteSpace($idText)) { continue }
+        if (Test-WmtGogdlInstallPending -Id $idText) {
+            [void]$gogPendingIds.Add($idText)
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace((Get-WmtGogdlTrackedInstallPath -Id $idText))) {
+            [void]$gogInstalledIds.Add($idText)
+        }
+    }
+}
+catch {}
+
+$ps = New-WmtPooledPowerShell
+[void]$ps.AddScript({
+        param($LegCacheFile, $GogCacheFile, $SteamCacheFile, $GogInstalledIds, $GogPendingIds)
+
+        $all = [System.Collections.Generic.List[object]]::new()
+
+        # --- Steam (read from cache file) ---
+        try {
+            if ($SteamCacheFile -and (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
+                $cacheText = [System.IO.File]::ReadAllText($SteamCacheFile)
+                $library = $cacheText | ConvertFrom-Json -ErrorAction Stop
+                if ($library) {
+                    $steamCount = 0
+                    foreach ($game in @($library)) {
+                        $title = [string]$game.Title
+                        if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                        $isInst = $false
+                        try { if ($game.PSObject.Properties["IsInstalled"]) { $isInst = [bool]$game.IsInstalled } } catch {}
+                        $instVer = ""
+                        try { if ($game.PSObject.Properties["InstalledVersion"]) { $instVer = [string]$game.InstalledVersion } } catch {}
+                        $all.Add([PSCustomObject]@{
+                                Source      = "Steam"
+                                Name        = $title
+                                Id          = [string]$game.Id
+                                Version     = if ($isInst) { $instVer } else { "Not installed" }
+                                Available   = "-"
+                                IsInstalled = $isInst
+                                ProviderKey = "steam"
+                            })
+                        $steamCount++
+                    }
+                    Write-Output "LOG:Steam: $steamCount games."
+                }
+            }
+            else {
+                Write-Output "LOG:Steam cache not found."
+            }
+        }
+        catch {
+            Write-Output "LOG:Steam library read failed: $($_.Exception.Message)"
+        }
+
+        # --- Legendary (read from cache file) ---
+        try {
+            if (Test-Path -LiteralPath $LegCacheFile -PathType Leaf) {
+                $cacheText = [System.IO.File]::ReadAllText($LegCacheFile)
+                $library = $cacheText | ConvertFrom-Json -ErrorAction Stop
+                $legCount = 0
+                # Legendary marks UE/Fab content with namespace 'ue' in its own assets.json.
+                # Use it as the authoritative UE/Fab tag (Fab app_names are arbitrary, e.g. "PlatformFunctionsPlugin_5.4").
+                $ueAppNames = @{}
+                # Legendary's config home (every release since ~2021, Windows included)
+                # is %USERPROFILE%\.config\legendary, overridable via LEGENDARY_CONFIG_PATH
+                # or XDG_CONFIG_HOME. Older builds used %USERPROFILE%\.legendary, and
+                # Heroic keeps its own copy. Probe every candidate; missing files are
+                # skipped and all hits are merged below.
+                $ueAssetsFiles = @()
+                try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+                try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+                try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
+                try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+                try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+                foreach ($ueAssetsFile in $ueAssetsFiles) {
+                    if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+                    try {
+                        $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                        foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                            # Platform value can be an array of assets (legendary) or a map of
+                            # app_name -> asset (heroic-style assets.json). Handle both.
+                            $uePlatformAssets = @()
+                            if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                                $uePlatformAssets = @($platformProp.Value)
+                            }
+                            elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                                $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                            }
+                            foreach ($asset in @($uePlatformAssets)) {
+                                if (([string]$asset.namespace) -eq 'ue') {
+                                    $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                                    if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                                }
+                            }
+                        }
+                    }
+                    catch {}
+                }
+                # Per-game metadata files are legendary's most durable UE tag
+                # source: every synced game gets metadata/<app_name>.json with
+                # the EGS namespace inside, even when assets.json is missing
+                # or stale.
+                $ueMetaRoots = @()
+                try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+                try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+                try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+                try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+                try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
+                foreach ($game in @($library)) {
+                    $title = [string]$game.Title
+                    if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                    # Tag Unreal Engine / Fab marketplace assets. The UI hides them
+                    # when the "Hide Unreal Engine / Fab assets" toggle is checked;
+                    # update checks are never affected by the toggle.
+                    $legId = ([string]$game.Id).Trim()
+                    # Prefer the IsUe tag newer WMT builds write into the cache
+                    # (from legendary's own namespace data), then fall back to the
+                    # assets.json namespace set and the name patterns so older or
+                    # stale caches still get tagged. OR semantics: a false tag from
+                    # a text-parsed cache does not veto the other sources.
+                    $legIsUe = $false
+                    try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
+                    if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
+                    if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                        foreach ($ueMetaRoot in $ueMetaRoots) {
+                            $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
+                            if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                            try {
+                                $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                                if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                            }
+                            catch {}
+                            break
+                        }
+                    }
+                    $isInst = $false
+                    try { if ($game.PSObject.Properties["IsInstalled"]) { $isInst = [bool]$game.IsInstalled } } catch {}
+                    $instVer = ""
+                    try { if ($game.PSObject.Properties["InstalledVersion"]) { $instVer = [string]$game.InstalledVersion } } catch {}
+                    $latestVer = [string]$game.Version
+                    $all.Add([PSCustomObject]@{
+                            Source      = "Epic"
+                            Name        = $title
+                            Id          = [string]$game.Id
+                            Version     = if ($isInst -and -not [string]::IsNullOrWhiteSpace($instVer)) { $instVer } else { "Not installed" }
+                            Available   = if (-not [string]::IsNullOrWhiteSpace($latestVer)) { $latestVer } else { "-" }
+                            IsInstalled = $isInst
+                            InstallPath = [string]$game.InstallPath
+                            ProviderKey = "legendary"
+                            IsUe        = $legIsUe
+                        })
+                    $legCount++
+                }
+                Write-Output "LOG:Epic (Legendary): $legCount games."
+            }
+            else {
+                Write-Output "LOG:Legendary cache not found."
+            }
+        }
+        catch {
+            Write-Output "LOG:Legendary library read failed: $($_.Exception.Message)"
+        }
+
+        # --- GOGDL (read from cache file) ---
+        try {
+            if (Test-Path -LiteralPath $GogCacheFile -PathType Leaf) {
+                $cacheText = [System.IO.File]::ReadAllText($GogCacheFile)
+                $library = $cacheText | ConvertFrom-Json -ErrorAction Stop
+                $gogCount = 0
+                foreach ($game in @($library)) {
+                    $title = [string]$game.Title
+                    if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                    $gameId = [string]$game.Id
+                    $isInstalled = ($GogInstalledIds -contains $gameId)
+                    $isPending = (-not $isInstalled -and ($GogPendingIds -contains $gameId))
+                    $all.Add([PSCustomObject]@{
+                            Source      = "GOG"
+                            Name        = $title
+                            Id          = $gameId
+                            Version     = if ($isInstalled) { "Installed" } elseif ($isPending) { "Downloading" } else { "Owned" }
+                            Available   = [string]$game.Version
+                            IsInstalled = $isInstalled
+                            IsPending   = $isPending
+                            ProviderKey = "gogdl"
+                        })
+                    $gogCount++
+                }
+                Write-Output "LOG:GOG: $gogCount games."
+            }
+            else {
+                Write-Output "LOG:GOG cache not found."
+            }
+        }
+        catch {
+            Write-Output "LOG:GOG library read failed: $($_.Exception.Message)"
+        }
+
+        Write-Output "COUNT:$($all.Count)"
+        foreach ($item in $all) { Write-Output $item }
+    }).AddArgument($legCacheFile).AddArgument($gogCacheFile).AddArgument($steamCacheFile).AddArgument($gogInstalledIds.ToArray()).AddArgument($gogPendingIds.ToArray())
+
+$script:WmtLibraryScanRunspace = $ps
+$script:WmtLibraryScanAsyncResult = $ps.BeginInvoke()
+
+# Collect results through the shared UI poller. There is no dedicated
+# DispatcherTimer object anymore, so the legacy timer-null guard must not be
+# used as an activity test (it would make every poll return immediately).
+$script:WmtLibraryScanTimer = $null
+Register-WmtUiPollOperation -Name "LibraryScan" -IntervalMs 500 -TestComplete { $false } -OnTick {
+        if (-not $script:WmtLibraryScanAsyncResult) { return }
+        if (-not $script:WmtLibraryScanAsyncResult.IsCompleted) {
+            
+            return
+        }
+        try {
+            $results = $script:WmtLibraryScanRunspace.EndInvoke($script:WmtLibraryScanAsyncResult)
+            $collected = [System.Collections.Generic.List[object]]::new()
+            foreach ($line in @($results)) {
+                if ($line -is [string]) {
+                    if ($line.StartsWith("LOG:")) {
+                        Write-GuiLog ($line.Substring(4))
+                    }
+                }
+                elseif ($line -and $line.PSObject.Properties["Name"]) {
+                    [void]$collected.Add($line)
+                }
+            }
+            # Store results in script scope so "Your Library" can display instantly.
+            $script:WmtLibraryScanResults = $collected.ToArray()
+
+            # If the library list is currently visible, populate it now.
+            if ($lstLibrary -and $brdLibraryList -and $brdLibraryList.Visibility -eq [System.Windows.Visibility]::Visible) {
+                $lstLibrary.Items.Clear()
+                foreach ($item in $script:WmtLibraryScanResults) {
+                    if (Test-WmtFabAssetHidden $item) { continue }
+                    [void]$lstLibrary.Items.Add($item)
+                }
+                if ($lblLibraryStatus) {
+                    if ($lstLibrary.Items.Count -gt 0) {
+                        $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
+                    }
+                    else {
+                        $lblLibraryStatus.Text = "No games found. Install Steam/Legendary/GOGDL and enable them in Providers."
+                    }
+                }
+                Write-GuiLog "Library scan complete: $($lstLibrary.Items.Count) game(s)."
+            }
+            else {
+                Write-GuiLog "Library scan pre-loaded: $($script:WmtLibraryScanResults.Count) game(s) ready."
+            }
+        }
+        catch {
+            Write-GuiLog "Library scan failed: $($_.Exception.Message)"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library scan failed." }
+        }
+        try { $script:WmtLibraryScanRunspace.Dispose() } catch {}
+        $script:WmtLibraryScanRunspace = $null
+        $script:WmtLibraryScanAsyncResult = $null
+        
+        Unregister-WmtUiPollOperation -Name "LibraryScan"
+        $script:WmtLibraryScanTimer = $null
+    } -TimeoutMs 120000 -OnTimeout {
+        $oldPs = $script:WmtLibraryScanRunspace
+        $oldAsync = $script:WmtLibraryScanAsyncResult
+        $script:WmtLibraryScanRunspace = $null
+        $script:WmtLibraryScanAsyncResult = $null
+        Write-GuiLog "Library scan timed out after 2 minutes; stopping worker."
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library scan timed out. Refresh to retry." }
+        if ($oldPs) { Stop-WmtPowerShellInvocationAsync -PowerShell $oldPs -Invocation $oldAsync -Name "Library scan timeout" }
+    } -OnError {
+        param($operation, $errorRecord)
+        Write-GuiLog "Library scan monitor failed: $errorRecord"
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library scan failed. Refresh to retry." }
+        $oldPs = $script:WmtLibraryScanRunspace
+        $oldAsync = $script:WmtLibraryScanAsyncResult
+        $script:WmtLibraryScanRunspace = $null
+        $script:WmtLibraryScanAsyncResult = $null
+        if ($oldPs) { Stop-WmtPowerShellInvocationAsync -PowerShell $oldPs -Invocation $oldAsync -Name "Library scan monitor failure" }
+    } | Out-Null
+}
+
+if ($btnShowLibrary -and $btnLibraryRefresh -and $brdCatalogList -and $brdLibraryList -and $pnlCatalogActions -and $lstLibrary) {
+$btnShowLibrary.Add_Click({
+        try {
+            # Switch to library view (keep all buttons visible).
+            $brdCatalogList.Visibility = "Collapsed"
+            $brdLibraryList.Visibility = "Visible"
+            if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+            if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
+            if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
+            if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install the selected uninstalled game(s) using their library provider." }
+            if ($btnCatalogSelectAll) { $btnCatalogSelectAll.ToolTip = "Select all visible games in Your Library." }
+            if ($btnCatalogClear) { $btnCatalogClear.ToolTip = "Clear the current Your Library selection." }
+
+            # Highlight the Your Library button (AccentBtn style).
+            if ($btnShowLibrary) { $btnShowLibrary.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
+
+            # If we have pre-loaded results, display them instantly.
+            if ($script:WmtLibraryScanResults -and $script:WmtLibraryScanResults.Count -gt 0) {
+                $lstLibrary.Items.Clear()
+                foreach ($item in $script:WmtLibraryScanResults) {
+                    if (Test-WmtFabAssetHidden $item) { continue }
+                    [void]$lstLibrary.Items.Add($item)
+                }
+                if ($lblLibraryStatus) {
+                    $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
+                }
+            }
+            elseif (-not $script:WmtLibraryScanRunspace) {
+                Start-WmtLibraryScan
+            }
+            else {
+                if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Scanning libraries..." }
+            }
+        }
+        catch {
+            Write-WmtLastCrash -Context "Open library view failed" -Exception $_.Exception -ErrorRecord $_
+            Write-GuiLog "ERROR: Could not open the library view: $($_.Exception.Message)"
+        }
+    })
+
+$btnLibraryRefresh.Add_Click({
+        try {
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Refreshing provider libraries..." }
+            Start-WmtLibraryCacheBuilder -Force
+        }
+        catch {
+            Write-WmtLastCrash -Context "Library refresh failed" -Exception $_.Exception -ErrorRecord $_
+            Write-GuiLog "ERROR: Library refresh failed: $($_.Exception.Message)"
+        }
+    })
+
+# --- Unreal Engine / Fab assets visibility toggle (Your Library) ---
+# Hides UE/Fab assets from the library view only; update scans for them
+# are never disabled. Persisted in settings.json as HideLegendaryUeAssets.
+# State lives in $global:WmtHideUeAssets (see Test-WmtFabAssetHidden) so the
+# search debounce and every list population path share one live value.
+if ($btnToggleFabAssets) {
+$btnToggleFabAssets.Add_Click({
+        $global:WmtHideUeAssets = -not $global:WmtHideUeAssets
+        try {
+            $wmtUeSettings = Get-WmtSettings
+            if ($wmtUeSettings -is [System.Collections.IDictionary]) { $wmtUeSettings["HideLegendaryUeAssets"] = [bool]$global:WmtHideUeAssets }
+            else { $wmtUeSettings | Add-Member -MemberType NoteProperty -Name "HideLegendaryUeAssets" -Value ([bool]$global:WmtHideUeAssets) -Force }
+            Save-WmtSettings -Settings $wmtUeSettings
+        }
+        catch {}
+        Set-WmtFabAssetsButtonLabel
+        # Re-apply the filter instantly; Update-WmtLibrarySearch respects any
+        # active search text and the shared hide flag.
+        Update-WmtLibrarySearch
+        # Rebuild the Legendary cache to match the new visibility: Hidden
+        # (default) builds it without --include-ue, Shown with UE/Fab rows.
+        # The builder's completion handler refreshes the open library view,
+        # so flipping the toggle both ways takes effect without a restart.
+        try { Start-WmtLibraryCacheBuilder } catch { Write-GuiLog "Fab assets cache refresh failed: $($_.Exception.Message)" }
+        if ($lblLibraryStatus -and $brdLibraryList -and $brdLibraryList.Visibility -eq "Visible" -and $lstLibrary -and $lstLibrary.Items.Count -gt 0) {
+            $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
+        }
+        Write-GuiLog ("Unreal Engine / Fab assets are now " + $(if ($global:WmtHideUeAssets) { "hidden" } else { "shown" }) + " in Your Library. Update checks are unaffected.")
+    })
+}
+
+
+# Locate / Import: provider registrations are intentionally distinct.
+# Steam is never marked installed without a matching appmanifest in an active Steam library.
+$script:WmtGameImportRunspace = $null
+$script:WmtGameImportAsync = $null
+$script:WmtGameImportContext = $null
+
+function Update-WmtLegendaryImportedGameCache {
+param([string]$Id, [string]$Name, [string]$InstallPath, [string]$Version)
+$cacheFile = Join-Path (Get-DataPath) "legendary_library.json"
+$rows = @()
+if (Test-Path -LiteralPath $cacheFile -PathType Leaf) {
+    $rows = @([System.IO.File]::ReadAllText($cacheFile) | ConvertFrom-Json -ErrorAction Stop)
+}
+$found = $false
+foreach ($row in $rows) {
+    if (([string]$row.Id) -ine $Id) { continue }
+    $found = $true
+    $row | Add-Member -NotePropertyName IsInstalled -NotePropertyValue $true -Force
+    $row | Add-Member -NotePropertyName InstallPath -NotePropertyValue $InstallPath -Force
+    $row | Add-Member -NotePropertyName InstalledVersion -NotePropertyValue $Version -Force
+}
+if (-not $found) {
+    $rows += [PSCustomObject]@{
+        Provider="legendary"; Source="legendary"; Kind="Library";
+        Title=$Name; Id=$Id; Version=$Version; InstalledVersion=$Version;
+        IsInstalled=$true; InstallPath=$InstallPath; IsUe=$false
+    }
+}
+Set-WmtJsonCacheFile -Path $cacheFile -InputObject $rows -Depth 5
+$script:WmtLegendaryLibraryCache = $null
+}
+
+function Invoke-WmtLibraryLocateImport {
+param($Item)
+if (-not $Item) {
+    Show-WmtMessageBox -Message "Select one game from Your Library." -Title "Locate / Import" -Image Information | Out-Null
+    return
+}
+$source = ([string]$Item.Source).Trim().ToLowerInvariant()
+$id = ([string]$Item.Id).Trim()
+$name = ([string]$Item.Name).Trim()
+if ($source -notin @("steam", "epic", "legendary", "gog", "gogdl") -or [string]::IsNullOrWhiteSpace($id) -or $id.Contains('"')) {
+    Show-WmtMessageBox -Message "Locate / Import is supported for Steam, Epic/Legendary, and GOG/GOGDL." -Title "Unsupported Source" -Image Information | Out-Null
+    return
+}
+if ($script:WmtGameImportRunspace) {
+    Show-WmtMessageBox -Message "Another game import is already running." -Title "Import in Progress" -Image Information | Out-Null
+    return
+}
+$initial = ""
+try { $initial = Get-WmtLibraryItemInstallDir -Item $Item } catch {}
+if (-not $initial -and $script:WmtLastGameLocatePath -and (Test-Path -LiteralPath $script:WmtLastGameLocatePath -PathType Container)) {
+    $initial = [string]$script:WmtLastGameLocatePath
+}
+if (-not $initial) { $initial = [string]$env:USERPROFILE }
+$path = Select-WmtExplorerFolder -Description "Locate existing files for $name ($source)" -InitialDirectory $initial -Owner $window
+if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Container)) { return }
+$path = [System.IO.Path]::GetFullPath([string]$path)
+$script:WmtLastGameLocatePath = $path
+
+if ($source -eq "steam") {
+    if ($id -notmatch '^\d+$') {
+        Show-WmtMessageBox -Message "This entry has an invalid Steam app ID." -Title "Steam Import" -Image Warning | Out-Null
+        return
+    }
+    foreach ($m in @(Get-WmtSteamInstalledManifests)) {
+        if (([string]$m.Id) -ne $id) { continue }
+        $actual = Join-Path (Join-Path ([string]$m.LibraryRoot) "steamapps\common") ([string]$m.InstallDir)
+        if ([string]::Equals(([System.IO.Path]::GetFullPath($actual)).TrimEnd('\'), $path.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-GuiLog "Steam game already registered: $name ($id) at $path"
+            Show-WmtMessageBox -Message "Steam has the matching appmanifest in a registered library. WMT will refresh the library cache." -Title "Steam Game Located" -Image Information | Out-Null
+            Start-WmtLibraryCacheBuilder -Force
+            return
+        }
+    }
+    $folderInfo = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    $commonDir = if ($folderInfo) { $folderInfo.Parent } else { $null }
+    $steamappsDir = if ($commonDir) { $commonDir.Parent } else { $null }
+    $properLayout = ($commonDir -and $steamappsDir -and $commonDir.Name -ieq "common" -and $steamappsDir.Name -ieq "steamapps")
+    $localManifest = if ($properLayout) { Join-Path $steamappsDir.FullName "appmanifest_$id.acf" } else { "" }
+    if ($properLayout -and (Test-Path -LiteralPath $localManifest -PathType Leaf)) {
+        $manifestText = Get-Content -LiteralPath $localManifest -Raw -ErrorAction SilentlyContinue
+        $manifestId = Get-WmtSteamManifestValue -Text $manifestText -Key "appid"
+        $manifestDir = Get-WmtSteamManifestValue -Text $manifestText -Key "installdir"
+        if ($manifestId -eq $id -and $manifestDir -ieq $folderInfo.Name) {
+            $line = [Environment]::NewLine
+            Show-WmtMessageBox -Message ("Matching Steam manifest found, but the library is not registered with Steam:" + $line + $steamappsDir.Parent.FullName + $line + $line + "Add this library root in Steam > Settings > Storage, then refresh WMT. Nothing has been marked installed.") -Title "Add Steam Library" -Image Information | Out-Null
+            return
+        }
+        Show-WmtMessageBox -Message "The local Steam appmanifest does not match this app ID or directory. WMT will not adopt incorrect metadata." -Title "Steam Manifest Mismatch" -Image Warning | Out-Null
+        return
+    }
+    $steamNote = if ($properLayout) { "A matching Steam appmanifest is missing." } else { "This folder is outside the usual steamapps\common layout." }
+    $prompt = $steamNote + [Environment]::NewLine + [Environment]::NewLine + "Add or move the files into a registered Steam library, then let Steam discover and verify them. Open Steam's install flow for this app? Steam may download missing or outdated files."
+    if ((Show-WmtMessageBox -Message $prompt -Title "Steam Locate" -Button YesNo -Image Question) -eq [System.Windows.MessageBoxResult]::Yes) {
+        try { Start-Process "steam://install/$id" | Out-Null }
+        catch { Show-WmtMessageBox -Message $_.Exception.Message -Title "Cannot Open Steam" -Image Warning | Out-Null }
+    }
+    return
+}
+if ($source -in @("gog", "gogdl")) {
+    if ($id -notmatch '^\d+$') {
+        Show-WmtMessageBox -Message "Invalid GOG app ID." -Title "GOG Import" -Image Warning | Out-Null
+        return
+    }
+    $matching = $false
+    foreach ($f in @(Get-ChildItem -LiteralPath $path -Filter "goggame-*.info" -File -ErrorAction SilentlyContinue)) {
+        try {
+            $info = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$info.rootGameId -eq $id) { $matching = $true; break }
+        } catch {}
+    }
+    if (-not $matching) {
+        Show-WmtMessageBox -Message "No goggame-*.info file matches the selected GOG title. Select the game root directory. Nothing was registered." -Title "GOG Metadata Missing" -Image Warning | Out-Null
+        return
+    }
+    $exe = Get-WmtGogdlResolvedExePath
+    $provider = "GOG"
+    $a = 'import "' + $path.Replace('"', '') + '"'
+} else {
+    $exe = Get-WmtLegendaryExePath
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        try {
+            $command = Get-Command legendary -ErrorAction SilentlyContinue
+            if ($command -and $command.Source) { $exe = [string]$command.Source }
+        } catch {}
+    }
+    $provider = "Legendary"
+    # Verify game content; skip potentially interactive DLC questions.
+    $a = 'import "' + $id + '" "' + $path.Replace('"', '') + '"'
+}
+if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+    Show-WmtMessageBox -Message "$provider executable was not found. Enable/install its provider first." -Title "Provider Missing" -Image Warning | Out-Null
+    return
+}
+if (@(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Select-Object -First 1).Count -eq 0) {
+    Show-WmtMessageBox -Message "The selected directory is empty." -Title "No Game Files" -Image Warning | Out-Null
+    return
+}
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell
+    $script:WmtGameImportContext = [PSCustomObject]@{ Provider=$provider; Id=$id; Name=$name; Path=$path }
+    [void]$ps.AddScript({
+        param($binary, $cmdArgs, $kind, $appId)
+        $run = Invoke-WmtProcess -FilePath $binary -Arguments $cmdArgs -TimeoutMs 7200000 -Encoding UTF8 -KillTree
+        $detectedId = ""
+        $registeredPath = ""
+        $registeredVersion = ""
+        $warning = ""
+        if ($kind -eq "GOG" -and $run.ExitCode -eq 0 -and -not $run.TimedOut) {
+            try {
+                $metadata = ([string]$run.StdOut).Trim() | ConvertFrom-Json -ErrorAction Stop
+                $detectedId = ([string]$metadata.appName).Trim()
+            } catch { $warning = "GOGDL import returned invalid JSON: $($_.Exception.Message)" }
+        }
+        elseif ($kind -eq "Legendary" -and $run.ExitCode -eq 0 -and -not $run.TimedOut) {
+            $installed = Invoke-WmtLegendaryInstalledData -LegendaryExe $binary -TimeoutMs 30000
+            if ($installed.ExitCode -eq 0) {
+                foreach ($game in @($installed.Rows)) {
+                    if (([string]$game.'App name') -ine $appId) { continue }
+                    $registeredPath = ([string]$game.'Install path').Trim()
+                    $registeredVersion = ([string]$game.'Installed version').Trim()
+                    break
+                }
+            } else {
+                $warning = "Legendary import exited successfully, but its local installed-game database could not be checked."
+            }
+        }
+        [PSCustomObject]@{
+            ExitCode=[int]$run.ExitCode; TimedOut=[bool]$run.TimedOut;
+            TerminationFailed=[bool]$run.TerminationFailed; Error=[string]$run.Error;
+            StdErr=[string]$run.StdErr; DetectedId=$detectedId;
+            RegisteredPath=$registeredPath; RegisteredVersion=$registeredVersion; Warning=$warning
+        }
+    }).AddArgument($exe).AddArgument($a).AddArgument($provider).AddArgument($id)
+    $script:WmtGameImportRunspace = $ps
+    $script:WmtGameImportAsync = $ps.BeginInvoke()
+    if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $false }
+    if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Importing $name with $provider (file verification may take time)..." }
+    Write-GuiLog "[Import] ${provider}: $name ($id) from $path"
+
+    Register-WmtUiPollOperation -Name "GameLibraryImport" -IntervalMs 500 -TimeoutMs 7260000 -TestComplete { $false } -OnTick {
+        if (-not $script:WmtGameImportAsync -or -not $script:WmtGameImportAsync.IsCompleted) { return }
+        $context = $script:WmtGameImportContext
+        try {
+            $records = @($script:WmtGameImportRunspace.EndInvoke($script:WmtGameImportAsync))
+            $record = @($records | Where-Object { $_ -and $_.PSObject.Properties["ExitCode"] } | Select-Object -Last 1)[0]
+            if (-not $record) { throw "Import returned no status." }
+            if ($record.TimedOut -or $record.TerminationFailed -or [int]$record.ExitCode -ne 0 -or $record.Error) {
+                $detail = ([string]$record.Error).Trim()
+                if (-not $detail) { $detail = ([string]$record.StdErr).Trim() }
+                if ($detail.Length -gt 500) { $detail = $detail.Substring($detail.Length - 500) }
+                throw "Import failed (exit $($record.ExitCode); timeout=$($record.TimedOut)). $detail"
+            }
+            if ([string]$context.Provider -eq "GOG") {
+                if (([string]$record.DetectedId) -ne ([string]$context.Id)) {
+                    throw "GOGDL detected app ID '$($record.DetectedId)' instead of '$($context.Id)'. No game was registered."
+                }
+                Set-WmtGogdlTrackedInstall -Id ([string]$context.Id) -Name ([string]$context.Name) -RootPath ([string]$context.Path) -InstallPath ([string]$context.Path) -Status Installed
+            } else {
+                $regPath = ([string]$record.RegisteredPath).Trim()
+                if (-not $regPath -or -not [string]::Equals(
+                    ([System.IO.Path]::GetFullPath($regPath)).TrimEnd('\'),
+                    ([System.IO.Path]::GetFullPath([string]$context.Path)).TrimEnd('\'),
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Legendary did not confirm the selected installation path after import. WMT's cache was not updated. $($record.Warning)"
+                }
+                Update-WmtLegendaryImportedGameCache -Id ([string]$context.Id) -Name ([string]$context.Name) -InstallPath $regPath -Version ([string]$record.RegisteredVersion)
+            }
+            Write-GuiLog "[Import] Registered $($context.Provider): $($context.Name) ($($context.Id)) -> $($context.Path)"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Imported $($context.Name) successfully." }
+            Start-WmtLibraryScan -Silent
+        }
+        catch {
+            Write-GuiLog "[Import] $($context.Provider) import failed: $($_.Exception.Message)"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Could not import $($context.Name)." }
+            Show-WmtMessageBox -Message ([string]$_.Exception.Message) -Title "Game Import Failed" -Image Warning | Out-Null
+        }
+        finally {
+            try { Unregister-WmtUiPollOperation -Name "GameLibraryImport" } catch {}
+            try { if ($script:WmtGameImportRunspace) { $script:WmtGameImportRunspace.Dispose() } } catch {}
+            $script:WmtGameImportRunspace = $null
+            $script:WmtGameImportAsync = $null
+            $script:WmtGameImportContext = $null
+            if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+        }
+    } -OnTimeout {
+        Write-GuiLog "[Import] Import watchdog expired after 121 minutes. Cancelling..."
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Import timed out; cancelling worker..." }
+        $active = $script:WmtGameImportRunspace
+        $async = $script:WmtGameImportAsync
+        if ($active) { Stop-WmtPowerShellInvocationAsync -PowerShell $active -Invocation $async -Name "Game import timeout" }
+        # Preserve in-flight references to prevent a second import overlapping it.
+        Register-WmtUiPollOperation -Name "GameLibraryImportStop" -IntervalMs 500 -TestComplete {
+            $script:WmtGameImportAsync -and $script:WmtGameImportAsync.IsCompleted
+        } -OnComplete {
+            $script:WmtGameImportRunspace = $null
+            $script:WmtGameImportAsync = $null
+            $script:WmtGameImportContext = $null
+            if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Import cancelled. Refresh the library before retrying." }
+        } | Out-Null
+    } -OnError {
+        param($operation, $errorRecord)
+        Write-GuiLog "[Import] Import monitor failed: $errorRecord"
+        if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Import monitor failed; restart WMT before importing again." }
+        if ($script:WmtGameImportRunspace) {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $script:WmtGameImportRunspace -Invocation $script:WmtGameImportAsync -Name "Game import monitor error"
+        }
+    } | Out-Null
+}
+catch {
+    Write-GuiLog "[Import] Cannot start import: $($_.Exception.Message)"
+    if ($script:WmtGameImportAsync) {
+        if ($script:WmtGameImportRunspace) {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $script:WmtGameImportRunspace -Invocation $script:WmtGameImportAsync -Name "Game import startup error"
+        }
+    }
+    else {
+        try { if ($ps) { $ps.Dispose() } } catch {}
+        $script:WmtGameImportRunspace = $null
+        $script:WmtGameImportAsync = $null
+        $script:WmtGameImportContext = $null
+        if ($btnLibraryLocate) { $btnLibraryLocate.IsEnabled = $true }
+    }
+    Show-WmtMessageBox -Message $_.Exception.Message -Title "Import Error" -Image Warning | Out-Null
+}
+}
+
+if ($btnLibraryLocate) {
+    $btnLibraryLocate.Add_Click({
+        $selected = @($lstLibrary.SelectedItems | Where-Object { $null -ne $_ })
+        if ($selected.Count -ne 1) {
+            Show-WmtMessageBox -Message "Select exactly one Steam, Epic, or GOG game, then choose its installation folder." -Title "Locate / Import" -Image Information | Out-Null
+            return
+        }
+        Invoke-WmtLibraryLocateImport -Item $selected[0]
+    }.GetNewClosure())
+}
+
+# --- Library context menu ---
+# Helper: get the selected library item.
+function Get-WmtSelectedLibraryItem {
+    if (-not $lstLibrary) { return $null }
+    return @($lstLibrary.SelectedItems | Select-Object -First 1)[0]
+}
+
+# Helper: resolve the install directory for a game.
+function Get-WmtLibraryItemInstallDir {
+    param($Item)
+    if (-not $Item) { return "" }
+    $source = ([string]$Item.Source).Trim().ToLowerInvariant()
+    $id = [string]$Item.Id
+
+    if ($source -eq "steam") {
+        foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+            if ([string]$manifest.Id -ne $id) { continue }
+            $installDirName=[string]$manifest.InstallDir
+            if ([string]::IsNullOrWhiteSpace($installDirName)) { return "" }
+            $installDir=Join-Path (Join-Path ([string]$manifest.LibraryRoot) "steamapps\common") $installDirName
+            if (Test-Path -LiteralPath $installDir) { return $installDir }
+            return ""
+        }
+    }
+
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
+        # The library cache already carries the installed directory. Opening a
+        # local folder must not depend on an online `legendary info` lookup.
+        $cachedPath = ([string]$Item.InstallPath).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($cachedPath) -and
+            (Test-Path -LiteralPath $cachedPath -PathType Container)) { return $cachedPath }
+        if ([string]::IsNullOrWhiteSpace($id)) { return "" }
+
+        # Older library rows may lack a path, or the game may have moved since
+        # the scan. Query the same local install database used by the builder.
+        try {
+            $legExe = Get-WmtLegendaryExePath
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $cmd = Get-Command legendary -ErrorAction SilentlyContinue
+                if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
+            }
+            if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $installedResult = Invoke-WmtLegendaryInstalledData -LegendaryExe $legExe -TimeoutMs 10000
+                if ($installedResult.ExitCode -eq 0) {
+                    foreach ($game in $installedResult.Rows) {
+                        if (([string]$game.'App name').Trim() -ne $id) { continue }
+                        $p = ([string]$game.'Install path').Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($p) -and
+                            (Test-Path -LiteralPath $p -PathType Container)) { return $p }
+                    }
+                }
+                if ($installedResult.TimedOut) { Write-GuiLog "Legendary install directory lookup timed out for '$id'." }
+                if ($installedResult.Error) { Write-GuiLog "Legendary install directory lookup failed for '$id': $($installedResult.Error)" }
+                if ($installedResult.ExitCode -ne 0 -and $installedResult.StdErr) {
+                    Write-GuiLog "Legendary install directory lookup failed for '$id': $(([string]$installedResult.StdErr).Trim())"
+                }
+            }
+        }
+        catch { Write-GuiLog "Legendary install directory lookup failed for '$id': $($_.Exception.Message)" }
+    }
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
+        # Prefer installs launched by WMT, then fall back to Heroic's registry.
+        $trackedPath = Get-WmtGogdlTrackedInstallPath -Id $id
+        if (-not [string]::IsNullOrWhiteSpace($trackedPath)) { return $trackedPath }
+
+        # GOG games installed via GOGDL/Heroic - check common locations.
+        $heroicConfig = Join-Path $env:APPDATA "heroic\gog_store\library.json"
+        if (Test-Path -LiteralPath $heroicConfig -PathType Leaf) {
+            try {
+                $lib = Get-Content -LiteralPath $heroicConfig -Raw | ConvertFrom-Json
+                $game = @($lib | Where-Object { [string]$_.appName -eq $id -or [string]$_.id -eq $id }) | Select-Object -First 1
+                if ($game -and $game.PSObject.Properties["install_path"]) {
+                    $p = [string]$game.install_path
+                    if ((Test-Path -LiteralPath $p)) { return $p }
+                }
+            }
+            catch {}
+        }
+    }
+    return ""
+}
+
+# Helper: launch a game.
+function Invoke-WmtLibraryLaunch {
+    param($Item)
+    if (-not $Item) { return }
+    $source = [string]$Item.Source
+    $id = [string]$Item.Id
+    $name = [string]$Item.Name
+
+    if ($source -eq "Steam") {
+        Start-Process "steam://run/$id"
+        Write-GuiLog "Launching Steam game: $name (app $id)"
+    }
+    elseif ($source -eq "Epic") {
+        try {
+            $legExe = Get-WmtLegendaryExePath
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $cmd = Get-Command legendary -ErrorAction SilentlyContinue
+                if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
+            }
+            if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                Start-Process -FilePath $legExe -ArgumentList "launch", $id -WindowStyle Normal
+                Write-GuiLog "Launching Epic game: $name (app $id)"
+            }
+            else {
+                Show-WmtMessageBox -Message "Legendary is not installed. Cannot launch Epic games." -Title "Launch Failed" -Image Warning | Out-Null
+            }
+        }
+        catch {
+            Show-WmtMessageBox -Message "Failed to launch: $($_.Exception.Message)" -Title "Launch Failed" -Image Warning | Out-Null
+        }
+    }
+    elseif ($source -eq "GOG") {
+        # GOGDL games are DRM-free � find the game executable in the
+        # install directory and launch it directly.
+        $installDir = Get-WmtLibraryItemInstallDir -Item $Item
+        if (-not [string]::IsNullOrWhiteSpace($installDir) -and (Test-Path -LiteralPath $installDir)) {
+            # Look for the most likely executable: prefer one matching
+            # the game name, then any .exe that's not an uninstaller.
+            $exes = @(Get-ChildItem -LiteralPath $installDir -Filter "*.exe" -File -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $n = $_.Name.ToLowerInvariant()
+                    $n -notmatch "unins|uninstall|setup|redist|installer|crash|report|config|helper" -and
+                    $_.Length -gt 100KB
+                } | Sort-Object Length -Descending)
+            if ($exes.Count -gt 0) {
+                Start-Process -FilePath $exes[0].FullName
+                Write-GuiLog "Launching GOG game: $name ($($exes[0].Name))"
+            }
+            else {
+                # No exe found � open the install directory instead.
+                Start-Process "explorer.exe" -ArgumentList "`"$installDir`""
+                Write-GuiLog "No game executable found for: $name. Opened install directory."
+            }
+        }
+        else {
+            Show-WmtMessageBox -Message "Could not find the install directory for this GOG game." -Title "Launch Failed" -Image Warning | Out-Null
+        }
+    }
+}
+
+# Helper: install a game.
+function Get-WmtGogdlInstallMapPath {
+return (Join-Path (Get-DataPath) "gogdl_installs.json")
+}
+
+function Get-WmtGogdlResolvedExePath {
+$exe = Get-WmtGogdlExePath
+if (-not [string]::IsNullOrWhiteSpace($exe) -and (Test-Path -LiteralPath $exe -PathType Leaf)) { return [string]$exe }
+foreach ($cmdName in @("gogdl", "gogdl.exe", "gogdl_windows_x86_64.exe", "gogdl_windows_arm64.exe")) {
+    try {
+        $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) { return [string]$cmd.Source }
+    }
+    catch {}
+}
+return ""
+}
+
+function Get-WmtGogdlResolvedAuthConfigPath {
+$auth = Get-WmtGogdlAuthConfigPath
+if (-not [string]::IsNullOrWhiteSpace($auth) -and (Test-Path -LiteralPath $auth -PathType Leaf)) { return [string]$auth }
+try {
+    $heroicAuth = Join-Path $env:APPDATA "heroic\gog_store\auth.json"
+    if (Test-Path -LiteralPath $heroicAuth -PathType Leaf) { return [string]$heroicAuth }
+}
+catch {}
+return ""
+}
+
+function Get-WmtGogdlManifestPath {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+$base = ""
+try {
+    if (-not [string]::IsNullOrWhiteSpace($env:GOGDL_CONFIG_PATH)) {
+        $base = Join-Path $env:GOGDL_CONFIG_PATH "heroic_gogdl\manifests"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        $base = Join-Path $env:APPDATA "heroic_gogdl\manifests"
+    }
+}
+catch {}
+if ([string]::IsNullOrWhiteSpace($base)) { return "" }
+return (Join-Path $base $Id)
+}
+
+function Get-WmtGogdlManifestInstallFolder {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+$manifestPath = Get-WmtGogdlManifestPath -Id $Id
+if ([string]::IsNullOrWhiteSpace($manifestPath) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return "" }
+try {
+    $manifest = [System.IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop
+    $folder = ""
+    if ($manifest.PSObject.Properties["installDirectory"]) {
+        $folder = ([string]$manifest.installDirectory).Trim()
+    }
+    elseif ($manifest.PSObject.Properties["product"] -and $manifest.product -and $manifest.product.PSObject.Properties["installDirectory"]) {
+        $folder = ([string]$manifest.product.installDirectory).Trim()
+    }
+    return $folder
+}
+catch {
+    Write-GuiLog "GOGDL manifest read warning for ${Id}: $($_.Exception.Message)"
+    return ""
+}
+}
+
+function Resolve-WmtGogdlInstallPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [string]$RootPath,
+    [string]$InstallPath
+)
+
+$folder = Get-WmtGogdlManifestInstallFolder -Id $Id
+if (-not [string]::IsNullOrWhiteSpace($folder) -and -not [string]::IsNullOrWhiteSpace($RootPath)) {
+    try {
+        $candidate = Join-Path $RootPath $folder
+        if (Test-Path -LiteralPath $candidate -PathType Container) { return [string]$candidate }
+    }
+    catch {}
+}
+
+if (-not [string]::IsNullOrWhiteSpace($InstallPath) -and (Test-Path -LiteralPath $InstallPath -PathType Container)) {
+    return [string]$InstallPath
+}
+return ""
+}
+
+function Get-WmtGogdlInstallMap {
+$map = @{}
+$path = Get-WmtGogdlInstallMapPath
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $map }
+try {
+    $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    foreach ($property in @($raw.PSObject.Properties)) {
+        $map[[string]$property.Name] = $property.Value
+    }
+}
+catch {
+    Write-GuiLog "GOGDL install tracking warning: $($_.Exception.Message)"
+}
+return $map
+}
+
+function Set-WmtGogdlTrackedInstall {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [string]$Name,
+    [string]$RootPath,
+    [string]$InstallPath,
+    [ValidateSet("Pending", "Installed", "Failed")][string]$Status = "Pending",
+    [int]$ProcessId = 0,
+    [int64]$ProcessStartUtcTicks = 0
+)
+
+$map = Get-WmtGogdlInstallMap
+$map[$Id] = [PSCustomObject]@{
+    Name        = [string]$Name
+    RootPath    = [string]$RootPath
+    InstallPath = [string]$InstallPath
+    Status      = [string]$Status
+    ProcessId           = [int]$ProcessId
+    ProcessStartUtcTicks = [int64]$ProcessStartUtcTicks
+    UpdatedUtc           = [DateTime]::UtcNow.ToString("o")
+}
+$path = Get-WmtGogdlInstallMapPath
+$dir = Split-Path -Parent $path
+if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+    [void][System.IO.Directory]::CreateDirectory($dir)
+}
+$tmp = "$path.tmp-$([guid]::NewGuid().ToString('N'))"
+try {
+    [System.IO.File]::WriteAllText($tmp, ($map | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+}
+finally {
+    try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch {}
+}
+}
+
+function Remove-WmtGogdlTrackedInstall {
+param([Parameter(Mandatory = $true)][string]$Id)
+$map = Get-WmtGogdlInstallMap
+if (-not $map.ContainsKey($Id)) { return }
+[void]$map.Remove($Id)
+$path = Get-WmtGogdlInstallMapPath
+$tmp = "$path.tmp-$([guid]::NewGuid().ToString('N'))"
+try {
+    [System.IO.File]::WriteAllText($tmp, ($map | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+}
+finally {
+    try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch {}
+}
+}
+
+function Test-WmtGogdlInstallPending {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+$map = Get-WmtGogdlInstallMap
+if (-not $map.ContainsKey($Id)) { return $false }
+$entry = $map[$Id]
+if ([string]$entry.Status -ne "Pending") { return $false }
+
+$pidValue = 0
+$expectedStartTicks = [int64]0
+try { if ($entry.PSObject.Properties["ProcessId"]) { $pidValue = [int]$entry.ProcessId } } catch {}
+try { if ($entry.PSObject.Properties["ProcessStartUtcTicks"]) { $expectedStartTicks = [int64]$entry.ProcessStartUtcTicks } } catch {}
+if ($pidValue -le 0) { return $false }
+
+try {
+    $p = Get-Process -Id $pidValue -ErrorAction Stop
+    if (-not $p -or $p.HasExited) { return $false }
+
+    $actualStartUtc = $p.StartTime.ToUniversalTime()
+    if ($expectedStartTicks -gt 0) {
+        return ([int64]$actualStartUtc.Ticks -eq $expectedStartTicks)
+    }
+
+    # Backward compatibility for Pending entries created before start-time
+    # tracking was added. Only trust the PID when the process start time closely
+    # matches the tracker's update timestamp; otherwise Windows may have reused it.
+    $trackedUtc = [DateTime]::MinValue
+    if ($entry.PSObject.Properties["UpdatedUtc"] -and
+        [DateTime]::TryParse([string]$entry.UpdatedUtc, [ref]$trackedUtc)) {
+        $deltaSeconds = [Math]::Abs(($actualStartUtc - $trackedUtc.ToUniversalTime()).TotalSeconds)
+        return ($deltaSeconds -le 10)
+    }
+    return $false
+}
+catch { return $false }
+}
+
+function Get-WmtGogdlTrackedInstallPath {
+param([Parameter(Mandatory = $true)][string]$Id)
+$map = Get-WmtGogdlInstallMap
+if (-not $map.ContainsKey($Id)) { return "" }
+$entry = $map[$Id]
+
+# A live tracked download takes precedence over a manifest or pre-created
+# install directory. GOGDL can create those before the download has finished.
+if ([string]$entry.Status -eq "Pending" -and (Test-WmtGogdlInstallPending -Id $Id)) { return "" }
+
+$resolved = Resolve-WmtGogdlInstallPath -Id $Id -RootPath ([string]$entry.RootPath) -InstallPath ([string]$entry.InstallPath)
+if ([string]::IsNullOrWhiteSpace($resolved)) { return "" }
+
+$completeMarker = Join-Path $resolved ".wmt-gogdl-installed"
+$manifestPath = Get-WmtGogdlManifestPath -Id $Id
+if ([string]$entry.Status -eq "Installed" -or
+    (Test-Path -LiteralPath $completeMarker -PathType Leaf) -or
+    (-not [string]::IsNullOrWhiteSpace($manifestPath) -and (Test-Path -LiteralPath $manifestPath -PathType Leaf))) {
+    return $resolved
+}
+return ""
+}
+
+function Resolve-WmtGogdlLanguageCode {
+param(
+    [Parameter(Mandatory = $true)][string]$GogdlExe,
+    [Parameter(Mandatory = $true)][string]$Language
+)
+
+$result = [PSCustomObject]@{ Valid = $false; Code = ""; Error = "" }
+$inputLanguage = $Language.Trim()
+if ([string]::IsNullOrWhiteSpace($inputLanguage)) {
+    $result.Error = "Choose a language."
+    return $result
+}
+try {
+    $quoted = ConvertTo-WmtProcessArgument $inputLanguage
+    $procResult = Invoke-WmtProcess -FilePath $GogdlExe -Arguments ("lang-match " + $quoted) -TimeoutMs 5000 -Encoding UTF8 -KillTree
+    if ($procResult.TimedOut) {
+        $result.Error = "GOGDL language validation timed out."
+        return $result
+    }
+    if ($procResult.ExitCode -ne 0) {
+        $detail = ([string]$procResult.StdErr).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = ([string]$procResult.Error).Trim() }
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit code $($procResult.ExitCode)" }
+        $result.Error = "GOGDL could not validate the language ($detail)."
+        return $result
+    }
+    $jsonText = ([string]$procResult.StdOut).Trim()
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        $result.Error = "GOGDL returned no language match."
+        return $result
+    }
+    $match = $jsonText | ConvertFrom-Json -ErrorAction Stop
+    if ($match -and $match.PSObject.Properties["code"] -and -not [string]::IsNullOrWhiteSpace([string]$match.code)) {
+        $result.Valid = $true
+        $result.Code = ([string]$match.code).Trim()
+        return $result
+    }
+    $result.Error = "'$inputLanguage' is not a language code/name recognized by GOGDL."
+}
+catch {
+    $result.Error = "Could not validate the GOG language: $($_.Exception.Message)"
+}
+return $result
+}
+
+
+function New-WmtGameLaunchShortcuts {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$TargetPath,
+    [string]$Arguments = "",
+    [string]$WorkingDirectory = "",
+    [string]$IconLocation = "",
+    [bool]$Desktop = $false,
+    [bool]$StartMenu = $false
+)
+
+if (-not $Desktop -and -not $StartMenu) { return @() }
+if ([string]::IsNullOrWhiteSpace($TargetPath) -or -not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+    throw "Shortcut target does not exist: $TargetPath"
+}
+
+$safeName = ($Name -replace '[<>:"/\\|?*]', '_').Trim()
+while (-not [string]::IsNullOrWhiteSpace($safeName) -and ($safeName.EndsWith(".") -or $safeName.EndsWith(" "))) {
+    $safeName = $safeName.Substring(0, $safeName.Length - 1)
+}
+if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = "Game" }
+
+$destinationDirectories = [System.Collections.Generic.List[string]]::new()
+if ($Desktop) {
+    $desktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+    if ([string]::IsNullOrWhiteSpace($desktopDirectory)) { throw "Windows did not return a Desktop directory." }
+    if (-not (Test-Path -LiteralPath $desktopDirectory -PathType Container)) {
+        [void][System.IO.Directory]::CreateDirectory($desktopDirectory)
+    }
+    [void]$destinationDirectories.Add($desktopDirectory)
+}
+if ($StartMenu) {
+    $programsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+    if ([string]::IsNullOrWhiteSpace($programsDirectory)) { throw "Windows did not return a Start menu Programs directory." }
+    $wmtProgramsDirectory = Join-Path $programsDirectory "WMT Games"
+    if (-not (Test-Path -LiteralPath $wmtProgramsDirectory -PathType Container)) {
+        [void][System.IO.Directory]::CreateDirectory($wmtProgramsDirectory)
+    }
+    [void]$destinationDirectories.Add($wmtProgramsDirectory)
+}
+
+$created = [System.Collections.Generic.List[string]]::new()
+$wshShell = $null
+try {
+    $wshShell = New-Object -ComObject WScript.Shell
+    foreach ($directory in $destinationDirectories) {
+        $shortcutPath = Join-Path $directory ($safeName + ".lnk")
+        $shortcut = $null
+        try {
+            $shortcut = $wshShell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = $TargetPath
+            $shortcut.Arguments = $Arguments
+            if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+                $shortcut.WorkingDirectory = $WorkingDirectory
+            }
+            if (-not [string]::IsNullOrWhiteSpace($IconLocation) -and (Test-Path -LiteralPath $IconLocation -PathType Leaf)) {
+                $shortcut.IconLocation = $IconLocation + ",0"
+            }
+            $shortcut.Description = "Launch $Name"
+            $shortcut.Save()
+            [void]$created.Add($shortcutPath)
+        }
+        finally {
+            if ($null -ne $shortcut -and [System.Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+                try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) } catch {}
+            }
+        }
+    }
+}
+finally {
+    if ($null -ne $wshShell -and [System.Runtime.InteropServices.Marshal]::IsComObject($wshShell)) {
+        try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($wshShell) } catch {}
+    }
+}
+return @($created)
+}
+
+
+function Test-WmtLegendaryInstallPending {
+param([Parameter(Mandatory = $true)][string]$Id)
+
+if (-not (Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:WmtLegendaryInstallProcesses = @{}
+}
+if (-not $script:WmtLegendaryInstallProcesses.ContainsKey($Id)) { return $false }
+
+$proc = $script:WmtLegendaryInstallProcesses[$Id]
+try {
+    if ($proc -and -not $proc.HasExited) { return $true }
+}
+catch {}
+
+try { if ($proc) { $proc.Dispose() } } catch {}
+[void]$script:WmtLegendaryInstallProcesses.Remove($Id)
+return $false
+}
+
+function Show-WmtLegendaryInstallOptions {
+param(
+    [Parameter(Mandatory = $true)][string]$GameName,
+    [string]$DefaultRoot = "",
+    $Metadata,
+    [string]$MetadataWarning = ""
+)
+
+$contentXaml = @'
+<Grid Margin="0" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+  </Grid.RowDefinitions>
+  <Grid Grid.Row="0" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Game subfolder (optional)" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <TextBox Name="txtGameFolder" Grid.Column="1" Height="34" VerticalContentAlignment="Center" ToolTip="Optional final folder name inside the game library folder. Leave blank (recommended) to let Legendary/Epic choose the normal game folder name." />
+  </Grid>
+  <Grid Grid.Row="1" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Final destination" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <TextBox Name="txtDestinationPreview" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center" ToolTip="Shows the exact final path when you provide a custom game subfolder. If blank, Legendary chooses the final folder from Epic metadata." />
+  </Grid>
+  <Grid Grid.Row="2" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Platform" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboPlatform" Grid.Column="1" Height="34" ToolTip="Platforms reported by Legendary for this title. Windows is preferred on Windows." />
+  </Grid>
+  <Grid Grid.Row="3" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Version / size" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <TextBox Name="txtVersion" Grid.Column="1" Height="34" IsReadOnly="True" VerticalContentAlignment="Center" />
+  </Grid>
+  <Grid Grid.Row="4" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboWorkers" Grid.Column="1" Height="34" ToolTip="Higher values may improve throughput but increase CPU, memory, network, and disk pressure." />
+  </Grid>
+  <Grid Grid.Row="5" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Shared memory" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboSharedMemory" Grid.Column="1" Height="34" ToolTip="Legendary download-manager shared memory limit in MiB." />
+  </Grid>
+  <Grid Grid.Row="6" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}" />
+      <TextBlock Text="Ctrl/Shift-select specific installable DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}" />
+    </StackPanel>
+    <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended" Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2"></ListBox>
+  </Grid>
+  <CheckBox Name="chkReorder" Style="{StaticResource WmtWrappingCheckBoxStyle}" Grid.Row="7" Margin="150,0,0,5" Content="Enable download reordering (lower RAM usage)" ToolTip="Passes Legendary --enable-reordering. Legendary notes this can have adverse results for some titles." />
+  <TextBlock Grid.Row="8" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}" Text="Legendary installs resumably. WMT tracks the running install, selected DLCs, and final install path when Legendary reports it." />
+</Grid>
+'@
+
+$dialog = New-WmtInstallerDialog -Title 'Legendary Install Options' -Description 'Choose where this game should be installed. Pick the parent game-library folder below; the final game directory is shown separately.' -OptionsXaml $contentXaml -PathLabel 'Game library folder' -PathDescription 'Choose the parent folder that should contain your Epic games' -Width 700 -Height 770
+
+$lblTitle = $dialog.FindName("lblTitle")
+$lblMetadata = $dialog.FindName("lblMetadata")
+$txtRoot = $dialog.FindName("txtRoot")
+$txtGameFolder = $dialog.FindName("txtGameFolder")
+$txtDestinationPreview = $dialog.FindName("txtDestinationPreview")
+$cboPlatform = $dialog.FindName("cboPlatform")
+$txtVersion = $dialog.FindName("txtVersion")
+$cboWorkers = $dialog.FindName("cboWorkers")
+$cboSharedMemory = $dialog.FindName("cboSharedMemory")
+$lstDlcs = $dialog.FindName("lstDlcs")
+$chkReorder = $dialog.FindName("chkReorder")
+$chkKeepOpen = $dialog.FindName("chkKeepOpen")
+$chkDesktopShortcut = $dialog.FindName("chkDesktopShortcut")
+$chkStartMenuShortcut = $dialog.FindName("chkStartMenuShortcut")
+$lblError = $dialog.FindName("lblError")
+$btnInstall = $dialog.FindName("btnInstall")
+$btnCancel = $dialog.FindName("btnCancel")
+
+
+$lblTitle.Text = "Install $GameName"
+$txtRoot.Text = $DefaultRoot
+
+$refreshDestinationPreview = {
+    $rootText = ([string]$txtRoot.Text).Trim()
+    $folderText = ([string]$txtGameFolder.Text).Trim()
+    if ([string]::IsNullOrWhiteSpace($rootText)) {
+        $txtDestinationPreview.Text = "Choose a game library folder"
+    }
+    elseif ([string]::IsNullOrWhiteSpace($folderText)) {
+        $txtDestinationPreview.Text = $rootText + "  [Legendary chooses the game's folder]"
+    }
+    else {
+        try { $txtDestinationPreview.Text = Join-Path $rootText $folderText }
+        catch { $txtDestinationPreview.Text = $rootText + "\" + $folderText }
+    }
+}.GetNewClosure()
+$txtRoot.Add_TextChanged({ & $refreshDestinationPreview }.GetNewClosure())
+$txtGameFolder.Add_TextChanged({ & $refreshDestinationPreview }.GetNewClosure())
+& $refreshDestinationPreview
+
+$metadataNotes = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($MetadataWarning)) { [void]$metadataNotes.Add($MetadataWarning) }
+
+$latestVersion = ""
+$downloadBytes = [int64]0
+$diskBytes = [int64]0
+try { $latestVersion = ([string]$Metadata.game.version).Trim() } catch {}
+try { $downloadBytes = [int64]$Metadata.manifest.download_size } catch {}
+try { $diskBytes = [int64]$Metadata.manifest.disk_size } catch {}
+
+$versionParts = [System.Collections.Generic.List[string]]::new()
+if (-not [string]::IsNullOrWhiteSpace($latestVersion)) { [void]$versionParts.Add($latestVersion) }
+if ($downloadBytes -gt 0) { [void]$versionParts.Add(("download {0:N2} GiB" -f ($downloadBytes / 1GB))) }
+if ($diskBytes -gt 0) { [void]$versionParts.Add(("installed {0:N2} GiB" -f ($diskBytes / 1GB))) }
+$txtVersion.Text = if ($versionParts.Count -gt 0) { $versionParts -join " | " } else { "Latest available version" }
+
+$platforms = [System.Collections.Generic.List[string]]::new()
+try {
+    foreach ($prop in @($Metadata.game.platform_versions.PSObject.Properties)) {
+        $platformName = ([string]$prop.Name).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($platformName) -and -not $platforms.Contains($platformName)) {
+            [void]$platforms.Add($platformName)
+        }
+    }
+}
+catch {}
+if ($platforms.Count -eq 0) { [void]$platforms.Add("Windows") }
+foreach ($platform in @($platforms | Sort-Object)) { [void]$cboPlatform.Items.Add($platform) }
+$windowsPlatform = @($cboPlatform.Items | Where-Object { ([string]$_) -ieq "Windows" } | Select-Object -First 1)
+if ($windowsPlatform.Count -gt 0) { $cboPlatform.SelectedItem = $windowsPlatform[0] }
+else { $cboPlatform.SelectedIndex = 0 }
+
+foreach ($workers in @(1, 2, 4, 8, 16)) { [void]$cboWorkers.Items.Add([string]$workers) }
+$cboWorkers.SelectedItem = "4"
+foreach ($memory in @(256, 512, 1024, 2048)) { [void]$cboSharedMemory.Items.Add([string]$memory) }
+$cboSharedMemory.SelectedItem = "1024"
+
+$dlcItems = [System.Collections.Generic.List[object]]::new()
+try {
+    foreach ($dlc in @($Metadata.game.owned_dlc)) {
+        $appName = ([string]$dlc.app_name).Trim()
+        if ([string]::IsNullOrWhiteSpace($appName)) {
+            try { $appName = ([string]$dlc.installable[0].appId).Trim() } catch {}
+        }
+        if ([string]::IsNullOrWhiteSpace($appName)) { continue }
+        $title = ([string]$dlc.title).Trim()
+        if ([string]::IsNullOrWhiteSpace($title)) { $title = $appName }
+        [void]$dlcItems.Add([PSCustomObject]@{ Title = $title; AppName = $appName })
+    }
+}
+catch {}
+$lstDlcs.DisplayMemberPath = "Title"
+$lstDlcs.ItemsSource = $dlcItems
+if ($dlcItems.Count -eq 0) { $lstDlcs.IsEnabled = $false }
+
+try {
+    $selectedRoot = ([string]$txtRoot.Text).Trim()
+    if ($diskBytes -gt 0 -and -not [string]::IsNullOrWhiteSpace($selectedRoot)) {
+        $probePath = $selectedRoot
+        while (-not (Test-Path -LiteralPath $probePath -PathType Container)) {
+            $parent = Split-Path -Parent $probePath
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probePath) { break }
+            $probePath = $parent
+        }
+        if (Test-Path -LiteralPath $probePath -PathType Container) {
+            $rootPath = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $probePath).Path)
+            $drive = New-Object System.IO.DriveInfo($rootPath)
+            if ($drive.AvailableFreeSpace -lt $diskBytes) {
+                [void]$metadataNotes.Add(("Warning: selected drive currently has {0:N2} GiB free; manifest reports about {1:N2} GiB installed." -f ($drive.AvailableFreeSpace / 1GB), ($diskBytes / 1GB)))
+            }
+        }
+    }
+}
+catch {}
+$lblMetadata.Text = $metadataNotes -join [Environment]::NewLine
+
+$result = @{ Value = $null }
+
+
+$btnInstall.Add_Click({
+        $root = ([string]$txtRoot.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            $lblError.Text = "Choose an install root."
+            return
+        }
+        if ($root.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) {
+            $lblError.Text = "The install path contains invalid characters."
+            return
+        }
+        try {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+                [void][System.IO.Directory]::CreateDirectory($root)
+            }
+        }
+        catch {
+            $lblError.Text = "Could not create the install root: $($_.Exception.Message)"
+            return
+        }
+
+        $gameFolder = ([string]$txtGameFolder.Text).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($gameFolder)) {
+            if ([System.IO.Path]::IsPathRooted($gameFolder)) {
+                $lblError.Text = "Game folder must be a relative folder inside the install root."
+                return
+            }
+            if ($gameFolder.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0 -or
+                $gameFolder -match '[<>:"|?*\x00-\x1F]') {
+                $lblError.Text = "The game folder contains invalid characters."
+                return
+            }
+            try {
+                $fullRoot = [System.IO.Path]::GetFullPath($root)
+                $fullDestination = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($fullRoot, $gameFolder))
+                $rootPrefix = $fullRoot.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+                if (-not $fullDestination.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $lblError.Text = "Game folder cannot navigate outside the selected install root."
+                    return
+                }
+            }
+            catch {
+                $lblError.Text = "Invalid game folder path: $($_.Exception.Message)"
+                return
+            }
+        }
+
+        $workers = 4
+        [void][int]::TryParse([string]$cboWorkers.SelectedItem, [ref]$workers)
+        if ($workers -notin @(1, 2, 4, 8, 16)) { $workers = 4 }
+
+        $sharedMemory = 1024
+        [void][int]::TryParse([string]$cboSharedMemory.SelectedItem, [ref]$sharedMemory)
+        if ($sharedMemory -notin @(256, 512, 1024, 2048)) { $sharedMemory = 1024 }
+
+        $selectedDlcs = @()
+        foreach ($dlc in @($lstDlcs.SelectedItems)) {
+            if ($dlc -and -not [string]::IsNullOrWhiteSpace([string]$dlc.AppName)) {
+                $selectedDlcs += [string]$dlc.AppName
+            }
+        }
+
+        $result.Value = [PSCustomObject]@{
+            RootPath          = $root
+            GameFolder        = $gameFolder
+            Platform          = [string]$cboPlatform.SelectedItem
+            Workers           = $workers
+            SharedMemoryMiB   = $sharedMemory
+            DlcAppNames       = @($selectedDlcs)
+            EnableReordering        = [bool]$chkReorder.IsChecked
+            KeepOpenOnSuccess       = [bool]$chkKeepOpen.IsChecked
+            CreateDesktopShortcut   = [bool]$chkDesktopShortcut.IsChecked
+            CreateStartMenuShortcut = [bool]$chkStartMenuShortcut.IsChecked
+        }
+        $dialog.DialogResult = $true
+    }.GetNewClosure())
+
+$btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
+[void]$dialog.ShowDialog()
+return $result.Value
+}
+
+function New-WmtLegendaryOperationLogPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$Action
+)
+
+try {
+    $settings = Get-WmtSettings
+    if (-not (Get-WmtProviderToggle -Settings $settings -ProviderKey "legendary" -ToggleName "Logs")) { return "" }
+
+    $root = Join-Path (Get-DataPath) "package-install-logs"
+    try { [void][System.IO.Directory]::CreateDirectory($root) }
+    catch {
+        $root = Join-Path $env:TEMP "WMT-PackageInstallLogs"
+        try { [void][System.IO.Directory]::CreateDirectory($root) } catch { return "" }
+    }
+
+    $safeId = ([string]$Id -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeId)) { $safeId = "package" }
+    $safeAction = ([string]$Action -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeAction)) { $safeAction = "Action" }
+    $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+    return (Join-Path $root "$stamp-$safeAction-$safeId-legendary.log")
+}
+catch { return "" }
+}
+
+function Start-WmtLegendaryLibraryInstall {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$LegendaryExe,
+    [Parameter(Mandatory = $true)]$Options
+)
+
+if (Test-WmtLegendaryInstallPending -Id $Id) {
+    Show-WmtMessageBox -Message "'$Name' already has a Legendary install running." -Title "Install Already Running" -Image Information | Out-Null
+    return
+}
+
+function ConvertTo-WmtLegendaryPsLiteral([string]$Value) {
+    if ($null -eq $Value) { return "''" }
+    return "'" + $Value.Replace("'", "''").Replace([Environment]::NewLine, " ") + "'"
+}
+
+$baseArgs = [System.Collections.Generic.List[string]]::new()
+foreach ($arg in @("-y", "--api-timeout", "30", "install", $Id, "--base-path", [string]$Options.RootPath, "--platform", [string]$Options.Platform,
+        "--max-workers", [string]$Options.Workers, "--max-shared-memory", [string]$Options.SharedMemoryMiB,
+        "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs")) {
+    [void]$baseArgs.Add([string]$arg)
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$Options.GameFolder)) {
+    [void]$baseArgs.Add("--game-folder")
+    [void]$baseArgs.Add([string]$Options.GameFolder)
+}
+if ([bool]$Options.EnableReordering) { [void]$baseArgs.Add("--enable-reordering") }
+
+$selectedDlcs = @($Options.DlcAppNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+
+$launcherDir = Join-Path (Get-DataPath) "legendary-launchers"
+if (-not (Test-Path -LiteralPath $launcherDir -PathType Container)) {
+    [void][System.IO.Directory]::CreateDirectory($launcherDir)
+}
+$resultPath = Join-Path $launcherDir ("legendary-result-{0}-{1}.json" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
+$logPath = New-WmtLegendaryOperationLogPath -Id $Id -Action "Install"
+
+$exeLiteral = ConvertTo-WmtLegendaryPsLiteral $LegendaryExe
+$resultLiteral = ConvertTo-WmtLegendaryPsLiteral $resultPath
+$logLiteral = ConvertTo-WmtLegendaryPsLiteral $logPath
+$appLiteral = ConvertTo-WmtLegendaryPsLiteral $Id
+$titleLiteral = ConvertTo-WmtLegendaryPsLiteral ("WMT Legendary Install - " + $Name + " [" + $Id + "]")
+$baseArgsLiteral = "@(" + (@($baseArgs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
+$dlcLiteral = "@(" + (@($selectedDlcs | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
+$dlcCommon = @("-y", "--api-timeout", "30", "install", "--platform", [string]$Options.Platform, "--max-workers", [string]$Options.Workers,
+    "--max-shared-memory", [string]$Options.SharedMemoryMiB, "--dl-timeout", "30", "--skip-sdl", "--skip-dlcs")
+if ([bool]$Options.EnableReordering) { $dlcCommon += "--enable-reordering" }
+$dlcCommonLiteral = "@(" + (@($dlcCommon | ForEach-Object { ConvertTo-WmtLegendaryPsLiteral ([string]$_) }) -join ", ") + ")"
+$pauseSuccessLiteral = if ([bool]$Options.KeepOpenOnSuccess) { '$true' } else { '$false' }
+
+$launcherTemplate = @'
+$ErrorActionPreference = 'Continue'
+try { $Host.UI.RawUI.WindowTitle = __TITLE__ } catch {}
+$exe = __EXE__
+$appId = __APP__
+$resultPath = __RESULT__
+$logPath = __LOG__
+$baseArgs = __BASEARGS__
+$dlcs = __DLCS__
+$dlcCommon = __DLCCOMMON__
+if (-not [string]::IsNullOrWhiteSpace($logPath)) {
+    try {
+        $header = "[" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") + "] COMMAND: " + $exe + " " + ($baseArgs -join " ") + [Environment]::NewLine
+        [System.IO.File]::WriteAllText($logPath, $header, [System.Text.UTF8Encoding]::new($false))
+    } catch {}
+    & $exe @baseArgs 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
+}
+else {
+    & $exe @baseArgs
+}
+$exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+
+if ($exitCode -eq 0 -and $dlcs.Count -gt 0) {
+    foreach ($dlc in $dlcs) {
+        Write-Host ""
+        Write-Host ("[WMT] Installing selected DLC: " + $dlc)
+        $dlcArgs = @("-y", "--api-timeout", "30", "install", $dlc) + $dlcCommon[4..($dlcCommon.Count - 1)]
+        if (-not [string]::IsNullOrWhiteSpace($logPath)) {
+            try { [System.IO.File]::AppendAllText($logPath, ("[WMT] DLC COMMAND: " + $exe + " " + ($dlcArgs -join " ") + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false)) } catch {}
+            & $exe @dlcArgs 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
+        }
+        else {
+            & $exe @dlcArgs
+        }
+        $dlcExit = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+        if ($dlcExit -ne 0) {
+            $exitCode = $dlcExit
+            Write-Host ("[WMT] DLC install failed with exit code " + $dlcExit + ": " + $dlc)
+            break
+        }
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($logPath)) {
+    try {
+        [System.IO.File]::AppendAllText(
+            $logPath,
+            ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), $exitCode, [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    } catch {}
+}
+
+$installPath = ""
+if ($exitCode -eq 0) {
+    try {
+        $installedJson = (& $exe list-installed --json 2>$null | Out-String).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($installedJson)) {
+            $installed = @($installedJson | ConvertFrom-Json)
+            $match = @($installed | Where-Object { ([string]$_.app_name) -eq $appId } | Select-Object -First 1)
+            if ($match.Count -gt 0) { $installPath = [string]$match[0].install_path }
+        }
+    }
+    catch {}
+}
+
+try {
+    [PSCustomObject]@{ ExitCode = $exitCode; InstallPath = $installPath } |
+        ConvertTo-Json -Compress |
+        Set-Content -LiteralPath $resultPath -Encoding UTF8 -Force
+}
+catch {}
+
+if ($exitCode -ne 0) {
+    Write-Host ""
+    Write-Host ("[WMT] Legendary exited before completing successfully. Exit code: " + $exitCode)
+    Write-Host "[WMT] Partial download data is preserved. Re-run Install from Your Library to resume."
+    Write-Host ""
+    [void](Read-Host "Press Enter to close")
+}
+else {
+    Write-Host ""
+    Write-Host "[WMT] Legendary install completed successfully."
+    if (__PAUSESUCCESS__) { [void](Read-Host "Press Enter to close") }
+}
+exit $exitCode
+'@
+
+$launcherScript = $launcherTemplate.Replace("__TITLE__", $titleLiteral).
+    Replace("__EXE__", $exeLiteral).
+    Replace("__APP__", $appLiteral).
+    Replace("__RESULT__", $resultLiteral).
+    Replace("__LOG__", $logLiteral).
+    Replace("__BASEARGS__", $baseArgsLiteral).
+    Replace("__DLCS__", $dlcLiteral).
+    Replace("__DLCCOMMON__", $dlcCommonLiteral).
+    Replace("__PAUSESUCCESS__", $pauseSuccessLiteral)
+
+$encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherScript))
+
+# Snapshot the selected library root before Legendary starts.  This is only a
+# last-resort path resolver: if Legendary's own installed registry cannot be
+# read after a successful install, a single newly-created game directory can
+# still be identified without guessing from the display title.
+$preInstallDirectories = @()
+try {
+    $installRootSnapshot = ([string]$Options.RootPath).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($installRootSnapshot) -and
+        (Test-Path -LiteralPath $installRootSnapshot -PathType Container)) {
+        $preInstallDirectories = @(
+            Get-ChildItem -LiteralPath $installRootSnapshot -Directory -Force -ErrorAction Stop |
+                ForEach-Object { [System.IO.Path]::GetFullPath([string]$_.FullName).TrimEnd([System.IO.Path]::DirectorySeparatorChar) }
+        )
+    }
+}
+catch {}
+
+$proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand -PassThru -WindowStyle Normal
+
+if (-not (Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:WmtLegendaryInstallProcesses = @{}
+}
+$script:WmtLegendaryInstallProcesses[$Id] = $proc
+$pendingInstallState = Get-Variable -Name WmtLegendaryInstallProcesses -Scope Script
+
+$expectedInstallPath = ""
+if (-not [string]::IsNullOrWhiteSpace([string]$Options.GameFolder)) {
+    try { $expectedInstallPath = Join-Path ([string]$Options.RootPath) ([string]$Options.GameFolder) } catch {}
+}
+
+Write-GuiLog "Starting Legendary install for: $Name (app $Id) -> $($Options.RootPath) | platform=$($Options.Platform) | workers=$($Options.Workers) | shared-memory=$($Options.SharedMemoryMiB) MiB | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
+if (-not [string]::IsNullOrWhiteSpace($logPath)) { Write-GuiLog "[Diagnostics] Legendary install log: $logPath" }
+
+$procRef = $proc
+$resultRef = $resultPath
+$idRef = $Id
+$nameRef = $Name
+$rootRef = [string]$Options.RootPath
+$expectedRef = $expectedInstallPath
+$legendaryExeRef = [string]$LegendaryExe
+$logRef = [string]$logPath
+$createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
+$createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
+$preInstallDirectoriesRef = @($preInstallDirectories)
+$operationName = "LegendaryLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
+$installFinalizeState = [PSCustomObject]@{ Attempted = $false; Completed = $false }
+
+$testComplete = {
+    param($Operation)
+    try {
+        return [bool]($procRef -and $procRef.HasExited)
+    }
+    catch { return $false }
+}.GetNewClosure()
+
+$onComplete = {
+    param($Operation)
+    if ($installFinalizeState.Completed) { return }
+    $installFinalizeState.Attempted = $true
+    if ($installFinalizeState.PSObject.Properties['OutcomeApplied'] -and $installFinalizeState.OutcomeApplied) {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+            catch { try { Write-GuiLog "Installer result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+        }
+        try { if ($procRef) { $procRef.Dispose() } } catch {}
+        $installFinalizeState.Completed = $true
+        return
+    }
+    $exitCode = 1
+    $installedPath = ""
+    # Completion monitor already verified exit. A truncated result file cannot
+    # become complete after its writer has exited; use the process exit code.
+    if (-not $procRef -or -not $procRef.HasExited) { throw "Legendary process exit not verified." }
+    $exitCode = [int]$procRef.ExitCode
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+        try {
+            $resultJson = Get-Content -LiteralPath $resultRef -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if (-not $resultJson.PSObject.Properties["ExitCode"]) { throw "Missing ExitCode field." }
+            $exitCode = [int]$resultJson.ExitCode
+            $installedPath = ([string]$resultJson.InstallPath).Trim()
+        }
+        catch {
+            Write-GuiLog "Legendary result file is invalid after process exit; using process exit code $exitCode. $($_.Exception.Message)"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($installedPath) -and
+        -not (Test-Path -LiteralPath $installedPath -PathType Container)) {
+        $installedPath = ""
+    }
+
+    # Legendary stores the authoritative installed-game map in installed.json,
+    # keyed by app name.  Resolve by the stable app id rather than by the Epic
+    # display title (which may contain punctuation such as ">observer_").
+    if ($exitCode -eq 0 -and [string]::IsNullOrWhiteSpace($installedPath)) {
+        try {
+            $configRoots = [System.Collections.Generic.List[string]]::new()
+            if (-not [string]::IsNullOrWhiteSpace($env:LEGENDARY_CONFIG_PATH)) {
+                [void]$configRoots.Add(([string]$env:LEGENDARY_CONFIG_PATH).Trim())
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+                [void]$configRoots.Add((Join-Path ([string]$env:XDG_CONFIG_HOME) "legendary"))
+            }
+            if (-not [string]::IsNullOrWhiteSpace($HOME)) {
+                [void]$configRoots.Add((Join-Path ([string]$HOME) ".config\legendary"))
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                [void]$configRoots.Add((Join-Path ([string]$env:USERPROFILE) ".config\legendary"))
+            }
+
+            foreach ($configRoot in @($configRoots | Select-Object -Unique)) {
+                if ([string]::IsNullOrWhiteSpace([string]$configRoot)) { continue }
+                $installedRegistryPath = Join-Path ([string]$configRoot) "installed.json"
+                if (-not (Test-Path -LiteralPath $installedRegistryPath -PathType Leaf)) { continue }
+
+                $registry = [System.IO.File]::ReadAllText($installedRegistryPath) | ConvertFrom-Json -ErrorAction Stop
+                $entry = $null
+                $property = $registry.PSObject.Properties[[string]$idRef]
+                if ($property) {
+                    $entry = $property.Value
+                }
+                else {
+                    foreach ($candidateProperty in @($registry.PSObject.Properties)) {
+                        $candidate = $candidateProperty.Value
+                        if ($candidate -and ([string]$candidate.app_name) -eq [string]$idRef) {
+                            $entry = $candidate
+                            break
+                        }
+                    }
+                }
+
+                if ($entry) {
+                    $candidatePath = ([string]$entry.install_path).Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and
+                        (Test-Path -LiteralPath $candidatePath -PathType Container)) {
+                        $installedPath = [System.IO.Path]::GetFullPath($candidatePath)
+                        break
+                    }
+                }
+            }
+        }
+        catch {}
+    }
+
+    if ([string]::IsNullOrWhiteSpace($installedPath) -and -not [string]::IsNullOrWhiteSpace($expectedRef) -and
+        (Test-Path -LiteralPath $expectedRef -PathType Container)) {
+        $installedPath = $expectedRef
+    }
+
+    # Last-resort resolver for new installs: compare the root's immediate
+    # directories with the pre-install snapshot.  Only accept an unambiguous
+    # single new directory; never guess among multiple candidates.
+    if ($exitCode -eq 0 -and [string]::IsNullOrWhiteSpace($installedPath) -and
+        -not [string]::IsNullOrWhiteSpace($rootRef) -and
+        (Test-Path -LiteralPath $rootRef -PathType Container)) {
+        try {
+            $before = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($path in @($preInstallDirectoriesRef)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                    [void]$before.Add(([System.IO.Path]::GetFullPath([string]$path)).TrimEnd([System.IO.Path]::DirectorySeparatorChar))
+                }
+            }
+
+            $newDirectories = @(
+                Get-ChildItem -LiteralPath $rootRef -Directory -Force -ErrorAction Stop |
+                    Where-Object {
+                        $full = ([System.IO.Path]::GetFullPath([string]$_.FullName)).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+                        -not $before.Contains($full)
+                    }
+            )
+            if ($newDirectories.Count -eq 1) {
+                $installedPath = [System.IO.Path]::GetFullPath([string]$newDirectories[0].FullName)
+            }
+        }
+        catch {}
+    }
+
+    if ($exitCode -eq 0) {
+        if (-not [string]::IsNullOrWhiteSpace($installedPath)) {
+            Write-GuiLog "Legendary install completed successfully: $nameRef (app $idRef) -> $installedPath"
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                try {
+                    $safeId = $idRef.Replace('"', "")
+                    $launchArguments = 'launch "' + $safeId + '"'
+                    $shortcutPaths = @(New-WmtGameLaunchShortcuts -Name $nameRef -TargetPath $legendaryExeRef -Arguments $launchArguments -WorkingDirectory $installedPath -IconLocation $legendaryExeRef -Desktop $createDesktopShortcutRef -StartMenu $createStartMenuShortcutRef)
+                    if ($shortcutPaths.Count -gt 0) {
+                        Write-GuiLog ("Created Legendary game shortcut(s): " + ($shortcutPaths -join "; "))
+                    }
+                }
+                catch {
+                    Write-GuiLog "Legendary install succeeded, but shortcut creation failed for ${nameRef}: $($_.Exception.Message)"
+                }
+            }
+        }
+        else {
+            Write-GuiLog "Legendary install completed successfully: $nameRef (app $idRef) under $rootRef."
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                Write-GuiLog "Legendary shortcut creation was requested for $nameRef, but the final install path could not be resolved."
+            }
+        }
+    }
+    else {
+        Write-GuiLog ("Legendary install ended with exit code " + $exitCode + ": " + $nameRef + " (app " + $idRef + "). Partial files were kept for resume.")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($logRef) -and (Test-Path -LiteralPath $logRef -PathType Leaf)) {
+        Write-GuiLog "[Diagnostics] Legendary log saved: $logRef"
+    }
+
+    if ($pendingInstallState.Value -and $pendingInstallState.Value.ContainsKey($idRef) -and
+        [object]::ReferenceEquals($pendingInstallState.Value[$idRef], $procRef)) {
+        [void]$pendingInstallState.Value.Remove($idRef)
+    }
+    try { Start-WmtLibraryCacheBuilder -Force } catch { try { Start-WmtLibraryScan -Silent } catch {} }
+    $installFinalizeState | Add-Member -NotePropertyName OutcomeApplied -NotePropertyValue $true -Force
+    # Deleting results is last: failed tracking can retry against the original outcome.
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+            catch { try { Write-GuiLog "Installer result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+        }
+    # Preserve the Process until all required bookkeeping succeeded.
+    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    $installFinalizeState.Completed = $true
+}.GetNewClosure()
+
+$fallbackTestComplete = {
+    param($Operation)
+    if ($installFinalizeState.Attempted) { return $true }
+    try { return [bool]($procRef -and $procRef.HasExited) } catch { return $false }
+}.GetNewClosure()
+$onError = {
+    param($Operation, $ErrorRecord)
+    $message = ""
+    try { $message = $ErrorRecord.Exception.Message } catch { $message = [string]$ErrorRecord }
+    Write-GuiLog ("Legendary install monitor failed for " + $nameRef + ": " + $message + ". Switching to independent exit monitoring.")
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
+}.GetNewClosure()
+
+try {
+    Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+}
+catch {
+    Write-GuiLog "Legendary shared monitor registration failed; using independent exit monitoring: $($_.Exception.Message)"
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
+}
+}
+
+function Show-WmtGogdlInstallOptions {
+param(
+    [Parameter(Mandatory = $true)][string]$GameName,
+    [string]$DefaultRoot = "",
+    $Metadata,
+    [string]$MetadataWarning = "",
+    [string]$GogdlExe = ""
+)
+
+$contentXaml = @'
+<Grid Margin="0" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+    <RowDefinition Height="Auto" />
+  </Grid.RowDefinitions>
+  <Grid Grid.Row="0" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Language" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboLanguage" Grid.Column="1" Height="34" IsEditable="True" ToolTip="Languages reported by GOGDL. You can also type a language code manually." />
+  </Grid>
+  <Grid Grid.Row="1" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Build / version" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboBuild" Grid.Column="1" Height="34" ToolTip="Choose a GOG build/version, or leave the GOGDL stable/default build selected." />
+  </Grid>
+  <Grid Grid.Row="2" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <TextBlock Text="Download workers" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+    <ComboBox Name="cboWorkers" Grid.Column="1" Height="34" ToolTip="1 is lowest-memory. More workers can improve throughput but create more GOGDL worker processes." />
+  </Grid>
+  <Grid Grid.Row="3" Margin="0,0,0,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="150" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock Text="Owned DLCs" Foreground="{DynamicResource TextSecondary}" />
+      <TextBlock Text="Ctrl/Shift-select specific DLCs; leave empty for base game only." FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}" />
+    </StackPanel>
+    <ListBox Name="lstDlcs" Grid.Column="1" Height="90" SelectionMode="Extended" Background="{DynamicResource BgPanel}" Foreground="{DynamicResource TextPrimary}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" ScrollViewer.VerticalScrollBarVisibility="Auto" Padding="2"></ListBox>
+  </Grid>
+  <TextBlock Grid.Row="4" Margin="150,2,0,0" TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Warning}" Text="Low-memory note: current GOGDL reserves a 1 GiB shared-memory block and maps it into its worker/writer processes. WMT defaults to 1 worker so Task Manager does not multiply those mappings as aggressively." />
+</Grid>
+'@
+
+$dialog = New-WmtInstallerDialog -Title 'GOGDL Install Options' -Description 'Choose how GOGDL should install this game. The selected path is a library/root folder; GOGDL creates the game''s own folder inside it.' -OptionsXaml $contentXaml -PathLabel 'Install root' -PathDescription 'Choose GOG game library folder' -Width 700 -Height 660
+# The generic runtime resources theme the controls; add the selection template
+# as well so DLC rows never fall back to Aero/SystemColors, and theme the
+# native title bar to match the current WMT palette.
+
+$lblTitle = $dialog.FindName("lblTitle")
+$lblMetadata = $dialog.FindName("lblMetadata")
+$txtRoot = $dialog.FindName("txtRoot")
+$cboLanguage = $dialog.FindName("cboLanguage")
+$cboBuild = $dialog.FindName("cboBuild")
+$cboWorkers = $dialog.FindName("cboWorkers")
+$lstDlcs = $dialog.FindName("lstDlcs")
+$chkKeepOpen = $dialog.FindName("chkKeepOpen")
+$chkDesktopShortcut = $dialog.FindName("chkDesktopShortcut")
+$chkStartMenuShortcut = $dialog.FindName("chkStartMenuShortcut")
+$lblError = $dialog.FindName("lblError")
+$btnInstall = $dialog.FindName("btnInstall")
+$btnCancel = $dialog.FindName("btnCancel")
+
+$lblTitle.Text = "Install $GameName"
+$lblMetadata.Text = $MetadataWarning
+$txtRoot.Text = $DefaultRoot
+
+$languageItems = [System.Collections.Generic.List[string]]::new()
+try {
+    foreach ($language in @($Metadata.languages | Sort-Object -Unique)) {
+        $code = ([string]$language).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($code) -and -not $languageItems.Contains($code)) {
+            [void]$languageItems.Add($code)
+        }
+    }
+}
+catch {}
+$hasMetadataLanguages = ($languageItems.Count -gt 0)
+if ($languageItems.Count -eq 0) {
+    [void]$languageItems.Add("en-US")
+}
+elseif ($languageItems.Contains("en-US")) {
+    [void]$languageItems.Remove("en-US")
+    $languageItems.Insert(0, "en-US")
+}
+foreach ($language in $languageItems) { [void]$cboLanguage.Items.Add($language) }
+$cboLanguage.SelectedIndex = 0
+$cboLanguage.Text = [string]$cboLanguage.SelectedItem
+$cboLanguage.Add_SelectionChanged({
+        if ($null -ne $cboLanguage.SelectedItem) {
+            $cboLanguage.Text = ([string]$cboLanguage.SelectedItem).Trim()
+        }
+    }.GetNewClosure())
+
+$buildItems = [System.Collections.Generic.List[object]]::new()
+[void]$buildItems.Add([PSCustomObject]@{ Label = "Latest stable / GOGDL default"; Value = "" })
+try {
+    foreach ($build in @($Metadata.builds.items)) {
+        $buildId = ([string]$build.build_id).Trim()
+        if ([string]::IsNullOrWhiteSpace($buildId)) { continue }
+        $versionName = ([string]$build.version_name).Trim()
+        if ([string]::IsNullOrWhiteSpace($versionName)) { $versionName = "Build $buildId" }
+        $branchName = ([string]$build.branch).Trim()
+        $branchText = if ([string]::IsNullOrWhiteSpace($branchName)) { "stable" } else { $branchName }
+        [void]$buildItems.Add([PSCustomObject]@{
+            Label = "$versionName | $branchText | $buildId"
+            Value = $buildId
+        })
+    }
+}
+catch {}
+$cboBuild.DisplayMemberPath = "Label"
+$cboBuild.SelectedValuePath = "Value"
+$cboBuild.ItemsSource = $buildItems
+$cboBuild.SelectedIndex = 0
+
+foreach ($workers in @(1, 2, 4)) { [void]$cboWorkers.Items.Add([string]$workers) }
+$cboWorkers.SelectedItem = "1"
+
+$dlcItems = [System.Collections.Generic.List[object]]::new()
+try {
+    foreach ($dlc in @($Metadata.dlcs)) {
+        $dlcId = ([string]$dlc.id).Trim()
+        if ([string]::IsNullOrWhiteSpace($dlcId)) { continue }
+        $title = ([string]$dlc.title).Trim()
+        if ([string]::IsNullOrWhiteSpace($title)) { $title = $dlcId }
+        [void]$dlcItems.Add([PSCustomObject]@{ Title = $title; Id = $dlcId })
+    }
+}
+catch {}
+$lstDlcs.DisplayMemberPath = "Title"
+$lstDlcs.ItemsSource = $dlcItems
+if ($dlcItems.Count -eq 0) { $lstDlcs.IsEnabled = $false }
+
+$result = @{ Value = $null }
+
+
+$btnInstall.Add_Click({
+        $root = ([string]$txtRoot.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            $lblError.Text = "Choose an install root."
+            return
+        }
+        if ($root.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) {
+            $lblError.Text = "The install path contains invalid characters."
+            return
+        }
+
+        try {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+                [void][System.IO.Directory]::CreateDirectory($root)
+            }
+        }
+        catch {
+            $lblError.Text = "Could not create the install root: $($_.Exception.Message)"
+            return
+        }
+
+        $languageCode = ([string]$cboLanguage.Text).Trim()
+        $knownLanguage = @($languageItems | Where-Object { [string]$_ -ieq $languageCode } | Select-Object -First 1)
+        if ($knownLanguage.Count -gt 0) {
+            $languageCode = [string]$knownLanguage[0]
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($GogdlExe) -and (Test-Path -LiteralPath $GogdlExe -PathType Leaf)) {
+            $languageMatch = Resolve-WmtGogdlLanguageCode -GogdlExe $GogdlExe -Language $languageCode
+            if (-not $languageMatch.Valid) {
+                $lblError.Text = [string]$languageMatch.Error
+                return
+            }
+            $languageCode = [string]$languageMatch.Code
+            if ($hasMetadataLanguages -and -not $languageItems.Contains($languageCode)) {
+                $lblError.Text = "Language '$languageCode' is recognized by GOGDL but is not available for this game."
+                return
+            }
+        }
+        else {
+            $lblError.Text = "Could not validate the language because GOGDL is unavailable."
+            return
+        }
+
+        $workerCount = 1
+        [void][int]::TryParse([string]$cboWorkers.SelectedItem, [ref]$workerCount)
+        if ($workerCount -notin @(1, 2, 4)) { $workerCount = 1 }
+
+        $selectedDlcs = @()
+        foreach ($dlc in @($lstDlcs.SelectedItems)) {
+            if ($dlc -and -not [string]::IsNullOrWhiteSpace([string]$dlc.Id)) { $selectedDlcs += [string]$dlc.Id }
+        }
+
+        $result.Value = [PSCustomObject]@{
+            RootPath          = $root
+            Language          = $languageCode
+            BuildId           = [string]$cboBuild.SelectedValue
+            DlcIds            = @($selectedDlcs)
+            Workers                 = $workerCount
+            KeepOpenOnSuccess       = [bool]$chkKeepOpen.IsChecked
+            CreateDesktopShortcut   = [bool]$chkDesktopShortcut.IsChecked
+            CreateStartMenuShortcut = [bool]$chkStartMenuShortcut.IsChecked
+        }
+        $dialog.DialogResult = $true
+    }.GetNewClosure())
+
+$btnCancel.Add_Click({ $dialog.Close() }.GetNewClosure())
+[void]$dialog.ShowDialog()
+return $result.Value
+}
+
+function New-WmtGogdlOperationLogPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$Action
+)
+
+try {
+    $settings = Get-WmtSettings
+    if (-not (Get-WmtProviderToggle -Settings $settings -ProviderKey "gogdl" -ToggleName "Logs")) { return "" }
+
+    $root = Join-Path (Get-DataPath) "package-install-logs"
+    try { [void][System.IO.Directory]::CreateDirectory($root) }
+    catch {
+        $root = Join-Path $env:TEMP "WMT-PackageInstallLogs"
+        try { [void][System.IO.Directory]::CreateDirectory($root) } catch { return "" }
+    }
+
+    $safeId = ([string]$Id -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeId)) { $safeId = "package" }
+    $safeAction = ([string]$Action -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeAction)) { $safeAction = "Action" }
+    $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+    return (Join-Path $root "$stamp-$safeAction-$safeId-gogdl.log")
+}
+catch { return "" }
+}
+
+function Start-WmtGogdlLibraryDownload {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$Id,
+    [Parameter(Mandatory = $true)][string]$GogdlExe,
+    [Parameter(Mandatory = $true)][string]$AuthConfig,
+    [Parameter(Mandatory = $true)]$Options,
+    $Metadata
+)
+
+if (Test-WmtGogdlInstallPending -Id $Id) {
+    Show-WmtMessageBox -Message "'$Name' already has a GOGDL download running." -Title "Download Already Running" -Image Information | Out-Null
+    return
+}
+
+$gogArgs = [System.Collections.Generic.List[string]]::new()
+[void]$gogArgs.Add("--auth-config-path")
+[void]$gogArgs.Add($AuthConfig)
+[void]$gogArgs.Add("download")
+[void]$gogArgs.Add($Id)
+[void]$gogArgs.Add("--path")
+[void]$gogArgs.Add([string]$Options.RootPath)
+[void]$gogArgs.Add("--os")
+[void]$gogArgs.Add("windows")
+[void]$gogArgs.Add("--max-workers")
+[void]$gogArgs.Add([string]$Options.Workers)
+
+if (-not [string]::IsNullOrWhiteSpace([string]$Options.Language)) {
+    [void]$gogArgs.Add("--lang")
+    [void]$gogArgs.Add([string]$Options.Language)
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$Options.BuildId)) {
+    [void]$gogArgs.Add("--build")
+    [void]$gogArgs.Add([string]$Options.BuildId)
+}
+
+$selectedDlcs = @($Options.DlcIds | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+if ($selectedDlcs.Count -gt 0) {
+    [void]$gogArgs.Add("--with-dlcs")
+    [void]$gogArgs.Add("--dlcs")
+    [void]$gogArgs.Add(($selectedDlcs -join ","))
+}
+else {
+    [void]$gogArgs.Add("--skip-dlcs")
+}
+
+$folderName = ""
+try { $folderName = ([string]$Metadata.folder_name).Trim() } catch {}
+$expectedInstallPath = ""
+if (-not [string]::IsNullOrWhiteSpace($folderName)) {
+    try { $expectedInstallPath = Join-Path ([string]$Options.RootPath) $folderName } catch {}
+}
+
+function ConvertTo-WmtPsSingleQuotedLiteral([string]$Value) {
+    if ($null -eq $Value) { return "''" }
+    $safe = $Value.Replace("'", "''").Replace("`r", " ").Replace("`n", " ")
+    return "'" + $safe + "'"
+}
+
+$launcherDir = Join-Path (Get-DataPath) "gogdl-launchers"
+if (-not (Test-Path -LiteralPath $launcherDir -PathType Container)) {
+    [void][System.IO.Directory]::CreateDirectory($launcherDir)
+}
+$resultPath = Join-Path $launcherDir ("gogdl-result-{0}-{1}.txt" -f (($Id -replace '[^A-Za-z0-9_.-]', '_')), ([guid]::NewGuid().ToString("N")))
+$logPath = New-WmtGogdlOperationLogPath -Id $Id -Action "Install"
+
+$exeLiteral = ConvertTo-WmtPsSingleQuotedLiteral $GogdlExe
+$resultLiteral = ConvertTo-WmtPsSingleQuotedLiteral $resultPath
+$logLiteral = ConvertTo-WmtPsSingleQuotedLiteral $logPath
+$argumentLiterals = @($gogArgs | ForEach-Object { ConvertTo-WmtPsSingleQuotedLiteral ([string]$_) })
+$argumentsLiteral = $argumentLiterals -join ", "
+$titleLiteral = ConvertTo-WmtPsSingleQuotedLiteral ("WMT GOGDL - " + $Name)
+$pauseSuccessLiteral = if ([bool]$Options.KeepOpenOnSuccess) { '$true' } else { '$false' }
+
+$launcherScript = @"
+`$ErrorActionPreference = 'Continue'
+try { `$Host.UI.RawUI.WindowTitle = $titleLiteral } catch {}
+`$exe = $exeLiteral
+`$arguments = @($argumentsLiteral)
+`$resultPath = $resultLiteral
+`$logPath = $logLiteral
+if (-not [string]::IsNullOrWhiteSpace(`$logPath)) {
+    try {
+        `$header = "[" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") + "] COMMAND: " + `$exe + " " + (`$arguments -join " ") + [Environment]::NewLine
+        [System.IO.File]::WriteAllText(`$logPath, `$header, [System.Text.UTF8Encoding]::new(`$false))
+    }
+    catch {}
+    & `$exe @arguments 2>&1 | Tee-Object -FilePath `$logPath -Append | ForEach-Object { Write-Host `$_ }
+}
+else {
+    & `$exe @arguments
+}
+`$exitCode = if (`$null -eq `$LASTEXITCODE) { 1 } else { [int]`$LASTEXITCODE }
+if (-not [string]::IsNullOrWhiteSpace(`$logPath)) {
+    try {
+        [System.IO.File]::AppendAllText(
+            `$logPath,
+            ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), `$exitCode, [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new(`$false)
+        )
+    }
+    catch {}
+}
+try { [System.IO.File]::WriteAllText(`$resultPath, [string]`$exitCode, [System.Text.UTF8Encoding]::new(`$false)) } catch {}
+if (`$exitCode -ne 0) {
+    Write-Host ""
+    Write-Host "[WMT] GOGDL exited before completing successfully. Exit code: `$exitCode"
+    Write-Host "[WMT] The partial download is preserved. Re-run Install from Your Library to resume."
+    Write-Host ""
+    [void](Read-Host "Press Enter to close")
+}
+else {
+    Write-Host ""
+    Write-Host "[WMT] GOGDL completed successfully."
+    if ($pauseSuccessLiteral) { [void](Read-Host "Press Enter to close") }
+}
+exit `$exitCode
+"@
+
+$encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherScript))
+$proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand -PassThru -WindowStyle Normal
+$procStartUtcTicks = [int64]0
+try { $procStartUtcTicks = [int64]$proc.StartTime.ToUniversalTime().Ticks } catch {}
+Set-WmtGogdlTrackedInstall -Id $Id -Name $Name -RootPath ([string]$Options.RootPath) -InstallPath $expectedInstallPath -Status Pending -ProcessId $proc.Id -ProcessStartUtcTicks $procStartUtcTicks
+Write-GuiLog "Starting GOGDL download for: $Name (id $Id) -> $($Options.RootPath) | language=$($Options.Language) | workers=$($Options.Workers) | build=$(if ($Options.BuildId) { $Options.BuildId } else { 'default' }) | DLCs=$($selectedDlcs.Count) selected | PID=$($proc.Id)"
+if (-not [string]::IsNullOrWhiteSpace($logPath)) { Write-GuiLog "[Diagnostics] GOGDL install log: $logPath" }
+
+$procRef = $proc
+$resultRef = $resultPath
+$idRef = $Id
+$nameRef = $Name
+$rootRef = [string]$Options.RootPath
+$installRef = $expectedInstallPath
+$gogdlExeRef = [string]$GogdlExe
+$authConfigRef = [string]$AuthConfig
+$createDesktopShortcutRef = [bool]$Options.CreateDesktopShortcut
+$createStartMenuShortcutRef = [bool]$Options.CreateStartMenuShortcut
+$operationName = "GogdlLibraryInstall:$($proc.Id):$([guid]::NewGuid().ToString('N'))"
+$installFinalizeState = [PSCustomObject]@{ Attempted = $false; Completed = $false }
+
+$testComplete = {
+    param($Operation)
+    try {
+        return [bool]($procRef -and $procRef.HasExited)
+    }
+    catch { return $false }
+}.GetNewClosure()
+
+$onComplete = {
+    param($Operation)
+    if ($installFinalizeState.Completed) { return }
+    $installFinalizeState.Attempted = $true
+    if ($installFinalizeState.PSObject.Properties['OutcomeApplied'] -and $installFinalizeState.OutcomeApplied) {
+        if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+            try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+            catch { try { Write-GuiLog "Installer result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+        }
+        try { if ($procRef) { $procRef.Dispose() } } catch {}
+        $installFinalizeState.Completed = $true
+        return
+    }
+    $exitCode = 1
+    if (-not $procRef -or -not $procRef.HasExited) { throw "GOGDL process exit not verified." }
+    $exitCode = [int]$procRef.ExitCode
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+        try {
+            $exitText = ([System.IO.File]::ReadAllText($resultRef)).Trim()
+            $parsedExitCode = 0
+            if (-not [int]::TryParse($exitText, [ref]$parsedExitCode)) {
+                throw "Invalid exit-code text."
+            }
+            $exitCode = $parsedExitCode
+        }
+        catch {
+            Write-GuiLog "GOGDL result file is invalid after process exit; using process exit code $exitCode. $($_.Exception.Message)"
+        }
+    }
+
+    if ($exitCode -eq 0) {
+        $resolvedInstallPath = Resolve-WmtGogdlInstallPath -Id $idRef -RootPath $rootRef -InstallPath $installRef
+        if (-not [string]::IsNullOrWhiteSpace($resolvedInstallPath)) {
+            $completeMarker = Join-Path $resolvedInstallPath ".wmt-gogdl-installed"
+            [System.IO.File]::WriteAllText($completeMarker, "WMT GOGDL install completed", [System.Text.UTF8Encoding]::new($false))
+            Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $resolvedInstallPath -Status Installed -ProcessId 0
+            Write-GuiLog "GOGDL download completed successfully: $nameRef (id $idRef) -> $resolvedInstallPath"
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                try {
+                    $safeAuthConfig = $authConfigRef.Replace('"', "")
+                    $safeInstallPath = $resolvedInstallPath.Replace('"', "")
+                    $safeId = $idRef.Replace('"', "")
+                    $launchArguments = '--auth-config-path "' + $safeAuthConfig + '" launch "' + $safeInstallPath + '" "' + $safeId + '" --platform windows'
+                    $shortcutPaths = @(New-WmtGameLaunchShortcuts -Name $nameRef -TargetPath $gogdlExeRef -Arguments $launchArguments -WorkingDirectory $resolvedInstallPath -IconLocation $gogdlExeRef -Desktop $createDesktopShortcutRef -StartMenu $createStartMenuShortcutRef)
+                    if ($shortcutPaths.Count -gt 0) {
+                        Write-GuiLog ("Created GOGDL game shortcut(s): " + ($shortcutPaths -join "; "))
+                    }
+                }
+                catch {
+                    Write-GuiLog "GOGDL download succeeded, but shortcut creation failed for ${nameRef}: $($_.Exception.Message)"
+                }
+            }
+        }
+        else {
+            Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath "" -Status Installed -ProcessId 0
+            Write-GuiLog "GOGDL completed successfully for $nameRef (id $idRef), but WMT could not resolve the final install directory from GOGDL metadata/manifest."
+            if ($createDesktopShortcutRef -or $createStartMenuShortcutRef) {
+                Write-GuiLog "GOGDL shortcut creation was requested for $nameRef, but the final install path could not be resolved."
+            }
+        }
+    }
+    else {
+        Set-WmtGogdlTrackedInstall -Id $idRef -Name $nameRef -RootPath $rootRef -InstallPath $installRef -Status Failed -ProcessId 0
+        Write-GuiLog ("GOGDL download ended with exit code " + $exitCode + ": " + $nameRef + " (id " + $idRef + "). Partial files were kept for resume.")
+    }
+
+    try { Start-WmtLibraryScan -Silent } catch {}
+    $installFinalizeState | Add-Member -NotePropertyName OutcomeApplied -NotePropertyValue $true -Force
+    if (Test-Path -LiteralPath $resultRef -PathType Leaf) {
+        try { Remove-Item -LiteralPath $resultRef -Force -ErrorAction Stop }
+        catch { try { Write-GuiLog "GOGDL result cleanup warning for $($idRef): $($_.Exception.Message)" } catch {} }
+    }
+    try { if ($procRef) { $procRef.Dispose() } } catch {}
+    $installFinalizeState.Completed = $true
+}.GetNewClosure()
+
+$fallbackTestComplete = {
+    param($Operation)
+    if ($installFinalizeState.Attempted) { return $true }
+    try { return [bool]($procRef -and $procRef.HasExited) } catch { return $false }
+}.GetNewClosure()
+$onError = {
+    param($Operation, $ErrorRecord)
+    $message = ""
+    try { $message = $ErrorRecord.Exception.Message } catch { $message = [string]$ErrorRecord }
+    Write-GuiLog ("GOGDL download monitor failed for " + $nameRef + ": " + $message + ". Switching to independent exit monitoring.")
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
+}.GetNewClosure()
+
+try {
+    Register-WmtUiPollOperation -Name $operationName -IntervalMs 1000 -TestComplete $testComplete -OnComplete $onComplete -OnError $onError | Out-Null
+}
+catch {
+    Write-GuiLog "GOGDL shared monitor registration failed; using independent exit monitoring: $($_.Exception.Message)"
+    Start-WmtFallbackUiMonitor -Name $operationName -TestComplete $fallbackTestComplete -OnComplete $onComplete | Out-Null
+}
+}
+
+function Invoke-WmtLibraryInstall {
+    param($Item)
+    if (-not $Item) { return }
+    # Normalize provider labels so package-search rows (legendary/gogdl) and
+    # Your Library rows (Epic/Legendary/GOG) share exactly the same installer.
+    $source = ([string]$Item.Source).Trim().ToLowerInvariant()
+    $id = [string]$Item.Id
+    $name = [string]$Item.Name
+
+    $isInstalled = $false
+    try {
+        if ($Item.PSObject.Properties["IsInstalled"]) {
+            $isInstalled = [bool]$Item.IsInstalled
+        }
+        if (-not $isInstalled -and $source -in @("epic", "legendary", "gog", "gogdl")) {
+            $knownInstallPath = Get-WmtLibraryItemInstallDir -Item $Item
+            $isInstalled = -not [string]::IsNullOrWhiteSpace([string]$knownInstallPath)
+        }
+    }
+    catch {}
+    if ($isInstalled -and $source -in @("epic", "legendary", "gog", "gogdl")) {
+        Show-WmtMessageBox -Message "'$name' is already installed." -Title "Already Installed" -Image Information | Out-Null
+        return
+    }
+
+    if ($source -eq "steam") {
+        Start-Process "steam://install/$id"
+        Write-GuiLog "Starting Steam install for: $name (app $id)"
+    }
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
+        try {
+            $legExe = Get-WmtLegendaryExePath
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $cmd = Get-Command legendary -ErrorAction SilentlyContinue
+                if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
+            }
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                Show-WmtMessageBox -Message "Legendary is not installed. Cannot install Epic games." -Title "Install Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $localCredentialState = Get-WmtLegendaryLocalCredentialState
+            if ([string]$localCredentialState.State -ne "Present") {
+                $credentialReason = if ([string]$localCredentialState.State -eq "Corrupt") {
+                    "Legendary's saved Epic credential file is unreadable or malformed."
+                }
+                else {
+                    "Legendary does not currently have a saved Epic login with a refresh token."
+                }
+                $credentialPrompt = $credentialReason + "`n`nOpen Legendary authentication now? After signing in, retry the install."
+                $credentialChoice = Show-WmtMessageBox -Message $credentialPrompt -Title "Epic Login Required" -Button YesNo -Image Warning
+                if ($credentialChoice -eq [System.Windows.MessageBoxResult]::Yes) {
+                    try {
+                        Start-Process -FilePath $legExe -ArgumentList "auth" -WindowStyle Normal | Out-Null
+                        Write-GuiLog "Started Legendary authentication because Epic credentials were $(([string]$localCredentialState.State).ToLowerInvariant())."
+                    }
+                    catch {
+                        Show-WmtMessageBox -Message "Could not start Legendary authentication: $($_.Exception.Message)" -Title "Authentication Failed" -Image Warning | Out-Null
+                    }
+                }
+                return
+            }
+
+            if (Test-WmtLegendaryInstallPending -Id $id) {
+                Show-WmtMessageBox -Message "'$name' already has a Legendary install running." -Title "Install Already Running" -Image Information | Out-Null
+                return
+            }
+
+            $defaultRoot = ""
+            if ($script:WmtLegendaryLastInstallRoot -and (Test-Path -LiteralPath $script:WmtLegendaryLastInstallRoot -PathType Container)) {
+                $defaultRoot = [string]$script:WmtLegendaryLastInstallRoot
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                $defaultRoot = Join-Path $env:USERPROFILE "Games\Epic"
+            }
+            else {
+                $defaultRoot = Join-Path (Get-DataPath) "legendary-games"
+            }
+
+            $legExeRef = [string]$legExe
+            $idRef = [string]$id
+            $nameRef = [string]$name
+            $defaultRootRef = [string]$defaultRoot
+
+            if (-not (Get-Variable -Name WmtLegendaryLastInstallRoot -Scope Script -ErrorAction SilentlyContinue)) {
+                Set-Variable -Name WmtLegendaryLastInstallRoot -Scope Script -Value ""
+            }
+            $lastInstallRootState = Get-Variable -Name WmtLegendaryLastInstallRoot -Scope Script
+
+            $showOptions = {
+                param($Metadata, [string]$Warning)
+                $options = Show-WmtLegendaryInstallOptions -GameName $nameRef -DefaultRoot $defaultRootRef -Metadata $Metadata -MetadataWarning $Warning
+                if (-not $options) { return }
+                $lastInstallRootState.Value = [string]$options.RootPath
+                Start-WmtLegendaryLibraryInstall -Name $nameRef -Id $idRef -LegendaryExe $legExeRef -Options $options
+            }.GetNewClosure()
+
+            $metadataDone = {
+                param($results)
+
+                $entry = @($results | Where-Object { $_ -and $_.PSObject.Properties["Stage"] } | Select-Object -Last 1)
+                if ($entry.Count -eq 0) {
+                    & $showOptions $null "Legendary credential/metadata validation returned no usable result. You can still configure the install, but live Epic data is unavailable."
+                    return
+                }
+
+                $entry = $entry[0]
+                $stage = ([string]$entry.Stage).Trim()
+                $category = ([string]$entry.Category).Trim()
+                $shortError = ([string]$entry.Error).Trim()
+                $account = ([string]$entry.Account).Trim()
+
+                if ($stage -eq "Auth" -and $category -in @("MissingCredentials", "Credentials", "CorruptCredentials")) {
+                    if ([string]::IsNullOrWhiteSpace($shortError)) {
+                        $shortError = "Legendary's saved Epic login is missing or no longer valid."
+                    }
+                    $authMessage = $shortError + "`n`nOpen Legendary authentication now? After signing in, retry the install."
+                    $authChoice = Show-WmtMessageBox -Message $authMessage -Title "Epic Login Required" -Button YesNo -Image Warning
+                    if ($authChoice -eq [System.Windows.MessageBoxResult]::Yes) {
+                        try {
+                            Start-Process -FilePath $legExeRef -ArgumentList "auth" -WindowStyle Normal | Out-Null
+                            Write-GuiLog "Started Legendary re-authentication after credential validation failed for $nameRef."
+                        }
+                        catch {
+                            Show-WmtMessageBox -Message "Could not start Legendary authentication: $($_.Exception.Message)" -Title "Authentication Failed" -Image Warning | Out-Null
+                        }
+                    }
+                    return
+                }
+
+                $metadata = $null
+                $warning = ""
+                $jsonText = ([string]$entry.Json).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($jsonText)) {
+                    try { $metadata = ($jsonText | ConvertFrom-Json -ErrorAction Stop) }
+                    catch { $warning = "Legendary returned metadata that WMT could not parse. Manual/default choices are still available." }
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($shortError)) {
+                    $warning = $shortError
+                }
+                elseif ($category -eq "OfflineFallback") {
+                    $warning = "Live Epic metadata was unavailable, so WMT is using Legendary's cached metadata."
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($account) -and [bool]$entry.AuthVerified) {
+                    Write-GuiLog "Legendary Epic credential validation succeeded for account '$account' before installing $nameRef."
+                }
+                elseif ([bool]$entry.AuthVerified) {
+                    Write-GuiLog "Legendary Epic credential validation succeeded before installing $nameRef."
+                }
+                elseif ($category -in @("Network", "RateLimit", "Service", "OfflineFallback")) {
+                    Write-GuiLog "Legendary online credential validation could not be completed for $nameRef ($category); continuing only with the available metadata/cache state."
+                }
+
+                & $showOptions $metadata $warning
+            }.GetNewClosure()
+
+            $metadataError = {
+                param($errorRecord)
+                $errorMessage = ""
+                if ($errorRecord -is [System.Exception]) { $errorMessage = $errorRecord.Message }
+                elseif ($errorRecord -and $errorRecord.Exception) { $errorMessage = $errorRecord.Exception.Message }
+                else { $errorMessage = [string]$errorRecord }
+                if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = "unknown internal error" }
+                & $showOptions $null ("Legendary preflight failed inside WMT: " + $errorMessage + ". Manual/default install choices are still available.")
+            }.GetNewClosure()
+
+            Invoke-WmtUiBackgroundCommand -Name ("LegendaryInstallInfo_" + $idRef) -Msg "Validating Epic login and loading Legendary install choices for $nameRef..." -TimeoutMs 90000 -SuppressResultLog -Sb {
+                param($ExePath, $GameId)
+
+                function Invoke-LegendaryCaptured {
+                    param(
+                        [string]$Arguments,
+                        [int]$TimeoutMs
+                    )
+
+                    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                    $psi.FileName = $ExePath
+                    $psi.Arguments = $Arguments
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+                    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+
+                    $proc = [System.Diagnostics.Process]::new()
+                    $proc.StartInfo = $psi
+                    try {
+                        if (-not $proc.Start()) { throw "Could not start Legendary." }
+                        $outTask = $proc.StandardOutput.ReadToEndAsync()
+                        $errTask = $proc.StandardError.ReadToEndAsync()
+                        $timedOut = -not $proc.WaitForExit($TimeoutMs)
+                        $exited = -not $timedOut
+                        if ($timedOut) {
+                            $killProcess = $null
+                            try {
+                                $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+                                if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+                                    $killProcess = Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -PassThru -ErrorAction Stop
+                                    if ($killProcess -and -not $killProcess.WaitForExit(5000)) {
+                                        try { $killProcess.Kill() } catch {}
+                                    }
+                                }
+                            }
+                            catch {}
+                            finally { try { if ($killProcess) { $killProcess.Dispose() } } catch {} }
+                            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                            try { $exited = [bool]$proc.WaitForExit(3000) } catch { $exited = $false }
+                            if (-not $exited) { try { $exited = [bool]$proc.HasExited } catch {} }
+                        }
+                        $readCompleted = $false
+                        if ($exited) {
+                            try {
+                                $readCompleted = [System.Threading.Tasks.Task]::WaitAll(
+                                    [System.Threading.Tasks.Task[]]@($outTask, $errTask), 3000)
+                            }
+                            catch {}
+                        }
+                        $stdout = ""
+                        $stderr = ""
+                        if ($readCompleted) {
+                            try { $stdout = [string]$outTask.Result } catch {}
+                            try { $stderr = [string]$errTask.Result } catch {}
+                        }
+                        $outputReadTimedOut = ($exited -and -not $readCompleted)
+                        $exitCode = if ($timedOut -or -not $exited -or $outputReadTimedOut) { 124 }
+                            else { try { [int]$proc.ExitCode } catch { 1 } }
+                        return [PSCustomObject]@{
+                            ExitCode           = $exitCode
+                            TimedOut           = ($timedOut -or $outputReadTimedOut)
+                            TerminationFailed  = (-not $exited -or ($timedOut -and $outputReadTimedOut))
+                            OutputReadTimedOut = $outputReadTimedOut
+                            StdOut             = $stdout
+                            StdErr             = $stderr
+                        }
+                    }
+                    finally {
+                        try { $proc.Dispose() } catch {}
+                    }
+                }
+
+                function Get-LegendaryFailureCategory {
+                    param(
+                        [string]$Text,
+                        [bool]$TimedOut
+                    )
+                    if ($TimedOut -or $Text -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|TimeoutError|timed out') {
+                        return "Network"
+                    }
+                    if ($Text -match '(?i)429|Too Many Requests|rate.?limit') { return "RateLimit" }
+                    if ($Text -match '(?i)Stored credentials are no longer valid|invalid credentials|invalid_grant|errors\.com\.epicgames\.account\.oauth|authentication failed|Login failed') {
+                        return "Credentials"
+                    }
+                    if ($Text -match '(?i)No saved credentials|not logged in|login is not configured') { return "MissingCredentials" }
+                    if ($Text -match '(?i)\b50[0-9]\b|\b51[0-9]\b|\b52[0-9]\b|\b53[0-9]\b|Service Unavailable|Bad Gateway|Gateway Timeout') {
+                        return "Service"
+                    }
+                    return "Unknown"
+                }
+
+                function Get-LegendaryShortError {
+                    param([string]$Text)
+                    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+
+                    $lines = @($Text -split '\r?\n' | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($lines.Count -eq 0) { return "" }
+
+                    $candidate = ""
+                    foreach ($line in $lines) {
+                        if ($line -match '(?i)(ERROR|WARNING|ReadTimeout|ConnectTimeout|ConnectionError|HTTPSConnectionPool|invalid credentials|Stored credentials|Login failed|No saved credentials|Too Many Requests|Service Unavailable|Bad Gateway|Gateway Timeout)') {
+                            $candidate = $line
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($candidate)) {
+                        $candidate = [string]$lines[$lines.Count - 1]
+                    }
+
+                    $candidate = $candidate -replace '^\[[^\]]+\]\s*(ERROR|WARNING):\s*', ''
+                    if ($candidate.Length -gt 420) { $candidate = $candidate.Substring(0, 417) + "..." }
+                    return $candidate
+                }
+
+                $configRoot = ""
+                try {
+                    if (-not [string]::IsNullOrWhiteSpace($env:LEGENDARY_CONFIG_PATH)) {
+                        $configRoot = [string]$env:LEGENDARY_CONFIG_PATH
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+                        $configRoot = Join-Path ([string]$env:XDG_CONFIG_HOME) "legendary"
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace($HOME)) {
+                        $configRoot = Join-Path ([string]$HOME) ".config\legendary"
+                    }
+                }
+                catch {}
+
+                $account = ""
+                $userPath = if ([string]::IsNullOrWhiteSpace($configRoot)) { "" } else { Join-Path $configRoot "user.json" }
+                if ([string]::IsNullOrWhiteSpace($userPath) -or -not (Test-Path -LiteralPath $userPath -PathType Leaf)) {
+                    return [PSCustomObject]@{
+                        Stage = "Auth"; Category = "MissingCredentials"; Error = "Legendary has no saved Epic login. Authenticate Legendary before installing Epic games."
+                        Json = ""; Account = ""; AuthVerified = $false
+                    }
+                }
+
+                try {
+                    $userData = [System.IO.File]::ReadAllText($userPath) | ConvertFrom-Json -ErrorAction Stop
+                    $refreshTokenPresent = -not [string]::IsNullOrWhiteSpace(([string]$userData.refresh_token).Trim())
+                    try { $account = ([string]$userData.displayName).Trim() } catch {}
+                    if (-not $refreshTokenPresent) {
+                        return [PSCustomObject]@{
+                            Stage = "Auth"; Category = "MissingCredentials"; Error = "Legendary's saved Epic login does not contain a refresh token. Re-authenticate Legendary."
+                            Json = ""; Account = $account; AuthVerified = $false
+                        }
+                    }
+                }
+                catch {
+                    return [PSCustomObject]@{
+                        Stage = "Auth"; Category = "CorruptCredentials"; Error = "Legendary's saved Epic credential file is unreadable or malformed. Re-authenticate Legendary."
+                        Json = ""; Account = ""; AuthVerified = $false
+                    }
+                }
+
+                $quote = [char]34
+                $authVerified = $false
+                $authWarning = ""
+
+                # get-token performs a real login/session refresh without opening an
+                # interactive browser. Its token JSON is deliberately parsed and discarded.
+                $authProbe = Invoke-LegendaryCaptured -Arguments "--api-timeout 15 get-token --json" -TimeoutMs 22000
+                if (-not $authProbe.TimedOut -and -not [string]::IsNullOrWhiteSpace([string]$authProbe.StdOut)) {
+                    try {
+                        $tokenProbe = ([string]$authProbe.StdOut).Trim() | ConvertFrom-Json -ErrorAction Stop
+                        if ($tokenProbe -and
+                            ((-not [string]::IsNullOrWhiteSpace([string]$tokenProbe.code)) -or
+                             (-not [string]::IsNullOrWhiteSpace([string]$tokenProbe.access_token)))) {
+                            $authVerified = $true
+                        }
+                    }
+                    catch {}
+                }
+
+                if (-not $authVerified) {
+                    $authText = (([string]$authProbe.StdErr) + "`n" + ([string]$authProbe.StdOut)).Trim()
+                    $authCategory = Get-LegendaryFailureCategory -Text $authText -TimedOut ([bool]$authProbe.TimedOut)
+                    $authDetail = Get-LegendaryShortError -Text $authText
+
+                    if ($authCategory -in @("Credentials", "MissingCredentials")) {
+                        return [PSCustomObject]@{
+                            Stage = "Auth"; Category = $authCategory
+                            Error = if ($authCategory -eq "Credentials") { "Legendary's saved Epic credentials are no longer valid. Re-authenticate Legendary." } else { "Legendary has no usable Epic login. Authenticate Legendary before installing." }
+                            Json = ""; Account = $account; AuthVerified = $false
+                        }
+                    }
+
+                    if ($authCategory -eq "Network") {
+                        $authWarning = "Epic login validation timed out. WMT will still try the game metadata request before deciding whether the saved credentials are unusable."
+                    }
+                    elseif ($authCategory -eq "RateLimit") {
+                        $authWarning = "Epic temporarily rate-limited the login validation request."
+                    }
+                    elseif ($authCategory -eq "Service") {
+                        $authWarning = "Epic's authentication service returned a temporary server error."
+                    }
+                    else {
+                        $authWarning = if ([string]::IsNullOrWhiteSpace($authDetail)) { "WMT could not conclusively validate the saved Epic login." } else { "WMT could not conclusively validate the saved Epic login: $authDetail" }
+                    }
+                }
+
+                $metadataArgs = "--api-timeout 25 info " + $quote + $GameId + $quote + " --json --platform Windows"
+                $metadataProbe = Invoke-LegendaryCaptured -Arguments $metadataArgs -TimeoutMs 35000
+                if (-not $metadataProbe.TimedOut -and $metadataProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$metadataProbe.StdOut)) {
+                    return [PSCustomObject]@{
+                        Stage = "Metadata"; Category = "Ok"; Error = ""; Json = ([string]$metadataProbe.StdOut).Trim()
+                        Account = $account; AuthVerified = $true
+                    }
+                }
+
+                $metadataText = (([string]$metadataProbe.StdErr) + "`n" + ([string]$metadataProbe.StdOut)).Trim()
+                $metadataCategory = Get-LegendaryFailureCategory -Text $metadataText -TimedOut ([bool]$metadataProbe.TimedOut)
+                $metadataDetail = Get-LegendaryShortError -Text $metadataText
+
+                if ($metadataCategory -in @("Credentials", "MissingCredentials")) {
+                    return [PSCustomObject]@{
+                        Stage = "Auth"; Category = $metadataCategory; Error = "Legendary's Epic login was rejected while requesting game metadata. Re-authenticate Legendary."
+                        Json = ""; Account = $account; AuthVerified = $false
+                    }
+                }
+
+                $offlineArgs = "info " + $quote + $GameId + $quote + " --offline --json --platform Windows"
+                $offlineProbe = Invoke-LegendaryCaptured -Arguments $offlineArgs -TimeoutMs 15000
+                if (-not $offlineProbe.TimedOut -and $offlineProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$offlineProbe.StdOut)) {
+                    $offlineWarning = switch ($metadataCategory) {
+                        "Network"   { "Epic's metadata service timed out, so WMT is using cached Legendary metadata." }
+                        "RateLimit" { "Epic rate-limited the metadata request, so WMT is using cached Legendary metadata." }
+                        "Service"   { "Epic's metadata service returned a server error, so WMT is using cached Legendary metadata." }
+                        default     { "Live Epic metadata was unavailable, so WMT is using cached Legendary metadata." }
+                    }
+                    if (-not $authVerified -and -not [string]::IsNullOrWhiteSpace($authWarning)) {
+                        $offlineWarning += " " + $authWarning
+                    }
+                    return [PSCustomObject]@{
+                        Stage = "Metadata"; Category = "OfflineFallback"; Error = $offlineWarning; Json = ([string]$offlineProbe.StdOut).Trim()
+                        Account = $account; AuthVerified = $authVerified
+                    }
+                }
+
+                $finalError = switch ($metadataCategory) {
+                    "Network" {
+                        if ($authVerified) { "Epic login validated, but Epic's game metadata service timed out. You can retry later or continue with manual/default install options." }
+                        else { "Epic services timed out before WMT could validate the saved login or load game metadata. Retry when Epic is reachable; manual/default install options remain available." }
+                    }
+                    "RateLimit" { "Epic temporarily rate-limited the metadata request. Wait a little and retry; manual/default install options remain available." }
+                    "Service"   { "Epic's metadata service returned a temporary server error. Retry later; manual/default install options remain available." }
+                    default {
+                        if ([string]::IsNullOrWhiteSpace($metadataDetail)) { "Legendary could not load live or cached metadata. Manual/default install options remain available." }
+                        else { "Legendary could not load metadata: $metadataDetail" }
+                    }
+                }
+
+                return [PSCustomObject]@{
+                    Stage = "Metadata"; Category = $metadataCategory; Error = $finalError; Json = ""
+                    Account = $account; AuthVerified = $authVerified
+                }
+            } -ArgumentList $legExeRef, $idRef -OnComplete $metadataDone -OnError $metadataError | Out-Null
+        }
+        catch {
+            Show-WmtMessageBox -Message "Failed to prepare Legendary install: $($_.Exception.Message)" -Title "Install Failed" -Image Warning | Out-Null
+        }
+    }
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
+        try {
+            if (Test-WmtGogdlInstallPending -Id $id) {
+                Show-WmtMessageBox -Message "'$name' already has a GOGDL download running." -Title "Download Already Running" -Image Information | Out-Null
+                return
+            }
+
+            $gogdlExe = Get-WmtGogdlResolvedExePath
+            if ([string]::IsNullOrWhiteSpace($gogdlExe) -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL is not installed. Cannot download GOG games." -Title "Download Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $authConfig = Get-WmtGogdlResolvedAuthConfigPath
+            if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL authentication was not found. Sign in to GOG / reinstall the GOGDL provider, then try again." -Title "Download Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $defaultRoot = ""
+            if ($script:WmtGogdlLastInstallRoot -and (Test-Path -LiteralPath $script:WmtGogdlLastInstallRoot -PathType Container)) {
+                $defaultRoot = [string]$script:WmtGogdlLastInstallRoot
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                $defaultRoot = Join-Path $env:USERPROFILE "Games\GOG"
+            }
+            else {
+                $defaultRoot = Join-Path (Get-DataPath) "gog-games"
+            }
+
+            $gogdlExeRef = [string]$gogdlExe
+            $authConfigRef = [string]$authConfig
+            $idRef = [string]$id
+            $nameRef = [string]$name
+            $defaultRootRef = [string]$defaultRoot
+
+            # GetNewClosure() runs in a dynamic module, so capture the actual
+            # main-script PSVariable before the delayed metadata callback runs.
+            if (-not (Get-Variable -Name WmtGogdlLastInstallRoot -Scope Script -ErrorAction SilentlyContinue)) {
+                Set-Variable -Name WmtGogdlLastInstallRoot -Scope Script -Value ""
+            }
+            $lastInstallRootState = Get-Variable -Name WmtGogdlLastInstallRoot -Scope Script
+
+            $showOptions = {
+                param($Metadata, [string]$Warning)
+                $options = Show-WmtGogdlInstallOptions -GameName $nameRef -DefaultRoot $defaultRootRef -Metadata $Metadata -MetadataWarning $Warning -GogdlExe $gogdlExeRef
+                if (-not $options) { return }
+                $lastInstallRootState.Value = [string]$options.RootPath
+                Start-WmtGogdlLibraryDownload -Name $nameRef -Id $idRef -GogdlExe $gogdlExeRef -AuthConfig $authConfigRef -Options $options -Metadata $Metadata
+            }.GetNewClosure()
+
+            $metadataDone = {
+                param($results)
+                $envelope = @($results | Where-Object { $_ -and $_.PSObject.Properties["Json"] } | Select-Object -Last 1)
+                $metadata = $null
+                $warning = ""
+                if ($envelope.Count -gt 0) {
+                    $entry = $envelope[0]
+                    if ([int]$entry.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$entry.Json)) {
+                        try { $metadata = ([string]$entry.Json | ConvertFrom-Json -ErrorAction Stop) }
+                        catch { $warning = "GOGDL metadata could not be parsed. Build/DLC choices may be unavailable." }
+                    }
+                    else {
+                        $detail = ([string]$entry.Error).Trim()
+                        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit code $($entry.ExitCode)" }
+                        $warning = "GOGDL metadata lookup failed ($detail). You can still install with manual/default options."
+                    }
+                }
+                else {
+                    $warning = "GOGDL metadata lookup returned no result. You can still install with manual/default options."
+                }
+                & $showOptions $metadata $warning
+            }.GetNewClosure()
+
+            $metadataError = {
+                param($errorRecord)
+                $errorMessage = ""
+                if ($errorRecord -is [System.Exception]) {
+                    $errorMessage = $errorRecord.Message
+                }
+                elseif ($errorRecord -and $errorRecord.Exception) {
+                    $errorMessage = $errorRecord.Exception.Message
+                }
+                else {
+                    $errorMessage = [string]$errorRecord
+                }
+                if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = "unknown error" }
+                & $showOptions $null ("GOGDL metadata lookup failed: " + $errorMessage + ". You can still install with manual/default options.")
+            }.GetNewClosure()
+
+            Invoke-WmtUiBackgroundCommand -Name ("GogdlInstallInfo_" + $idRef) -Msg "Loading GOGDL install choices for $nameRef..." -TimeoutMs 30000 -SuppressResultLog -Sb {
+                param($ExePath, $AuthPath, $GameId)
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName = $ExePath
+                $quote = [char]34
+                $psi.Arguments = "--auth-config-path " + $quote + $AuthPath + $quote + " info " + $quote + $GameId + $quote + " --os windows --skip-dlcs --max-workers 1"
+                $psi.UseShellExecute = $false
+                $psi.CreateNoWindow = $true
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+                $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+                $proc = [System.Diagnostics.Process]::new()
+                $proc.StartInfo = $psi
+                try {
+                    if (-not $proc.Start()) { throw "Could not start GOGDL metadata query." }
+                    $outTask = $proc.StandardOutput.ReadToEndAsync()
+                    $errTask = $proc.StandardError.ReadToEndAsync()
+                    if (-not $proc.WaitForExit(25000)) {
+                        try { $proc.Kill() } catch {}
+                        try { [void]$proc.WaitForExit(2000) } catch {}
+                        return [PSCustomObject]@{ ExitCode = 124; Json = ""; Error = "metadata query timed out" }
+                    }
+                    $proc.WaitForExit()
+                    [PSCustomObject]@{
+                        ExitCode = [int]$proc.ExitCode
+                        Json     = [string]$outTask.GetAwaiter().GetResult()
+                        Error    = [string]$errTask.GetAwaiter().GetResult()
+                    }
+                }
+                finally {
+                    try { $proc.Dispose() } catch {}
+                }
+            } -ArgumentList $gogdlExeRef, $authConfigRef, $idRef -OnComplete $metadataDone -OnError $metadataError | Out-Null
+        }
+        catch {
+            Show-WmtMessageBox -Message "Failed to prepare GOGDL install: $($_.Exception.Message)" -Title "Download Failed" -Image Warning | Out-Null
+        }
+    }
+}
+
+function Invoke-WmtLibraryRepair {
+    param($Item)
+    if (-not $Item) { return }
+    $source = ([string]$Item.Source).ToLowerInvariant()
+    $id = [string]$Item.Id
+    $name = [string]$Item.Name
+
+    # Repair is only available for installed items.
+    $isInstalled = $false
+    try { if ($Item.PSObject.Properties["IsInstalled"]) { $isInstalled = [bool]$Item.IsInstalled } } catch {}
+    if (-not $isInstalled) {
+        Show-WmtMessageBox -Message "'$name' is not installed. Repair is only available for installed items." -Title "Repair Unavailable" -Image Information | Out-Null
+        return
+    }
+
+    if ($source -eq "steam") {
+        Start-Process "steam://validate/$id"
+        Write-GuiLog "Verifying Steam game files: $name (app $id)"
+    }
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
+        try {
+            $legExe = Get-WmtLegendaryExePath
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $cmd = Get-Command legendary -ErrorAction SilentlyContinue
+                if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
+            }
+            if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                Start-Process -FilePath $legExe -ArgumentList "verify", $id -WindowStyle Normal
+                Write-GuiLog "Verifying Epic game files: $name (app $id)"
+            }
+            else {
+                Show-WmtMessageBox -Message "Legendary is not installed. Cannot repair Epic games." -Title "Repair Failed" -Image Warning | Out-Null
+            }
+        }
+        catch {
+            Show-WmtMessageBox -Message "Failed to start repair: $($_.Exception.Message)" -Title "Repair Failed" -Image Warning | Out-Null
+        }
+    }
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
+        try {
+            $installDir = Get-WmtLibraryItemInstallDir -Item $Item
+            if ([string]::IsNullOrWhiteSpace($installDir) -or -not (Test-Path -LiteralPath $installDir -PathType Container)) {
+                Show-WmtMessageBox -Message "Could not find the install directory for this GOG game." -Title "Repair Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $gogdlExe = Get-WmtGogdlResolvedExePath
+            if ([string]::IsNullOrWhiteSpace($gogdlExe) -or -not (Test-Path -LiteralPath $gogdlExe -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL is not installed. Cannot repair GOG games." -Title "Repair Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $authConfig = Get-WmtGogdlResolvedAuthConfigPath
+            if ([string]::IsNullOrWhiteSpace($authConfig) -or -not (Test-Path -LiteralPath $authConfig -PathType Leaf)) {
+                Show-WmtMessageBox -Message "GOGDL authentication was not found. Sign in to GOG / reinstall the GOGDL provider, then try again." -Title "Repair Failed" -Image Warning | Out-Null
+                return
+            }
+
+            $repairArgs = @(
+                "--auth-config-path", (ConvertTo-WmtProcessArgument $authConfig),
+                "repair", (ConvertTo-WmtProcessArgument $id),
+                "--path", (ConvertTo-WmtProcessArgument $installDir),
+                "--os", "windows",
+                "--max-workers", "1"
+            )
+            Start-Process -FilePath $gogdlExe -ArgumentList $repairArgs -WindowStyle Normal
+            Write-GuiLog "Repairing GOG game: $name (id $id) -> $installDir"
+        }
+        catch {
+            Show-WmtMessageBox -Message "Failed to start GOG repair: $($_.Exception.Message)" -Title "Repair Failed" -Image Warning | Out-Null
+        }
+    }
+    elseif ($source -eq "winget") {
+        Start-Process -FilePath "winget" -ArgumentList "repair", "--id", "`"$id`"", "--accept-source-agreements", "--accept-package-agreements" -WindowStyle Normal
+        Write-GuiLog "Repairing winget package: $name ($id)"
+    }
+    elseif ($source -eq "pip" -or $source -eq "pip3") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "python -m pip install --force-reinstall `"$id`"" -WindowStyle Normal
+        Write-GuiLog "Force-reinstalling pip package: $name"
+    }
+    elseif ($source -eq "npm") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "npm install `"$id`" --force" -WindowStyle Normal
+        Write-GuiLog "Force-reinstalling npm package: $name"
+    }
+    elseif ($source -eq "pnpm") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "pnpm rebuild `"$id`"" -WindowStyle Normal
+        Write-GuiLog "Rebuilding pnpm package: $name"
+    }
+    elseif ($source -eq "chocolatey" -or $source -eq "choco") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "choco install `"$id`" -y --force" -WindowStyle Normal
+        Write-GuiLog "Force-reinstalling choco package: $name"
+    }
+    elseif ($source -eq "scoop") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "scoop reset `"$id`"" -WindowStyle Normal
+        Write-GuiLog "Resetting scoop package: $name"
+    }
+    elseif ($source -eq "gem" -or $source -eq "ruby") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "gem pristine `"$id`"" -WindowStyle Normal
+        Write-GuiLog "Restoring pristine gem: $name"
+    }
+    elseif ($source -eq "cargo" -or $source -eq "rust") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "cargo install --force `"$id`"" -WindowStyle Normal
+        Write-GuiLog "Force-reinstalling cargo package: $name"
+    }
+    elseif ($source -eq "dotnet") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "dotnet tool install --global `"$id`" --force" -WindowStyle Normal
+        Write-GuiLog "Force-reinstalling dotnet tool: $name"
+    }
+    elseif ($source -eq "psmodule") {
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Install-Module -Name '$id' -Scope CurrentUser -Force -AllowClobber" -WindowStyle Normal
+        Write-GuiLog "Force-reinstalling PowerShell module: $name"
+    }
+    elseif ($source -eq "composer") {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "composer reinstall `"$id`" --no-interaction" -WindowStyle Normal
+        Write-GuiLog "Reinstalling composer package: $name"
+    }
+    else {
+        Show-WmtMessageBox -Message "Repair is not supported for source: $source" -Title "Repair Unavailable" -Image Information | Out-Null
+    }
+}
+
+function Invoke-WmtLibraryUninstall {
+    param(
+        $Item,
+        [switch]$SkipConfirmation
+    )
+    if (-not $Item) { return }
+    $source = ([string]$Item.Source).Trim().ToLowerInvariant()
+    $id = [string]$Item.Id
+    $name = [string]$Item.Name
+
+    if (-not $SkipConfirmation) {
+        $msg = "Uninstall '$name'?`n`nThis will remove the game from your system."
+        if ((Show-WmtMessageBox -Message $msg -Title "Uninstall Game" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    }
+
+    if ($source -eq "steam") {
+        Start-Process "steam://uninstall/$id"
+        Write-GuiLog "Starting Steam uninstall for: $name (app $id)"
+    }
+    elseif ($source -eq "epic" -or $source -eq "legendary") {
+        try {
+            $legExe = Get-WmtLegendaryExePath
+            if ([string]::IsNullOrWhiteSpace($legExe) -or -not (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $cmd = Get-Command legendary -ErrorAction SilentlyContinue
+                if ($cmd -and $cmd.Source) { $legExe = [string]$cmd.Source }
+            }
+            if ($legExe -and (Test-Path -LiteralPath $legExe -PathType Leaf)) {
+                $legendaryUninstallLog = New-WmtLegendaryOperationLogPath -Id $id -Action "Uninstall"
+                if (-not [string]::IsNullOrWhiteSpace($legendaryUninstallLog)) {
+                    $exeLiteral = "'" + ([string]$legExe).Replace("'", "''") + "'"
+                    $idLiteral = "'" + ([string]$id).Replace("'", "''") + "'"
+                    $logLiteral = "'" + ([string]$legendaryUninstallLog).Replace("'", "''") + "'"
+                    $uninstallTemplate = @'
+$ErrorActionPreference = 'Continue'
+$exe = __EXE__
+$appId = __APP__
+$logPath = __LOG__
+try {
+    $header = "[" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") + "] COMMAND: " + $exe + " -y uninstall " + $appId + [Environment]::NewLine
+    [System.IO.File]::WriteAllText($logPath, $header, [System.Text.UTF8Encoding]::new($false))
+} catch {}
+& $exe -y uninstall $appId 2>&1 | Tee-Object -FilePath $logPath -Append | ForEach-Object { Write-Host $_ }
+$exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+try {
+    [System.IO.File]::AppendAllText(
+        $logPath,
+        ("[{0}] EXIT: {1}{2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), $exitCode, [Environment]::NewLine),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+} catch {}
+exit $exitCode
+'@
+                    $uninstallScript = $uninstallTemplate.Replace("__EXE__", $exeLiteral).Replace("__APP__", $idLiteral).Replace("__LOG__", $logLiteral)
+                    $encodedUninstall = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($uninstallScript))
+                    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedUninstall -WindowStyle Normal | Out-Null
+                    Write-GuiLog "Starting Legendary uninstall for: $name (app $id)"
+                    Write-GuiLog "[Diagnostics] Legendary uninstall log: $legendaryUninstallLog"
+                }
+                else {
+                    Start-Process -FilePath $legExe -ArgumentList "-y", "uninstall", $id -WindowStyle Normal
+                    Write-GuiLog "Starting Legendary uninstall for: $name (app $id)"
+                }
+            }
+            else {
+                Show-WmtMessageBox -Message "Legendary is not installed. Cannot uninstall Epic games." -Title "Uninstall Failed" -Image Warning | Out-Null
+            }
+        }
+        catch {
+            Show-WmtMessageBox -Message "Failed to start uninstall: $($_.Exception.Message)" -Title "Uninstall Failed" -Image Warning | Out-Null
+        }
+    }
+    elseif ($source -eq "gog" -or $source -eq "gogdl") {
+        # GOGDL games are DRM-free � just delete the install directory.
+        $installDir = Get-WmtLibraryItemInstallDir -Item $Item
+        if (-not [string]::IsNullOrWhiteSpace($installDir) -and (Test-Path -LiteralPath $installDir)) {
+            try {
+                Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+                try { Remove-WmtGogdlTrackedInstall -Id $id } catch {}
+                Write-GuiLog "Deleted GOG game directory: $installDir"
+            }
+            catch {
+                Show-WmtMessageBox -Message "Failed to delete: $($_.Exception.Message)`n`nThe directory may be in use. Close the game and try again." -Title "Uninstall Failed" -Image Warning | Out-Null
+            }
+        }
+        else {
+            Show-WmtMessageBox -Message "Could not find the install directory for this GOG game." -Title "Uninstall Failed" -Image Warning | Out-Null
+        }
+    }
+}
+
+# Wire up context menu: show/hide items based on installed state.
+if ($ctxLibrary -and $lstLibrary) {
+    # Select item on right-click (SelectionMode=Single doesn't auto-select).
+    $lstLibrary.Add_PreviewMouseRightButtonDown({
+        param($s, $e)
+        try { Set-WmtListViewRightClickSelection -ListView $s -OriginalSource $e.OriginalSource } catch {}
+    })
+
+    $lstLibrary.Add_ContextMenuOpening({
+            $item = Get-WmtSelectedLibraryItem
+            if (-not $item) {
+                $ctxLibrary.Items | ForEach-Object { $_.Visibility = [System.Windows.Visibility]::Collapsed }
+                return
+            }
+
+            $isInstalled = $false
+            $isPending = $false
+            try { if ($item.PSObject.Properties["IsInstalled"]) { $isInstalled = [bool]$item.IsInstalled } } catch {}
+            if (([string]$item.Source) -eq "GOG") {
+                try {
+                    if (-not $isInstalled) {
+                        $trackedGogPath = Get-WmtGogdlTrackedInstallPath -Id ([string]$item.Id)
+                        if (-not [string]::IsNullOrWhiteSpace($trackedGogPath)) {
+                            $isInstalled = $true
+                            if ($item.PSObject.Properties["IsInstalled"]) { $item.IsInstalled = $true }
+                            if ($item.PSObject.Properties["Version"]) { $item.Version = "Installed" }
+                        }
+                    }
+                    if (-not $isInstalled) {
+                        $isPending = Test-WmtGogdlInstallPending -Id ([string]$item.Id)
+                        if ($item.PSObject.Properties["IsPending"]) { $item.IsPending = $isPending }
+                        if ($isPending -and $item.PSObject.Properties["Version"]) { $item.Version = "Downloading" }
+                    }
+                }
+                catch {}
+            }
+
+            # Show Launch + Uninstall + Repair + Go to Dir only if installed.
+            if ($miLibLaunch) { $miLibLaunch.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            if ($miLibUninstall) { $miLibUninstall.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            if ($miLibRepair) { $miLibRepair.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            if ($miLibGoToDir) { $miLibGoToDir.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+
+            # Show Install only if NOT installed and not already downloading.
+            if ($miLibInstall) { $miLibInstall.Visibility = if (-not $isInstalled -and -not $isPending) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            if ($miLibLocate) { $miLibLocate.Visibility = if (([string]$item.Source).Trim().ToLowerInvariant() -in @("steam", "epic", "legendary", "gog", "gogdl") -and -not $isPending) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+
+            # Store page + Copy ID + Copy Row Data always visible.
+            if ($miLibStorePage) { $miLibStorePage.Visibility = [System.Windows.Visibility]::Visible }
+            if ($miLibCopyId) { $miLibCopyId.Visibility = [System.Windows.Visibility]::Visible }
+            if ($miLibCopyRows) { $miLibCopyRows.Visibility = [System.Windows.Visibility]::Visible }
+        }.GetNewClosure())
+
+    if ($miLibLaunch) {
+        $miLibLaunch.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                Invoke-WmtLibraryLaunch -Item $item
+            }.GetNewClosure())
+    }
+
+    if ($miLibInstall) {
+        $miLibInstall.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                Invoke-WmtLibraryInstall -Item $item
+            }.GetNewClosure())
+    }
+
+    if ($miLibLocate) {
+        $miLibLocate.Add_Click({ Invoke-WmtLibraryLocateImport -Item (Get-WmtSelectedLibraryItem) }.GetNewClosure())
+    }
+    if ($miLibUninstall) {
+        $miLibUninstall.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                Invoke-WmtLibraryUninstall -Item $item
+            }.GetNewClosure())
+    }
+
+    if ($miLibRepair) {
+        $miLibRepair.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                Invoke-WmtLibraryRepair -Item $item
+            }.GetNewClosure())
+    }
+
+    if ($miLibGoToDir) {
+        $miLibGoToDir.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                $installDir = Get-WmtLibraryItemInstallDir -Item $item
+                if (-not [string]::IsNullOrWhiteSpace($installDir) -and (Test-Path -LiteralPath $installDir)) {
+                    Start-Process "explorer.exe" -ArgumentList "`"$installDir`""
+                    Write-GuiLog "Opening: $installDir"
+                }
+                else {
+                    Show-WmtMessageBox -Message "Could not find the install directory for this game." -Title "Directory Not Found" -Image Information | Out-Null
+                }
+            }.GetNewClosure())
+    }
+
+    if ($miLibStorePage) {
+        $miLibStorePage.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                if (-not $item) { return }
+                
+                $source = [string]$item.Source
+                $id = [string]$item.Id
+                $name = if ($item.PSObject.Properties["Name"]) { [string]$item.Name } elseif ($item.PSObject.Properties["Title"]) { [string]$item.Title } else { "" }
+                $url = $null
+                
+                # Safely encode the name for URLs
+                $encodedName = [uri]::EscapeDataString($name)
+    
+                # Use -match to catch UI display names like "Epic", "Epic Games", or "GOG"
+                if ($source -match "(?i)steam") { 
+                    $url = "https://store.steampowered.com/app/$id" 
+                }
+                elseif ($source -match "(?i)legendary|epic") { 
+                    $url = "https://store.epicgames.com/en-US/browse?q=$encodedName" 
+                }
+                elseif ($source -match "(?i)gogdl|gog") { 
+                    $gogSlug = ($name.ToLowerInvariant() -replace '[^a-z0-9\s]', '') -replace '\s+', '_'
+                    $url = "https://www.gog.com/en/game/$gogSlug"
+                }
+                
+                if ($url) { Start-Process $url }
+            }.GetNewClosure())
+    }
+
+    if ($miLibCopyId) {
+        $miLibCopyId.Add_Click({
+                $item = Get-WmtSelectedLibraryItem
+                if (-not $item) { return }
+                $id = [string]$item.Id
+                try { Set-Clipboard -Value $id; Write-GuiLog "Copied ID: $id" } catch {}
+            }.GetNewClosure())
+    }
+
+    if ($miLibCopyRows) {
+        $miLibCopyRows.Add_Click({
+                # Full-row copy (Source/Name/Id/Version/Available/IsUe) - the
+                # same TSV Ctrl+C produces, so the UE/Fab tag of any row can
+                # be verified straight from a paste.
+                try { [void](Copy-WmtLibrarySelectedRowsToClipboard -ListView $lstLibrary) } catch { Write-GuiLog "ERROR: Copy row data failed: $($_.Exception.Message)" }
+            }.GetNewClosure())
+    }
+}
+
+# Ctrl+C copies the selected library line(s) to the clipboard as
+# tab-separated rows (Source, Name, ID, Installed, Latest, IsUe); Ctrl+A
+# selects every row first. Mirrors the keyboard support the updates list
+# has; "Copy Row Data" in the right-click menu performs the same copy.
+if ($lstLibrary) {
+    $lstLibrary.Add_PreviewKeyDown({
+            param($s, $e)
+            try {
+                $hasControl = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq [System.Windows.Input.ModifierKeys]::Control)
+                if ($hasControl -and $e.Key -eq [System.Windows.Input.Key]::C) {
+                    if (Copy-WmtLibrarySelectedRowsToClipboard -ListView $s) { $e.Handled = $true }
+                }
+                elseif ($hasControl -and $e.Key -eq [System.Windows.Input.Key]::A) {
+                    $s.SelectAll()
+                    $e.Handled = $true
+                }
+            }
+            catch {
+                Write-GuiLog "ERROR: Library key handler failed: $($_.Exception.Message)"
+            }
+        })
+}
+
+# --- Library search box ---
+# Filters the library list by name or ID (case-insensitive substring).
+# Uses a debounce timer so typing doesn't re-filter on every keystroke.
+$script:WmtLibrarySearchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WmtLibrarySearchTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+
+$script:WmtLibrarySearchPlaceholder = "Search library..."
+
+function Update-WmtLibrarySearch {
+    if (-not $txtLibrarySearch -or -not $lstLibrary) { return }
+    $query = ([string]$txtLibrarySearch.Text).Trim()
+    if ($query -eq $script:WmtLibrarySearchPlaceholder) { $query = "" }
+
+    $lstLibrary.Items.Clear()
+    if (-not $script:WmtLibraryScanResults) { return }
+
+    if ([string]::IsNullOrWhiteSpace($query)) {
+        # No filter � show all.
+        foreach ($item in $script:WmtLibraryScanResults) {
+            if (Test-WmtFabAssetHidden $item) { continue }
+            [void]$lstLibrary.Items.Add($item)
+        }
+    }
+    else {
+        $needle = $query.ToLowerInvariant()
+        foreach ($item in $script:WmtLibraryScanResults) {
+            if (Test-WmtFabAssetHidden $item) { continue }
+            $name = ([string]$item.Name).ToLowerInvariant()
+            $id = ([string]$item.Id).ToLowerInvariant()
+            $source = ([string]$item.Source).ToLowerInvariant()
+            if ($name.Contains($needle) -or $id.Contains($needle) -or $source.Contains($needle)) {
+                [void]$lstLibrary.Items.Add($item)
+            }
+        }
+    }
+
+    # Re-apply sort if active.
+    if ($script:LibrarySortChain -and $script:LibrarySortChain.Count -gt 0) {
+        Set-ListViewSort -ListView $lstLibrary -Chain $script:LibrarySortChain
+    }
+}
+
+if ($txtLibrarySearch) {
+    # Get reference to the search box border for focus glow effect.
+    $librarySearchBorder = $txtLibrarySearch.Parent
+    if ($librarySearchBorder -and $librarySearchBorder.Parent -is [System.Windows.Controls.Border]) {
+        $librarySearchBorder = $librarySearchBorder.Parent
+    }
+    $librarySearchPlaceholder = [string]$script:WmtLibrarySearchPlaceholder
+    $librarySearchTimer = $script:WmtLibrarySearchTimer
+
+    # Placeholder behavior (focus/blur) with border glow.
+    $txtLibrarySearch.Add_GotFocus({
+            if ($txtLibrarySearch.Text -eq $librarySearchPlaceholder) {
+                $txtLibrarySearch.Text = ""
+                $txtLibrarySearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextPrimary")
+            }
+            if ($librarySearchBorder) {
+                $librarySearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "Accent")
+                $librarySearchBorder.BorderThickness = [System.Windows.Thickness]::new(2)
+            }
+        }.GetNewClosure())
+
+    $txtLibrarySearch.Add_LostFocus({
+            if ([string]::IsNullOrWhiteSpace($txtLibrarySearch.Text)) {
+                $txtLibrarySearch.Text = $librarySearchPlaceholder
+                $txtLibrarySearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextMuted")
+            }
+            if ($librarySearchBorder) {
+                $librarySearchBorder.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, "BorderBrush")
+                $librarySearchBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+            }
+        }.GetNewClosure())
+
+    # Debounced filter on text change + toggle clear button.
+    $txtLibrarySearch.Add_TextChanged({
+            try { $librarySearchTimer.Stop() } catch {}
+            try { $librarySearchTimer.Start() } catch {}
+            # Toggle clear button visibility
+            $hasRealText = (-not [string]::IsNullOrWhiteSpace($txtLibrarySearch.Text)) -and
+                            ($txtLibrarySearch.Text -ne $librarySearchPlaceholder)
+            if ($btnLibraryClearSearch) {
+                $btnLibraryClearSearch.Visibility = if ($hasRealText) { "Visible" } else { "Collapsed" }
+            }
+        }.GetNewClosure())
+
+    $librarySearchTimer.Add_Tick({
+            try { $librarySearchTimer.Stop() } catch {}
+            Update-WmtLibrarySearch
+        }.GetNewClosure())
+}
+
+if ($btnLibraryClearSearch) {
+    $btnLibraryClearSearch.Add_Click({
+            $txtLibrarySearch.Text = $librarySearchPlaceholder
+            $txtLibrarySearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextMuted")
+            $btnLibraryClearSearch.Visibility = "Collapsed"
+            Update-WmtLibrarySearch
+        }.GetNewClosure())
+}
+}
+
+$btnToggleMemCompress = Get-Ctrl "btnToggleMemCompress"
+if ($btnToggleMemCompress) {
+$btnToggleMemCompress.Add_Click({
+        $mma = Get-MMAgent
+        if ($mma -and $null -ne $mma.MemoryCompression) {
+            if ([bool]$mma.MemoryCompression) {
+                Invoke-UiCommand { Disable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue; Write-GuiLog "Memory compression disabled." } "Disabling memory compression..."
+            }
+            else {
+                Invoke-UiCommand { Enable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue; Write-GuiLog "Memory compression enabled." } "Enabling memory compression..."
+            }
+            Update-WmtTweakToggle $btnToggleMemCompress (-not [bool]$mma.MemoryCompression) "Disable Mem Compression" "Enable Mem Compression"
+        }
+    })
+}
+
+$btnToggleHags = Get-Ctrl "btnToggleHags"
+if ($btnToggleHags) {
+$btnToggleHags.Add_Click({
+        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers")
+        $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 0) 0)
+        if ($h -eq 2) {
+            Set-Hags -Enable $false
+        }
+        else {
+            Set-Hags -Enable $true
+        }
+        Update-WmtTweakToggle $btnToggleHags ($h -ne 2) "Disable HAGS" "Enable HAGS"
+    })
+}
+
+$btnToggleWidgets = Get-Ctrl "btnToggleWidgets"
+if ($btnToggleWidgets) {
+$btnToggleWidgets.Add_Click({
+        if (-not $btnToggleWidgets.IsEnabled) { return }
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 1) 0) -eq 0)
+        if ($currentlyHidden) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 1; Write-GuiLog "Widgets shown." } "Showing widgets..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0; Write-GuiLog "Widgets hidden." } "Hiding widgets..."
+        }
+        Update-WmtTweakToggle $btnToggleWidgets (-not $currentlyHidden) "Show Widgets" "Hide Widgets"
+    })
+}
+
+$btnToggleTaskView = Get-Ctrl "btnToggleTaskView"
+if ($btnToggleTaskView) {
+$btnToggleTaskView.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1) 0) -eq 0)
+        if ($currentlyHidden) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1; Write-GuiLog "Task View shown." } "Showing Task View..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0; Write-GuiLog "Task View hidden." } "Hiding Task View..."
+        }
+        Update-WmtTweakToggle $btnToggleTaskView (-not $currentlyHidden) "Show Task View" "Hide Task View"
+    })
+}
+
+$btnToggleChat = Get-Ctrl "btnToggleChat"
+if ($btnToggleChat) {
+$btnToggleChat.Add_Click({
+        if (-not $btnToggleChat.IsEnabled) { return }
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 1) 0) -eq 0)
+        if ($currentlyHidden) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 1; Write-GuiLog "Chat shown." } "Showing Chat..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0; Write-GuiLog "Chat hidden." } "Hiding Chat..."
+        }
+        Update-WmtTweakToggle $btnToggleChat (-not $currentlyHidden) "Show Chat" "Hide Chat"
+    })
+}
+
+$btnToggleCombine = Get-Ctrl "btnToggleCombine"
+if ($btnToggleCombine) {
+$btnToggleCombine.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $tc = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0) 0)
+        if ($tc -eq 2) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0; Write-GuiLog "Taskbar set to Always Combine." } "Setting taskbar to Always Combine..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 2; Write-GuiLog "Taskbar set to Never Combine." } "Setting taskbar to Never Combine..."
+        }
+        Update-WmtTweakToggle $btnToggleCombine ($tc -ne 2) "Never Combine" "Always Combine"
+    })
+}
+
+$btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"
+if ($btnToggleTaskbarAlign) {
+$btnToggleTaskbarAlign.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $ta = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0) 0)
+        if ($ta -eq 0) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 1; Write-GuiLog "Taskbar aligned to center." } "Aligning taskbar to center..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0; Write-GuiLog "Taskbar aligned to left." } "Aligning taskbar to left..."
+        }
+        Update-WmtTweakToggle $btnToggleTaskbarAlign ($ta -ne 0) "Align Taskbar Left" "Align Taskbar Center"
+    })
+}
+
+$btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"
+if ($btnToggleClockFormat) {
+$btnToggleClockFormat.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Control Panel\International")
+        $is24 = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\International" "iTime" 0) 0) -eq 1)
+        $intlPath = "HKCU:\Control Panel\International"
+        # Compile the P/Invoke once (shared by both branches)
+        Add-Type -Namespace Win32 -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] public static extern bool SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);' -ErrorAction SilentlyContinue
+        if ($is24) {
+            Invoke-UiCommand {
+                Set-WmtRegString $intlPath "iTime" "0"
+                Set-WmtRegString $intlPath "sTimeFormat" "h:mm tt"
+                Set-WmtRegString $intlPath "sShortTime" "h:mm tt"
+                $HWND_BROADCAST = [IntPtr]0xffff
+                $WM_SETTINGCHANGE = 0x1A
+                $result = [IntPtr]::Zero
+                [Win32.Native]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [IntPtr]::Zero, "intl", 2, 5000, [ref]$result) | Out-Null
+                Write-GuiLog "Clock set to 12-hour format."
+            } "Setting 12-hour clock..."
+        }
+        else {
+            Invoke-UiCommand {
+                Set-WmtRegString $intlPath "iTime" "1"
+                Set-WmtRegString $intlPath "sTimeFormat" "H:mm"
+                Set-WmtRegString $intlPath "sShortTime" "H:mm"
+                $HWND_BROADCAST = [IntPtr]0xffff
+                $WM_SETTINGCHANGE = 0x1A
+                $result = [IntPtr]::Zero
+                [Win32.Native]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [IntPtr]::Zero, "intl", 2, 5000, [ref]$result) | Out-Null
+                Write-GuiLog "Clock set to 24-hour format."
+            } "Setting 24-hour clock..."
+        }
+        Update-WmtTweakToggle $btnToggleClockFormat (-not $is24) "12-Hour Clock" "24-Hour Clock"
+    })
+}
+
+$btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"
+if ($btnToggleSearchDisplay) {
+$btnToggleSearchDisplay.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
+        $smode = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1) 0)
+        if ($smode -eq 0) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1; Write-GuiLog "Search set to icon." } "Setting search to icon..."
+        }
+        elseif ($smode -eq 1) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 2; Write-GuiLog "Search set to full box." } "Setting search to box..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0; Write-GuiLog "Search hidden." } "Hiding search..."
+        }
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
+        $newMode = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1) 0)
+        try {
+            if ($newMode -eq 0) { $btnToggleSearchDisplay.Content = "Show Search Box"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
+            elseif ($newMode -eq 1) { $btnToggleSearchDisplay.Content = "Hide Search"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
+            else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
+        } catch {}
+    })
+}
+
+$btnToggleClockSecs = Get-Ctrl "btnToggleClockSecs"
+if ($btnToggleClockSecs) {
+$btnToggleClockSecs.Add_Click({
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        $cs = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" 0) 0)
+        if ($cs -eq 1) {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" 0; Write-GuiLog "Hid seconds on the system clock." } "Hiding seconds on the system clock..."
+        }
+        else {
+            Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" 1; Write-GuiLog "Enabled seconds on the system clock." } "Enabling seconds on the system clock..."
+        }
+        Update-WmtTweakToggle $btnToggleClockSecs ($cs -ne 1) "Hide Clock Seconds" "Show Clock Seconds"
+    })
+}
+
+# My Device shortcuts point at the original page buttons so all confirmations, logging, and state checks stay in one place.
+function Connect-WmtMyDeviceShortcut {
+param(
+    [string]$ShortcutButtonName,
+    [string]$TargetButtonName
+)
+
+$shortcutButton = Get-Ctrl $ShortcutButtonName
+$targetButton = Get-Ctrl $TargetButtonName
+if (-not $shortcutButton -or -not $targetButton) { return }
+
+try {
+    $enabledBinding = [System.Windows.Data.Binding]::new("IsEnabled")
+    $enabledBinding.Source = $targetButton
+    [void][System.Windows.Data.BindingOperations]::SetBinding($shortcutButton, [System.Windows.Controls.Button]::IsEnabledProperty, $enabledBinding)
+}
+catch {}
+
+$shortcutButton.Add_Click({
+        if (-not $targetButton.IsEnabled) { return }
+        $targetButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    }.GetNewClosure())
+}
+
+@{
+btnMyDeviceQuickFix          = "btnQuickFix"
+btnMyDeviceWinRE             = "btnUtilWinRE"
+btnMyDeviceSysReport         = "btnUtilSysInfo"
+btnMyDeviceRestoreMgr        = "btnUtilRestoreMgr"
+btnMyDeviceStartupMgr        = "btnUtilStartupMgr"
+btnMyDeviceUpdateRepair      = "btnUpdateRepair"
+btnMyDeviceUpdateServices    = "btnUpdateServices"
+btnMyDeviceNetInfo           = "btnNetInfo"
+btnMyDeviceFlushDNS          = "btnFlushDNS"
+btnMyDeviceResetWifi         = "btnResetWifi"
+btnMyDeviceNetRepair         = "btnNetRepair"
+btnMyDeviceDnsCustom         = "btnDnsCustom"
+btnMyDeviceHostsEdit         = "btnHostsEdit"
+btnMyDeviceHostsAdBlock      = "btnHostsUpdate"
+btnMyDeviceRouteView         = "btnRouteView"
+btnMyDeviceUltimatePower     = "btnPerfUltimatePower"
+btnMyDeviceHibernateToggle   = "btnToggleHibernate"
+btnMyDeviceMemCompressToggle = "btnToggleMemCompress"
+btnMyDeviceHagsToggle        = "btnToggleHags"
+btnMyDeviceDriverReport      = "btnDrvReport"
+btnMyDeviceDriverBackup      = "btnDrvBackup"
+btnMyDeviceGhostDrivers      = "btnDrvGhost"
+btnMyDeviceDriverClean       = "btnDrvClean"
+btnMyDeviceDriverRestore     = "btnDrvRestore"
+btnMyDeviceChkdsk            = "btnCHKDSK"
+btnMyDeviceDiskCleanup       = "btnCleanDisk"
+btnMyDeviceTempCleanup       = "btnCleanTemp"
+}.GetEnumerator() | ForEach-Object {
+Connect-WmtMyDeviceShortcut -ShortcutButtonName $_.Key -TargetButtonName $_.Value
+}
+
+function Test-WmtMyDevicePreloadBusy {
+try {
+    if ($script:MyDevicePendingSections -and $script:MyDevicePendingSections.Count -gt 0) { return $true }
+    if ($script:MyDeviceSectionJobs -and $script:MyDeviceSectionJobs.Count -gt 0) { return $true }
+    if ($script:BitLockerStatusAsyncResult -and -not $script:BitLockerStatusAsyncResult.IsCompleted) { return $true }
+}
+catch {}
+
+return $false
+}
+
+function Stop-WmtStartupBackgroundPreload {
+if ($script:WmtStartupPreloadTimer) {
+    try { $script:WmtStartupPreloadTimer.Stop() } catch {}
+    $script:WmtStartupPreloadTimer = $null
+}
+}
+
+function Start-WmtStartupBackgroundPreload {
+if ($script:WmtStartupPreloadTimer) { return }
+if (Test-WmtAggressiveTrayMemoryMode) { return }
+
+# "Bg Jobs: Off" suppresses automatic hidden-page warming. Manual page opens
+# and Refresh actions still use UiSupport runspaces so they remain responsive.
+if (Get-WmtDisableBackgroundJobs) {
+    Write-GuiLog "Startup background preload skipped because background jobs are disabled."
+    return
+}
+
+if (-not $script:MyDeviceStatsStarted) {
+    Update-MyDeviceStats -Preload
+}
+if (-not $script:FirewallRulesLoaded -and -not $script:FirewallLoadInProgress) {
+    Start-FirewallRuleLoad -Preload
+}
+# One shared preload for Quickfind and Tweaks, independent of page navigation.
+if (-not $script:TweakStatesReady -and -not $script:TweakStatesBgStarted) { Start-TweakButtonStatesBackgroundUpdate }
+if (-not $script:OptionalFeaturesReady -and -not $script:OptionalFeaturesCheckStarted) { Start-OptionalFeaturesBackgroundCheck }
+
+$script:WmtStartupPreloadTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WmtStartupPreloadTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
+$script:WmtStartupPreloadTimer.Add_Tick({
+        if (Test-WmtMyDevicePreloadBusy) { return }
+        if ($script:FirewallLoadInProgress) { return }
+        Stop-WmtStartupBackgroundPreload
+    })
+$script:WmtStartupPreloadTimer.Start()
+}
+
+# --- LAUNCH ---
+Start-WmtSingleInstanceActivationListener
+
+$script:TweakStatesReady = $false
+
+function Set-TweakStatesLoadingOverlay {
+param([bool]$Visible, [string]$ErrorMessage = "")
+try {
+    $overlay = Get-Ctrl "tweaksLoadingOverlay"
+    if ($overlay) {
+        # The overlay sits outside pnlTweaks in the root content Grid so it can cover
+        # the full Tweaks viewport. Async tweak/feature jobs may finish after the user
+        # has switched tabs; never let those delayed callbacks re-show it elsewhere.
+        $tweaksPanel = Get-Ctrl "pnlTweaks"
+        $isTweaksVisible = ($tweaksPanel -and $tweaksPanel.Visibility -eq "Visible")
+        $showOverlay = ($Visible -and $isTweaksVisible)
+        $overlay.Visibility = if ($showOverlay) { "Visible" } else { "Collapsed" }
+
+        # If Tweaks is no longer active, visibility is all we need to update. Keep
+        # the loading/error text untouched so returning to Tweaks can resume cleanly.
+        if (-not $showOverlay) { return }
+
+        # Reset error state when showing overlay fresh, or restore error text
+        $errText = Get-Ctrl "txtTweakOverlayError"
+        $errTitle = Get-Ctrl "txtTweakOverlayTitle"
+        $errSubtitle = Get-Ctrl "txtTweakOverlaySubtitle"
+        $retryBtn = Get-Ctrl "btnTweakOverlayRetry"
+        if ($errText) {
+            if ($Visible -and [string]::IsNullOrWhiteSpace($ErrorMessage)) {
+                # Fresh loading state — reset to default
+                $errText.Text = ""
+                $errText.Visibility = "Collapsed"
+                if ($errTitle) { $errTitle.Text = "Loading tweak states..." }
+                if ($errSubtitle) { $errSubtitle.Text = "Buttons will be ready in a moment" }
+                if ($retryBtn) { $retryBtn.Visibility = "Collapsed" }
+            }
+            elseif ($Visible -and -not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
+                # Error state
+                $errText.Text = $ErrorMessage
+                $errText.Visibility = "Visible"
+                if ($errTitle) { $errTitle.Text = "Failed to load tweak states" }
+                if ($errSubtitle) { $errSubtitle.Text = "Toggle buttons may display incorrect on/off states" }
+                if ($retryBtn) { $retryBtn.Visibility = "Visible" }
+            }
+        }
+    }
+} catch {}
+}
+
+function Show-TweakStatesLoadError {
+param([string]$Message)
+$script:WmtTweakLoadError = $Message
+try {
+    Set-TweakStatesLoadingOverlay -Visible $true -ErrorMessage $Message
+    # Wire up retry button if not already done
+    $retryBtn = Get-Ctrl "btnTweakOverlayRetry"
+    if ($retryBtn -and -not $script:TweakOverlayRetryWired) {
+        $script:TweakOverlayRetryWired = $true
+        $retryBtn.Add_Click({
+            # Retry whichever scanner is incomplete. Preserve already verified states.
+            $retryTweaks = -not $script:TweakStatesReady
+            $retryFeatures = -not $script:OptionalFeaturesReady
+            $script:WmtTweakLoadError = ""
+            Set-TweakStatesLoadingOverlay -Visible $true
+            if ($retryTweaks) {
+                $script:TweakStatesBgStarted = $false
+                $script:TweakButtonStatesCache = $null
+                $script:TweakNonRegDataCache = $null
+                $script:TweakSupportChecksCache = $null
+                $script:TweakButtonStatesPathChecks = $null
+                Start-TweakButtonStatesBackgroundUpdate
+            }
+            if ($retryFeatures) {
+                if ($script:FeaturesCheckTimeout) {
+                    try { $script:FeaturesCheckTimeout.Stop() } catch {}
+                    $script:FeaturesCheckTimeout = $null
+                }
+                try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+                $oldFeaturesPs = $script:FeaturesCheckPS
+                $oldFeaturesAsync = $script:FeaturesCheckAsync
+                $script:FeaturesCheckPS = $null
+                $script:FeaturesCheckAsync = $null
+                if ($oldFeaturesPs) {
+                    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldFeaturesPs -Invocation $oldFeaturesAsync -Name "Optional features retry" } catch {
+                        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldFeaturesPs -Invocation $oldFeaturesAsync -Name "Optional features retry" } catch {}
+                    }
+                }
+                $script:OptionalFeaturesCheckStarted = $false
+                $script:OptionalFeatureStateCache = @{}
+                Sync-WmtOptionalFeatureButtons
+                $script:OptionalFeaturesReady = $false
+                $script:OptionalFeatureUnavailableCache = @{}
+                $script:OptionalFeatureProviderCache = @{}
+                Start-OptionalFeaturesBackgroundCheck
+            }
+            Sync-WmtQuickFindStateAvailability
+            Sync-WmtTweakOverlayHide
+        })
+    }
+    # Do not auto-hide the blocking overlay while states remain unverified.
+    if ($script:TweakOverlayAutoHideTimer) { try { $script:TweakOverlayAutoHideTimer.Stop() } catch {} }
+    # Keep the blocker visible until a successful retry.
+} catch {}
+}
+
+function Sync-WmtTweakOverlayHide {
+# Coordinate the tweaks overlay visibility: only hide it when BOTH the tweak
+# states background job AND the optional features background check have
+# completed.  Updates the overlay subtitle so the user knows what's still loading.
+try {
+    $tweakStatesDone = [bool]$script:TweakStatesReady
+    $optFeaturesDone = [bool]$script:OptionalFeaturesReady
+    if (-not ($tweakStatesDone -and $optFeaturesDone) -and
+        -not [string]::IsNullOrWhiteSpace([string]$script:WmtTweakLoadError)) {
+        Set-TweakStatesLoadingOverlay -Visible $true -ErrorMessage $script:WmtTweakLoadError
+        return
+    }
+    if ($tweakStatesDone -and $optFeaturesDone) {
+        $script:WmtTweakLoadError = ""
+        Set-TweakStatesLoadingOverlay -Visible $false
+    }
+    elseif ($tweakStatesDone -and -not $optFeaturesDone) {
+        # Tweak toggle buttons are ready, but optional features (.NET, WSL, etc.)
+        # are still loading — update the subtitle to reflect this.
+        Set-TweakStatesLoadingOverlay -Visible $true
+        $sub = Get-Ctrl "txtTweakOverlaySubtitle"
+        if ($sub) { $sub.Text = "Tweak buttons loaded. Checking optional features (.NET, WSL, Hyper-V...)" }
+        }
+    elseif (-not $tweakStatesDone -and $optFeaturesDone) {
+        # Optional features are ready, but tweak toggle buttons are still loading.
+        Set-TweakStatesLoadingOverlay -Visible $true
+        $sub = Get-Ctrl "txtTweakOverlaySubtitle"
+        if ($sub) { $sub.Text = "Optional features loaded. Loading tweak buttons..." }
+    }
+    else {
+        # Both tweak states and optional features are still loading.
+        Set-TweakStatesLoadingOverlay -Visible $true
+        $sub = Get-Ctrl "txtTweakOverlaySubtitle"
+        if ($sub) { $sub.Text = "Loading tweak buttons and checking optional features..." }
+    }
+} catch {}
+}
+
+function Start-TweakButtonStatesBackgroundUpdate {
+# Pre-load ALL registry values in a background PowerShell job.
+# The job returns a hashtable of Path -> Get-ItemProperty result.
+# Update-TweakButtonStates then uses this as $regCache, so it does
+# ZERO Get-ItemProperty calls on the UI thread (instant button updates).
+
+if ($script:TweakStatesBgStarted) { return }
+$script:TweakStatesBgStarted = $true
+
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell -PoolKind UiSupport
+}
+catch {
+    # A failed worker must not fall back to expensive UI-thread registry scans.
+    $script:TweakStatesBgStarted = $false
+    $script:TweakStatesReady = $false
+    Show-TweakStatesLoadError -Message "Could not start background tweak-state detection: $($_.Exception.Message). Click Retry."
+    Sync-WmtTweakOverlayHide
+    return
+}
+[void]$ps.AddScript({
+        # Collect all unique registry paths that Update-TweakButtonStates queries.
+        # Pre-loading them in background means the UI thread never blocks on registry I/O.
+        $paths = @(
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "HKCU:\Control Panel\Mouse",
+            "HKCU:\Control Panel\Keyboard",
+            "HKCU:\Control Panel\International",
+            "HKCU:\Control Panel\Desktop",
+            "HKCU:\Control Panel\Desktop\WindowMetrics",
+            "HKCU:\Control Panel\Accessibility\HighContrast",
+            "HKCU:\Control Panel\Accessibility\Keyboard Response",
+            "HKCU:\Control Panel\Accessibility\ToggleKeys",
+            "HKCU:\Control Panel\Accessibility\StickyKeys",
+            "HKCU:\Software\Microsoft\InputPersonalization",
+            "HKCU:\Software\Microsoft\Speech_OneSet",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+            "HKCU:\Software\Microsoft\Siuf\Rules",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound",
+            "HKCU:\Software\Microsoft\ColorFiltering",
+            "HKCU:\Software\Microsoft\Paint\App",
+            "HKCU:\Software\Microsoft\Notepad",
+            "HKCU:\Software\Microsoft\Windows Script Host\Settings",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\AppModelUnlock",
+            "HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}",
+            "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI",
+            "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current",
+            "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat",
+            "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Edge",
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power",
+            "HKLM:\SYSTEM\CurrentControlSet\Services\SysMain",
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Power",
+            "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\FindMyDevice\LocationSync",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceInstall\Settings",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config",
+            "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager",
+            "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag"
+        )
+
+        # Local copy of Convert-WmtRegistryPath: this scriptblock runs on the pooled
+        # runspace (New-WmtPooledPowerShell), whose InitialSessionState only pre-loads
+        # MyDeviceCommonHelpers + ConvertTo-Int/ConvertTo-Str/Invoke-WmtCliText (see
+        # Initialize-WmtBackgroundRunspacePool). Convert-WmtRegistryPath isn't in that
+        # list, so without a local copy every call below throws "command not found",
+        # gets swallowed by the try/catch, and both $regCache and $pathChecks (via
+        # Get-WmtRegistryPathExists just below, which also depends on this) end up
+        # filled with $null/$false for every single path — which then gets cached and
+        # trusted as real data instead of falling back to a live read. Kept as a
+        # same-scoped copy (not a rename) so both call sites below need no changes.
+        function Convert-WmtRegistryPath {
+            param([string]$Path)
+            if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+            $normalized = $Path.Trim()
+            $normalized = $normalized -replace "^Registry::", ""
+            $normalized = $normalized -replace "^Computer\\", ""
+            $normalized = $normalized -replace "^HKEY_LOCAL_MACHINE\\", "HKLM:\"
+            $normalized = $normalized -replace "^HKEY_CURRENT_USER\\", "HKCU:\"
+            $normalized = $normalized -replace "^HKEY_CLASSES_ROOT\\", "HKCR:\"
+            $normalized = $normalized -replace "^HKEY_USERS\\", "HKU:\"
+
+            if ($normalized -notmatch '^(?<Hive>HKLM|HKCU|HKCR|HKU):\\(?<SubPath>.*)$') { return $null }
+
+            $hive = switch ($Matches.Hive) {
+                "HKLM" { [Microsoft.Win32.RegistryHive]::LocalMachine }
+                "HKCU" { [Microsoft.Win32.RegistryHive]::CurrentUser }
+                "HKCR" { [Microsoft.Win32.RegistryHive]::ClassesRoot }
+                "HKU" { [Microsoft.Win32.RegistryHive]::Users }
+            }
+
+            [PSCustomObject]@{
+                Hive    = $hive
+                Root    = $Matches.Hive
+                SubPath = $Matches.SubPath
+            }
+        }
+
+        $regCache = @{}
+        # Use .NET RegistryKey for faster reads (~10x faster than Get-ItemProperty)
+        foreach ($path in $paths) {
+            try {
+                $parts = Convert-WmtRegistryPath -Path $path
+                if (-not $parts) {
+                    $regCache[$path] = $null
+                    continue
+                }
+
+                $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
+                $key = $baseKey.OpenSubKey($parts.SubPath)
+                if ($key) {
+                    $values = @{}
+                    foreach ($valName in $key.GetValueNames()) {
+                        $values[$valName] = $key.GetValue($valName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    }
+                    $key.Close()
+                    $regCache[$path] = [PSCustomObject]$values
+                }
+                else {
+                    $regCache[$path] = $null
+                }
+            }
+            catch {
+                $regCache[$path] = $null
+            }
+        }
+
+        # Also collect Test-Path results
+        function Get-WmtRegistryPathExists {
+            param([string]$Path)
+
+            if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+            try {
+                $parts = Convert-WmtRegistryPath -Path $Path
+                if (-not $parts) { return $false }
+
+                $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
+                # OpenSubKey default wildcardsAllowed=$false — literal '*'/'?' in
+                # subkey names are NOT expanded as globs. Prevents 0xCFFFFFFF hangs.
+                $key = $baseKey.OpenSubKey($parts.SubPath, $false)
+                $exists = $null -ne $key
+                if ($key) { $key.Close() }
+                if ($baseKey) { $baseKey.Close() }
+                return $exists
+            }
+            catch {
+                return $false
+            }
+        }
+
+        $pathChecks = @{
+            "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+            "HKCR:\Directory\shell\WMT_TakeOwnership" = Get-WmtRegistryPathExists "HKCR:\Directory\shell\WMT_TakeOwnership"
+            "HKCR:\Directory\Background\shell\WMT_OpenPowerShell" = Get-WmtRegistryPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
+            "HKCU:\Software\Classes\Directory\shell\WmtCmdHere" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\Directory\shell\WmtCmdHere"
+            "HKCU:\Software\Classes\*\shell\WmtNotepad" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"
+            "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print"
+            "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice"
+        }
+
+        # ── Pre-load blocking non-registry calls (the ones that crash low-end PCs) ──
+        $nonRegData = @{}
+
+        # Get-Service calls (WMI/CIM — very slow on low-end hardware)
+        try {
+            $sm = Get-Service "SysMain" -ErrorAction SilentlyContinue
+            $nonRegData["SysMainStartType"] = if ($sm) { $sm.StartType } else { $null }
+        } catch { $nonRegData["SysMainStartType"] = $null }
+
+        try {
+            $ws = Get-Service "WSearch" -ErrorAction SilentlyContinue
+            $nonRegData["WSearchStartType"] = if ($ws) { $ws.StartType } else { $null }
+        } catch { $nonRegData["WSearchStartType"] = $null }
+
+        # Get-MMAgent (CIM — very slow on low-end hardware)
+        try {
+            if (Get-Command Get-MMAgent -ErrorAction Ignore) {
+                $mma = Get-MMAgent -ErrorAction SilentlyContinue
+                $nonRegData["MMAgentMemoryCompression"] = if ($mma -and $null -ne $mma.MemoryCompression) { [bool]$mma.MemoryCompression } else { $null }
+            } else {
+                $nonRegData["MMAgentMemoryCompression"] = $null
+            }
+        } catch { $nonRegData["MMAgentMemoryCompression"] = $null }
+
+        # fsutil behavior query ×2 (process spawns)
+        try {
+            $out1 = (& fsutil behavior query DisableLastAccess 2>$null)
+            $nonRegData["FsutilDisableLastAccess"] = if ($out1 -match "1") { $true } else { $false }
+        } catch { $nonRegData["FsutilDisableLastAccess"] = $null }
+        try {
+            $out2 = (& fsutil behavior query Disable8dot3 2>$null)
+            $nonRegData["FsutilDisable8dot3"] = if ($out2 -match "1") { $true } else { $false }
+        } catch { $nonRegData["FsutilDisable8dot3"] = $null }
+
+        # Get-ExecutionPolicy
+        try {
+            $nonRegData["ExecutionPolicy"] = Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue
+        } catch { $nonRegData["ExecutionPolicy"] = $null }
+
+        # Get-WmtPowerSettingIndex — powercfg calls (4 unique settings × up to 2 attempts each)
+        function Get-PowerSettingIdx {
+            param(
+                [string]$SubGroup,
+                [string]$Setting,
+                [string]$Mode = "AC"
+            )
+            try {
+                $output = powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>$null
+                $label = if ($Mode -eq "DC") { "Current DC Power Setting Index" } else { "Current AC Power Setting Index" }
+                $pattern = [regex]::Escape($label) + "\s*:\s*0x([0-9a-fA-F]+)"
+                foreach ($line in $output) {
+                    if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
+                }
+                $output = powercfg /qh SCHEME_CURRENT $SubGroup $Setting 2>$null
+                foreach ($line in $output) {
+                    if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
+                }
+            } catch {}
+            return $null
+        }
+
+        $nonRegData["BatterySaverThreshold"] = Get-PowerSettingIdx "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" "DC"
+
+        $usbSub = "2a737441-1930-4402-8d77-b2bebba308a3"
+        $usbSetting = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+        $nonRegData["UsbSuspendAC"] = Get-PowerSettingIdx $usbSub $usbSetting "AC"
+        $nonRegData["UsbSuspendDC"] = Get-PowerSettingIdx $usbSub $usbSetting "DC"
+
+        $pcieSub = "501a4d13-42af-4429-9fd1-a8218c268e20"
+        $pcieSetting = "ee12f906-d277-404b-b6da-e5fa1a576df5"
+        $nonRegData["PcieASPMAc"] = Get-PowerSettingIdx $pcieSub $pcieSetting "AC"
+        $nonRegData["PcieASPMDc"] = Get-PowerSettingIdx $pcieSub $pcieSetting "DC"
+
+        # Direct registry reads not in the 54-path list
+        try { $nonRegData["DrvMetadata"] = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata" -Name "PreventDeviceMetadataFromNetwork" -ErrorAction SilentlyContinue).PreventDeviceMetadataFromNetwork } catch { $nonRegData["DrvMetadata"] = $null }
+        try { $nonRegData["DrvSearchOrder"] = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching" -Name "SearchOrderConfig" -ErrorAction SilentlyContinue).SearchOrderConfig } catch { $nonRegData["DrvSearchOrder"] = $null }
+
+        # Support-check Test-Path results
+        $supportChecks = @{}
+        try { $supportChecks["3DObjects"] = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\{0DB7E03F-FC29-4DC6-9020-FF41B59E513A}" } catch { $supportChecks["3DObjects"] = $true }
+        try { $supportChecks["Chat"] = Get-WmtRegistryPathExists "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarMn" } catch { $supportChecks["Chat"] = $true }
+        try { $supportChecks["Widgets"] = ($null -ne (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarDa" -ErrorAction SilentlyContinue)) } catch { $supportChecks["Widgets"] = $true }
+        try { $supportChecks["Activity"] = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Microsoft\PolicyManager\Default\ActivityHistory" } catch { $supportChecks["Activity"] = $true }
+        try { $supportChecks["CEIP"] = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" } catch { $supportChecks["CEIP"] = $true }
+        try { $supportChecks["Speech"] = ($null -ne (Get-ItemProperty "HKCU:\Software\Microsoft\Speech_OneSet" -Name "AcceptPrivacyNotice" -ErrorAction SilentlyContinue)) } catch { $supportChecks["Speech"] = $true }
+
+        return @{ RegCache = $regCache; PathChecks = $pathChecks; NonRegData = $nonRegData; SupportChecks = $supportChecks }
+    })
+
+$async = $null
+try {
+    $async = $ps.BeginInvoke()
+}
+catch {
+    try { Write-GuiLog "[Tweak States] BeginInvoke failed: $($_.Exception.Message)." } catch {}
+}
+
+# BeginInvoke throws on start failure; a null result is also treated as failure.
+if ($null -eq $async) {
+    try { $ps.Dispose() } catch {}
+    $script:TweakStatesBgStarted = $false
+    $script:TweakStatesReady = $false
+    Show-TweakStatesLoadError -Message "Tweak-state background job did not start. The Tweaks page remains blocked; click Retry."
+    Sync-WmtTweakOverlayHide
+    return
+}
+
+$script:TweakStatesBgAsync = $async
+$script:TweakStatesBgPS = $ps
+$script:TweakStatesBgTimer = $null
+Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplete { $false } -OnTick {
+        if ($script:TweakStatesBgAsync -and $script:TweakStatesBgAsync.IsCompleted) {
+            Unregister-WmtUiPollOperation -Name "TweakStatesLoad"
+            try {
+                $result = $script:TweakStatesBgPS.EndInvoke($script:TweakStatesBgAsync)
+                # EndInvoke's real return type is PSDataCollection[PSObject] — that's the
+                # "System.Management.Automation.PSDataCollection`1[[...PSObject...]]" seen
+                # in the "unexpected type" log — NOT System.Collections.ObjectModel.Collection[PSObject].
+                # The old check only matched the latter, so it never unwrapped the collection;
+                # $result stayed a PSDataCollection, failed the -is [hashtable] test right
+                # below, and every cache field was silently left unset, which forced
+                # Update-TweakButtonStates onto its slow live-registry fallback every time.
+                # Match both container types so this keeps working either way.
+                if ($result -is [System.Management.Automation.PSDataCollection[psobject]] -or $result -is [System.Collections.ObjectModel.Collection[PSObject]]) {
+                    if ($result.Count -gt 0) { $result = $result[$result.Count - 1] }
+                }
+                if ($result -and $result -is [hashtable]) {
+                    # Store the pre-loaded regCache, path checks, non-registry data, and support checks
+                    $script:TweakButtonStatesCache = $result.RegCache
+                    $script:TweakButtonStatesPathChecks = $result.PathChecks
+                    $script:TweakNonRegDataCache = $result.NonRegData
+                    $script:TweakSupportChecksCache = $result.SupportChecks
+                    # Apply to buttons (instant – no registry I/O, reads from cache)
+                    Update-TweakButtonStates
+                    # Cache is ready — coordinate overlay hide with optional features check
+                    $script:TweakStatesReady = $true
+                    if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Sync-WmtQuickFindStateAvailability }
+                    Sync-WmtTweakOverlayHide
+                } else {
+                    $typeInfo = if ($result) { $result.GetType().FullName } else { "null" }
+                    try { Write-GuiLog "[Tweak States] Background preload returned unexpected type: $typeInfo" } catch {}
+                    # Cache was not populated; keep the tweak overlay blocked until Retry
+                    $script:TweakStatesReady = $false
+                    Show-TweakStatesLoadError -Message "Tweak state cache returned invalid data (type: $typeInfo). Buttons will use live registry reads as fallback, which may be slow."
+                }
+            }
+            catch [System.Management.Automation.Runspaces.InvalidRunspacePoolStateException] {
+                $script:TweakStatesReady = $false
+                Show-TweakStatesLoadError -Message "The background runspace pool closed before tweak states could load. Click Retry."
+            }
+            catch [System.Management.Automation.Runspaces.InvalidRunspaceStateException] {
+                $script:TweakStatesReady = $false
+                Show-TweakStatesLoadError -Message "The tweak-state runspace was disposed. Click Retry."
+            }
+            catch {
+                $errMsg = $_.Exception.Message
+                try { Write-GuiLog "[Tweak States] Background load failed: $errMsg" } catch {}
+                $script:TweakStatesReady = $false
+                Sync-WmtTweakOverlayHide
+                Show-TweakStatesLoadError -Message "Background tweak state load failed: $errMsg. Buttons will use live registry reads."
+            }
+            if ($script:TweakStatesBgTimeout) { try { $script:TweakStatesBgTimeout.Stop() } catch {}; $script:TweakStatesBgTimeout = $null }
+            if (-not $script:TweakStatesReady) { $script:TweakStatesBgStarted = $false }
+            try { $script:TweakStatesBgPS.Dispose() } catch {}
+            $script:TweakStatesBgAsync = $null
+            $script:TweakStatesBgPS = $null
+        }
+    } | Out-Null
+
+# Timeout guard: if the runspace pool is starved (e.g. My Device jobs filling
+# all slots), the background job may never start. After 30 seconds, keep
+# the overlay blocking toggles and offer a retry.
+$script:TweakStatesBgTimeout = New-Object System.Windows.Threading.DispatcherTimer
+$script:TweakStatesBgTimeout.Interval = [TimeSpan]::FromSeconds(30)
+$script:TweakStatesBgTimeout.Add_Tick({
+        $script:TweakStatesBgTimeout.Stop()
+        if (-not $script:TweakStatesReady) {
+            try { Write-GuiLog "[Tweak States] Background preload timed out; Tweaks remains blocked until retry." } catch {}
+            $timedOutTweakPs = $script:TweakStatesBgPS
+            $timedOutTweakAsync = $script:TweakStatesBgAsync
+            $script:TweakStatesBgAsync = $null
+            $script:TweakStatesBgPS = $null
+            try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
+            if ($timedOutTweakPs) {
+                try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutTweakPs -Invocation $timedOutTweakAsync -Name "Tweak state preload timeout" } catch {
+                    try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutTweakPs -Invocation $timedOutTweakAsync -Name "Tweak state preload timeout" } catch {}
+                }
+            }
+            $script:TweakStatesBgStarted = $false
+            $script:TweakStatesReady = $false
+            Show-TweakStatesLoadError -Message "Tweak state detection timed out. The Tweaks page remains blocked until states load. Click Retry."
+
+        }
+    })
+$script:TweakStatesBgTimeout.Start()
+}
+
+$script:OptionalFeaturesMap = @{
+    "Microsoft-Hyper-V-All"              = "btnFeatHyperV"
+    "Microsoft-Windows-Subsystem-Linux"  = "btnFeatWSL"
+    "Containers-DisposableClientVM"      = "btnFeatSandbox"
+    "NetFx3"                             = "btnFeatDotNet35"
+    "ServicesForNFS-ClientOnly"          = "btnFeatNFS"
+    "TelnetClient"                       = "btnFeatTelnet"
+    "IIS-WebServerRole"                  = "btnFeatIIS"
+    "WindowsMediaPlayer"                 = "btnFeatLegacy"
+    "VirtualMachinePlatform"             = "btnFeatVMP"
+    "HypervisorPlatform"                 = "btnFeatWHP"
+    "OpenSSH.Client"                     = "btnFeatSSHClient"
+    "OpenSSH.Server"                     = "btnFeatSSHServer"
+    "Windows-Defender-ApplicationGuard"  = "btnFeatAppGuard"
+    "WirelessDisplay"                    = "btnFeatMiracast"
+    "QuickAssist"                        = "btnFeatQuickAssist"
+    "XpsViewer"                          = "btnFeatXPS"
+    "TIFFIFilter"                        = "btnFeatTIFF"
+}
+
+function Sync-WmtOptionalFeatureButtons {
+    foreach ($btnName in $script:OptionalFeaturesMap.Values) {
+        Update-SingleFeatureButtonState -ButtonName $btnName -FeatureName ""
+    }
+}
+# Prevent toggles before feature states are known.
+Sync-WmtOptionalFeatureButtons
+
+function Start-OptionalFeaturesBackgroundCheck {
+# One bulk feature query and (where available) one bulk capability query.
+# Neither the scan nor its retry ever executes OS queries on the WPF thread.
+if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted) { return }
+$script:OptionalFeaturesCheckStarted = $true
+$featureMap = $script:OptionalFeaturesMap
+$ps = $null
+try { $ps = New-WmtPooledPowerShell -PoolKind UiSupport }
+catch {
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    Show-TweakStatesLoadError -Message "Could not start optional-feature background worker: $($_.Exception.Message). Click Retry."
+    Sync-WmtTweakOverlayHide
+    return
+}
+[void]$ps.AddScript({
+    param($map)
+    $states = @{}
+    $providers = @{}
+    $unavailable = @{}
+    $featureStates = @{}
+    $featuresEnumerated = $false
+
+    # Complete successful enumeration is required before absent items can be
+    # classified as unsupported. Unknown/pending states must never become false.
+    if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+        try {
+            $allFeatures = @(Get-WindowsOptionalFeature -Online -ErrorAction Stop)
+            if ($allFeatures.Count -gt 0) {
+                foreach ($feat in $allFeatures) {
+                    $name = [string]$feat.FeatureName
+                    if ($map.ContainsKey($name)) {
+                        $featureStates[$name] = [string]$feat.State
+                    }
+                }
+                $featuresEnumerated = $true
+            }
+        }
+        catch { $featuresEnumerated = $false; $featureStates = @{} }
+    }
+    if (-not $featuresEnumerated) {
+        $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-Features" -TimeoutMs 120000
+        if ($global:LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
+            throw "Bulk Windows feature enumeration failed (DISM exit: $global:LASTEXITCODE)."
+        }
+        $currentFeature = $null
+        foreach ($line in ([string]$output -split "\r?\n")) {
+            if ($line -match '^\s*Feature Name\s*:\s*(.*?)\s*$') {
+                $currentFeature = [string]$Matches[1].Trim()
+            }
+            elseif ($currentFeature -and $line -match '^\s*State\s*:\s*(.*?)\s*$') {
+                if ($map.ContainsKey($currentFeature)) {
+                    $featureStates[$currentFeature] = [string]$Matches[1].Trim()
+                }
+                $currentFeature = $null
+            }
+        }
+        if ($featureStates.Count -eq 0) {
+            throw "DISM output did not provide any recognized optional-feature states."
+        }
+        $featuresEnumerated = $true
+    }
+
+    foreach ($name in $featureStates.Keys) {
+        $button = [string]$map[$name]
+        $state = [string]$featureStates[$name]
+        switch -Regex ($state) {
+            '^Enabled$' { $states[$button] = $true; break }
+            '^(Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)$' {
+                $states[$button] = $false; break
+            }
+            default { throw "Unrecognized state '$state' returned for $name; scan cannot be trusted." }
+        }
+        $providers[$button] = @{ Type = "Feature"; Name = $name }
+    }
+
+    # OpenSSH and several Windows accessories are capabilities, not DISM
+    # optional features, on current Windows builds. Enumerate once, not per item.
+    $capabilityPrefixes = @{
+        "OpenSSH.Client" = "OpenSSH.Client~~~~"
+        "OpenSSH.Server" = "OpenSSH.Server~~~~"
+        "WirelessDisplay" = "App.WirelessDisplay.Connect~~~~"
+        "QuickAssist" = "App.Support.QuickAssist~~~~"
+        "XpsViewer" = "XPS.Viewer~~~~"
+    }
+    $needCapabilities = @($capabilityPrefixes.Keys | Where-Object { -not $states.ContainsKey([string]$map[$_]) })
+    if ($needCapabilities.Count -gt 0) {
+        if (-not (Get-Command Get-WindowsCapability -ErrorAction SilentlyContinue)) {
+            throw "Cannot enumerate Windows capabilities for $($needCapabilities -join ', ')."
+        }
+        $allCapabilities = @(Get-WindowsCapability -Online -ErrorAction Stop)
+        if ($allCapabilities.Count -eq 0) { throw "Windows capability enumeration returned no results." }
+        foreach ($name in $needCapabilities) {
+            $prefix = [string]$capabilityPrefixes[$name]
+            $cap = $allCapabilities | Where-Object { ([string]$_.Name).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+                Select-Object -First 1
+            if (-not $cap) { continue }
+            $btn = [string]$map[$name]
+            switch ([string]$cap.State) {
+                "Installed" { $states[$btn] = $true }
+                "NotPresent" { $states[$btn] = $false }
+                "Staged" { $states[$btn] = $false }
+                default { throw "Unrecognized capability state '$($cap.State)' for $name." }
+            }
+            $providers[$btn] = @{ Type = "Capability"; Name = [string]$cap.Name }
+        }
+    }
+
+    # A successful *complete* enumeration can establish that a feature is not
+    # present on this OS. It is not a disabled state and cannot be toggled.
+    foreach ($name in $map.Keys) {
+        $button = [string]$map[$name]
+        if (-not $states.ContainsKey($button)) {
+            $unavailable[$button] = "Unsupported / not present on this Windows build"
+        }
+    }
+    if (($states.Count + $unavailable.Count) -ne $map.Count -or
+        $providers.Count -ne $states.Count) {
+        throw "Optional-feature scan incomplete: $($states.Count) states, $($unavailable.Count) unsupported of $($map.Count)."
+    }
+    return @{ States = $states; Providers = $providers; Unavailable = $unavailable }
+})
+[void]$ps.AddArgument($featureMap)
+$async = $null
+try { $async = $ps.BeginInvoke() }
+catch { try { Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message)." } catch {} }
+if ($null -eq $async) {
+    try { $ps.Dispose() } catch {}
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    Show-TweakStatesLoadError -Message "Optional-feature scan could not start. Click Retry."
+    Sync-WmtTweakOverlayHide
+    return
+}
+$script:FeaturesCheckAsync = $async
+$script:FeaturesCheckPS = $ps
+$script:FeaturesCheckTimer = $null
+Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -TestComplete { $false } -OnTick {
+    if ($script:FeaturesCheckAsync -and $script:FeaturesCheckAsync.IsCompleted) {
+        Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck"
+        $script:OptionalFeaturesReady = $false
+        $script:OptionalFeatureStateCache = @{}
+        $script:OptionalFeatureUnavailableCache = @{}
+        $script:OptionalFeatureProviderCache = @{}
+        $scanError = ""
+        try {
+            $raw = $script:FeaturesCheckPS.EndInvoke($script:FeaturesCheckAsync)
+            if (-not $raw -or $raw.Count -ne 1) { throw "Scan returned no complete result." }
+            $result = $raw[0]
+            if ($result -isnot [System.Collections.IDictionary] -or
+                $result.States -isnot [System.Collections.IDictionary] -or
+                $result.Unavailable -isnot [System.Collections.IDictionary] -or
+                $result.Providers -isnot [System.Collections.IDictionary]) {
+                throw "Scan result type is invalid."
+            }
+            $valid = @($script:OptionalFeaturesMap.Values)
+            foreach ($button in $result.States.Keys) {
+                if ($button -notin $valid -or $result.Providers.ContainsKey($button) -eq $false) {
+                    throw "Scan returned an unrecognized or providerless feature."
+                }
+            }
+            foreach ($button in $result.Unavailable.Keys) {
+                if ($button -notin $valid -or $result.States.ContainsKey($button)) {
+                    throw "Scan returned contradictory or unknown feature data."
+                }
+            }
+            if (($result.States.Count + $result.Unavailable.Count) -ne $valid.Count -or
+                $result.Providers.Count -ne $result.States.Count) {
+                throw "Only $($result.States.Count + $result.Unavailable.Count) / $($valid.Count) features were classified."
+            }
+            $script:OptionalFeatureStateCache = $result.States
+            $script:OptionalFeatureUnavailableCache = $result.Unavailable
+            $script:OptionalFeatureProviderCache = $result.Providers
+            $script:OptionalFeaturesReady = $true
+            try {
+                Write-GuiLog "[Optional Features] Verified $($result.States.Count) states; $($result.Unavailable.Count) not available on this Windows build."
+            } catch {}
+        }
+        catch {
+            $scanError = $_.Exception.Message
+            try { Write-GuiLog "[Optional Features] Background scan failed: $scanError" } catch {}
+        }
+        if ($script:FeaturesCheckTimeout) {
+            try { $script:FeaturesCheckTimeout.Stop() } catch {}
+            $script:FeaturesCheckTimeout = $null
+        }
+        try { $script:FeaturesCheckPS.Dispose() } catch {}
+        $script:FeaturesCheckAsync = $null
+        $script:FeaturesCheckPS = $null
+        Sync-WmtOptionalFeatureButtons
+        if (-not $script:OptionalFeaturesReady) {
+            $script:OptionalFeaturesCheckStarted = $false
+            Show-TweakStatesLoadError -Message "Optional-feature verification failed: $scanError. Tweaks remains blocked; click Retry."
+        }
+        Sync-WmtTweakOverlayHide
+        Sync-WmtQuickFindStateAvailability
+    }
+} | Out-Null
+$script:FeaturesCheckTimeout = [System.Windows.Threading.DispatcherTimer]::new()
+$script:FeaturesCheckTimeout.Interval = [TimeSpan]::FromSeconds(150)
+$script:FeaturesCheckTimeout.Add_Tick({
+    $script:FeaturesCheckTimeout.Stop()
+    $script:FeaturesCheckTimeout = $null
+    if ($script:OptionalFeaturesReady -or -not $script:FeaturesCheckPS) { return }
+    try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+    $timedOutPs = $script:FeaturesCheckPS
+    $timedOutAsync = $script:FeaturesCheckAsync
+    $script:FeaturesCheckPS = $null
+    $script:FeaturesCheckAsync = $null
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    $script:OptionalFeatureStateCache = @{}
+    $script:OptionalFeatureUnavailableCache = @{}
+    $script:OptionalFeatureProviderCache = @{}
+    Sync-WmtOptionalFeatureButtons
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {}
+    }
+    Show-TweakStatesLoadError -Message "Optional-feature detection timed out. Tweaks remains blocked until verified; click Retry."
+    Sync-WmtQuickFindStateAvailability
+})
+$script:FeaturesCheckTimeout.Start()
+}
+
+$onMainWindowContentRendered = {
+# Build identity first: the title suffix and the log line answer
+# "is this the latest build?" without guessing (see the download page
+# for the line count / size / MD5 of the newest delivery).
+try {
+    Write-GuiLog "WMT GUI v$AppVersion started."
+} catch {}
+$settings = Get-WmtSettings
+
+# Restore persisted window geometry/state when valid.
+if ($settings.WindowBounds) {
+    $wb = $settings.WindowBounds
+    if ($wb.Width -ge $window.MinWidth -and $wb.Height -ge $window.MinHeight) {
+        $window.Width = [double]$wb.Width
+        $window.Height = [double]$wb.Height
+    }
+    if (($wb.Left -ne 0 -or $wb.Top -ne 0) -and $settings.WindowState -ne "Maximized") {
+        $screenW = [System.Windows.SystemParameters]::VirtualScreenWidth
+        $screenH = [System.Windows.SystemParameters]::VirtualScreenHeight
+        $screenX = [System.Windows.SystemParameters]::VirtualScreenLeft
+        $screenY = [System.Windows.SystemParameters]::VirtualScreenTop
+
+        $clampedLeft = [math]::Max($screenX, [math]::Min([double]$wb.Left, $screenX + $screenW - 100))
+        $clampedTop = [math]::Max($screenY, [math]::Min([double]$wb.Top, $screenY + $screenH - 40))
+
+        $window.Left = $clampedLeft
+        $window.Top = $clampedTop
+    }
+}
+
+Set-WmtTheme -Theme $settings.Theme
+if ($settings.WindowState -eq "Maximized") {
+    $window.WindowState = [System.Windows.WindowState]::Maximized
+}
+
+# 1. Click the Updates tab by default.
+(Get-Ctrl "btnTabUpdates").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+
+# 1b. Initialize the shared RunspacePool early for an interactive launch.
+# Launch-minimized + Reduce RAM leaves it unallocated until real work requests it.
+if (-not ((Get-WmtLaunchMinimized) -and (Get-WmtReduceRamInTray))) {
+    Initialize-WmtBackgroundRunspacePool
+}
+
+# 2. Warm hidden pages in the background (deferred 1s so UI paints first).
+$script:preloadDeferTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:preloadDeferTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:preloadDeferTimer.Add_Tick({
+        try { $script:preloadDeferTimer.Stop() } catch {}
+        if (-not (Test-WmtAggressiveTrayMemoryMode)) {
+            Start-WmtStartupBackgroundPreload
+        }
+        $script:preloadDeferTimer = $null
+    })
+$script:preloadDeferTimer.Start()
+
+# 3. Trigger the background update check (deferred).
+[System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+    [System.Windows.Threading.DispatcherPriority]::Background,
+    [Action] { Start-UpdateCheckBackground }
+)
+
+# 3b. Start a one-time startup scan, plus periodic scans if configured.
+# Deferred to Background priority � toast registration is not needed immediately.
+[System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+    [System.Windows.Threading.DispatcherPriority]::Background,
+    [Action] {
+        if (Get-WmtUpdateNotificationsEnabled -Settings $settings) {
+            [void](Initialize-WmtNativeToastSupport)
+        }
+        if (-not (Get-WmtDisableBackgroundJobs -Settings $settings)) {
+            if (-not (Get-WmtUpdateScansDisabled -Settings $settings)) {
+                Start-WmtUpdateAutoScanTimer -ResetNextRun
+                # One scan on launch, even when the recurring interval is disabled.
+                # Keep the startup trigger out of Updates tab navigation.
+                if (-not $script:WmtStartupUpdateScanTriggered) {
+                    $script:WmtStartupUpdateScanTriggered = $true
+                    Invoke-WmtUpdateAutoScan -Startup
+                }
+            }
+            Start-WmtCleanerDefinitionRefreshTimer -ResetNextRun
+            Start-WmtCleanerAutoCleanTimer
+        }
+    }
+)
+
+# 4. Tweak button states are loaded on first Tweaks tab visit
+# (deferred to avoid competing with My Device page stats for system resources).
+Update-MyDeviceResponsiveLayout
+Update-TweaksResponsiveLayout
+
+# If Launch Minimized is enabled, hide the freshly rendered window in the
+# system tray. This runs after ContentRendered so WPF has a real window to hide.
+try {
+    if (Get-WmtLaunchMinimized) {
+        if (Initialize-WmtTrayIcon -Window $window) {
+            $script:WmtHiddenToTray = $true
+            $window.ShowInTaskbar = $false
+            $window.Hide()
+            if (Get-WmtReduceRamInTray) {
+                Enter-WmtAggressiveTrayMode
+            }
+            Write-GuiLog "Launch Minimized is enabled. WMT started hidden in the system tray."
+        }
+    }
+}
+catch {
+    try { Write-GuiLog "Launch Minimized startup handling failed: $($_.Exception.Message)" } catch {}
+}
+}
+[void]$window.Add_ContentRendered($onMainWindowContentRendered)
+
+$onMainWindowSizeChanged = {
+Update-MyDeviceResponsiveLayout
+Update-TweaksResponsiveLayout
+}.GetNewClosure()
+[void]$window.Add_SizeChanged($onMainWindowSizeChanged)
+
+# --- Background AppX Load (no busy cursor, no UI thread blocking) ---
+$script:WmtAppxLoadRunspace = $null
+$script:WmtAppxLoadAsyncResult = $null
+
+function Start-AppxBackgroundLoad {
+if ($script:WmtAppxLoadAsyncResult) {
+    if (-not $script:WmtAppxLoadAsyncResult.IsCompleted) { return }
+
+    # The shared poller may not have consumed a just-completed invocation yet.
+    # Finalize it before replacing the script-level worker references.
+    try {
+        if ($script:WmtAppxLoadRunspace) {
+            [void]$script:WmtAppxLoadRunspace.EndInvoke($script:WmtAppxLoadAsyncResult)
+        }
+    }
+    catch {}
+    finally {
+        try { Unregister-WmtUiPollOperation -Name "AppxBackgroundLoad" } catch {}
+        try { if ($script:WmtAppxLoadRunspace) { $script:WmtAppxLoadRunspace.Dispose() } } catch {}
+        $script:WmtAppxLoadRunspace = $null
+        $script:WmtAppxLoadAsyncResult = $null
+    }
+}
+
+$ps = $null
+try {
+    $ps = New-WmtPooledPowerShell -PoolKind UiSupport
+}
+catch {
+    Write-GuiLog "AppX background load could not create a worker: $($_.Exception.Message)"
+    return
+}
+[void]$ps.AddScript({
+    $results = [System.Collections.Generic.List[object]]::new()
+    $usedCmdlet = $false
+
+    if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+        try {
+            $allPkgs = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name })
+            foreach ($pkg in @($allPkgs | Sort-Object Name)) {
+                if ($pkg.NonRemovable -eq $true) { continue }
+                [void]$results.Add([PSCustomObject]@{
+                    Name            = [string]$pkg.Name
+                    PackageFullName = [string]$pkg.PackageFullName
+                })
+            }
+            $usedCmdlet = ($results.Count -gt 0)
+        }
+        catch {}
+    }
+
+    if (-not $usedCmdlet) {
+        $output = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-ProvisionedAppxPackages" -TimeoutMs 120000
+        foreach ($block in @($output -split '(?=Package Identity\s*:)')) {
+            $pkgId = ""
+            $displayName = ""
+            if ($block -match 'Package Identity\s*:\s*(.+)') { $pkgId = $Matches[1].Trim() }
+            if ($block -match 'DisplayName\s*:\s*(.+)') { $displayName = $Matches[1].Trim() }
+            if ([string]::IsNullOrWhiteSpace($pkgId)) { continue }
+            if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $pkgId }
+            [void]$results.Add([PSCustomObject]@{
+                Name            = $displayName
+                PackageFullName = $pkgId
+            })
+        }
+    }
+
+    $results.ToArray()
+})
+
+$script:WmtAppxLoadRunspace = $ps
+try {
+    $script:WmtAppxLoadAsyncResult = $ps.BeginInvoke()
+}
+catch {
+    Write-GuiLog "AppX background load failed to start: $($_.Exception.Message)"
+    try { $ps.Dispose() } catch {}
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
+    return
+}
+
+Register-WmtUiPollOperation -Name "AppxBackgroundLoad" -IntervalMs 250 -TestComplete {
+    $script:WmtAppxLoadAsyncResult -and $script:WmtAppxLoadAsyncResult.IsCompleted
+} -OnComplete {
+    try {
+        $results = @($script:WmtAppxLoadRunspace.EndInvoke($script:WmtAppxLoadAsyncResult))
+        $lst = Get-Ctrl "lstAppxPackages"
+        if ($lst) {
+            $lst.Items.Clear()
+            foreach ($app in $results) {
+                [void]$lst.Items.Add([PSCustomObject]@{
+                    Name    = [string]$app.Name
+                    Package = [string]$app.PackageFullName
+                })
+            }
+            Write-GuiLog "Loaded $($results.Count) removable UWP apps."
+        }
+    }
+    catch {
+        Write-GuiLog "AppX background load failed: $($_.Exception.Message)"
+    }
+    finally {
+        try { $script:WmtAppxLoadRunspace.Dispose() } catch {}
+        $script:WmtAppxLoadRunspace = $null
+        $script:WmtAppxLoadAsyncResult = $null
+    }
+} -OnError {
+    param($Operation, $ErrorRecord)
+    Write-GuiLog "AppX background monitor failed: $($ErrorRecord.Exception.Message)"
+    $failedPs = $script:WmtAppxLoadRunspace
+    $failedAsync = $script:WmtAppxLoadAsyncResult
+    $script:WmtAppxLoadRunspace = $null
+    $script:WmtAppxLoadAsyncResult = $null
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $failedPs -Invocation $failedAsync -Name "AppX background load"
+    }
+    catch {
+        try { if ($failedPs) { Start-WmtPowerShellCleanupDetached -PowerShell $failedPs -Invocation $failedAsync -Name "AppX background load" } } catch {}
+    }
+} | Out-Null
+}
+
+# Start background library cache builder for Legendary/GOGDL on boot
+# so the main Updates search box can find owned games without a first-run delay.
+$script:WmtLibraryCacheRunspace = $null
+$script:WmtLibraryCacheAsyncResult = $null
+
+function Start-WmtLibraryCacheBuilder {
+param([switch]$Force)
+try {
+    if ($script:WmtLibraryCacheAsyncResult) {
+        if (-not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
+            Write-GuiLog "Library cache build already in progress."
+            return
+        }
+
+        # A completed invocation can still be waiting for the shared poller.
+        # Finalize it here before replacing the script-level worker references.
+        try {
+            if ($script:WmtLibraryCacheRunspace) {
+                $priorResults = @($script:WmtLibraryCacheRunspace.EndInvoke($script:WmtLibraryCacheAsyncResult))
+                foreach ($line in $priorResults) {
+                    if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog ($line.Substring(4)) }
+                }
+                foreach ($workerError in $script:WmtLibraryCacheRunspace.Streams.Error) {
+                    Write-GuiLog "Library cache worker error: $workerError | $($workerError.ScriptStackTrace)"
+                }
+            }
+        }
+        catch {
+            Write-GuiLog "Previous library cache build finalization failed: $($_.Exception.Message)"
+        }
+        finally {
+            try { Unregister-WmtUiPollOperation -Name "LibraryCacheBuilder" } catch {}
+            try { if ($script:WmtLibraryCacheRunspace) { $script:WmtLibraryCacheRunspace.Dispose() } } catch {}
+            $script:WmtLibraryCacheRunspace = $null
+            $script:WmtLibraryCacheAsyncResult = $null
+        }
+    }
+    $settings = Get-WmtSettings
+    $enabled = @($settings.EnabledProviders)
+    $toggles = Get-WmtProviderToggles -Settings $settings
+
+    $needLeg = $false
+    $needGog = $false
+    $dataPath = Get-DataPath
+    $legFile = Join-Path $dataPath "legendary_library.json"
+    $gogFile = Join-Path $dataPath "gog_library.json"
+
+    # Cache expiry: re-fetch if the cache file is older than 24 hours
+    # (in case the user bought more games since the cache was last updated).
+    $cacheExpiryHours = 24
+
+    # Your Library follows the provider's enabled state, not its package-search
+    # toggle. Search can be disabled while library/install/update features remain
+    # enabled, so still keep the Legendary cache current.
+    if ("legendary" -in $enabled) {
+        $fileExists = (Test-Path -LiteralPath $legFile -PathType Leaf)
+        $isStale = $false
+        if ($fileExists) {
+            try {
+                $age = (Get-Date) - (Get-Item -LiteralPath $legFile).LastWriteTime
+                if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
+                if (-not $isStale) {
+                    $cachedLibrary = [System.IO.File]::ReadAllText($legFile) | ConvertFrom-Json -ErrorAction Stop
+                    if (@($cachedLibrary | Where-Object { $_ -and $_.Id }).Count -eq 0) { $isStale = $true }
+                }
+            }
+            catch {
+                $isStale = $true
+                Write-GuiLog "Legendary library cache is unreadable; rebuilding: $($_.Exception.Message)"
+            }
+        }
+        $needLeg = [bool]$Force -or (-not $fileExists) -or $isStale
+    }
+
+    # Same rule for GOGDL: the user's owned library is independent of whether
+    # catalog searching through that provider is enabled.
+    if ("gogdl" -in $enabled) {
+        $fileExists = (Test-Path -LiteralPath $gogFile -PathType Leaf)
+        $isStale = $false
+        if ($fileExists) {
+            try {
+                $age = (Get-Date) - (Get-Item -LiteralPath $gogFile).LastWriteTime
+                if ($age.TotalHours -ge $cacheExpiryHours) { $isStale = $true }
+            }
+            catch {}
+        }
+        $needGog = [bool]$Force -or (-not $fileExists) -or $isStale
+    }
+
+    # Also check PyPI index cache if pip is enabled + search on.
+    $pypiFile = Join-Path $dataPath "pypi_index.json"
+    $needPypi = $false
+    if ("pip" -in $enabled) {
+        $t = $null
+        if ($toggles -is [System.Collections.IDictionary] -and $toggles.Contains("pip")) {
+            $t = $toggles["pip"]
+        }
+        $searchOn = $false
+        if ($t) {
+            if ($t -is [System.Collections.IDictionary]) {
+                if ($t.Contains("Search")) { $searchOn = [bool]$t["Search"] }
+            }
+            else {
+                try { if ($t.PSObject.Properties["Search"]) { $searchOn = [bool]$t.Search } } catch {}
+            }
+        }
+        if ($searchOn) {
+            $fileExists = (Test-Path -LiteralPath $pypiFile -PathType Leaf)
+            $isStale = $false
+            if ($fileExists) {
+                try {
+                    $age = (Get-Date) - (Get-Item -LiteralPath $pypiFile).LastWriteTime
+                    if ($age.TotalHours -ge 24) { $isStale = $true }
+                }
+                catch {}
+            }
+            $needPypi = (-not $fileExists) -or $isStale
+        }
+    }
+
+    # Also check Steam library cache if Steam is enabled.
+    $steamFile = Join-Path $dataPath "steam_library.json"
+    $steamAppFile = Join-Path $dataPath "steam_applist.json"
+    $needSteam = $false
+    if ("steam" -in $enabled) {
+        $fileExists = (Test-Path -LiteralPath $steamFile -PathType Leaf)
+        $isStale = $false
+        if ($fileExists) {
+            try {
+                $age = (Get-Date) - (Get-Item -LiteralPath $steamFile).LastWriteTime
+                if ($age.TotalHours -ge 24) { $isStale = $true }
+            }
+            catch {}
+        }
+        $needSteam = (-not $fileExists) -or $isStale
+    }
+
+    if (-not $needLeg -and -not $needGog -and -not $needPypi -and -not $needSteam) { return }
+
+    if ($script:WmtLibraryCacheRunspace) {
+        $staleLibraryCachePs = $script:WmtLibraryCacheRunspace
+        $staleLibraryCacheAsync = $script:WmtLibraryCacheAsyncResult
+        $script:WmtLibraryCacheRunspace = $null
+        $script:WmtLibraryCacheAsyncResult = $null
+        try { Stop-WmtPowerShellInvocationAsync -PowerShell $staleLibraryCachePs -Invocation $staleLibraryCacheAsync -Name "Library cache builder replacement" } catch {
+            try { Start-WmtPowerShellCleanupDetached -PowerShell $staleLibraryCachePs -Invocation $staleLibraryCacheAsync -Name "Library cache builder replacement" } catch {}
+        }
+    }
+
+    # Resolve all paths in the main scope � the background runspace does NOT
+    # have access to main-scope functions like Get-DataPath, Get-WmtLegendaryExePath,
+    # Get-WmtGogdlAuthConfigPath, or Get-WmtLegendaryLibrary.
+    $legendaryExe = Get-WmtLegendaryExePath
+    if ([string]::IsNullOrWhiteSpace($legendaryExe) -or -not (Test-Path -LiteralPath $legendaryExe -PathType Leaf)) {
+        try {
+            $cmd = Get-Command legendary -ErrorAction SilentlyContinue
+            if ($cmd -and $cmd.Source) { $legendaryExe = [string]$cmd.Source }
+        }
+        catch {}
+    }
+    $gogAuthPath = Get-WmtGogdlAuthConfigPath
+    if ([string]::IsNullOrWhiteSpace($gogAuthPath) -or -not (Test-Path -LiteralPath $gogAuthPath -PathType Leaf)) {
+        $heroicAuthPath = Join-Path $env:APPDATA "heroic\gog_store\auth.json"
+        if (Test-Path -LiteralPath $heroicAuthPath -PathType Leaf) { $gogAuthPath = $heroicAuthPath }
+    }
+
+    Write-GuiLog "Building Legendary/GOGDL library caches in background..."
+    $ps = New-WmtPooledPowerShell
+
+    # Self-contained scriptBlock: provider state is passed as arguments.
+    # Shared pooled helpers are available, but main-scope variables are not.
+    [void]$ps.AddScript({
+            param($DoLeg, $DoGog, $LegendaryExe, $LegCacheFile, $GogAuthPath, $GogCacheFile, $DoPypi, $PypiCacheFile, $DoSteam, $SteamCacheFile, $SteamAppListFile)
+
+            # --- Fetch Legendary library (inline, self-contained) ---
+            if ($DoLeg) {
+                try {
+                    Write-Output "LOG:Fetching Legendary library..."
+                    $result = New-Object System.Collections.Generic.List[object]
+
+                    if ($LegendaryExe -and (Test-Path -LiteralPath $LegendaryExe -PathType Leaf)) {
+                        # --include-ue only while UE/Fab assets are shown;
+                        # this runspace cannot call the settings helper,
+                        # so read the persisted flag from settings.json.
+                        $ueFlag = ""
+                        try {
+                            $wmtUeSettingsFile = Join-Path (Split-Path -Parent $LegCacheFile) "settings.json"
+                            if (Test-Path -LiteralPath $wmtUeSettingsFile -PathType Leaf) {
+                                $wmtUeSettingsJson = [System.IO.File]::ReadAllText($wmtUeSettingsFile) | ConvertFrom-Json -ErrorAction Stop
+                                if ($wmtUeSettingsJson.PSObject.Properties["HideLegendaryUeAssets"] -and -not [bool]$wmtUeSettingsJson.HideLegendaryUeAssets) { $ueFlag = " --include-ue" }
+                            }
+                        }
+                        catch {}
+                        $legendaryResult = Invoke-WmtLegendaryLibraryJson -LegendaryExe $LegendaryExe -IncludeUe:($ueFlag -ne "") -ForceRefresh:$true -TimeoutMs 30000
+                        $stdout = [string]$legendaryResult.Json
+
+                        $installedByApp = @{}
+                        $installedQuerySucceeded = $false
+                        try {
+                            $installedResult = Invoke-WmtLegendaryInstalledData -LegendaryExe $LegendaryExe -TimeoutMs 30000
+                            if ($installedResult.ExitCode -eq 0) {
+                                $installedQuerySucceeded = $true
+                                foreach ($installedGame in @($installedResult.Rows)) {
+                                    $installedId = ([string]$installedGame.'App name').Trim()
+                                    if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+                                    $installedByApp[$installedId.ToLowerInvariant()] = [PSCustomObject]@{
+                                        Id               = $installedId
+                                        Title            = ([string]$installedGame.'App title').Trim()
+                                        Version          = ([string]$installedGame.'Installed version').Trim()
+                                        AvailableVersion = ([string]$installedGame.'Available version').Trim()
+                                        InstallPath      = ([string]$installedGame.'Install path').Trim()
+                                        Platform         = ([string]$installedGame.Platform).Trim()
+                                    }
+                                }
+                                Write-Output "LOG:Legendary local install database: $($installedByApp.Count) installed app(s)."
+                            }
+                            elseif ($installedResult.TimedOut) {
+                                Write-Output "LOG:Legendary installed-state query timed out; preserving cached install state."
+                            }
+                            elseif (-not [string]::IsNullOrWhiteSpace([string]$installedResult.StdErr)) {
+                                Write-Output "LOG:Legendary installed-state query failed: $(([string]$installedResult.StdErr).Trim())"
+                            }
+                            if ($installedResult.Error) { Write-Output "LOG:Legendary installed-state error: $($installedResult.Error)" }
+                        }
+                        catch {
+                            Write-Output "LOG:Legendary installed-state query failed: $($_.Exception.Message)"
+                        }
+
+                        if ($legendaryResult.TimedOut) { Write-Output "LOG:Legendary library fetch timed out after 30 seconds." }
+                        if ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
+                            Write-Output "LOG:Legendary library fetch failed (exit $($legendaryResult.ExitCode)): $(([string]$legendaryResult.StdErr).Trim())"
+                        }
+                        if ($legendaryResult.Error) { Write-Output "LOG:Legendary library error: $($legendaryResult.Error)" }
+                        if ($legendaryResult.OfflineFallback) {
+                            Write-Output "LOG:Legendary: using local cached catalog ($($legendaryResult.CachedCount) entries; $($legendaryResult.MissingTitles) titles awaiting metadata)."
+                        }
+
+                        $parsed = $false
+
+                        # Attempt 1: JSON parsing
+                        if (-not $parsed -and -not [string]::IsNullOrWhiteSpace($stdout)) {
+                            try {
+                                $json = $stdout | ConvertFrom-Json -ErrorAction Stop
+                                if ($json) {
+                                    foreach ($game in @($json)) {
+                                        $title = [string]$game.app_title
+                                        if ([string]::IsNullOrWhiteSpace($title)) { $title = [string]$game.title }
+                                        if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                                        $gameId = ([string]$game.app_name).Trim()
+                                        $installedRecord = if ([string]::IsNullOrWhiteSpace($gameId)) { $null } else { $installedByApp[$gameId.ToLowerInvariant()] }
+                                        $isInstalled = ($null -ne $installedRecord)
+                                        $installedVer = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                                        $latestVer = [string]$game.app_version
+                                        if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
+                                        # Tag UE/Fab assets from the JSON namespace data
+                                        # (asset_infos per platform, or the metadata blob).
+                                        $legIsUe = [bool]$game.is_ue
+                                        try {
+                                            if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
+                                                foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
+                                                    # Object form: read .namespace directly. String form:
+                                                    # legendary serializes GameAsset objects via str() (json
+                                                    # default=str), so the value arrives as a Python repr - match
+                                                    # the namespace field inside that text instead.
+                                                    if ($aiProp.Value -is [string]) {
+                                                        if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
+                                                    }
+                                                    elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
+                                                }
+                                            }
+                                        } catch {}
+                                        if (-not $legIsUe) {
+                                            try {
+                                                if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                            } catch {}
+                                        }
+                                        $result.Add([PSCustomObject]@{
+                                                Provider         = "legendary"
+                                                Title            = $title
+                                                Id               = [string]$game.app_name
+                                                Version          = $latestVer
+                                                InstalledVersion = $installedVer
+                                                IsInstalled      = $isInstalled
+                                                Source           = "legendary"
+                                                Kind             = "Library"
+                                                IsUe             = $legIsUe
+                                            })
+                                    }
+                                    if ($result.Count -gt 0) { $parsed = $true }
+                                }
+                            }
+                            catch {
+                                Write-Output "LOG:Legendary library JSON conversion failed: $($_.Exception.Message) | $($_.ScriptStackTrace)"
+                            }
+                        }
+
+                        # Attempt 2: Text parsing fallback
+                        if (-not $parsed) {
+                            # The text output carries no UE/Fab marker; tag each
+                            # row from legendary's own side data (assets.json
+                            # namespace set plus per-game metadata files) and
+                            # the name heuristics, like every other site.
+                            $ueAppNames = @{}
+                            $ueAssetsFiles = @()
+                            try { if ($env:LEGENDARY_CONFIG_PATH) { $ueAssetsFiles += (Join-Path $env:LEGENDARY_CONFIG_PATH "assets.json") } } catch {}
+                            try { if ($env:XDG_CONFIG_HOME) { $ueAssetsFiles += (Join-Path $env:XDG_CONFIG_HOME "legendary\assets.json") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".config\legendary\assets.json") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueAssetsFiles += (Join-Path $env:USERPROFILE ".legendary\assets.json") } } catch {}
+                            try { if ($env:APPDATA) { $ueAssetsFiles += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\assets.json") } } catch {}
+                            foreach ($ueAssetsFile in $ueAssetsFiles) {
+                                if (-not (Test-Path -LiteralPath $ueAssetsFile -PathType Leaf)) { continue }
+                                try {
+                                    $assetsJson = [System.IO.File]::ReadAllText($ueAssetsFile) | ConvertFrom-Json -ErrorAction Stop
+                                    foreach ($platformProp in @($assetsJson.PSObject.Properties)) {
+                                        $uePlatformAssets = @()
+                                        if ($platformProp.Value -is [System.Collections.IEnumerable] -and $platformProp.Value -isnot [string] -and $platformProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                                            $uePlatformAssets = @($platformProp.Value)
+                                        }
+                                        elseif ($platformProp.Value -and $platformProp.Value.PSObject) {
+                                            $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
+                                        }
+                                        foreach ($asset in @($uePlatformAssets)) {
+                                            if (([string]$asset.namespace) -eq 'ue') {
+                                                $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
+                                                if ($ueKey) { $ueAppNames[$ueKey] = $true }
+                                            }
+                                        }
+                                    }
+                                }
+                                catch {}
+                            }
+                            $ueMetaRoots = @()
+                            try { if ($env:LEGENDARY_CONFIG_PATH) { $ueMetaRoots += (Join-Path $env:LEGENDARY_CONFIG_PATH "metadata") } } catch {}
+                            try { if ($env:XDG_CONFIG_HOME) { $ueMetaRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary\metadata") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".config\legendary\metadata") } } catch {}
+                            try { if ($env:USERPROFILE) { $ueMetaRoots += (Join-Path $env:USERPROFILE ".legendary\metadata") } } catch {}
+                            try { if ($env:APPDATA) { $ueMetaRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary\metadata") } } catch {}
+                            $regex = [regex]'\*+\s*(?<title>.+?)\s*\(\s*App(?:\s+name)?\s*:\s*(?<app>[^,|)]+?)\s*(?:[,|]\s*Version\s*:\s*(?<version>[^,|)]+?))?\s*(?:[,|]\s*[^)]*)?\)'
+                            foreach ($match in $regex.Matches($stdout)) {
+                                $title = $match.Groups["title"].Value.Trim()
+                                if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                                $app = $match.Groups["app"].Value.Trim()
+                                $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
+                                $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
+                                if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
+                                    foreach ($ueMetaRoot in $ueMetaRoots) {
+                                        $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
+                                        if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
+                                        try {
+                                            $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
+                                            if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                        }
+                                        catch {}
+                                        break
+                                    }
+                                }
+                                $installedRecord = if ([string]::IsNullOrWhiteSpace($app)) { $null } else { $installedByApp[$app.ToLowerInvariant()] }
+                                $result.Add([PSCustomObject]@{
+                                        Provider         = "legendary"
+                                        Title            = $title
+                                        Id               = $app
+                                        Version          = $ver
+                                        InstalledVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                                        IsInstalled      = ($null -ne $installedRecord)
+                                        InstallPath      = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                                        Platform         = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
+                                        Source           = "legendary"
+                                        Kind             = "Library"
+                                        IsUe             = $legIsUe
+                                    })
+                            }
+                        }
+                    }
+
+                    if ($result.Count -eq 0 -and (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
+                        try {
+                            $previousLibrary = [System.IO.File]::ReadAllText($LegCacheFile) | ConvertFrom-Json -ErrorAction Stop
+                            foreach ($cachedGame in @($previousLibrary)) { if ($cachedGame) { [void]$result.Add($cachedGame) } }
+                            if ($result.Count -gt 0) {
+                                Write-Output "LOG:Legendary owned-catalog refresh returned zero games; preserving $($result.Count) cached owned game(s)."
+                            }
+                        }
+                        catch {}
+                    }
+
+                    if ($installedQuerySucceeded) {
+                        $seenIds = @{}
+                        foreach ($existing in $result.ToArray()) {
+                            $existingId = ([string]$existing.Id).Trim()
+                            if ([string]::IsNullOrWhiteSpace($existingId)) { continue }
+                            $key = $existingId.ToLowerInvariant()
+                            $seenIds[$key] = $true
+                            $installedRecord = $installedByApp[$key]
+                            $isInstalled = ($null -ne $installedRecord)
+                            try {
+                                if ($existing.PSObject.Properties["IsInstalled"]) { $existing.IsInstalled = $isInstalled }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name IsInstalled -Value $isInstalled -Force }
+                                $installedVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                                if ($existing.PSObject.Properties["InstalledVersion"]) { $existing.InstalledVersion = $installedVersion }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name InstalledVersion -Value $installedVersion -Force }
+                                $installPath = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                                if ($existing.PSObject.Properties["InstallPath"]) { $existing.InstallPath = $installPath }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name InstallPath -Value $installPath -Force }
+                                $platform = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
+                                if ($existing.PSObject.Properties["Platform"]) { $existing.Platform = $platform }
+                                else { $existing | Add-Member -MemberType NoteProperty -Name Platform -Value $platform -Force }
+                            }
+                            catch {}
+                        }
+
+                        foreach ($installedRecord in @($installedByApp.Values)) {
+                            $installedId = ([string]$installedRecord.Id).Trim()
+                            if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+                            $key = $installedId.ToLowerInvariant()
+                            if ($seenIds.ContainsKey($key)) { continue }
+                            $title = ([string]$installedRecord.Title).Trim()
+                            if ([string]::IsNullOrWhiteSpace($title)) { $title = $installedId }
+                            $latest = ([string]$installedRecord.AvailableVersion).Trim()
+                            if ([string]::IsNullOrWhiteSpace($latest)) { $latest = [string]$installedRecord.Version }
+                            [void]$result.Add([PSCustomObject]@{
+                                    Provider         = "legendary"
+                                    Title            = $title
+                                    Id               = $installedId
+                                    Version          = $latest
+                                    InstalledVersion = [string]$installedRecord.Version
+                                    IsInstalled      = $true
+                                    InstallPath      = [string]$installedRecord.InstallPath
+                                    Platform         = [string]$installedRecord.Platform
+                                    Source           = "legendary"
+                                    Kind             = "Library"
+                                    IsUe             = $false
+                                })
+                        }
+                    }
+
+                    $mergeWarning = Merge-WmtLegendaryCachedDetails -Rows $result.ToArray() -CacheFile $LegCacheFile -PreserveTitles:([bool]$legendaryResult.OfflineFallback) -PreserveInstalledState:(-not $installedQuerySucceeded)
+                    if ($mergeWarning) { Write-Output "LOG:$mergeWarning" }
+                    $arr = $result.ToArray()
+                    if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $LegCacheFile -PathType Leaf)) {
+                        Set-WmtJsonCacheFile -Path $LegCacheFile -InputObject $arr -Depth 3
+                    }
+                    $installedCount = @($arr | Where-Object { $_.IsInstalled }).Count
+                    Write-Output "LOG:Legendary library cached: $($arr.Count) game(s), including $installedCount installed."
+                }
+                catch {
+                    Write-Output "LOG:Legendary library cache failed: $($_.Exception.Message) | $($_.ScriptStackTrace)"
+                }
+            }
+
+            # --- Fetch GOG library (inline, self-contained) ---
+            if ($DoGog) {
+                try {
+                    Write-Output "LOG:Fetching GOG library..."
+                    $result = New-Object System.Collections.Generic.List[object]
+
+                    if ($GogAuthPath -and (Test-Path -LiteralPath $GogAuthPath -PathType Leaf)) {
+                        $text = [System.IO.File]::ReadAllText($GogAuthPath).TrimStart([char]0xFEFF)
+                        $json = $text | ConvertFrom-Json -ErrorAction Stop
+                        $gogClientId = "46899977096215655"
+                        $creds = $null
+                        $clientProp = $json.PSObject.Properties[$gogClientId]
+                        if ($clientProp) { $creds = $clientProp.Value }
+                        elseif (-not [string]::IsNullOrWhiteSpace([string]$json.access_token)) { $creds = $json }
+                        if ($creds -and -not [string]::IsNullOrWhiteSpace([string]$creds.access_token)) {
+                            try {
+                                $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                                if ([int]$wmtTlsProtocols -ne 0) {
+                                    [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                                }
+                            }
+                            catch {}
+                            $token = [string]$creds.access_token
+                            $headers = @{
+                                "Authorization" = "Bearer $token"
+                                "User-Agent"    = "Windows-Maintenance-Tool"
+                            }
+                            $page = 1
+                            $totalPages = 1
+                            while ($page -le $totalPages -and $page -le 50) {
+                                $url = "https://embed.gog.com/account/getFilteredProducts?mediaType=1&page=$page"
+                                $resp = Invoke-RestMethod -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+                                if (-not $resp) { break }
+                                if ($resp.totalPages) { $totalPages = [int]$resp.totalPages }
+                                if ($resp.products) {
+                                    foreach ($prod in @($resp.products)) {
+                                        $title = [string]$prod.title
+                                        if ([string]::IsNullOrWhiteSpace($title)) { continue }
+                                        $result.Add([PSCustomObject]@{
+                                                Provider = "gogdl"
+                                                Title    = $title
+                                                Id       = [string]$prod.id
+                                                Version  = [string]$prod.version
+                                                Source   = "gogdl"
+                                                Kind     = "Library"
+                                            })
+                                    }
+                                }
+                                $page++
+                            }
+                        }
+                    }
+
+                    $arr = $result.ToArray()
+                    if ($arr.Count -gt 0 -or -not (Test-Path -LiteralPath $GogCacheFile -PathType Leaf)) {
+                        Set-WmtJsonCacheFile -Path $GogCacheFile -InputObject $arr -Depth 3
+                        Write-Output "LOG:GOG library cached: $($arr.Count) games."
+                    }
+                    else {
+                        Write-Output "LOG:GOG library refresh returned no games; keeping the existing cache."
+                    }
+                }
+                catch {
+                    Write-Output "LOG:GOG library cache failed: $($_.Exception.Message)"
+                }
+            }
+
+            # --- Fetch PyPI index (inline, self-contained) ---
+            if ($DoPypi) {
+                try {
+                    Write-Output "LOG:Fetching PyPI package index..."
+                    try {
+                        $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                        if ([int]$wmtTlsProtocols -ne 0) {
+                            [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                        }
+                    }
+                    catch {}
+                    $headers = @{
+                        "Accept"     = "application/vnd.pypi.simple.v1+json"
+                        "User-Agent" = "Windows-Maintenance-Tool"
+                    }
+                    $resp = Invoke-RestMethod -Uri "https://pypi.org/simple/" -Headers $headers -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+                    if ($resp -and $resp.projects) {
+                        $names = @($resp.projects | ForEach-Object { [string]$_.name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                        if ($names.Count -gt 0 -or -not (Test-Path -LiteralPath $PypiCacheFile -PathType Leaf)) {
+                            Set-WmtJsonCacheFile -Path $PypiCacheFile -InputObject $names -Depth 1
+                            Write-Output "LOG:PyPI index cached: $($names.Count) packages."
+                        }
+                        else {
+                            Write-Output "LOG:PyPI index refresh returned no packages; keeping the existing cache."
+                        }
+                    }
+                }
+                catch {
+                    Write-Output "LOG:PyPI index fetch failed: $($_.Exception.Message)"
+                }
+            }
+            # --- Fetch Steam library (inline, self-contained) ---
+            if ($DoSteam) {
+                try {
+                    Write-Output "LOG:Fetching Steam library..."
+
+                    # Reuse the same Steam helper layer as update and library scans.
+                    $steamInstall = @(Get-WmtSteamInstallRoots | Select-Object -First 1)[0]
+                    if ($steamInstall) {
+                        $installedApps=@{}
+                        foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
+                            $installedApps[[string]$manifest.Id]=@{ Name=[string]$manifest.Name; BuildId=[string]$manifest.BuildId }
+                        }
+                        $ownedIds=[System.Collections.Generic.List[string]]::new()
+                        foreach ($aid in @(Get-WmtSteamOwnedAppIds -SteamRoot $steamInstall)) {
+                            if (-not [string]::IsNullOrWhiteSpace([string]$aid) -and -not $ownedIds.Contains([string]$aid)) { [void]$ownedIds.Add([string]$aid) }
+                        }
+
+                        # Resolve names for ALL apps using the GitHub-hosted Steam app ID
+                        # list (single download, ~17MB for games + ~7.5MB for DLC).
+                        # This is much faster than per-app API calls and contains every
+                        # Steam app ever. Cached in steam_applist.json with 7-day expiry.
+                        $appNames = @{}
+                        $appListFile = $SteamAppListFile
+
+                        # Check if we need to download the app list.
+                        $needAppList = $true
+                        if (Test-Path -LiteralPath $appListFile -PathType Leaf) {
+                            try {
+                                $aAge = (Get-Date) - (Get-Item -LiteralPath $appListFile).LastWriteTime
+                                if ($aAge.TotalDays -lt 7) { $needAppList = $false }
+                            }
+                            catch {}
+                        }
+
+                        if ($needAppList) {
+                            try {
+                                try {
+                                    $wmtTlsProtocols = [Net.ServicePointManager]::SecurityProtocol
+                                    if ([int]$wmtTlsProtocols -ne 0) {
+                                        [Net.ServicePointManager]::SecurityProtocol = $wmtTlsProtocols -bor [Net.SecurityProtocolType]::Tls12
+                                    }
+                                }
+                                catch {}
+                                Write-Output "LOG:Downloading Steam app ID list..."
+
+                                # Download games list.
+                                $gamesUrl = "https://raw.githubusercontent.com/jsnli/steamappidlist/master/data/games_appid.json"
+                                $gamesResp = Invoke-RestMethod -Uri $gamesUrl -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+
+                                # Download DLC list.
+                                $dlcUrl = "https://raw.githubusercontent.com/jsnli/steamappidlist/master/data/dlc_appid.json"
+                                $dlcResp = Invoke-RestMethod -Uri $dlcUrl -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+
+                                # Build appNames hashtable from both lists.
+                                $allApps = [System.Collections.Generic.List[object]]::new()
+                                if ($gamesResp) {
+                                    foreach ($e in @($gamesResp)) {
+                                        $ea = [string]$e.appid
+                                        $en = [string]$e.name
+                                        if (-not [string]::IsNullOrWhiteSpace($ea) -and -not [string]::IsNullOrWhiteSpace($en)) {
+                                            $appNames[$ea] = $en
+                                            [void]$allApps.Add([PSCustomObject]@{ appid = $ea; name = $en })
+                                        }
+                                    }
+                                }
+                                if ($dlcResp) {
+                                    foreach ($e in @($dlcResp)) {
+                                        $ea = [string]$e.appid
+                                        $en = [string]$e.name
+                                        if (-not [string]::IsNullOrWhiteSpace($ea) -and -not [string]::IsNullOrWhiteSpace($en) -and -not $appNames.ContainsKey($ea)) {
+                                            $appNames[$ea] = $en
+                                            [void]$allApps.Add([PSCustomObject]@{ appid = $ea; name = $en })
+                                        }
+                                    }
+                                }
+
+                                # Preserve a previously good app list if a transient refresh
+                                # produces no usable rows.
+                                $allAppsArray = $allApps.ToArray()
+                                if ($allAppsArray.Count -gt 0 -or -not (Test-Path -LiteralPath $appListFile -PathType Leaf)) {
+                                    Set-WmtJsonCacheFile -Path $appListFile -InputObject $allAppsArray -Depth 1
+                                    Write-Output "LOG:Steam app list cached: $($appNames.Count) apps."
+                                }
+                                else {
+                                    Write-Output "LOG:Steam app list refresh returned no apps; keeping the existing cache."
+                                }
+                            }
+                            catch {
+                                Write-Output "LOG:Steam app list download failed: $($_.Exception.Message)"
+                            }
+                        }
+                        else {
+                            # Load from existing cache.
+                            try {
+                                $alT = [System.IO.File]::ReadAllText($appListFile)
+                                $al = $alT | ConvertFrom-Json -ErrorAction Stop
+                                if ($al) {
+                                    foreach ($e in @($al)) {
+                                        $ea = [string]$e.appid
+                                        $en = [string]$e.name
+                                        if (-not [string]::IsNullOrWhiteSpace($ea) -and -not [string]::IsNullOrWhiteSpace($en)) {
+                                            $appNames[$ea] = $en
+                                        }
+                                    }
+                                }
+                            }
+                            catch {}
+                        }
+
+                        # Build result.
+                        $sResult = [System.Collections.Generic.List[object]]::new()
+                        $sSeen = @{}
+                        if ($ownedIds.Count -gt 0) {
+                            foreach ($aid in $ownedIds) {
+                                if ($sSeen.ContainsKey($aid)) { continue }
+                                $sSeen[$aid] = $true
+                                if ($installedApps.ContainsKey($aid)) {
+                                    $info = $installedApps[$aid]
+                                    $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = [string]$info.Name; Id = $aid; Version = [string]$info.BuildId; Source = "steam"; Kind = "Library"; IsInstalled = $true; InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" } })
+                                }
+                                else {
+                                    $n = if ($appNames.ContainsKey($aid)) { $appNames[$aid] } else { "Steam App $aid" }
+                                    $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = $n; Id = $aid; Version = ""; Source = "steam"; Kind = "Library"; IsInstalled = $false; InstalledVersion = "Not installed" })
+                                }
+                            }
+                        }
+                        else {
+                            foreach ($aid in @($installedApps.Keys)) {
+                                if ($sSeen.ContainsKey($aid)) { continue }
+                                $sSeen[$aid] = $true
+                                $info = $installedApps[$aid]
+                                $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = [string]$info.Name; Id = $aid; Version = [string]$info.BuildId; Source = "steam"; Kind = "Library"; IsInstalled = $true; InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" } })
+                            }
+                        }
+                        $steamArray = $sResult.ToArray()
+                        if ($steamArray.Count -gt 0 -or -not (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
+                            Set-WmtJsonCacheFile -Path $SteamCacheFile -InputObject $steamArray -Depth 3
+                            Write-Output "LOG:Steam library cached: $($sResult.Count) games."
+                        }
+                        else {
+                            Write-Output "LOG:Steam library refresh returned no games; keeping the existing cache."
+                        }
+                    }
+                    else {
+                        Write-Output "LOG:Steam install not found."
+                    }
+                }
+                catch {
+                    Write-Output "LOG:Steam library cache failed: $($_.Exception.Message)"
+                }
+            }
+        }).AddArgument($needLeg).AddArgument($needGog).AddArgument($legendaryExe).AddArgument($legFile).AddArgument($gogAuthPath).AddArgument($gogFile).AddArgument($needPypi).AddArgument($pypiFile).AddArgument($needSteam).AddArgument($steamFile).AddArgument($steamAppFile)
+
+    $script:WmtLibraryCacheRunspace = $ps
+    $script:WmtLibraryCacheAsyncResult = $ps.BeginInvoke()
+
+    # Collect completion through the shared UI poller rather than allocating a
+    # dedicated DispatcherTimer for this one background job.
+    Register-WmtUiPollOperation -Name "LibraryCacheBuilder" -IntervalMs 1000 -TimeoutMs 1800000 `
+        -TestComplete { $script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult.IsCompleted } `
+        -OnComplete {
+            try {
+                $results = $script:WmtLibraryCacheRunspace.EndInvoke($script:WmtLibraryCacheAsyncResult)
+                foreach ($line in @($results)) {
+                    if ($line -is [string] -and $line.StartsWith("LOG:")) { Write-GuiLog ($line.Substring(4)) }
+                }
+                foreach ($workerError in $script:WmtLibraryCacheRunspace.Streams.Error) {
+                    Write-GuiLog "Library cache worker error: $workerError | $($workerError.ScriptStackTrace)"
+                }
+            }
+            catch {
+                Write-GuiLog "Library cache build finalization failed: $($_.Exception.Message) | $($_.ScriptStackTrace)"
+            }
+            finally {
+                try { $script:WmtLibraryCacheRunspace.Dispose() } catch {}
+                $script:WmtLibraryCacheRunspace = $null
+                $script:WmtLibraryCacheAsyncResult = $null
+            }
+            # Always refresh the in-memory library snapshot when provider caches
+            # finish. Otherwise a scan preloaded before Legendary/GOGDL completed
+            # remains stale and opening Your Library later can keep showing zero
+            # provider games until another manual refresh.
+            try { Start-WmtLibraryScan -Silent } catch {}
+        } `
+        -OnTimeout {
+            Write-GuiLog "Library cache refresh timed out after 30 minutes; stopping worker."
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library cache refresh timed out; stopping..." }
+            $active = $script:WmtLibraryCacheRunspace
+            if ($active) {
+                Stop-WmtPowerShellInvocationAsync -PowerShell $active -Invocation $script:WmtLibraryCacheAsyncResult -Name "Library cache timeout"
+            }
+            # Keep the references until the invocation has actually stopped.
+            Register-WmtUiPollOperation -Name "LibraryCacheBuilderStop" -IntervalMs 1000 `
+                -TestComplete { $script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult.IsCompleted } `
+                -OnComplete {
+                    $script:WmtLibraryCacheRunspace = $null
+                    $script:WmtLibraryCacheAsyncResult = $null
+                    if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library cache refresh timed out. Retry Refresh." }
+                } | Out-Null
+        } `
+        -OnError {
+            param($operation, $errorRecord)
+            Write-GuiLog "Library cache watcher failed: $errorRecord"
+            if ($lblLibraryStatus) { $lblLibraryStatus.Text = "Library cache watcher failed. Restart WMT to retry." }
+            if ($script:WmtLibraryCacheRunspace) {
+                Stop-WmtPowerShellInvocationAsync -PowerShell $script:WmtLibraryCacheRunspace -Invocation $script:WmtLibraryCacheAsyncResult -Name "Library cache watcher failure"
+            }
+        } | Out-Null
+}
+catch {
+    Write-GuiLog "Library cache builder failed to start: $($_.Exception.Message)"
+}
+}
+
+# Kick off the background library cache builder shortly after the window opens.
+$script:bootCacheTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:bootCacheTimer.Interval = [TimeSpan]::FromSeconds(2)
+$script:bootCacheTimer.Add_Tick({
+    try { $script:bootCacheTimer.Stop() } catch {}
+    if (-not (Test-WmtAggressiveTrayMemoryMode)) {
+        Sync-WmtCompactRecompressWorker
+        Start-WmtLibraryCacheBuilder
+    }
+    $script:bootCacheTimer = $null
+})
+$script:bootCacheTimer.Start()
+
+$onMainWindowClosing = {
+param($s, $e)
+
+if (-not $script:WmtAllowFinalClose -and (Get-WmtRunInTrayOnClose)) {
+    try {
+        if (Initialize-WmtTrayIcon -Window $window) {
+            if ($e) { $e.Cancel = $true }
+            $script:WmtHiddenToTray = $true
+            $window.ShowInTaskbar = $false
+            $window.Hide()
+            if (Get-WmtReduceRamInTray) {
+                Enter-WmtAggressiveTrayMode
+            }
+            Show-WmtTrayHiddenBalloon
+            Write-GuiLog "WMT hidden to the system tray. Background update scans will continue. Left-click the tray icon to reopen, or right-click it to exit."
+            return
+        }
+    }
+    catch {
+        Write-GuiLog "Tray close fallback failed: $($_.Exception.Message)"
+    }
+}
+
+# Cancel any ongoing scan without blocking the WPF close callback.
+if ($script:ActiveScans) {
+    $closingScans = @($script:ActiveScans)
+    $script:ActiveScans.Clear()
+    foreach ($task in $closingScans) {
+        try {
+            if ($task -and $task.PowerShell) {
+                Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan shutdown"
+            }
+        }
+        catch {}
+    }
+}
+if ($script:ScanTimer) { $script:ScanTimer.Stop() }
+if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() }
+Stop-WmtUpdateAutoScanTimer
+Stop-WmtTrayMemoryTimer
+Stop-WmtCleanerDefinitionRefreshTimer
+Stop-WmtCleanerAutoCleanTimer
+Remove-WmtTrayIcon
+Stop-WmtNotificationFallbackTimers
+try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
+$closingWingetPs = $script:WingetJob
+$closingWingetAsync = $script:WingetAsyncResult
+$script:WingetJob = $null
+$script:WingetAsyncResult = $null
+if ($closingWingetPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingWingetPs -Invocation $closingWingetAsync -Name "Package action shutdown" } catch {} }
+$script:WingetOutputQueue = $null
+Stop-WmtStartupBackgroundPreload
+try { Unregister-WmtUiPollOperation -Name "WingetSourcePreflight" } catch {}
+$closingPreflightPs = $script:WingetSourcePreflightRunspace
+$closingPreflightAsync = $script:WingetSourcePreflightAsyncResult
+$script:WingetSourcePreflightRunspace = $null
+$script:WingetSourcePreflightAsyncResult = $null
+if ($closingPreflightPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingPreflightPs -Invocation $closingPreflightAsync -Name "Winget source preflight shutdown" } catch {} }
+Stop-FirewallRuleLoad
+Stop-FirewallDetailLoad
+if ($script:WmtPeriodicMemoryTrimTimer) { try { $script:WmtPeriodicMemoryTrimTimer.Stop() } catch {}; $script:WmtPeriodicMemoryTrimTimer = $null }
+Stop-MyDeviceSectionJobs
+Stop-WmtDnsRunspaces
+# Clean up search runspace + timer (in-flight package searches)
+if ($script:SearchTimer) { try { $script:SearchTimer.Stop() } catch {} }
+$closingSearchPs = $script:AsyncPowerShell
+$closingSearchAsync = $script:AsyncSearch
+$script:AsyncPowerShell = $null
+$script:AsyncSearch = $null
+if ($closingSearchPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingSearchPs -Invocation $closingSearchAsync -Name "Package search shutdown" } catch {} }
+# Clean up tweak states background preload
+try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
+$closingTweakPs = $script:TweakStatesBgPS
+$closingTweakAsync = $script:TweakStatesBgAsync
+$script:TweakStatesBgPS = $null
+$script:TweakStatesBgAsync = $null
+if ($closingTweakPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingTweakPs -Invocation $closingTweakAsync -Name "Tweak preload shutdown" } catch {} }
+
+if ($script:WmtRegistryCleanupTimer) { try { $script:WmtRegistryCleanupTimer.Stop() } catch {}; $script:WmtRegistryCleanupTimer = $null }
+$closingRegistryPs = $script:WmtRegistryCleanupPowerShell
+$closingRegistryAsync = $script:WmtRegistryCleanupAsync
+$closingRegistryRunspace = $script:WmtRegistryCleanupRunspace
+$script:WmtRegistryCleanupPowerShell = $null
+$script:WmtRegistryCleanupRunspace = $null
+$script:WmtRegistryCleanupAsync = $null
+$script:WmtRegistryCleanupSync = $null
+$script:WmtRegistryCleanupActive = $false
+if ($closingRegistryPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingRegistryPs -Invocation $closingRegistryAsync -Runspace $closingRegistryRunspace -Name "Registry cleanup shutdown" } catch {} }
+
+try { Unregister-WmtUiPollOperation -Name "BitLockerStatus" } catch {}
+$closingBitLockerPs = $script:BitLockerStatusRunspace
+$closingBitLockerAsync = $script:BitLockerStatusAsyncResult
+$script:BitLockerStatusRunspace = $null
+$script:BitLockerStatusAsyncResult = $null
+if ($closingBitLockerPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingBitLockerPs -Invocation $closingBitLockerAsync -Name "BitLocker status shutdown" } catch {} }
+
+# Do not synchronously close active runspace pools during the WPF close callback.
+Stop-WmtUiPoller
+
+try {
+    $settings = Get-WmtSettings
+    $settings.Theme = $script:CurrentTheme
+    $settings.WindowState = [string]$window.WindowState
+
+    $rb = if ($window.WindowState -eq [System.Windows.WindowState]::Normal) { $null } else { $window.RestoreBounds }
+    if ($rb) {
+        $settings.WindowBounds = @{
+            Top    = [double]$rb.Top
+            Left   = [double]$rb.Left
+            Width  = [double]$rb.Width
+            Height = [double]$rb.Height
+        }
+    }
+    else {
+        $settings.WindowBounds = @{
+            Top    = [double]$window.Top
+            Left   = [double]$window.Left
+            Width  = [double]$window.Width
+            Height = [double]$window.Height
+        }
+    }
+    Save-WmtSettings -Settings $settings
+}
+catch {}
+}
+[void]$window.Add_Closing($onMainWindowClosing)
+
+$onMainWindowClosed = {
+try { Remove-WmtTrayIcon } catch {}
+try { Stop-WmtNotificationFallbackTimers } catch {}
+try {
+    $closedLibraryCachePs = $script:WmtLibraryCacheRunspace
+    $closedLibraryCacheAsync = $script:WmtLibraryCacheAsyncResult
+    $script:WmtLibraryCacheRunspace = $null
+    $script:WmtLibraryCacheAsyncResult = $null
+    if ($closedLibraryCachePs) { Start-WmtPowerShellCleanupDetached -PowerShell $closedLibraryCachePs -Invocation $closedLibraryCacheAsync -Name "Library cache shutdown" }
+}
+catch {}
+try {
+    $closedLibraryScanPs = $script:WmtLibraryScanRunspace
+    $closedLibraryScanAsync = $script:WmtLibraryScanAsyncResult
+    $script:WmtLibraryScanRunspace = $null
+    $script:WmtLibraryScanAsyncResult = $null
+    if ($closedLibraryScanPs) { Start-WmtPowerShellCleanupDetached -PowerShell $closedLibraryScanPs -Invocation $closedLibraryScanAsync -Name "Library scan shutdown" }
+}
+catch {}
+try { if ($script:WmtTaskBatchTimer) { $script:WmtTaskBatchTimer.Stop(); $script:WmtTaskBatchTimer = $null } } catch {}
+try {
+    $closedTaskBatchPs = $script:WmtTaskBatchPs
+    $closedTaskBatchAsync = $script:WmtTaskBatchAsync
+    $script:WmtTaskBatchPs = $null
+    $script:WmtTaskBatchAsync = $null
+    if ($closedTaskBatchPs) { Start-WmtPowerShellCleanupDetached -PowerShell $closedTaskBatchPs -Invocation $closedTaskBatchAsync -Name "Scheduled task batch shutdown" }
+}
+catch {}
+try {
+    $closedTaskViewPs = $script:WmtTaskViewPs
+    $closedTaskViewAsync = $script:WmtTaskViewAsync
+    $script:WmtTaskViewPs = $null
+    $script:WmtTaskViewAsync = $null
+    if ($closedTaskViewPs) { Start-WmtPowerShellCleanupDetached -PowerShell $closedTaskViewPs -Invocation $closedTaskViewAsync -Name "Scheduled task view shutdown" }
+}
+catch {}
+try { if ($script:WmtLibrarySearchTimer) { $script:WmtLibrarySearchTimer.Stop(); $script:WmtLibrarySearchTimer = $null } } catch {}
+try { if ($script:StatsTimer) { $script:StatsTimer.Stop(); $script:StatsTimer = $null } } catch {}
+try { Unregister-WmtUiPollOperation -Name "SelfUpdateCheck"; $script:UpdateTimer = $null } catch {}
+try { if ($script:WmtProviderMgrLibrarySearchTimer) { $script:WmtProviderMgrLibrarySearchTimer.Stop(); $script:WmtProviderMgrLibrarySearchTimer = $null } } catch {}
+try {
+    if ($script:bootCacheTimer) {
+        try { $script:bootCacheTimer.Stop() } catch {}
+        $script:bootCacheTimer = $null
+    }
+}
+catch {}
+try { Stop-WmtSingleInstanceActivationListener } catch {}
+try { if ($script:WmtSingleInstanceActivationEvent) { $script:WmtSingleInstanceActivationEvent.Dispose() } } catch {}
+try {
+    if ($script:WmtSingleInstanceMutexOwned -and $script:WmtSingleInstanceMutex) {
+        $script:WmtSingleInstanceMutex.ReleaseMutex()
+    }
+}
+catch {}
+try { if ($script:WmtSingleInstanceMutex) { $script:WmtSingleInstanceMutex.Dispose() } } catch {}
+$script:WmtSingleInstanceActivationEvent = $null
+$script:WmtSingleInstanceMutex = $null
+$script:WmtSingleInstanceMutexOwned = $false
+try {
+    $app = $script:WmtApplication
+    if (-not $app) { $app = [System.Windows.Application]::Current }
+    if ($app) { $app.Shutdown() }
+}
+catch {}
+}
+[void]$window.Add_Closed($onMainWindowClosed)
+
+# Show the Window.
+# Use a real WPF Application message loop instead of ShowDialog().
+# ShowDialog() can unwind after a modal window is hidden, which leaves a stale tray icon that vanishes when clicked.
+try {
+$ErrorActionPreference = 'Stop'
+$script:WmtApplication = [System.Windows.Application]::Current
+if (-not $script:WmtApplication) {
+    $script:WmtApplication = New-Object System.Windows.Application
+}
+if (-not $script:WmtApplication) {
+    throw [System.ApplicationException]::new('Failed to create WPF Application object. Check that PresentationFramework is loaded.')
+}
+$ErrorActionPreference = 'SilentlyContinue'
+
+if ($script:WmtDispatcherUnhandledHandler) {
+    try { $script:WmtApplication.remove_DispatcherUnhandledException($script:WmtDispatcherUnhandledHandler) } catch {}
+}
+$script:WmtDispatcherUnhandledHandler = [System.Windows.Threading.DispatcherUnhandledExceptionEventHandler] {
+    param($s, $e)
+
+    try { $e.Handled = $true } catch {}
+    try {
+        Write-WmtLastCrash -Context "Unhandled WPF dispatcher exception" -Exception $e.Exception
+        if ($script:WingetJob -or $script:WingetActiveAction) {
+            Reset-WmtUpdateUiAfterMonitorError -Context "Unhandled WPF dispatcher exception" -Exception $e.Exception -SkipCrashWrite
+        }
+    }
+    catch {}
+}
+$script:WmtApplication.add_DispatcherUnhandledException($script:WmtDispatcherUnhandledHandler)
+
+$script:WmtApplication.ShutdownMode = [System.Windows.ShutdownMode]::OnLastWindowClose
+$script:WmtApplication.MainWindow = $window
+[void]$script:WmtApplication.Run($window)
+}
+catch {
+Write-WmtLastCrash -Context "WMT application loop failed" -Exception $_.Exception -ErrorRecord $_
+Write-Warning "WMT application loop failed: $($_.Exception.Message)"
+}
+) {
+        throw "Unrecognized feature state '$state' for $dn; no changes were made."
+    }
+    $disable = ($state -eq "Enabled")
+    $cmdlet = if ($disable) { "Disable-WindowsOptionalFeature" } else { "Enable-WindowsOptionalFeature" }
+    if (Get-Command $cmdlet -ErrorAction SilentlyContinue) {
+        if ($disable) {
+            Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
+        } else {
+            Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
+        }
+    } else {
+        # Query must have succeeded before fallback; execution must also succeed.
+        $args = if ($disable) { @("/Online", "/Disable-Feature", "/FeatureName:$fn", "/NoRestart") } else {
+            @("/Online", "/Enable-Feature", "/FeatureName:$fn", "/All", "/NoRestart")
+        }
+        & dism.exe @args | Out-Null
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+            throw "DISM could not change $dn (exit code $LASTEXITCODE)."
+        }
+    }
+    Write-Output "$(if ($disable) { 'Disabled' } else { 'Enabled' }): $dn"
 } -ArgumentList $FeatureName, $DisplayName, $kind, $targetName -OnComplete $done | Out-Null
 }
 
