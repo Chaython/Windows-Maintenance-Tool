@@ -108,8 +108,10 @@ v6.8 updates WMT's software catalogue, game import/recovery, system tweaks, driv
 
 ### Drivers and Windows tweaks
 
-- Restored the fast, local **disconnected/ghost-device scan** instead of the slower isolated child-process scanner that could remain stuck on "Starting disconnected device scan." Retained connected-device checks before removal and refreshed the full-width, themed review dialog.
+- Retained fast disconnected/ghost-device enumeration but moved it off the WPF thread to a background worker. Connected-device checks still run before removal, and the full-width review dialog is retained.
 - Improved the layout of the old-driver cleanup, driver export, and driver backup/restore dialogs, including more consistent edge-to-edge lists and controls.
+- **Preload driver inventory on startup**, after initial system checks. Package enumeration and the slower device/service usage check run in separate background phases, with deferred runspace retries.
+- **Reuse the completed Drivers inventory in Clean Old Drivers**, including protections for service/filter drivers; no redundant `pnputil` enumeration just to open cleanup. After removals, update the cached rows in place and recheck only device usage when necessary. Deletion still verifies live usage.
 - Added a **Windows pagefile** configuration tweak with detection of current settings, safe saved-state restoration, rollback/error handling, and handling for empty `REG_MULTI_SZ` values. Pagefile changes may require a restart before they take effect.
 
 ### Logging, shortcuts, and release security
@@ -308,12 +310,12 @@ Quick Find is in the left sidebar above the navigation buttons (without an extra
 - Inventory third-party packages staged in the Windows Driver Store.
 - Show package status including **In Use**, **Old**, **Unattached**, and **Inactive** with device-usage context.
 - Search/filter drivers by status, class, provider, file name, and related metadata.
-- Reload/rescan the driver list with caching to avoid unnecessary repeated work.
+- Preload the driver list at startup when Background Jobs are enabled, reuse cached rows on tab visits, and retry the device-usage phase without re-enumerating packages. Use **Reload** for an explicit full refresh.
 - Export installed drivers and selected categories.
 - Restore drivers from backup.
 - Generate detailed driver reports.
 - Remove ghost devices.
-- Clean old/superseded duplicate driver packages with safety checks for unknown/in-use devices.
+- Clean old/superseded driver packages from the shared inventory, protecting packages used by PnP devices or installed driver services. Backups, confirmation prompts and live pre-deletion usage checks remain in place.
 - Enable/disable Windows automatic driver updates and device metadata downloads.
 - Open external research/update checks for selected drivers, including Microsoft Update Catalog and VirusTotal where supported by the UI.
 - Driver backup/cleanup and `pnputil` operations are moved off the WPF thread where possible.
