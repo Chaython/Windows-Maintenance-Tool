@@ -37865,6 +37865,11 @@ function Restore-WmtQuickFindButtons {
         }
         $button = $record.Button
         $parent = $record.Parent
+        if ($button.Parent -and $button.Parent -ne $parent -and
+            $button.Parent -isnot [System.Windows.Controls.Panel]) {
+            [void]$pending.Add($record)
+            continue
+        }
         $placeholder = $record.Placeholder
         $restored = $false
         $quickFindHost = if ($button.Parent -is [System.Windows.Controls.Panel] -and $button.Parent -ne $parent) { $button.Parent } else { $null }
@@ -37960,6 +37965,10 @@ function Add-WmtQuickFindOriginalButton {
         $originalParent.Children.Insert($index, $placeholder)
         if ($inheritedContext) { $Button.DataContext = $originalContext }
         [void]$DestinationPanel.Children.Add($Button)
+        # Never expose an action that becomes enabled solely by leaving its native container.
+        if (-not $originalEnabled -or -not $Button.IsEnabled) {
+            throw "Tool enabled state changed during Quick Find relocation."
+        }
         [void]$script:WmtQuickFindMovedButtons.Add([PSCustomObject]@{
             Button = $Button; Parent = $originalParent; Index = $index
             Placeholder = $placeholder; InheritedDataContext = $inheritedContext
@@ -38028,6 +38037,9 @@ function Update-WmtQuickFindResults {
         return
     }
     $script:WmtQuickFindUpdating = $true
+    # A search refresh must not steal typing focus or move the caret.
+    $searchHadFocus = [bool]$txtGlobalSearch.IsKeyboardFocusWithin
+    $searchCaret = if ($searchHadFocus) { $txtGlobalSearch.CaretIndex } else { -1 }
     try {
     Restore-WmtQuickFindButtons
     if ($script:WmtQuickFindMovedButtons.Count -gt 0) {
@@ -38048,13 +38060,8 @@ function Update-WmtQuickFindResults {
     $seen = @{}
     foreach ($entry in $script:WmtSearchIndexEntries) {
         if (-not $entry) { continue }
-        $liveTooltip = ""
-        try { if ($entry.Item.Button.ToolTip -is [string]) { $liveTooltip = [string]$entry.Item.Button.ToolTip } } catch {}
-        $entry.Description = $liveTooltip
-        $entry.SearchText = "$($entry.Text) $liveTooltip"
-        if ($entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-        # Dynamic pages can replace controls after the index was built. Resolve
-        # the current named instance instead of hosting a detached stale button.
+        # Dynamic pages can replace controls after indexing. Resolve the live
+        # named instance before reading tooltip and applying the search filter.
         $name = [string]$entry.Item.Button.Name
         # Get-Ctrl uses a persistent cache, which can point to replaced controls.
         # Prefer the live namescope and only fall back to a still-attached control.
@@ -38063,6 +38070,11 @@ function Update-WmtQuickFindResults {
             $current = $entry.Item.Button
         }
         if (-not $current -or $current -isnot [System.Windows.Controls.Button] -or -not $current.Parent) { continue }
+        $liveTooltip = ""
+        try { if ($current.ToolTip -is [string]) { $liveTooltip = [string]$current.ToolTip } } catch {}
+        $entry.Description = $liveTooltip
+        $entry.SearchText = "$($entry.Text) $liveTooltip"
+        if ($entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         $script:WmtControlCache[$name] = $current
         if (-not [object]::ReferenceEquals($current, $entry.Item.Button)) {
             $entry.Item.Button = $current
@@ -38203,7 +38215,13 @@ function Update-WmtQuickFindResults {
         try { $lblQuickFindSummary.Text = "Quick Find could not render this search. Please refine your query." } catch {}
         try { Write-GuiLog "[Quick Find] Failed to render tool buttons: $($_.Exception.Message)" } catch {}
     }
-    finally { $script:WmtQuickFindUpdating = $false }
+    finally {
+        $script:WmtQuickFindUpdating = $false
+        if ($searchHadFocus -and $pnlQuickFind.IsVisible -and -not $txtGlobalSearch.IsKeyboardFocusWithin) {
+            [void]$txtGlobalSearch.Focus()
+            $txtGlobalSearch.CaretIndex = [Math]::Min($searchCaret, $txtGlobalSearch.Text.Length)
+        }
+    }
 }
 $script:WmtQuickFindRenderTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:WmtQuickFindRenderTimer.Interval = [TimeSpan]::FromMilliseconds(220)
