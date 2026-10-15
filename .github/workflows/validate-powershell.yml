@@ -353,7 +353,12 @@ jobs:
               $preload -notmatch 'Start-DriverListLoad') {
               throw 'Driver inventory preloading, cache reuse or fail-closed usage scanning regressed.'
           }
-          Write-Host 'PASS: driver inventory preloading and verified cache reuse.'
+          if ($cleanup -notmatch 'DriverServiceMap.Keys' -or
+              $cleanup -notmatch 'if \(-not \$script:DriverLoadInProgress\) \{ Start-DriverListLoad \}' -or
+              (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Start-DriverUsageLoad -Infs \$usageInfs') {
+              throw 'Clean Old Drivers lost service-only protection or shared inventory reuse.'
+          }
+          Write-Host 'PASS: verified driver inventory and service-only cleanup safety.'
           $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
           if ($ghostDialog -notmatch 'GhostDeviceScan_' -or
               $ghostDialog -notmatch 'Invoke-WmtUiBackgroundCommand' -or
@@ -401,7 +406,9 @@ jobs:
           if ($dialogText.Value -match 'WmtGhostScan_|\$ghostScanScript|Starting disconnected.device scan') {
               throw 'Broken child scanner was reintroduced in the ghost dialog.'
           }
-          if ($dialogText.Value -notmatch 'Get-WmtGhostDeviceCandidates' -or $dialogText.Value -notmatch 'Get-PnpDevice -PresentOnly -ErrorAction Stop') {
+          if ($dialogText.Value -notmatch 'Get-PnpDevice -ErrorAction Stop' -or
+    $dialogText.Value -notmatch 'GhostDeviceScan_' -or
+    $dialogText.Value -notmatch 'Get-PnpDevice -PresentOnly -ErrorAction Stop') {
               throw 'Fast scanning or pre-removal connected-device verification missing.'
           }
           $themedHeaderBands = [regex]::Matches($source,
