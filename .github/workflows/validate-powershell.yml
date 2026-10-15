@@ -416,6 +416,62 @@ jobs:
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
+      - name: Smoke test driver-service removal guard
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $fn = $ast.Find({
+              param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $n.Name -eq 'Get-WmtDriverCleanupUsage'
+          }, $true)
+          if (-not $fn) { throw 'Targeted driver-usage verification is missing.' }
+          Invoke-Expression $fn.Extent.Text
+          # Avoid driver-store mutations. Mock the CIM and INF reads but leave
+          # the real read-only SYSTEM\CurrentControlSet\Services registry check.
+          function Get-CimInstance {
+              [CmdletBinding()]
+              param([string]$ClassName, [string]$Property, [string]$Filter, [int]$OperationTimeoutSec)
+              [PSCustomObject]@{ InfName = 'oem17.inf' }
+          }
+          function Test-Path {
+              [CmdletBinding()]
+              param([string]$LiteralPath, [string]$PathType)
+              return $true
+          }
+          function Get-Content {
+              [CmdletBinding()]
+              param([string]$LiteralPath)
+              'AddService = Tcpip, 0x00000002, Tcpip_Service'
+          }
+          $usage = Get-WmtDriverCleanupUsage -PublishedName 'oem17.inf'
+          if (-not $usage.Succeeded -or
+              $usage.InUseInfs -notcontains 'oem17.inf' -or
+              $usage.RegisteredServices -notcontains 'Tcpip') {
+              throw 'Registered Windows service was not detected during targeted cleanup verification.'
+          }
+          function Get-Content {
+              [CmdletBinding()]
+              param([string]$LiteralPath)
+              'AddService = %UnresolvedSvcName%, 0x2, UnknownService'
+          }
+          $rejected = $false
+          try { $null = Get-WmtDriverCleanupUsage -PublishedName 'oem17.inf' } catch { $rejected = $true }
+          if (-not $rejected) { throw 'An unresolved AddService name was treated as safe.' }
+          function Test-Path {
+              [CmdletBinding()]
+              param([string]$LiteralPath, [string]$PathType)
+              return $false
+          }
+          $rejected = $false
+          try { $null = Get-WmtDriverCleanupUsage -PublishedName 'oem17.inf' } catch { $rejected = $true }
+          if (-not $rejected) { throw 'A missing INF was treated as safe.' }
+          Write-Host 'PASS: active driver services protected; unresolved and missing INF identities fail closed.'
+
       - name: Smoke test fast ghost-device scan and full-width dialog
         shell: powershell
         run: |
