@@ -35150,6 +35150,28 @@ if ($script:TweakButtonStatesCache) {
 }
 }
 
+# A snapshot can contain a dictionary (including the unnamed registry value
+# stored under an empty-string key) or a legacy PSObject from Read-WmtRegValuesFast.
+# Do not cast dictionaries to PSCustomObject: that rejects empty property names.
+function Get-WmtRegistrySnapshotValue {
+param(
+    $Item,
+    [string]$Name,
+    $Default = $null
+)
+if ($null -eq $Item -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
+if ($Item -is [System.Collections.IDictionary]) {
+    if ($Item.Contains($Name)) { return $Item[$Name] }
+    # Get-WmtRegValue and toggle definitions call the unnamed registry value
+    # "(Default)", whereas RegistryKey.GetValueNames() represents it as "".
+    if ($Name -eq "(Default)" -and $Item.Contains("")) { return $Item[""] }
+    return $Default
+}
+$property = $Item.PSObject.Properties[$Name]
+if ($property) { return $property.Value }
+return $Default
+}
+
 function Get-WmtRegValueCached {
 param(
     [string]$Path,
@@ -35159,8 +35181,7 @@ param(
 
 if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
 $item = Get-WmtRegistryKeyValuesCached -Path $Path
-if ($item -and $item.PSObject.Properties[$Name]) { return $item.$Name }
-return $Default
+return (Get-WmtRegistrySnapshotValue -Item $item -Name $Name -Default $Default)
 }
 
 function Get-WmtRegistryPathExists {
@@ -35280,8 +35301,7 @@ try {
         if (-not $regCache.ContainsKey($Path)) { return $Default }
 
         $item = $regCache[$Path]
-        if ($item -and $item.PSObject.Properties[$Name]) { return $item.$Name }
-        return $Default
+        return (Get-WmtRegistrySnapshotValue -Item $item -Name $Name -Default $Default)
     }.GetNewClosure()
 
     $pathChecks = $script:TweakButtonStatesPathChecks
@@ -62211,6 +62231,20 @@ catch {
             }
         }
 
+        # Preserve all registry value names, including the empty string used by
+        # the unnamed (Default) value. PSCustomObject cannot represent that key.
+        function ConvertTo-WmtRegistrySnapshotValues {
+            param([Microsoft.Win32.RegistryKey]$RegistryKey)
+            $values = @{}
+            foreach ($valueName in $RegistryKey.GetValueNames()) {
+                $values[$valueName] = $RegistryKey.GetValue(
+                    $valueName, $null,
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+                )
+            }
+            return $values
+        }
+
         $regCache = @{}
         # Distinguish missing registry keys from exceptions while reading them.
         $registryReadErrors = [System.Collections.Generic.List[string]]::new()
@@ -62227,11 +62261,7 @@ catch {
                 $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
                 $key = $baseKey.OpenSubKey($parts.SubPath, $false)
                 if ($key) {
-                    $values = @{}
-                    foreach ($valName in $key.GetValueNames()) {
-                        $values[$valName] = $key.GetValue($valName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-                    }
-                    $regCache[$path] = [PSCustomObject]$values
+                    $regCache[$path] = ConvertTo-WmtRegistrySnapshotValues -RegistryKey $key
                 } else {
                     $regCache[$path] = $null
                 }
@@ -62433,7 +62463,11 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                     Sync-WmtTweakOverlayHide
                 } else {
                     $typeInfo = if ($result) { $result.GetType().FullName } else { "null" }
-                    try { Write-GuiLog "[Tweak States] Background preload returned unexpected type: $typeInfo" } catch {}
+                    # A hashtable may have failed validation (e.g., unreadable
+                    # registry values); its type alone is not the problem.
+                    if ($result -isnot [hashtable]) {
+                        try { Write-GuiLog "[Tweak States] Background preload returned unexpected type: $typeInfo" } catch {}
+                    }
                     # Unreadable paths are not equivalent to disabled settings.
                     $script:TweakStatesReady = $false
                     $failureDetails = if ($result -is [hashtable] -and @($result.RegistryReadErrors).Count -gt 0) {
@@ -62444,6 +62478,7 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                             try { Write-GuiLog "[Tweak States] Registry read failure: $readError" } catch {}
                         }
                     }
+                    try { Write-GuiLog "[Tweak States] $failureDetails" } catch {}
                     Show-TweakStatesLoadError -Message "$failureDetails Tweaks remain blocked. Click Retry."
                 }
             }
