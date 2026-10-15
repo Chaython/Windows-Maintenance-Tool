@@ -50,9 +50,17 @@ required GitHub variables/secrets, and verification instructions. The
 proposed [SignPath artifact configuration](.signpath/artifact-configurations/default.xml)
 enforces WMT's executable metadata when approved and activated.
 
+## Download channels
+
+**Stable releases:** [Versioned GitHub releases](https://github.com/Chaython/Windows-Maintenance-Tool/releases/latest) are published manually. Only those stable releases are eligible for optional WinGet/Chocolatey updates.
+
+**Rolling prerelease:** [Latest Main preview](https://github.com/Chaython/Windows-Maintenance-Tool/releases/tag/rolling) is built automatically on pushes to Main after the executable passes the build syntax check, SHA-256 hashing and GitHub/Sigstore provenance verification. The rolling tag and its download assets are replaced with the newest successful build; **the URL remains the same but the file bytes can change**. This channel is for testing, not package-manager distribution.
+
+Both newly published channels include WindowsMaintenanceTool.exe, WindowsMaintenanceTool.exe.sha256, and WindowsMaintenanceTool.exe.sigstore.json. The rolling release notes identify the exact source commit and SHA-256. Download the EXE and bundle together, and use the documented attestation verification below. Automatic rolling builds intentionally skip SignPath's manual Authenticode approval process, even when stable-release signing is enabled.
+
 ## Verify release provenance (Sigstore / GitHub Attestations)
 
-Official EXE releases produced by the **Build PS2EXE Release** GitHub Actions workflow now include a `WindowsMaintenanceTool.exe.sigstore.json` attestation bundle and a SHA-256 checksum. The build workflow uses GitHub's public Sigstore integration to issue a short-lived signing certificate, attest the built executable, and verify its provenance before publishing. Existing releases built before this change do **not** have this attestation.
+Newly published stable and rolling EXE releases produced by the **Build PS2EXE Release** GitHub Actions workflow include a `WindowsMaintenanceTool.exe.sigstore.json` attestation bundle and a SHA-256 checksum. The build workflow uses GitHub's public Sigstore integration to issue a short-lived signing certificate, attest the built executable, and verify its provenance before publishing. Existing releases built before this change do **not** have this attestation.
 
 Install the [GitHub CLI](https://cli.github.com/) and download both `WindowsMaintenanceTool.exe` and `WindowsMaintenanceTool.exe.sigstore.json` from the *same* new release. Then run this in PowerShell from the download directory:
 
@@ -500,7 +508,7 @@ WMT stores generated data next to the script in its local `data` folder.
 <summary><strong>Development and Releases</strong></summary>
 
 - `.github/workflows/validate-powershell.yml` validates PowerShell syntax and can also be run manually.
-- `.github/workflows/release-ps2exe.yml` builds PS2EXE releases and supports manual release controls, Sigstore build attestations, and optional SignPath Authenticode signing after approval.
+- `.github/workflows/release-ps2exe.yml` automatically publishes a rolling prerelease from `Main`, and separately supports manual versioned releases, Sigstore attestations, and optional SignPath Authenticode signing for manual releases after approval.
 - Release tooling includes optional WinGet submission and Chocolatey package publication paths when the required secrets/package entries are available.
 - Long-running GUI operations are increasingly routed through shared runspace/process/polling infrastructure to keep the main WPF dispatcher responsive.
 

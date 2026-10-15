@@ -71,6 +71,10 @@ application privacy review or an assertion that no network connections occur.
    that exact final executable, then publishes release assets and optionally
    submits winget/Chocolatey updates.
 
+## Rolling prereleases
+
+The rolling prerelease is built automatically from Main and generates verified GitHub/Sigstore provenance for the final EXE. It deliberately **does not request SignPath Authenticode signing**, even after SignPath is enabled, because the configured release-signing policy requires manual maintainer approval. Rolling downloads are for testers and are never submitted to WinGet or Chocolatey. The exact source commit and binary hash for each rolling update are recorded in its release notes, even though the rolling tag/assets are updated in place.
+
 ## Verification
 
 On Windows, download the executable from the official [Releases](https://github.com/Chaython/Windows-Maintenance-Tool/releases)

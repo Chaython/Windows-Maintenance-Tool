@@ -1,6 +1,9 @@
 name: Build PS2EXE Release
 
 on:
+  push:
+    branches:
+      - Main
   workflow_dispatch:
     inputs:
       prerelease:
@@ -25,6 +28,12 @@ permissions:
   id-token: write
   attestations: write
   artifact-metadata: write
+
+# Serialize rolling publication so old and new runs cannot overwrite each other.
+# A stale run also checks the Main HEAD immediately before publishing.
+concurrency:
+  group: wmt-ps2exe-${{ github.event_name == 'push' && 'rolling-main' || format('manual-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
   build-release:
@@ -80,7 +89,7 @@ jobs:
       # SignPath Foundation approval and its GitHub App/project configuration
       # are prerequisites. Until explicitly enabled, releases remain unchanged.
       - name: Validate SignPath configuration
-        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && vars.WMT_SIGNPATH_ENABLED == 'true' }}
         shell: powershell
         env:
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -99,7 +108,7 @@ jobs:
           }
 
       - name: Upload unsigned executable to SignPath
-        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && vars.WMT_SIGNPATH_ENABLED == 'true' }}
         id: signpath_unsigned
         uses: actions/upload-artifact@v4
         with:
@@ -109,7 +118,7 @@ jobs:
           retention-days: 7
 
       - name: Sign executable with SignPath
-        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && vars.WMT_SIGNPATH_ENABLED == 'true' }}
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -124,7 +133,7 @@ jobs:
           output-artifact-directory: signpath-signed
 
       - name: Verify and adopt signed executable
-        if: ${{ vars.WMT_SIGNPATH_ENABLED == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && vars.WMT_SIGNPATH_ENABLED == 'true' }}
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -192,7 +201,100 @@ jobs:
               throw "Sigstore attestation verification failed; refusing to publish release."
           }
 
+      # Rolling builds reuse the same parse-checked PS2EXE build, checksum and
+      # verified Sigstore provenance as the manually published stable releases.
+      # SignPath requires manual approval; automatic previews stay unsigned.
+      - name: Publish rolling prerelease
+        if: github.event_name == 'push'
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA256: ${{ steps.checksum.outputs.sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "rolling"
+          $shortSha = $env:GITHUB_SHA.Substring(0, 12)
+          $title = "WMT Rolling Preview ($shortSha)"
+
+          # A newer push may have arrived while this build was in progress.
+          # Never replace the rolling release with an already-outdated build.
+          $remoteMain = & git ls-remote origin "refs/heads/Main"
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteMain)) {
+              throw "Could not check the current Main revision."
+          }
+          $currentHead = ($remoteMain -split '\s+')[0]
+          if ($currentHead -ne $env:GITHUB_SHA) {
+              Write-Host "Skipping stale rolling build $env:GITHUB_SHA; Main is now $currentHead."
+              exit 0
+          }
+
+          $notes = @"
+          Automated prerelease from Main, intended for testing. For regular installs use a versioned stable release.
+
+          Source commit: https://github.com/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA
+          Source version: $env:RELEASE_VERSION
+          SHA-256: $env:RELEASE_SHA256
+          Build run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+
+          The EXE, SHA-256 checksum and Sigstore provenance bundle are all from this build.
+          Verify: gh attestation verify .\WindowsMaintenanceTool.exe --repo $env:GITHUB_REPOSITORY --bundle .\WindowsMaintenanceTool.exe.sigstore.json --source-digest $env:GITHUB_SHA
+
+          This rolling preview is not Authenticode-signed and is not submitted to WinGet or Chocolatey.
+          "@
+          $notesPath = ".\dist\rolling-release-notes.md"
+          $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
+
+          $assets = @(
+              ".\dist\WindowsMaintenanceTool.exe",
+              ".\dist\WindowsMaintenanceTool.exe.sha256",
+              ".\dist\WindowsMaintenanceTool.exe.sigstore.json"
+          )
+
+          # Keep the same download URLs while advancing the preview to this
+          # exact verified build. Versioned tags/releases are never touched.
+          & git tag -f $tag $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Failed to prepare rolling tag." }
+          & git push --force origin "refs/tags/rolling:refs/tags/rolling"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to move rolling tag." }
+
+          $releaseApi = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          $headers = @{
+              Authorization = "Bearer $env:GITHUB_TOKEN"
+              Accept = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+              "User-Agent" = "Windows-Maintenance-Tool-rolling"
+          }
+          $releaseExists = $false
+          try {
+              Invoke-RestMethod -Uri $releaseApi -Headers $headers -UseBasicParsing -TimeoutSec 15 | Out-Null
+              $releaseExists = $true
+          }
+          catch {
+              $statusCode = $null
+              try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+              if ($statusCode -ne 404) { throw }
+          }
+
+          if ($releaseExists) {
+              & gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
+              if ($LASTEXITCODE -ne 0) { throw "Failed to replace rolling release assets." }
+              & gh release edit $tag --repo $env:GITHUB_REPOSITORY --title $title --notes-file $notesPath --prerelease --latest=false
+              if ($LASTEXITCODE -ne 0) { throw "Failed to update rolling release metadata." }
+          }
+          else {
+              $createArgs = @(
+                  "release", "create", $tag,
+                  "--repo", $env:GITHUB_REPOSITORY,
+                  "--verify-tag", "--title", $title,
+                  "--notes-file", $notesPath,
+                  "--prerelease", "--latest=false"
+              ) + $assets
+              & gh @createArgs
+              if ($LASTEXITCODE -ne 0) { throw "Failed to create rolling prerelease." }
+          }
+
       - name: Create or update GitHub release
+        if: github.event_name == 'workflow_dispatch'
         shell: powershell
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
@@ -257,7 +359,7 @@ jobs:
           }
 
       - name: Submit WinGet update
-        if: ${{ !inputs.prerelease && inputs.submit_winget }}
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.prerelease && inputs.submit_winget }}
         shell: powershell
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
@@ -294,7 +396,7 @@ jobs:
           }
 
       - name: Push Chocolatey update
-        if: ${{ !inputs.prerelease && inputs.push_chocolatey }}
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.prerelease && inputs.push_chocolatey }}
         shell: powershell
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
