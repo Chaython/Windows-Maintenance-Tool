@@ -52891,6 +52891,8 @@ $script:DriverCacheLoaded = $false
 $script:DriverCacheLoadedAt = [DateTime]::MinValue
 $script:DriverCacheTtlSeconds = 600
 $script:DriverCleanupPendingOpen = $false
+$script:DriverPoolRetryTimer = $null
+$script:DriverPoolRetryAtUtc = $null
 $script:DriverLoadInProgress = $false
 $script:DriverLoadPhase = ""
 $script:DriverLoadRunspace = $null
@@ -53289,6 +53291,34 @@ if ($script:DriverCleanupPendingOpen) {
 }
 }
 
+function Schedule-DriverPoolRetry {
+# UiSupport pool opens asynchronously. Retry without blocking the dispatcher.
+if ($script:DriverPoolRetryTimer) { return }
+if (-not $script:DriverPoolRetryAtUtc) { $script:DriverPoolRetryAtUtc = [DateTime]::UtcNow }
+if (([DateTime]::UtcNow - $script:DriverPoolRetryAtUtc).TotalSeconds -ge 20) {
+    $script:DriverPoolRetryAtUtc = $null
+    Set-DriverStatus "Driver worker is unavailable. Click Reload to retry." -Visible $true
+    Write-GuiLog "[Drivers] Background worker still unavailable after deferred retries."
+    if ($script:DriverCleanupPendingOpen) { Complete-DriverLoadState }
+    return
+}
+$retry = [System.Windows.Threading.DispatcherTimer]::new()
+$retry.Interval = [TimeSpan]::FromMilliseconds(500)
+$script:DriverPoolRetryTimer = $retry
+$retry.Add_Tick({
+    $timer = $script:DriverPoolRetryTimer
+    if ($timer) { $timer.Stop() }
+    $script:DriverPoolRetryTimer = $null
+    if (Test-WmtAggressiveTrayMemoryMode) {
+        $script:DriverPoolRetryAtUtc = $null
+        $script:DriverCleanupPendingOpen = $false
+        return
+    }
+    if (-not $script:DriverLoadInProgress) { Start-DriverListLoad }
+})
+$retry.Start()
+}
+
 function Test-DriverResultShouldBeDiscarded {
 try { return [bool](Test-WmtAggressiveTrayMemoryMode) } catch { return $false }
 }
@@ -53390,8 +53420,19 @@ try {
     if (-not $script:DriverInfServiceCache) { $script:DriverInfServiceCache = @{} }
     $script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript($usageWorker).AddArgument(@($Infs)).AddArgument($script:DriverInfServiceCache)
     $script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
+    $script:DriverPoolRetryAtUtc = $null
 }
 catch {
+    if ($_.Exception.Message -like '*pool is initializing*') {
+        $script:DriverLoadRunspace = $null
+        $script:DriverLoadAsyncResult = $null
+        $script:DriverLoadInProgress = $false
+        $script:DriverLoadPhase = ""
+        if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
+        Set-DriverStatus "Driver usage worker is initializing..." -Visible $true
+        Schedule-DriverPoolRetry
+        return
+    }
     Set-DriverStatus "Driver usage scan failed to start — package list remains available" -Visible $true
     Write-GuiLog "[Drivers] Device/service usage scan failed to start: $($_.Exception.Message)"
     Complete-DriverLoadState
@@ -53555,11 +53596,19 @@ catch {
 try {
     $script:DriverLoadRunspace = (New-WmtPooledPowerShell -PoolKind UiSupport).AddScript($packageWorker)
     $script:DriverLoadAsyncResult = $script:DriverLoadRunspace.BeginInvoke()
+    $script:DriverPoolRetryAtUtc = $null
 }
 catch {
-    Set-DriverStatus "Driver package load failed to start" -Visible $true
-    Write-GuiLog "[Drivers] Package load failed to start: $($_.Exception.Message)"
+    $workerError = $_.Exception.Message
+    Write-GuiLog "[Drivers] Package worker start failed: $workerError"
     Stop-DriverLoad
+    if ($workerError -like '*pool is initializing*') {
+        Set-DriverStatus "Driver worker pool is initializing..." -Visible $true
+        Schedule-DriverPoolRetry
+        return
+    }
+    Set-DriverStatus "Driver package load failed to start — click Reload" -Visible $true
+    if ($script:DriverCleanupPendingOpen) { Complete-DriverLoadState }
     return
 }
 

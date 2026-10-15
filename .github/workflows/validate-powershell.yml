@@ -359,7 +359,13 @@ jobs:
               (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Start-DriverUsageLoad -Infs \$usageInfs') {
               throw 'Cleanup lost service-only protection or shared inventory usage-phase reuse.'
           }
-          Write-Host 'PASS: shared driver cache, service-only driver safety and usage-phase reuse.'
+          $poolRetry = Find-FunctionText 'Schedule-DriverPoolRetry'
+          if ($poolRetry -notmatch 'DispatcherTimer' -or
+              (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Schedule-DriverPoolRetry' -or
+              (Find-FunctionText 'Start-DriverUsageLoad') -notmatch 'Schedule-DriverPoolRetry') {
+              throw 'Worker pool initialization can silently prevent driver loading.'
+          }
+          Write-Host 'PASS: shared driver inventory, service safety and nonblocking pool retry.'
           $ghostDialog = Find-FunctionText 'Show-GhostDevicesDialog'
           if ($ghostDialog -notmatch 'GhostDeviceScan_' -or
               $ghostDialog -notmatch 'Invoke-WmtUiBackgroundCommand' -or
