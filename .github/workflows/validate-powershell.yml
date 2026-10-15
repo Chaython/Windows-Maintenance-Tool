@@ -213,8 +213,11 @@ jobs:
           }
           $tweak = Find-FunctionText 'Start-TweakButtonStatesBackgroundUpdate'
           $renderer = Find-FunctionText 'Update-TweakButtonStates'
+          # Inspect executable statements, not comments that describe removed fallbacks.
+          $rendererStatements = (($renderer -split '\r?\n') |
+              Where-Object { $_ -notmatch '^\s*#' }) -join [Environment]::NewLine
           if ($tweak -match 'Falling back to synchronous load' -or
-              $renderer -match 'Get-WmtRegistryKeyValuesCached|Get-Service\s|Get-ItemProperty\s|Get-WmtRegistryPathExists\s|Get-WmtRegValue\s') {
+              $rendererStatements -match 'Get-WmtRegistryKeyValuesCached|Get-Service\s|Get-ItemProperty\s|Get-WmtRegistryPathExists\s|Get-WmtRegValue\s') {
               throw 'Tweak state application still reads OS state synchronously.'
           }
           if ($renderer -match '(?m)^\s*(?:&\s*)?fsutil\s') {
