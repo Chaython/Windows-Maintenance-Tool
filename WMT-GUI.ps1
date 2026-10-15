@@ -35225,14 +35225,19 @@ try {
 
         if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
 
-        if (-not $regCache.ContainsKey($Path)) {
-            $values = Get-WmtRegistryKeyValuesCached -Path $Path
-            $regCache[$Path] = $values
-        }
+        # Snapshot only: never read the registry during WPF rendering.
+        if (-not $regCache.ContainsKey($Path)) { return $Default }
 
         $item = $regCache[$Path]
         if ($item -and $item.PSObject.Properties[$Name]) { return $item.$Name }
         return $Default
+    }.GetNewClosure()
+
+    $pathChecks = $script:TweakButtonStatesPathChecks
+    $getPathExists = {
+        param([string]$Path)
+        if ($pathChecks -and $pathChecks.ContainsKey($Path)) { return [bool]$pathChecks[$Path] }
+        return $false
     }.GetNewClosure()
 
     $setButtonEnabled = {
@@ -35250,10 +35255,7 @@ try {
     Update-WmtTweakToggle $btnMyDeviceHagsToggle $hagsOn "Disable HAGS" "Enable HAGS"
 
     $smStartType = $nrd["SysMainStartType"]
-    if ($null -eq $smStartType) {
-        # Fallback: read live (only if background preload hasn't completed)
-        try { $smLive = Get-Service "SysMain" -EA Ignore; if ($smLive) { $smStartType = $smLive.StartType } } catch {}
-    }
+
     if ($null -ne $smStartType) {
         $superfetchDisabled = ($smStartType -eq 'Disabled')
         Update-WmtTweakToggle $btnToggleSuperfetch $superfetchDisabled "Enable Superfetch" "Disable Superfetch"
@@ -35323,13 +35325,13 @@ try {
     $btnToggleClickMode = Get-Ctrl "btnToggleClickMode"
     Update-WmtTweakToggle $btnToggleClickMode $singleClick "Single-Click Folders" "Double-Click Folders"
 
-    $classicContext = Get-WmtRegistryPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+    $classicContext = & $getPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
     $btnToggleCtxMenu = Get-Ctrl "btnToggleCtxMenu"
     Update-WmtTweakToggle $btnToggleCtxMenu $classicContext "Classic Right-Click" "Modern Right-Click"
-    $takeOwnInstalled = Get-WmtRegistryPathExists "HKCR:\Directory\shell\WMT_TakeOwnership"
+    $takeOwnInstalled = & $getPathExists "HKCR:\Directory\shell\WMT_TakeOwnership"
     $btnToggleTakeOwnership = Get-Ctrl "btnToggleTakeOwnership"
     Update-WmtTweakToggle $btnToggleTakeOwnership $takeOwnInstalled "Remove Take Ownership" "Add Take Ownership"
-    $psHereInstalled = Get-WmtRegistryPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
+    $psHereInstalled = & $getPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
     $btnTogglePsHere = Get-Ctrl "btnTogglePsHere"
     Update-WmtTweakToggle $btnTogglePsHere $psHereInstalled "Remove PowerShell Here" "Add PowerShell Here"
 
@@ -35558,9 +35560,9 @@ try {
 
         # Explorer (round 2)
         $ntlaBtn = Get-Ctrl "btnToggleNTFSLastAccess"
-        if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -eq $off) { try { $out = (& fsutil behavior query DisableLastAccess 2>$null); $off = ($out -match "1") } catch {} }; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn $off "Enable NTFS Last Access" "Disable NTFS Last Access" } }
+        if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn $off "Enable NTFS Last Access" "Disable NTFS Last Access" } }
         $n83Btn = Get-Ctrl "btnToggleNTFS83"
-        if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -eq $off) { try { $out = (& fsutil behavior query Disable8dot3 2>$null); $off = ($out -match "1") } catch {} }; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn $off "Enable NTFS 8.3" "Disable NTFS 8.3" } }
+        if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn $off "Enable NTFS 8.3" "Disable NTFS 8.3" } }
         $tcBtn = Get-Ctrl "btnToggleThumbCache"
         if ($tcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisableThumbnails" 0) 0); Update-WmtTweakToggle $tcBtn ($v -eq 1) "Thumbnail Cache On" "Thumbnail Cache Off" }
         $dlfBtn = Get-Ctrl "btnToggleDriveLettersFirst"
@@ -35568,13 +35570,13 @@ try {
 
         # Context Menu (round 2)
         $cmdBtn = Get-Ctrl "btnToggleCmdHere"
-        if ($cmdBtn) { $exists = Get-WmtRegistryPathExists "HKCU:\Software\Classes\Directory\shell\WmtCmdHere"; Update-WmtTweakToggle $cmdBtn $exists "Remove CMD Here" "Add CMD Here" }
+        if ($cmdBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\Directory\shell\WmtCmdHere"; Update-WmtTweakToggle $cmdBtn $exists "Remove CMD Here" "Add CMD Here" }
         $npBtn = Get-Ctrl "btnToggleNotepadCtx"
-        if ($npBtn) { $exists = Get-WmtRegistryPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"; Update-WmtTweakToggle $npBtn $exists "Remove Notepad" "Add Notepad" }
+        if ($npBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"; Update-WmtTweakToggle $npBtn $exists "Remove Notepad" "Add Notepad" }
         $prBtn = Get-Ctrl "btnToggleRemovePrint"
-        if ($prBtn) { $exists = (-not (Get-WmtRegistryPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn $exists "Restore Print" "Remove Print" }
+        if ($prBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn $exists "Restore Print" "Remove Print" }
         $castBtn = Get-Ctrl "btnToggleRemoveCast"
-        if ($castBtn) { $exists = (-not (Get-WmtRegistryPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn $exists "Restore Cast to Device" "Remove Cast to Device" }
+        if ($castBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn $exists "Restore Cast to Device" "Remove Cast to Device" }
 
         # Sound
         $ssBtn = Get-Ctrl "btnToggleStartupSound"
@@ -35648,9 +35650,7 @@ try {
     $btnToggleWebSearch = Get-Ctrl "btnToggleWebSearch"
     Update-WmtTweakToggle $btnToggleWebSearch $webSearchOff "Web Search Off" "Web Search On"
     $wsStartType = $nrd["WSearchStartType"]
-    if ($null -eq $wsStartType) {
-        try { $wsLive = Get-Service "WSearch" -ErrorAction Ignore; if ($wsLive) { $wsStartType = $wsLive.StartType } } catch {}
-    }
+
     if ($null -ne $wsStartType) {
         $indexReduced = ($wsStartType -ne "Automatic")
         $btnToggleSearchIndex = Get-Ctrl "btnToggleSearchIndex"
@@ -35731,13 +35731,13 @@ try {
     Update-WmtTweakToggle $btnToggleDevMode $devModeOn "Developer Mode On" "Developer Mode Off"
     $drvMetaDisabled = $false
     $drvMetaVal = $nrd["DrvMetadata"]
-    if ($null -eq $drvMetaVal) { try { $drvMetaVal = Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata" "PreventDeviceMetadataFromNetwork" 0 } catch {} }
+
     if ($null -ne $drvMetaVal) { $drvMetaDisabled = ([int]$drvMetaVal -eq 1) }
     $btnToggleDrvMeta = Get-Ctrl "btnToggleDrvMeta"
     Update-WmtTweakToggle $btnToggleDrvMeta $drvMetaDisabled "Enable Metadata" "Disable Metadata" "Toggle device metadata downloads (icons/info) from the internet."
     $drvWUDisabled = $false
     $drvWUVal = $nrd["DrvSearchOrder"]
-    if ($null -eq $drvWUVal) { try { $drvWUVal = Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching" "SearchOrderConfig" 0 } catch {} }
+
     if ($null -ne $drvWUVal) { $drvWUDisabled = ([int]$drvWUVal -eq 1) }
     $btnToggleDrvUpdates = Get-Ctrl "btnToggleDrvUpdates"
     Update-WmtTweakToggle $btnToggleDrvUpdates $drvWUDisabled "Enable Auto-Drivers" "Disable Auto-Drivers" "Toggle automatic driver updates via Windows Update."
@@ -35749,42 +35749,42 @@ try {
     $btn3D = Get-Ctrl "btnToggle3DObjects"
     if ($btn3D) {
         if ($sc.Count -gt 0) { $isSupported = $sc["3DObjects"] }
-        else { try { $isSupported = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\{0DB7E03F-FC29-4DC6-9020-FF41B59E513A}" } catch { $isSupported = $true } }
+        else { $isSupported = $true }
         if (-not $isSupported) { $btn3D.IsEnabled = $false; $btn3D.Opacity = 0.45; $btn3D.ToolTip = "The 3D Objects shell folder has been removed in your version of Windows 11." }
     }
 
     $btnChat = Get-Ctrl "btnToggleChat"
     if ($btnChat) {
         if ($sc.Count -gt 0) { $isSupported = $sc["Chat"] }
-        else { try { $isSupported = Get-WmtRegistryPathExists "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarMn" } catch { $isSupported = $true } }
+        else { $isSupported = $true }
         if (-not $isSupported) { $btnChat.IsEnabled = $false; $btnChat.Opacity = 0.45; $btnChat.ToolTip = "The Chat (Microsoft Teams) taskbar button has been removed in your version of Windows 11." }
     }
 
     $btnWidgets = Get-Ctrl "btnToggleWidgets"
     if ($btnWidgets) {
         if ($sc.Count -gt 0) { $isSupported = $sc["Widgets"] }
-        else { try { $isSupported = ($null -ne (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarDa" -ErrorAction SilentlyContinue)) } catch { $isSupported = $true } }
+        else { $isSupported = $true }
         if (-not $isSupported) { $btnWidgets.IsEnabled = $false; $btnWidgets.Opacity = 0.45; $btnWidgets.ToolTip = "The Widgets panel has been removed or deprecated in your version of Windows 11." }
     }
 
     $btnActivity = Get-Ctrl "btnToggleActivity"
     if ($btnActivity) {
         if ($sc.Count -gt 0) { $isSupported = $sc["Activity"] }
-        else { try { $isSupported = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Microsoft\PolicyManager\Default\ActivityHistory" } catch { $isSupported = $true } }
+        else { $isSupported = $true }
         if (-not $isSupported) { $btnActivity.IsEnabled = $false; $btnActivity.Opacity = 0.45; $btnActivity.ToolTip = "Activity History / Timeline has been removed in your version of Windows 11." }
     }
 
     $btnCEIP = Get-Ctrl "btnToggleCEIP"
     if ($btnCEIP) {
         if ($sc.Count -gt 0) { $isSupported = $sc["CEIP"] }
-        else { try { $isSupported = Get-WmtRegistryPathExists "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" } catch { $isSupported = $true } }
+        else { $isSupported = $true }
         if (-not $isSupported) { $btnCEIP.IsEnabled = $false; $btnCEIP.Opacity = 0.45; $btnCEIP.ToolTip = "The Customer Experience Improvement Program (CEIP) is no longer present on your system." }
     }
 
     $btnSpeech = Get-Ctrl "btnToggleSpeechOnline"
     if ($btnSpeech) {
         if ($sc.Count -gt 0) { $isSupported = $sc["Speech"] }
-        else { try { $isSupported = ($null -ne (Get-ItemProperty "HKCU:\Software\Microsoft\Speech_OneSet" -Name "AcceptPrivacyNotice" -ErrorAction SilentlyContinue)) } catch { $isSupported = $true } }
+        else { $isSupported = $true }
         if (-not $isSupported) { $btnSpeech.IsEnabled = $false; $btnSpeech.Opacity = 0.45; $btnSpeech.ToolTip = "Online speech recognition settings are no longer available on your version of Windows." }
     }
 }
@@ -62054,7 +62054,7 @@ catch {
             "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI",
             "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current",
             "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current",
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat",
@@ -62073,6 +62073,29 @@ catch {
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager",
             "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem",
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag"
+            "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Toast",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Tips",
+            "HKCU:\Software\Microsoft\GameBar",
+            "HKCU:\System\GameConfigStore",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer",
+            "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+            "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+            "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters",
+            "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config",
+            "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\``$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy",
+            "HKCU:\Software\Policies\Microsoft\Windows\CloudContent",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System",
+            "HKCU:\Software\Policies\Microsoft\Windows\Explorer",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock",
         )
 
         # Local copy of Convert-WmtRegistryPath: this scriptblock runs on the pooled
