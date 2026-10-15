@@ -9516,6 +9516,7 @@ $script:TweakStatesBgStarted = $false
 $script:TweakStatesReady = $false
 
 try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+if ($script:FeaturesCheckTimeout) { try { $script:FeaturesCheckTimeout.Stop() } catch {}; $script:FeaturesCheckTimeout = $null }
 $oldFeaturesPs = $script:FeaturesCheckPS
 $oldFeaturesAsync = $script:FeaturesCheckAsync
 $script:FeaturesCheckPS = $null
@@ -9680,6 +9681,7 @@ try {
         }
     }
     try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}; $script:FeaturesCheckTimer = $null
+    if ($script:FeaturesCheckTimeout) { try { $script:FeaturesCheckTimeout.Stop() } catch {}; $script:FeaturesCheckTimeout = $null }
 
     # Clear completed update ID tracking
     $script:WmtCompletedWindowsUpdateIds = $null
@@ -36483,8 +36485,9 @@ $tabButton.Add_Click({
                 try {
                     $sw = [System.Diagnostics.Stopwatch]::StartNew()
                     Update-OptionalFeaturesSynchronously                                        
-                    $optionalFeaturesLoaded = $true                                     
-                                        $script:OptionalFeaturesReady = $true
+                    $optionalFeaturesLoaded = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
+                    $script:OptionalFeaturesReady = $optionalFeaturesLoaded
+                    if (-not $optionalFeaturesLoaded) { throw "Optional-feature scan returned no verified states." }
                     # Update the overlay immediately after the first load
                     Sync-WmtTweakOverlayHide                                    
                     Update-TweakButtonStates
@@ -61904,6 +61907,7 @@ try {
 
 function Show-TweakStatesLoadError {
 param([string]$Message)
+$script:WmtTweakLoadError = $Message
 try {
     Set-TweakStatesLoadingOverlay -Visible $true -ErrorMessage $Message
     # Wire up retry button if not already done
@@ -61911,30 +61915,61 @@ try {
     if ($retryBtn -and -not $script:TweakOverlayRetryWired) {
         $script:TweakOverlayRetryWired = $true
         $retryBtn.Add_Click({
-            # Reset state so retry re-triggers the full load
-            $script:TweakStatesReady = $false
-            $script:TweakStatesBgStarted = $false
-            $script:TweakButtonStatesCache = $null
-            $script:TweakNonRegDataCache = $null
-            $script:TweakSupportChecksCache = $null
-            $script:TweakButtonStatesPathChecks = $null
+            # Retry whichever scanner is incomplete. Preserve already verified states.
+            $retryTweaks = -not $script:TweakStatesReady
+            $retryFeatures = -not $script:OptionalFeaturesReady
+            $script:WmtTweakLoadError = ""
             Set-TweakStatesLoadingOverlay -Visible $true
-            # Re-trigger background load
-            if (-not (Get-WmtDisableBackgroundJobs)) {
-                Start-TweakButtonStatesBackgroundUpdate
-            }
-            else {
-                try {
-                    Update-TweakButtonStates
-                    $script:TweakStatesReady = $true
-                    Sync-WmtTweakOverlayHide
+            if ($retryTweaks) {
+                $script:TweakStatesBgStarted = $false
+                $script:TweakButtonStatesCache = $null
+                $script:TweakNonRegDataCache = $null
+                $script:TweakSupportChecksCache = $null
+                $script:TweakButtonStatesPathChecks = $null
+                if (-not (Get-WmtDisableBackgroundJobs)) {
+                    Start-TweakButtonStatesBackgroundUpdate
+                } else {
+                    try {
+                        Update-TweakButtonStates
+                        $script:TweakStatesReady = $true
+                    } catch {
+                        $script:TweakStatesReady = $false
+                        Show-TweakStatesLoadError -Message "Retry failed to load tweak states: $($_.Exception.Message)"
+                    }
                 }
-                catch {
-                    try { Write-GuiLog "[Tweak States] Retry also failed: $($_.Exception.Message)" } catch {}
-                    $script:TweakStatesReady = $false
-                    Show-TweakStatesLoadError -Message "Retry failed: $($_.Exception.Message). Tweak controls remain blocked."
+            }
+            if ($retryFeatures) {
+                if ($script:FeaturesCheckTimeout) {
+                    try { $script:FeaturesCheckTimeout.Stop() } catch {}
+                    $script:FeaturesCheckTimeout = $null
+                }
+                try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+                $oldFeaturesPs = $script:FeaturesCheckPS
+                $oldFeaturesAsync = $script:FeaturesCheckAsync
+                $script:FeaturesCheckPS = $null
+                $script:FeaturesCheckAsync = $null
+                if ($oldFeaturesPs) {
+                    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldFeaturesPs -Invocation $oldFeaturesAsync -Name "Optional features retry" } catch {
+                        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldFeaturesPs -Invocation $oldFeaturesAsync -Name "Optional features retry" } catch {}
+                    }
+                }
+                $script:OptionalFeaturesCheckStarted = $false
+                $script:OptionalFeatureStateCache = @{}
+                if (-not (Get-WmtDisableBackgroundJobs)) {
+                    Start-OptionalFeaturesBackgroundCheck
+                } else {
+                    try {
+                        Update-OptionalFeaturesSynchronously
+                        $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
+                        if (-not $script:OptionalFeaturesReady) { throw "No feature states were detected." }
+                    } catch {
+                        $script:OptionalFeaturesReady = $false
+                        Show-TweakStatesLoadError -Message "Retry failed to load optional features: $($_.Exception.Message)"
+                    }
                 }
             }
+            Sync-WmtQuickFindStateAvailability
+            Sync-WmtTweakOverlayHide
         })
     }
     # Do not auto-hide the blocking overlay while states remain unverified.
@@ -61950,7 +61985,13 @@ function Sync-WmtTweakOverlayHide {
 try {
     $tweakStatesDone = [bool]$script:TweakStatesReady
     $optFeaturesDone = [bool]$script:OptionalFeaturesReady
+    if (-not ($tweakStatesDone -and $optFeaturesDone) -and
+        -not [string]::IsNullOrWhiteSpace([string]$script:WmtTweakLoadError)) {
+        Set-TweakStatesLoadingOverlay -Visible $true -ErrorMessage $script:WmtTweakLoadError
+        return
+    }
     if ($tweakStatesDone -and $optFeaturesDone) {
+        $script:WmtTweakLoadError = ""
         Set-TweakStatesLoadingOverlay -Visible $false
     }
     elseif ($tweakStatesDone -and -not $optFeaturesDone) {
@@ -62398,10 +62439,9 @@ try {
     $ps = New-WmtPooledPowerShell -PoolKind UiSupport
 }
 catch {
-    Write-GuiLog "[Optional Features] Could not create background worker: $($_.Exception.Message). Using synchronous fallback."
-    try { Update-OptionalFeaturesSynchronously } catch { Write-GuiLog "[Optional Features] Synchronous fallback failed: $($_.Exception.Message)" }
-    $script:OptionalFeaturesReady = $true
-    Sync-WmtTweakOverlayHide
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    Show-TweakStatesLoadError -Message "Could not start optional-feature background worker: $($_.Exception.Message). Click Retry."
     return
 }
 [void]$ps.AddScript({
@@ -62453,13 +62493,13 @@ try {
     $async = $ps.BeginInvoke()
 }
 catch {
-    Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message). Using synchronous fallback."
+    Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message)."
 }
 if ($null -eq $async) {
     try { $ps.Dispose() } catch {}
-    try { Update-OptionalFeaturesSynchronously } catch { Write-GuiLog "[Optional Features] Synchronous fallback failed: $($_.Exception.Message)" }
-    $script:OptionalFeaturesReady = $true
-    Sync-WmtTweakOverlayHide
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    Show-TweakStatesLoadError -Message "Optional-feature scan could not start. Click Retry."
     return
 }
 
@@ -62498,17 +62538,47 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
                     }
                 }
             }
-            catch {}
+            catch {
+                try { Write-GuiLog "[Optional Features] Background scan failed: $($_.Exception.Message)" } catch {}
+            }
+            if ($script:FeaturesCheckTimeout) {
+                try { $script:FeaturesCheckTimeout.Stop() } catch {}
+                $script:FeaturesCheckTimeout = $null
+            }
             try { $script:FeaturesCheckPS.Dispose() } catch {}
             $script:FeaturesCheckAsync = $null
             $script:FeaturesCheckPS = $null
             # Only release the overlay when optional feature detection actually returned states.
             $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
-            if (-not $script:OptionalFeaturesReady) { Write-GuiLog "[Optional Features] No valid feature states were returned. Tweaks remains blocked." }
+            if (-not $script:OptionalFeaturesReady) {
+                $script:OptionalFeaturesCheckStarted = $false
+                Show-TweakStatesLoadError -Message "No verified optional-feature states were returned. Tweaks remains blocked; click Retry."
+            }
             Sync-WmtTweakOverlayHide
             if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Sync-WmtQuickFindStateAvailability }
         }
     } | Out-Null
+# DISM can take 120 seconds; allow additional dispatch time, then fail closed.
+$script:FeaturesCheckTimeout = [System.Windows.Threading.DispatcherTimer]::new()
+$script:FeaturesCheckTimeout.Interval = [TimeSpan]::FromSeconds(150)
+$script:FeaturesCheckTimeout.Add_Tick({
+    $script:FeaturesCheckTimeout.Stop()
+    $script:FeaturesCheckTimeout = $null
+    if ($script:OptionalFeaturesReady -or -not $script:FeaturesCheckPS) { return }
+    try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+    $timedOutPs = $script:FeaturesCheckPS
+    $timedOutAsync = $script:FeaturesCheckAsync
+    $script:FeaturesCheckPS = $null
+    $script:FeaturesCheckAsync = $null
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {}
+    }
+    Show-TweakStatesLoadError -Message "Optional-feature detection timed out. Tweaks remains blocked until verified; click Retry."
+    Sync-WmtQuickFindStateAvailability
+})
+$script:FeaturesCheckTimeout.Start()
 }
 
 function Update-OptionalFeaturesSynchronously {
@@ -62573,6 +62643,8 @@ function Update-OptionalFeaturesSynchronously {
             $btn.ToolTip = "Current state: Disabled (Gray = not installed)`nClick to install this feature (Blue).`nRestart recommended after toggling.`n`nOptional Windows feature. See card description for details."
         }
     }
+    $script:OptionalFeaturesReady = [bool]($script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.Count -gt 0)
+    Sync-WmtQuickFindStateAvailability
     Write-GuiLog "[Optional Features] Synchronous detection completed. Buttons updated: $($results.Count)"
 }
 
