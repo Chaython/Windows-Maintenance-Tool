@@ -277,6 +277,26 @@ jobs:
           if ($script:MyDeviceWorkerRetryAfterUtc -ne $retryAt) {
               throw 'My Device retried before its backoff elapsed.'
           }
+          # Check the cached-state acceptance contract and pool initialization.
+          if ($source -notmatch 'RegistryReadErrors = @\(' -or
+              $source -notmatch '@\(\$result\.RegistryReadErrors\)\.Count -eq 0' -or
+              $source -notmatch 'Registry read failure:' -or
+              $source -notmatch 'Tweaks remain blocked') {
+              throw 'Unreadable registry values can masquerade as valid cached states.'
+          }
+          if ($source -match '(?m)^\s*\$pool\.Open\(\)' -or
+              $source -notmatch '\$pool\.BeginOpen\(\$null, \$null\)' -or
+              $source -notmatch '\$existing\.EndOpen\(\$opening\)' -or
+              $source -notmatch 'TweakPoolRetryTimer' -or
+              $source -notmatch 'FeaturesPoolRetryTimer') {
+              throw 'Runspace initialization regressed to blocking Open() or lost deferred retry.'
+          }
+          $deviceJob = Find-FunctionText 'Start-MyDeviceSectionJob'
+          if ($deviceJob -notmatch 'New-WmtPooledPowerShell -PoolKind Background' -or
+              $source -notmatch 'MyDeviceStatsMaxConcurrent = 3') {
+              throw 'My Device jobs still compete with interactive runspace capacity.'
+          }
+          Write-Host 'PASS: unreadable registry state rejected, pool opening deferred, My Device isolated.'
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
