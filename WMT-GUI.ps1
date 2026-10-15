@@ -38087,6 +38087,9 @@ function Update-WmtQuickFindResults {
     } elseif ($matches.Count -gt $limit) {
         "$($matches.Count) related tools found for '$query' (showing $limit). Refine your search."
     } else { "$($matches.Count) related tools found for '$query'." }
+    # Apply the result limit after relevance ranking, not after section ordering.
+    # Otherwise an unrelated early section can hide a more relevant result.
+    $matches = @($matches | Select-Object -First $limit)
     $rendered = 0
     foreach ($section in $script:WmtQuickFindSections) {
         if ($rendered -ge $limit) { break }
