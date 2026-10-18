@@ -9414,6 +9414,20 @@ $script:Winapp2RulesMemoryCache = $null
 $script:Winapp3RulesMemoryCache = $null
 }
 
+function Set-WmtCleanerRulesMemoryCacheEntry {
+param(
+    [Parameter(Mandatory = $true)][hashtable]$Cache,
+    [Parameter(Mandatory = $true)][string]$Key,
+    [Parameter(Mandatory = $true)]$Rules
+)
+if (-not (Test-WmtCleanerRuleMemoryCacheEnabled) -or [string]::IsNullOrWhiteSpace($Key)) { return }
+# Rule snapshots are large object graphs. Keeping every historical source
+# signature retains an entire old definition set after each refresh/update.
+# This is a one-version cache by design: preserve the current snapshot only.
+$Cache.Clear()
+$Cache[$Key] = $Rules
+}
+
 function Test-WmtTrayMemoryBusy {
 try {
     if (Get-Command Test-WmtUpdateScanEngineBusy -ErrorAction SilentlyContinue) {
@@ -13333,7 +13347,7 @@ if ($CacheOnly -and (Test-Path $cachePath)) {
     try {
         $cachedRules = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         if ($cachedRules.Count -gt 0) {
-            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:CleanerMlRulesMemoryCache -Key $memoryKey -Rules $cachedRules }
             return $cachedRules
         }
     }
@@ -13393,7 +13407,7 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                 catch {}
             }
             Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
-            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:CleanerMlRulesMemoryCache -Key $memoryKey -Rules $cachedRules }
             return $cachedRules
         }
     }
@@ -13425,7 +13439,7 @@ try {
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "CleanerML cache write error: $($_.Exception.Message)" } }
 
-if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:CleanerMlRulesMemoryCache[$memoryKey] = $final }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:CleanerMlRulesMemoryCache -Key $memoryKey -Rules $final }
 return $final
 }
 
@@ -13467,7 +13481,7 @@ if ($CacheOnly -and (Test-Path $cachePath)) {
     try {
         $cachedRules = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         if ($cachedRules.Count -gt 0) {
-            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:Winapp2RulesMemoryCache -Key $memoryKey -Rules $cachedRules }
             return $cachedRules
         }
     }
@@ -13535,7 +13549,7 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                 catch {}
             }
             Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
-            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:Winapp2RulesMemoryCache -Key $memoryKey -Rules $cachedRules }
             return $cachedRules
         }
     }
@@ -13735,7 +13749,7 @@ try {
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "Winapp2 cache write error: $($_.Exception.Message)" } }
 
-if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp2RulesMemoryCache[$memoryKey] = $finalList }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:Winapp2RulesMemoryCache -Key $memoryKey -Rules $finalList }
 
 return $finalList
 }
@@ -13778,7 +13792,7 @@ if ($CacheOnly -and (Test-Path $cachePath)) {
     try {
         $cachedRules = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         if ($cachedRules.Count -gt 0) {
-            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:Winapp3RulesMemoryCache -Key $memoryKey -Rules $cachedRules }
             return $cachedRules
         }
     }
@@ -13841,7 +13855,7 @@ if (-not $forceRebuild -and (Test-Path $cachePath)) {
                 catch {}
             }
             Set-WmtCleanerLocalRefreshStamp -MetaPath $cacheMetaPath
-            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $cachedRules }
+            if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:Winapp3RulesMemoryCache -Key $memoryKey -Rules $cachedRules }
             return $cachedRules
         }
     }
@@ -14007,7 +14021,7 @@ try {
     }
 }
 catch { if ($script:WmtDebug) { Write-GuiLog "Winapp3 cache write error: $($_.Exception.Message)" } }
-if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { $script:Winapp3RulesMemoryCache[$memoryKey] = $finalList }
+if ((Test-WmtCleanerRuleMemoryCacheEnabled) -and $memoryKey) { Set-WmtCleanerRulesMemoryCacheEntry -Cache $script:Winapp3RulesMemoryCache -Key $memoryKey -Rules $finalList }
 return $finalList
 }
 
