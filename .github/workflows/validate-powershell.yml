@@ -331,6 +331,26 @@ jobs:
           }
           Write-Host 'PASS: pip and custom PowerShell installer output is bounded.'
 
+
+          # Run the real pip process wrapper against a noisy child. Its in-memory
+          # result must stay bounded while preserving the newest lines and summary.
+          Invoke-Expression (Find-FunctionText 'Invoke-WmtPipDirect')
+          $pipTestHost = Join-Path $PSHOME 'powershell.exe'
+          if (-not (Test-Path -LiteralPath $pipTestHost -PathType Leaf)) {
+              throw 'Cannot find Windows PowerShell for pip output smoke test.'
+          }
+          $pipOutputTest = Invoke-WmtPipDirect -PythonPath $pipTestHost -ArgumentList @(
+              '-NoProfile', '-Command', '1..3000 | ForEach-Object { "LINE$_" }'
+          ) -TimeoutSeconds 30
+          $pipSummaryPresent = @($pipOutputTest.OutputLines | Where-Object { $_ -match 'Earlier pip output was omitted' }).Count -gt 0
+          if ($pipOutputTest.ExitCode -ne 0 -or
+              @($pipOutputTest.OutputLines).Count -gt 2000 -or
+              -not ($pipOutputTest.OutputLines -contains 'LINE3000') -or
+              -not $pipSummaryPresent) {
+              throw "Pip output streaming/cap smoke test failed (exit=$($pipOutputTest.ExitCode), lines=$(@($pipOutputTest.OutputLines).Count))."
+          }
+          Write-Host 'PASS: noisy pip output is streamed and retained output is bounded.'
+
           Write-Host 'PASS: registry snapshots and UI cache lookups are safe.'
 
           # Exercise the actual My Device queue with an unavailable pool.
