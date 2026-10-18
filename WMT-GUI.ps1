@@ -2217,7 +2217,9 @@ try {
             $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(3)
         }
 
-        if ($outTask -and $outTask.IsCompleted) {
+        $outDrainCount = 0
+        while ($outTask -and $outTask.IsCompleted -and $outDrainCount -lt 256) {
+            $outDrainCount++
             $line = $null
             try { $line = $outTask.GetAwaiter().GetResult() } catch {}
             if ($null -eq $line) {
@@ -2228,7 +2230,9 @@ try {
                 $outTask = $proc.StandardOutput.ReadLineAsync()
             }
         }
-        if ($errTask -and $errTask.IsCompleted) {
+        $errDrainCount = 0
+        while ($errTask -and $errTask.IsCompleted -and $errDrainCount -lt 256) {
+            $errDrainCount++
             $line = $null
             try { $line = $errTask.GetAwaiter().GetResult() } catch {}
             if ($null -eq $line) {
@@ -2259,7 +2263,9 @@ try {
             $errTask = $null
             break
         }
-        Start-Sleep -Milliseconds 25
+        if (-not (($outTask -and $outTask.IsCompleted) -or ($errTask -and $errTask.IsCompleted))) {
+            Start-Sleep -Milliseconds 10
+        }
     }
 
     try {
@@ -41210,7 +41216,9 @@ exit $exitCode
                     $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(5)
                 }
 
-                if ($outTask -and $outTask.IsCompleted) {
+                $outDrainCount = 0
+                while ($outTask -and $outTask.IsCompleted -and $outDrainCount -lt 256) {
+                    $outDrainCount++
                     $line = $null
                     try { $line = $outTask.GetAwaiter().GetResult() } catch {}
                     if ($null -eq $line) {
@@ -41221,7 +41229,9 @@ exit $exitCode
                         $outTask = $proc.StandardOutput.ReadLineAsync()
                     }
                 }
-                if ($errTask -and $errTask.IsCompleted) {
+                $errDrainCount = 0
+                while ($errTask -and $errTask.IsCompleted -and $errDrainCount -lt 256) {
+                    $errDrainCount++
                     $line = $null
                     try { $line = $errTask.GetAwaiter().GetResult() } catch {}
                     if ($null -eq $line) {
@@ -41252,7 +41262,9 @@ exit $exitCode
                     $errTask = $null
                     break
                 }
-                Start-Sleep -Milliseconds 25
+                if (-not (($outTask -and $outTask.IsCompleted) -or ($errTask -and $errTask.IsCompleted))) {
+                    Start-Sleep -Milliseconds 10
+                }
             }
 
             if ($outputReadTimedOut -and -not $timedOut) {
