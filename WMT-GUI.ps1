@@ -41096,7 +41096,7 @@ exit $exitCode
                     $outputState.DroppedLines++
                     $outputState.Truncated = $true
                 }
-            }.GetNewClosure()
+            }
 
             # Stream output line-by-line while the process runs. The previous
             # ReadToEndAsync approach held complete stdout, stderr and split copies
@@ -41162,6 +41162,9 @@ exit $exitCode
                         $outputReadTimedOut = $true
                         $outputState.ReadTimedOut = $true
                         $outputState.Truncated = $true
+                        # An exited launcher with pipes still held open may have left a
+                        # descendant running. Do not report a verified successful install.
+                        $terminationFailed = $true
                     }
                     $outTask = $null
                     $errTask = $null
@@ -41170,8 +41173,16 @@ exit $exitCode
                 Start-Sleep -Milliseconds 25
             }
 
+            if ($outputReadTimedOut -and -not $timedOut) {
+                $timedOut = $true
+                $timeoutReason = "Pip exited but output streams remained open; child completion could not be verified"
+                $terminationFailed = $true
+            }
             if ($outputState.Truncated) {
-                $summary = if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                $summary = if ($outputState.ReadTimedOut) {
+                    "[WMT] Pip output streams did not close within 5 seconds; remaining output was discarded to bound RAM use."
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
                     "[WMT] Earlier pip output was omitted from the in-memory summary to limit RAM use; full output is in the provider transcript."
                 } else {
                     "[WMT] Earlier pip output was omitted from the in-memory summary to limit RAM use."
@@ -41193,6 +41204,8 @@ exit $exitCode
                     TimedOut          = $true
                     TimeoutReason     = $timeoutReason
                     TerminationFailed = $terminationFailed
+                    OutputReadTimedOut = [bool]$outputReadTimedOut
+                    OutputTruncated = [bool]$outputState.Truncated
                 }
             }
 
@@ -41205,7 +41218,9 @@ exit $exitCode
                 OutputLines       = @($outputLines.ToArray())
                 TimedOut          = $false
                 TimeoutReason     = ""
-                TerminationFailed = $false
+                TerminationFailed = [bool]$outputReadTimedOut
+                OutputReadTimedOut = [bool]$outputReadTimedOut
+                OutputTruncated = [bool]$outputState.Truncated
             }
         }
         catch {
