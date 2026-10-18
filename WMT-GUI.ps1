@@ -3658,8 +3658,18 @@ return $state
 }
 
 function Stop-WmtUiPoller {
-if ($script:WmtUiPollTimer) { try { $script:WmtUiPollTimer.Stop() } catch {} }
+# Ask manager-owned workers to stop asynchronously, then keep the shared timer
+# alive long enough to observe completion and dispose their PowerShell handles.
+try { [void](Stop-WmtBackgroundOperationManager) } catch {}
 if ($script:WmtUiPollOperations) { $script:WmtUiPollOperations.Clear() }
+$managerHasWork = $false
+try { $managerHasWork = (@(Get-WmtBackgroundOperationSnapshot).Count -gt 0) } catch {}
+if ($script:WmtUiPollTimer) {
+    if ($managerHasWork) {
+        try { if (-not $script:WmtUiPollTimer.IsEnabled) { $script:WmtUiPollTimer.Start() } } catch {}
+    }
+    else { try { $script:WmtUiPollTimer.Stop() } catch {} }
+}
 }
 
 function Start-MyDeviceSectionJob {
