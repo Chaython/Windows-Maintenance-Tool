@@ -9,7 +9,6 @@ on:
       - "WMT-GUI.ps1"
       - "PS2EXE/**/*.ps1"
       - "tools/diagnostics/**/*.ps1"
-      - "WmtBackgroundOperationManager.ps1"
       - ".github/workflows/validate-powershell.yml"
   pull_request:
     branches:
@@ -18,7 +17,6 @@ on:
       - "WMT-GUI.ps1"
       - "PS2EXE/**/*.ps1"
       - "tools/diagnostics/**/*.ps1"
-      - "WmtBackgroundOperationManager.ps1"
       - ".github/workflows/validate-powershell.yml"
 
 permissions:
@@ -49,8 +47,7 @@ jobs:
           $files = @(
               ".\WMT-GUI.ps1",
               ".\PS2EXE\Build-Exe.ps1",
-              ".\tools\diagnostics\Measure-WmtResources.ps1",
-              ".\WmtBackgroundOperationManager.ps1"
+              ".\tools\diagnostics\Measure-WmtResources.ps1"
           )
 
           $failed = $false
@@ -2634,7 +2631,16 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          . .\WmtBackgroundOperationManager.ps1
+          # The manager now lives inside WMT-GUI.ps1; extract just that block
+          # (state init through Stop-WmtBackgroundOperationManager) and load it.
+          $source = [System.IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $startMarker = 'if (-not (Get-Variable -Name WmtBackgroundOperationState'
+          $endMarker = 'Initialize-WmtBackgroundOperationManager -Log {'
+          $start = $source.IndexOf($startMarker, [System.StringComparison]::Ordinal)
+          $end = $source.IndexOf($endMarker, [System.StringComparison]::Ordinal)
+          if ($start -lt 0 -or $end -le $start) { throw 'Background-operation manager block not found in WMT-GUI.ps1.' }
+          $managerSource = $source.Substring($start, $end - $start)
+          Invoke-Expression $managerSource
           $script:managerCallbackState = $null
           Initialize-WmtBackgroundOperationManager
           $id = Start-WmtBackgroundOperation -Name 'ci-success' -ScriptBlock {
