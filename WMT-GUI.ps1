@@ -36898,7 +36898,7 @@ $btnToggleCopilot.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $adv "ShowCopilotButton" 0; Set-WmtRegDword $polUser "TurnOffWindowsCopilot" 1; Set-WmtRegDword $polMachine "TurnOffWindowsCopilot" 1; Write-GuiLog "Copilot disabled." } "Disabling Copilot..."
         }
-        Update-WmtTweakToggle $btnToggleCopilot (-not $currentlyOff) "Copilot On" "Copilot Off"
+        Update-WmtTweakToggle $btnToggleCopilot $currentlyOff "Copilot On" "Copilot Off"
     })
 }
 
@@ -36915,7 +36915,7 @@ $btnToggleRecall.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polUser "DisableAIDataAnalysis" 1; Set-WmtRegDword $polMachine "AllowRecallEnablement" 0; Set-WmtRegDword $polMachine "TurnOffSavingSnapshots" 1; Write-GuiLog "Recall disabled." } "Disabling Recall..."
         }
-        Update-WmtTweakToggle $btnToggleRecall (-not $currentlyOff) "Recall On" "Recall Off"
+        Update-WmtTweakToggle $btnToggleRecall $currentlyOff "Recall On" "Recall Off"
     })
 }
 
@@ -36932,7 +36932,7 @@ $btnToggleClickToDo.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polUser "DisableClickToDo" 1; Set-WmtRegDword $polMachine "DisableClickToDo" 1; Write-GuiLog "Click To Do disabled." } "Disabling Click To Do..."
         }
-        Update-WmtTweakToggle $btnToggleClickToDo (-not $currentlyOff) "Click To Do On" "Click To Do Off"
+        Update-WmtTweakToggle $btnToggleClickToDo $currentlyOff "Click To Do On" "Click To Do Off"
     })
 }
 
@@ -36948,7 +36948,7 @@ $btnToggleAISvcAutoStart.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polMachine "DisableAIDataAnalysis" 1; Write-GuiLog "Windows AI service autostart disabled." } "Disabling AI service autostart..."
         }
-        Update-WmtTweakToggle $btnToggleAISvcAutoStart (-not $currentlyOff) "AI Svc AutoStart On" "AI Svc AutoStart Off"
+        Update-WmtTweakToggle $btnToggleAISvcAutoStart $currentlyOff "AI Svc AutoStart On" "AI Svc AutoStart Off"
     })
 }
 
@@ -36964,7 +36964,7 @@ $btnToggleEdgeAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 0; Write-GuiLog "Edge AI features disabled." } "Disabling Edge AI..."
         }
-        Update-WmtTweakToggle $btnToggleEdgeAI (-not $currentlyOff) "Edge AI On" "Edge AI Off"
+        Update-WmtTweakToggle $btnToggleEdgeAI $currentlyOff "Edge AI On" "Edge AI Off"
     })
 }
 
@@ -36980,7 +36980,7 @@ $btnTogglePaintAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableCopilot" 0; Write-GuiLog "Paint AI disabled." } "Disabling Paint AI..."
         }
-        Update-WmtTweakToggle $btnTogglePaintAI (-not $currentlyOff) "Paint AI On" "Paint AI Off"
+        Update-WmtTweakToggle $btnTogglePaintAI $currentlyOff "Paint AI On" "Paint AI Off"
     })
 }
 
@@ -36996,7 +36996,7 @@ $btnToggleNotepadAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "CocreatorEnabled" 0; Write-GuiLog "Notepad AI disabled." } "Disabling Notepad AI..."
         }
-        Update-WmtTweakToggle $btnToggleNotepadAI (-not $currentlyOff) "Notepad AI On" "Notepad AI Off"
+        Update-WmtTweakToggle $btnToggleNotepadAI $currentlyOff "Notepad AI On" "Notepad AI Off"
     })
 }
 
@@ -37012,7 +37012,7 @@ $btnToggleFindMyDevice.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Find My Device disabled." } "Disabling Find My Device..."
         }
-        Update-WmtTweakToggle $btnToggleFindMyDevice (-not $currentlyOff) "Find My Device On" "Find My Device Off"
+        Update-WmtTweakToggle $btnToggleFindMyDevice $currentlyOff "Find My Device On" "Find My Device Off"
     })
 }
 
@@ -37028,7 +37028,7 @@ $btnToggleLocationSvc.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Value" 0; Write-GuiLog "Location services disabled." } "Disabling location services..."
         }
-        Update-WmtTweakToggle $btnToggleLocationSvc (-not $currentlyOff) "Location On" "Location Off"
+        Update-WmtTweakToggle $btnToggleLocationSvc $currentlyOff "Location On" "Location Off"
     })
 }
 
@@ -37044,7 +37044,7 @@ $btnToggleModernStandby.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "EnableAwakeNetworkOnDisconnect" 0; Set-WmtRegDword $p1 "EnforceConnectedStandby" 0; Write-GuiLog "Modern Standby networking disabled." } "Disabling Modern Standby networking..."
         }
-        Update-WmtTweakToggle $btnToggleModernStandby (-not $currentlyOff) "Modern Standby Net On" "Modern Standby Net Off"
+        Update-WmtTweakToggle $btnToggleModernStandby $currentlyOff "Modern Standby Net On" "Modern Standby Net Off"
     })
 }
 
@@ -37060,7 +37060,7 @@ $btnToggleDeviceAutoApp.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisableDeviceAutoInstall" 1; Write-GuiLog "Device auto-app download disabled." } "Disabling device auto-apps..."
         }
-        Update-WmtTweakToggle $btnToggleDeviceAutoApp (-not $currentlyOff) "Device Auto-Apps On" "Device Auto-Apps Off"
+        Update-WmtTweakToggle $btnToggleDeviceAutoApp $currentlyOff "Device Auto-Apps On" "Device Auto-Apps Off"
     })
 }
 
@@ -37190,7 +37190,7 @@ $btnToggleSnapAssist.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "SnapAssist" 0; Write-GuiLog "Snap Assist disabled." } "Disabling Snap Assist..."
         }
-        Update-WmtTweakToggle $btnToggleSnapAssist (-not $currentlyOff) "Snap Assist On" "Snap Assist Off"
+        Update-WmtTweakToggle $btnToggleSnapAssist $currentlyOff "Snap Assist On" "Snap Assist Off"
     })
 }
 
@@ -37206,7 +37206,7 @@ $btnToggleSnapLayouts.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableSnapLayouts" 0; Write-GuiLog "Snap Layouts disabled." } "Disabling Snap Layouts..."
         }
-        Update-WmtTweakToggle $btnToggleSnapLayouts (-not $currentlyOff) "Snap Layouts On" "Snap Layouts Off"
+        Update-WmtTweakToggle $btnToggleSnapLayouts $currentlyOff "Snap Layouts On" "Snap Layouts Off"
     })
 }
 
@@ -37222,7 +37222,7 @@ $btnToggleWindowSnapping.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "WindowArrangementActive" 0; Write-GuiLog "Window snapping disabled." } "Disabling window snapping..."
         }
-        Update-WmtTweakToggle $btnToggleWindowSnapping (-not $currentlyOff) "Window Snapping On" "Window Snapping Off"
+        Update-WmtTweakToggle $btnToggleWindowSnapping $currentlyOff "Window Snapping On" "Window Snapping Off"
     })
 }
 
@@ -37254,7 +37254,7 @@ $btnToggleTransparency.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableTransparency" 0; Write-GuiLog "Transparency disabled." } "Disabling transparency..."
         }
-        Update-WmtTweakToggle $btnToggleTransparency (-not $currentlyOff) "Transparency On" "Transparency Off"
+        Update-WmtTweakToggle $btnToggleTransparency $currentlyOff "Transparency On" "Transparency Off"
     })
 }
 
@@ -37270,7 +37270,7 @@ $btnToggleAnimations.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "MinAnimate" 0; Write-GuiLog "Window animations disabled." } "Disabling animations..."
         }
-        Update-WmtTweakToggle $btnToggleAnimations (-not $currentlyOff) "Animations On" "Animations Off"
+        Update-WmtTweakToggle $btnToggleAnimations $currentlyOff "Animations On" "Animations Off"
     })
 }
 
@@ -37287,7 +37287,7 @@ $btnToggleLockscreenTips.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "Enabled" 0; Set-WmtRegDword $p2 "Enabled" 0; Write-GuiLog "Lockscreen tips disabled." } "Disabling lockscreen tips..."
         }
-        Update-WmtTweakToggle $btnToggleLockscreenTips (-not $currentlyOff) "Lockscreen Tips On" "Lockscreen Tips Off"
+        Update-WmtTweakToggle $btnToggleLockscreenTips $currentlyOff "Lockscreen Tips On" "Lockscreen Tips Off"
     })
 }
 
@@ -37303,7 +37303,7 @@ $btnToggleSearchHighlights.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "IsDynamicSearchBoxEnabled" 0; Write-GuiLog "Search highlights disabled." } "Disabling search highlights..."
         }
-        Update-WmtTweakToggle $btnToggleSearchHighlights (-not $currentlyOff) "Search Highlights On" "Search Highlights Off"
+        Update-WmtTweakToggle $btnToggleSearchHighlights $currentlyOff "Search Highlights On" "Search Highlights Off"
     })
 }
 
@@ -37319,7 +37319,7 @@ $btnToggleSearchHistory.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "IsDeviceSearchHistoryEnabled" 0; Write-GuiLog "Search history disabled." } "Disabling search history..."
         }
-        Update-WmtTweakToggle $btnToggleSearchHistory (-not $currentlyOff) "Search History On" "Search History Off"
+        Update-WmtTweakToggle $btnToggleSearchHistory $currentlyOff "Search History On" "Search History Off"
     })
 }
 
@@ -37336,7 +37336,7 @@ $btnToggleGameBarIntegration.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "AllowAutoGameMode" 0; Set-WmtRegDword $p1 "AutoGameModeEnabled" 0; Set-WmtRegDword $p2 "GameDVR_Enabled" 0; Write-GuiLog "Game Bar integration disabled." } "Disabling Game Bar integration..."
         }
-        Update-WmtTweakToggle $btnToggleGameBarIntegration (-not $currentlyOff) "Game Bar Int. On" "Game Bar Int. Off"
+        Update-WmtTweakToggle $btnToggleGameBarIntegration $currentlyOff "Game Bar Int. On" "Game Bar Int. Off"
     })
 }
 
@@ -37353,7 +37353,7 @@ $btnToggleDVR.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "GameDVR_Enabled" 0; Set-WmtRegDword $p2 "AllowGameDVR" 0; Write-GuiLog "Game DVR disabled." } "Disabling Game DVR..."
         }
-        Update-WmtTweakToggle $btnToggleDVR (-not $currentlyOff) "DVR On" "DVR Off"
+        Update-WmtTweakToggle $btnToggleDVR $currentlyOff "DVR On" "DVR Off"
     })
 }
 
@@ -37369,7 +37369,7 @@ $btnToggleBitlocker.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "PreventDeviceEncryption" 1; Write-GuiLog "Bitlocker auto-encryption disabled for new OS installs." } "Disabling Bitlocker auto..."
         }
-        Update-WmtTweakToggle $btnToggleBitlocker (-not $currentlyOff) "Bitlocker Auto On" "Bitlocker Auto Off"
+        Update-WmtTweakToggle $btnToggleBitlocker $currentlyOff "Bitlocker Auto On" "Bitlocker Auto Off"
     })
 }
 
@@ -37385,7 +37385,7 @@ $btnToggleStickyKeys.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "58"; Write-GuiLog "Sticky Keys shortcut disabled." } "Disabling Sticky Keys..."
         }
-        Update-WmtTweakToggle $btnToggleStickyKeys (-not $currentlyOff) "Sticky Keys On" "Sticky Keys Off"
+        Update-WmtTweakToggle $btnToggleStickyKeys $currentlyOff "Sticky Keys On" "Sticky Keys Off"
     })
 }
 
@@ -37401,7 +37401,7 @@ $btnToggleDeliveryOpt.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DODownloadMode" 0; Write-GuiLog "Delivery Optimization disabled." } "Disabling Delivery Optimization..."
         }
-        Update-WmtTweakToggle $btnToggleDeliveryOpt (-not $currentlyOff) "Delivery Opt On" "Delivery Opt Off"
+        Update-WmtTweakToggle $btnToggleDeliveryOpt $currentlyOff "Delivery Opt On" "Delivery Opt Off"
     })
 }
 
@@ -37417,7 +37417,7 @@ $btnToggleUpdateASAP.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AllowAutoWindowsUpdateDownloadOverMeteredNetwork" 0; Write-GuiLog "Update ASAP disabled (no auto-download over metered connections)." } "Disabling Update ASAP..."
         }
-        Update-WmtTweakToggle $btnToggleUpdateASAP (-not $currentlyOff) "Update ASAP On" "Update ASAP Off"
+        Update-WmtTweakToggle $btnToggleUpdateASAP $currentlyOff "Update ASAP On" "Update ASAP Off"
     })
 }
 
@@ -37501,7 +37501,7 @@ $btnToggleIPv6.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisabledComponents" 255; Write-GuiLog "IPv6 disabled (reboot required)." } "Disabling IPv6..."
         }
-        Update-WmtTweakToggle $btnToggleIPv6 (-not $currentlyOff) "Enable IPv6" "Disable IPv6"
+        Update-WmtTweakToggle $btnToggleIPv6 $currentlyOff "Enable IPv6" "Disable IPv6"
     })
 }
 
@@ -37517,7 +37517,7 @@ $btnToggleNetThrottling.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "NetworkThrottlingIndex" 0xFFFFFFFF; Write-GuiLog "Network throttling disabled (unlimited)." } "Disabling network throttling..."
         }
-        Update-WmtTweakToggle $btnToggleNetThrottling (-not $currentlyOff) "Enable Net Throttling" "Disable Net Throttling"
+        Update-WmtTweakToggle $btnToggleNetThrottling $currentlyOff "Enable Net Throttling" "Disable Net Throttling"
     })
 }
 
@@ -37533,7 +37533,7 @@ $btnToggleNetLocationWizard.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowNetworkLocationWizard" 0; Write-GuiLog "Network Location Wizard disabled." } "Disabling network location wizard..."
         }
-        Update-WmtTweakToggle $btnToggleNetLocationWizard (-not $currentlyOff) "Net Location Wizard On" "Net Location Wizard Off"
+        Update-WmtTweakToggle $btnToggleNetLocationWizard $currentlyOff "Net Location Wizard On" "Net Location Wizard Off"
     })
 }
 
@@ -37549,7 +37549,7 @@ $btnToggleWifiSense.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AutoConnectAllowedOEM" 0; Set-WmtRegDword $p "WiFISenseAllowed" 0; Write-GuiLog "Wi-Fi Sense disabled." } "Disabling Wi-Fi Sense..."
         }
-        Update-WmtTweakToggle $btnToggleWifiSense (-not $currentlyOff) "Wi-Fi Sense On" "Wi-Fi Sense Off"
+        Update-WmtTweakToggle $btnToggleWifiSense $currentlyOff "Wi-Fi Sense On" "Wi-Fi Sense Off"
     })
 }
 
@@ -37565,7 +37565,7 @@ $btnToggleAutoWifi.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AutoConnectAllowedOEM" 0; Write-GuiLog "Suggested WiFi auto-connect disabled." } "Disabling suggested WiFi..."
         }
-        Update-WmtTweakToggle $btnToggleAutoWifi (-not $currentlyOff) "Suggested WiFi On" "Suggested WiFi Off"
+        Update-WmtTweakToggle $btnToggleAutoWifi $currentlyOff "Suggested WiFi On" "Suggested WiFi Off"
     })
 }
 
@@ -37599,7 +37599,7 @@ $btnToggleInkingPersonal.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "RestrictImplicitInkCollection" 1; Set-WmtRegDword $p "RestrictImplicitTextCollection" 1; Write-GuiLog "Inking personalization disabled." } "Disabling inking personalization..."
         }
-        Update-WmtTweakToggle $btnToggleInkingPersonal (-not $currentlyOff) "Inking Personal On" "Inking Personal Off"
+        Update-WmtTweakToggle $btnToggleInkingPersonal $currentlyOff "Inking Personal On" "Inking Personal Off"
     })
 }
 
@@ -37616,7 +37616,7 @@ $btnToggleSpeechOnline.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AcceptPrivacyNotice" 0; Write-GuiLog "Online speech recognition disabled." } "Disabling online speech recognition..."
         }
-        Update-WmtTweakToggle $btnToggleSpeechOnline (-not $currentlyOff) "Speech Online On" "Speech Online Off"
+        Update-WmtTweakToggle $btnToggleSpeechOnline $currentlyOff "Speech Online On" "Speech Online Off"
     })
 }
 
@@ -37632,7 +37632,7 @@ $btnToggleAppDiagnostics.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "Value" "Deny"; Write-GuiLog "App diagnostics access disabled." } "Disabling app diagnostics..."
         }
-        Update-WmtTweakToggle $btnToggleAppDiagnostics (-not $currentlyOff) "App Diagnostics On" "App Diagnostics Off"
+        Update-WmtTweakToggle $btnToggleAppDiagnostics $currentlyOff "App Diagnostics On" "App Diagnostics Off"
     })
 }
 
@@ -37648,7 +37648,7 @@ $btnToggleBackgroundApps.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "GlobalUserDisabled" 1; Write-GuiLog "Background apps disabled." } "Disabling background apps..."
         }
-        Update-WmtTweakToggle $btnToggleBackgroundApps (-not $currentlyOff) "Background Apps On" "Background Apps Off"
+        Update-WmtTweakToggle $btnToggleBackgroundApps $currentlyOff "Background Apps On" "Background Apps Off"
     })
 }
 
@@ -37664,7 +37664,7 @@ $btnToggleFeedbackNotify.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "NumberOfSIUFInPeriod" 0; Set-WmtRegDword $p "PeriodInNanoSeconds" 0; Write-GuiLog "Feedback notifications disabled." } "Disabling feedback notifications..."
         }
-        Update-WmtTweakToggle $btnToggleFeedbackNotify (-not $currentlyOff) "Feedback Notify On" "Feedback Notify Off"
+        Update-WmtTweakToggle $btnToggleFeedbackNotify $currentlyOff "Feedback Notify On" "Feedback Notify Off"
     })
 }
 
@@ -37680,7 +37680,7 @@ $btnToggleCompatTelemetry.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AITEnable" 0; Write-GuiLog "Compatibility telemetry disabled." } "Disabling compatibility telemetry..."
         }
-        Update-WmtTweakToggle $btnToggleCompatTelemetry (-not $currentlyOff) "Compat Telemetry On" "Compat Telemetry Off"
+        Update-WmtTweakToggle $btnToggleCompatTelemetry $currentlyOff "Compat Telemetry On" "Compat Telemetry Off"
     })
 }
 
@@ -37697,7 +37697,7 @@ $btnToggleCEIP.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "CEIPEnable" "0"; Write-GuiLog "Customer Experience Improvement Program disabled." } "Disabling CEIP..."
         }
-        Update-WmtTweakToggle $btnToggleCEIP (-not $currentlyOff) "CEIP On" "CEIP Off"
+        Update-WmtTweakToggle $btnToggleCEIP $currentlyOff "CEIP On" "CEIP Off"
     })
 }
 
@@ -37712,7 +37712,7 @@ $btnToggleNTFSLastAccess.Add_Click({
         else {
             Invoke-UiCommand { & fsutil behavior set DisableLastAccess 1 | Out-Null; Write-GuiLog "NTFS Last Access time updates disabled." } "Disabling NTFS Last Access..."
         }
-        Update-WmtTweakToggle $btnToggleNTFSLastAccess (-not $currentlyOff) "Enable NTFS Last Access" "Disable NTFS Last Access"
+        Update-WmtTweakToggle $btnToggleNTFSLastAccess $currentlyOff "Enable NTFS Last Access" "Disable NTFS Last Access"
     })
 }
 
@@ -37726,7 +37726,7 @@ $btnToggleNTFS83.Add_Click({
         else {
             Invoke-UiCommand { & fsutil behavior set Disable8dot3 1 | Out-Null; Write-GuiLog "NTFS 8.3 short names disabled." } "Disabling NTFS 8.3..."
         }
-        Update-WmtTweakToggle $btnToggleNTFS83 (-not $currentlyOff) "Enable NTFS 8.3" "Disable NTFS 8.3"
+        Update-WmtTweakToggle $btnToggleNTFS83 $currentlyOff "Enable NTFS 8.3" "Disable NTFS 8.3"
     })
 }
 
@@ -37742,7 +37742,7 @@ $btnToggleThumbCache.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisableThumbnails" 1; Write-GuiLog "Thumbnail cache disabled." } "Disabling thumbnail cache..."
         }
-        Update-WmtTweakToggle $btnToggleThumbCache (-not $currentlyOff) "Thumbnail Cache On" "Thumbnail Cache Off"
+        Update-WmtTweakToggle $btnToggleThumbCache $currentlyOff "Thumbnail Cache On" "Thumbnail Cache Off"
     })
 }
 
@@ -37857,7 +37857,7 @@ $btnToggleStartupSound.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Startup sound disabled." } "Disabling startup sound..."
         }
-        Update-WmtTweakToggle $btnToggleStartupSound (-not $currentlyOff) "Startup Sound On" "Startup Sound Off"
+        Update-WmtTweakToggle $btnToggleStartupSound $currentlyOff "Startup Sound On" "Startup Sound Off"
     })
 }
 
@@ -37873,7 +37873,7 @@ $btnToggleNotifySound.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDefaultValue $p ""; Write-GuiLog "Notification sounds disabled." } "Disabling notification sounds..."
         }
-        Update-WmtTweakToggle $btnToggleNotifySound (-not $currentlyOff) "Notification Sound On" "Notification Sound Off"
+        Update-WmtTweakToggle $btnToggleNotifySound $currentlyOff "Notification Sound On" "Notification Sound Off"
     })
 }
 
@@ -37889,7 +37889,7 @@ $btnToggleDeviceSound.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDefaultValue $p ""; Write-GuiLog "Device connect sounds disabled." } "Disabling device connect sounds..."
         }
-        Update-WmtTweakToggle $btnToggleDeviceSound (-not $currentlyOff) "Device Connect Sound On" "Device Connect Sound Off"
+        Update-WmtTweakToggle $btnToggleDeviceSound $currentlyOff "Device Connect Sound On" "Device Connect Sound Off"
     })
 }
 
@@ -38094,7 +38094,7 @@ $btnToggleWSH.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Windows Script Host disabled (blocks .vbs/.js)." } "Disabling WSH..."
         }
-        Update-WmtTweakToggle $btnToggleWSH (-not $currentlyOff) "Enable WSH" "Disable WSH"
+        Update-WmtTweakToggle $btnToggleWSH $currentlyOff "Enable WSH" "Disable WSH"
     })
 }
 
