@@ -736,6 +736,12 @@ jobs:
               $success.TerminationFailed -or $success.StdOut -notmatch 'WMT_PROCESS_OK') {
               throw ("Normal process output capture failed: " + ($success | ConvertTo-Json -Compress))
           }
+          $noisy = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "1..1000 | ForEach-Object { ''X'' * 10000 }"' -TimeoutMs 30000 -Encoding UTF8 -KillTree
+          if ($noisy.ExitCode -ne 0 -or -not $noisy.OutputTruncated -or
+              $noisy.StdOut.Length -gt (8 * 1024 * 1024) -or
+              $noisy.StdOut.Length -lt 1000000) {
+              throw ("High-volume process output was not bounded: " + ($noisy | ConvertTo-Json -Compress))
+          }
           $stopwatch = [Diagnostics.Stopwatch]::StartNew()
           $timeoutResult = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "Start-Sleep -Seconds 20"' -TimeoutMs 2500 -Encoding UTF8 -KillTree
           $stopwatch.Stop()
