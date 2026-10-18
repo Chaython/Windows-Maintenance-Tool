@@ -297,6 +297,24 @@ jobs:
               (Find-FunctionText 'Get-WmtRegistryKeyValuesCached') -match 'Read-WmtRegValuesFast|OpenSubKey|Get-ItemProperty') {
               throw 'Registry cache fallback can block on WPF or lose unnamed registry values.'
           }
+          # Cleaner rule definitions can be large. Cache only the active signature
+          # so repeated refreshes never retain every prior parsed object graph.
+          function Test-WmtCleanerRuleMemoryCacheEnabled { return $true }
+          Invoke-Expression (Find-FunctionText 'Set-WmtCleanerRulesMemoryCacheEntry')
+          $ruleCache = @{ 'old-signature' = @([pscustomobject]@{ Name = 'old rules' }) }
+          Set-WmtCleanerRulesMemoryCacheEntry -Cache $ruleCache -Key 'new-signature' -Rules @([pscustomobject]@{ Name = 'new rules' })
+          if ($ruleCache.Count -ne 1 -or -not $ruleCache.ContainsKey('new-signature') -or $ruleCache.ContainsKey('old-signature')) {
+              throw 'Cleaner rule cache retained the previous definition snapshot.'
+          }
+          Set-WmtCleanerRulesMemoryCacheEntry -Cache $ruleCache -Key 'latest-signature' -Rules @([pscustomobject]@{ Name = 'latest rules' })
+          if ($ruleCache.Count -ne 1 -or -not $ruleCache.ContainsKey('latest-signature') -or $ruleCache.ContainsKey('new-signature')) {
+              throw 'Cleaner rule cache grew beyond one source signature.'
+          }
+          if ($source -match '\\$script:(?:CleanerMlRulesMemoryCache|Winapp2RulesMemoryCache|Winapp3RulesMemoryCache)\\[\\$memoryKey\\]\\s*=') {
+              throw 'Cleaner rule memory cache once again retains unbounded historical signatures.'
+          }
+          Write-Host 'PASS: cleaner rule memory caches retain only the latest definition snapshot.'
+
           Write-Host 'PASS: registry snapshots and UI cache lookups are safe.'
 
           # Exercise the actual My Device queue with an unavailable pool.
