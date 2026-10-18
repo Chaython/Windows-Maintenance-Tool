@@ -2131,25 +2131,22 @@ $result = [PSCustomObject]@{
 $proc = $null
 $stdoutBuilder = [System.Text.StringBuilder]::new()
 $stderrBuilder = [System.Text.StringBuilder]::new()
-# CLI output is streamed and bounded. JSON callers get ample headroom, while
-# a noisy child can never force WMT to retain an unlimited ReadToEndAsync buffer.
+# Read fixed-size character chunks, never lines: ReadLineAsync can allocate an
+# arbitrarily large string when a child emits a huge line without a newline.
+# Retained output is capped per stream, but reads continue after the cap so
+# the child cannot deadlock on a full redirected pipe.
 $maxOutputChars = 8 * 1024 * 1024
-$appendOutputLine = {
-    param([string]$Line, [System.Text.StringBuilder]$Builder)
-    if ($null -eq $Line) { return }
-    $lineWithNewline = $Line + [Environment]::NewLine
+$appendOutputChunk = {
+    param([char[]]$Buffer, [int]$Count, [System.Text.StringBuilder]$Builder)
+    if ($Count -le 0) { return }
     $remaining = $maxOutputChars - $Builder.Length
     if ($remaining -le 0) {
         $result.OutputTruncated = $true
         return
     }
-    if ($lineWithNewline.Length -gt $remaining) {
-        [void]$Builder.Append($lineWithNewline.Substring(0, $remaining))
-        $result.OutputTruncated = $true
-    }
-    else {
-        [void]$Builder.Append($lineWithNewline)
-    }
+    $take = [Math]::Min($Count, $remaining)
+    [void]$Builder.Append($Buffer, 0, $take)
+    if ($take -lt $Count) { $result.OutputTruncated = $true }
 }
 try {
     $textEncoding = switch ($Encoding) {
@@ -2173,8 +2170,10 @@ try {
     $result.ProcessId = $proc.Id
     $startedAtUtc = [DateTime]::UtcNow
     $timedOut = $false
-    $outTask = $proc.StandardOutput.ReadLineAsync()
-    $errTask = $proc.StandardError.ReadLineAsync()
+    $outBuffer = New-Object char[] 4096
+    $errBuffer = New-Object char[] 4096
+    $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
     $drainDeadlineUtc = $null
 
     while ($true) {
@@ -2220,27 +2219,27 @@ try {
         $outDrainCount = 0
         while ($outTask -and $outTask.IsCompleted -and $outDrainCount -lt 256) {
             $outDrainCount++
-            $line = $null
-            try { $line = $outTask.GetAwaiter().GetResult() } catch {}
-            if ($null -eq $line) {
+            $count = 0
+            try { $count = [int]$outTask.GetAwaiter().GetResult() } catch {}
+            if ($count -le 0) {
                 $outTask = $null
             }
             else {
-                & $appendOutputLine $line $stdoutBuilder
-                $outTask = $proc.StandardOutput.ReadLineAsync()
+                & $appendOutputChunk $outBuffer $count $stdoutBuilder
+                $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
             }
         }
         $errDrainCount = 0
         while ($errTask -and $errTask.IsCompleted -and $errDrainCount -lt 256) {
             $errDrainCount++
-            $line = $null
-            try { $line = $errTask.GetAwaiter().GetResult() } catch {}
-            if ($null -eq $line) {
+            $count = 0
+            try { $count = [int]$errTask.GetAwaiter().GetResult() } catch {}
+            if ($count -le 0) {
                 $errTask = $null
             }
             else {
-                & $appendOutputLine $line $stderrBuilder
-                $errTask = $proc.StandardError.ReadLineAsync()
+                & $appendOutputChunk $errBuffer $count $stderrBuilder
+                $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
             }
         }
 
