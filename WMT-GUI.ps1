@@ -39712,6 +39712,12 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 $exitCode = 1
 $proc = $null
 $stderrCapture = [System.Text.StringBuilder]::new()
+# PowerShell progress/CLIXML on stderr can be enormous during long installs.
+# Keep a bounded prefix in memory and spool the complete overflow to disk.
+$stderrCaptureLimit = 2 * 1024 * 1024
+$stderrCaptureTruncated = $false
+$stderrOverflowPath = $transcriptPath + '.clixml'
+$stderrOverflowWriter = $null
 $stdoutTail = [System.Text.StringBuilder]::new()
 try {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -39763,7 +39769,31 @@ try {
                 # Windows PowerShell 5.1 serializes redirected host/progress
                 # records as CLIXML on stderr. Buffer stderr separately so
                 # markup never mixes with readable stdout in the package log.
-                [void]$stderrCapture.Append($chunk)
+                if (-not $stderrCaptureTruncated) {
+                    $remainingChars = $stderrCaptureLimit - $stderrCapture.Length
+                    if ($chunk.Length -le $remainingChars) {
+                        [void]$stderrCapture.Append($chunk)
+                    }
+                    else {
+                        if ($remainingChars -gt 0) {
+                            [void]$stderrCapture.Append($chunk.Substring(0, $remainingChars))
+                        }
+                        try {
+                            $stderrOverflowWriter = [System.IO.StreamWriter]::new($stderrOverflowPath, $false, $utf8)
+                            [void]$stderrOverflowWriter.Write($stderrCapture.ToString())
+                            [void]$stderrOverflowWriter.Write($chunk.Substring([Math]::Max(0, $remainingChars)))
+                            $stderrCaptureTruncated = $true
+                        }
+                        catch {
+                            try { if ($stderrOverflowWriter) { $stderrOverflowWriter.Dispose() } } catch {}
+                            $stderrOverflowWriter = $null
+                            $stderrCaptureTruncated = $true
+                        }
+                    }
+                }
+                elseif ($stderrOverflowWriter) {
+                    try { [void]$stderrOverflowWriter.Write($chunk) } catch {}
+                }
                 $errBuffer = New-Object char[] 4096
                 $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
             }
@@ -39775,7 +39805,24 @@ try {
     $proc.WaitForExit()
     $exitCode = [int]$proc.ExitCode
 
-    if ($stderrCapture.Length -gt 0) {
+    if ($stderrCaptureTruncated) {
+        try {
+            if ($stderrOverflowWriter) {
+                $stderrOverflowWriter.Flush()
+                $stderrOverflowWriter.Dispose()
+                $stderrOverflowWriter = $null
+            }
+        } catch {}
+        $overflowDetail = if (Test-Path -LiteralPath $stderrOverflowPath -PathType Leaf) {
+            "Full raw stream saved to $stderrOverflowPath"
+        } else {
+            "The raw overflow sidecar could not be written; excess stderr was discarded."
+        }
+        $overflowMessage = "PowerShell stderr exceeded the bounded in-memory capture; CLIXML decoding was skipped to avoid unbounded memory use. $overflowDetail"
+        try { [System.IO.File]::AppendAllText($transcriptPath, ($overflowMessage + [Environment]::NewLine), $utf8) } catch {}
+        [Console]::Error.WriteLine($overflowMessage)
+    }
+    elseif ($stderrCapture.Length -gt 0) {
         $stderrText = $stderrCapture.ToString()
         if ($stderrText -match '^\s*#< CLIXML(?:\r?\n)') {
             try {
@@ -39912,6 +39959,13 @@ try {
     try { [System.IO.File]::AppendAllText($transcriptPath, ($message + [Environment]::NewLine), $utf8) } catch {}
     [Console]::Error.WriteLine($message)
 } finally {
+    try {
+        if ($stderrOverflowWriter) {
+            $stderrOverflowWriter.Flush()
+            $stderrOverflowWriter.Dispose()
+            $stderrOverflowWriter = $null
+        }
+    } catch {}
     try { if ($proc) { $proc.Dispose() } } catch {}
 }
 try {
@@ -41011,62 +41065,122 @@ exit $exitCode
             $proc = [System.Diagnostics.Process]::Start($pInfo)
             if (-not $proc) { throw "Python/pip process failed to start." }
 
-            $outTask = $proc.StandardOutput.ReadToEndAsync()
-            $errTask = $proc.StandardError.ReadToEndAsync()
             $timeoutMs = if ($TimeoutSeconds -gt 0) { [Math]::Min([int]::MaxValue, [int64]$TimeoutSeconds * 1000) } else { [int]::MaxValue }
-            $exited = $proc.WaitForExit([int]$timeoutMs)
-            $timedOut = -not $exited
+            $startedAtUtc = [DateTime]::UtcNow
+            $timedOut = $false
             $terminationFailed = $false
             $timeoutReason = ""
+            $outputReadTimedOut = $false
+            $outputLines = [System.Collections.Generic.Queue[string]]::new()
+            $outputState = [PSCustomObject]@{ Chars = 0; Truncated = $false; DroppedLines = 0; ReadTimedOut = $false }
+            $maxOutputLines = 2000
+            $maxOutputChars = 2 * 1024 * 1024
+            $maxDisplayLineChars = 16384
+            $appendOutputLine = {
+                param([string]$Line)
+                if ($null -eq $Line) { return }
+                if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                    Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text ("OUTPUT: " + $Line)
+                }
+                if ([string]::IsNullOrWhiteSpace($Line)) { return }
+                $displayLine = $Line
+                if ($displayLine.Length -gt $maxDisplayLineChars) {
+                    $displayLine = $displayLine.Substring(0, $maxDisplayLineChars) + " [line shortened in memory; full line remains in transcript]"
+                    $outputState.Truncated = $true
+                }
+                $outputLines.Enqueue($displayLine)
+                $outputState.Chars += $displayLine.Length
+                while ($outputLines.Count -gt $maxOutputLines -or $outputState.Chars -gt $maxOutputChars) {
+                    $removedLine = $outputLines.Dequeue()
+                    $outputState.Chars -= $removedLine.Length
+                    $outputState.DroppedLines++
+                    $outputState.Truncated = $true
+                }
+            }.GetNewClosure()
 
-            if ($timedOut) {
-                $timeoutReason = "Pip exceeded the $TimeoutSeconds-second runtime limit"
-                Stop-WmtChildProcessTree -Process $proc
-                try { [void]$proc.WaitForExit(5000) } catch {}
-                try {
-                    $proc.Refresh()
-                    if (-not $proc.HasExited) {
-                        try { $proc.Kill() } catch {}
-                        try { [void]$proc.WaitForExit(3000) } catch {}
-                        try { $proc.Refresh() } catch {}
+            # Stream output line-by-line while the process runs. The previous
+            # ReadToEndAsync approach held complete stdout, stderr and split copies
+            # simultaneously, which could consume gigabytes for noisy pip installs.
+            $outTask = $proc.StandardOutput.ReadLineAsync()
+            $errTask = $proc.StandardError.ReadLineAsync()
+            $drainDeadlineUtc = $null
+            while ($true) {
+                $nowUtc = [DateTime]::UtcNow
+                $hasExited = $false
+                try { $hasExited = [bool]$proc.HasExited } catch { $hasExited = $true }
+
+                if (-not $hasExited -and -not $timedOut -and $TimeoutSeconds -gt 0 -and
+                    ($nowUtc - $startedAtUtc).TotalMilliseconds -ge $timeoutMs) {
+                    $timedOut = $true
+                    $timeoutReason = "Pip exceeded the $TimeoutSeconds-second runtime limit"
+                    Stop-WmtChildProcessTree -Process $proc
+                    try { [void]$proc.WaitForExit(5000) } catch {}
+                    try {
+                        $proc.Refresh()
+                        if (-not $proc.HasExited) {
+                            try { $proc.Kill() } catch {}
+                            try { [void]$proc.WaitForExit(3000) } catch {}
+                            try { $proc.Refresh() } catch {}
+                        }
+                        $terminationFailed = -not $proc.HasExited
                     }
-                    $terminationFailed = -not $proc.HasExited
+                    catch { $terminationFailed = $true }
+                    $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(5)
                 }
-                catch { $terminationFailed = $true }
-            }
-            else {
-                try { $proc.WaitForExit() } catch {}
-            }
 
-            $drainDeadline = (Get-Date).AddSeconds(5)
-            while (((-not $outTask.IsCompleted) -or (-not $errTask.IsCompleted)) -and (Get-Date) -lt $drainDeadline) {
-                Start-Sleep -Milliseconds 50
-            }
-
-            $outputLines = [System.Collections.Generic.List[string]]::new()
-            if ($outTask.IsCompleted) {
-                try {
-                    $stdout = [string]$outTask.GetAwaiter().GetResult()
-                    foreach ($line in @($stdout -split "\r?\n")) {
-                        if (-not [string]::IsNullOrWhiteSpace($line)) { [void]$outputLines.Add($line) }
+                if ($outTask -and $outTask.IsCompleted) {
+                    $line = $null
+                    try { $line = $outTask.GetAwaiter().GetResult() } catch {}
+                    if ($null -eq $line) {
+                        $outTask = $null
+                    }
+                    else {
+                        & $appendOutputLine $line
+                        $outTask = $proc.StandardOutput.ReadLineAsync()
                     }
                 }
-                catch {}
-            }
-            if ($errTask.IsCompleted) {
-                try {
-                    $stderr = [string]$errTask.GetAwaiter().GetResult()
-                    foreach ($line in @($stderr -split "\r?\n")) {
-                        if (-not [string]::IsNullOrWhiteSpace($line)) { [void]$outputLines.Add($line) }
+                if ($errTask -and $errTask.IsCompleted) {
+                    $line = $null
+                    try { $line = $errTask.GetAwaiter().GetResult() } catch {}
+                    if ($null -eq $line) {
+                        $errTask = $null
+                    }
+                    else {
+                        & $appendOutputLine $line
+                        $errTask = $proc.StandardError.ReadLineAsync()
                     }
                 }
-                catch {}
+
+                $hasExited = $false
+                try { $hasExited = [bool]$proc.HasExited } catch { $hasExited = $true }
+                if ($hasExited -and $null -eq $drainDeadlineUtc) {
+                    $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(5)
+                }
+                if ($hasExited -and -not $outTask -and -not $errTask) { break }
+                if ($drainDeadlineUtc -and [DateTime]::UtcNow -ge $drainDeadlineUtc) {
+                    if ($outTask -or $errTask) {
+                        $outputReadTimedOut = $true
+                        $outputState.ReadTimedOut = $true
+                        $outputState.Truncated = $true
+                    }
+                    $outTask = $null
+                    $errTask = $null
+                    break
+                }
+                Start-Sleep -Milliseconds 25
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
-                foreach ($outputLine in @($outputLines)) {
-                    Add-WmtPackageTranscriptLine -Path $TranscriptPath -Text ("OUTPUT: " + [string]$outputLine)
+            if ($outputState.Truncated) {
+                $summary = if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+                    "[WMT] Earlier pip output was omitted from the in-memory summary to limit RAM use; full output is in the provider transcript."
+                } else {
+                    "[WMT] Earlier pip output was omitted from the in-memory summary to limit RAM use."
                 }
+                while ($outputLines.Count -ge $maxOutputLines) {
+                    $removedLine = $outputLines.Dequeue()
+                    $outputState.Chars -= $removedLine.Length
+                }
+                $outputLines.Enqueue($summary)
             }
 
             if ($timedOut) {
@@ -41075,7 +41189,7 @@ exit $exitCode
                 }
                 return [PSCustomObject]@{
                     ExitCode          = 124
-                    OutputLines       = @($outputLines)
+                    OutputLines       = @($outputLines.ToArray())
                     TimedOut          = $true
                     TimeoutReason     = $timeoutReason
                     TerminationFailed = $terminationFailed
@@ -41088,7 +41202,7 @@ exit $exitCode
             }
             return [PSCustomObject]@{
                 ExitCode          = $normalizedExit
-                OutputLines       = @($outputLines)
+                OutputLines       = @($outputLines.ToArray())
                 TimedOut          = $false
                 TimeoutReason     = ""
                 TerminationFailed = $false
