@@ -2124,10 +2124,33 @@ $result = [PSCustomObject]@{
     TimedOut           = $false
     TerminationFailed  = $false
     OutputReadTimedOut = $false
+    OutputTruncated    = $false
     ProcessId          = 0
     Error              = ""
 }
 $proc = $null
+$stdoutBuilder = [System.Text.StringBuilder]::new()
+$stderrBuilder = [System.Text.StringBuilder]::new()
+# CLI output is streamed and bounded. JSON callers get ample headroom, while
+# a noisy child can never force WMT to retain an unlimited ReadToEndAsync buffer.
+$maxOutputChars = 8 * 1024 * 1024
+$appendOutputLine = {
+    param([string]$Line, [System.Text.StringBuilder]$Builder)
+    if ($null -eq $Line) { return }
+    $lineWithNewline = $Line + [Environment]::NewLine
+    $remaining = $maxOutputChars - $Builder.Length
+    if ($remaining -le 0) {
+        $result.OutputTruncated = $true
+        return
+    }
+    if ($lineWithNewline.Length -gt $remaining) {
+        [void]$Builder.Append($lineWithNewline.Substring(0, $remaining))
+        $result.OutputTruncated = $true
+    }
+    else {
+        [void]$Builder.Append($lineWithNewline)
+    }
+}
 try {
     $textEncoding = switch ($Encoding) {
         "UTF8"    { [System.Text.UTF8Encoding]::new($false) }
@@ -2148,62 +2171,119 @@ try {
     $proc.StartInfo = $psi
     if (-not $proc.Start()) { throw "Process failed to start." }
     $result.ProcessId = $proc.Id
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $exited = [bool]$proc.WaitForExit([Math]::Max(1, $TimeoutMs))
-    if (-not $exited) {
-        $result.TimedOut = $true
-        if ($KillTree) {
-            # taskkill itself can hang; a synchronous Start-Process -Wait is not safe here.
-            $killProcess = $null
-            try {
-                $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
-                if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
-                    $killProcess = Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -PassThru -ErrorAction Stop
-                    if ($killProcess -and -not $killProcess.WaitForExit(5000)) {
-                        try { $killProcess.Kill() } catch {}
+    $startedAtUtc = [DateTime]::UtcNow
+    $timedOut = $false
+    $outTask = $proc.StandardOutput.ReadLineAsync()
+    $errTask = $proc.StandardError.ReadLineAsync()
+    $drainDeadlineUtc = $null
+
+    while ($true) {
+        $nowUtc = [DateTime]::UtcNow
+        $hasExited = $false
+        try { $hasExited = [bool]$proc.HasExited } catch { $hasExited = $true }
+
+        if (-not $hasExited -and -not $timedOut -and
+            ($nowUtc - $startedAtUtc).TotalMilliseconds -ge [Math]::Max(1, $TimeoutMs)) {
+            $timedOut = $true
+            $result.TimedOut = $true
+            if ($KillTree) {
+                # taskkill itself can hang; wait only for a bounded interval.
+                $killProcess = $null
+                try {
+                    $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+                    if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+                        $killProcess = Start-Process -FilePath $taskkill -ArgumentList @("/PID", "$($proc.Id)", "/T", "/F") -WindowStyle Hidden -PassThru -ErrorAction Stop
+                        if ($killProcess -and -not $killProcess.WaitForExit(5000)) {
+                            try { $killProcess.Kill() } catch {}
+                        }
                     }
                 }
+                catch {}
+                finally { try { if ($killProcess) { $killProcess.Dispose() } } catch {} }
             }
-            catch {}
-            finally { try { if ($killProcess) { $killProcess.Dispose() } } catch {} }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+            try { [void]$proc.WaitForExit(2000) } catch {}
+            try {
+                $proc.Refresh()
+                if (-not $proc.HasExited) {
+                    $result.TerminationFailed = $true
+                    $result.Error = "Process timed out and termination could not be verified."
+                }
+            }
+            catch {
+                $result.TerminationFailed = $true
+                $result.Error = "Process timed out and termination could not be verified."
+            }
+            $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(3)
         }
-        # Also try the root when tree termination failed or is still in progress.
-        try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
-        try { $exited = [bool]$proc.WaitForExit(2000) } catch { $exited = $false }
-        if (-not $exited) { try { $exited = [bool]$proc.HasExited } catch {} }
-        if (-not $exited) {
-            $result.TerminationFailed = $true
-            $result.Error = "Process timed out and termination could not be verified."
-            return $result
+
+        if ($outTask -and $outTask.IsCompleted) {
+            $line = $null
+            try { $line = $outTask.GetAwaiter().GetResult() } catch {}
+            if ($null -eq $line) {
+                $outTask = $null
+            }
+            else {
+                & $appendOutputLine $line $stdoutBuilder
+                $outTask = $proc.StandardOutput.ReadLineAsync()
+            }
         }
+        if ($errTask -and $errTask.IsCompleted) {
+            $line = $null
+            try { $line = $errTask.GetAwaiter().GetResult() } catch {}
+            if ($null -eq $line) {
+                $errTask = $null
+            }
+            else {
+                & $appendOutputLine $line $stderrBuilder
+                $errTask = $proc.StandardError.ReadLineAsync()
+            }
+        }
+
+        $hasExited = $false
+        try { $hasExited = [bool]$proc.HasExited } catch { $hasExited = $true }
+        if ($hasExited -and $null -eq $drainDeadlineUtc) {
+            # Descendants can inherit redirected handles; never wait indefinitely.
+            $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(3)
+        }
+        if ($hasExited -and -not $outTask -and -not $errTask) { break }
+        if ($drainDeadlineUtc -and [DateTime]::UtcNow -ge $drainDeadlineUtc) {
+            if ($outTask -or $errTask) {
+                $result.OutputReadTimedOut = $true
+                if ($result.TimedOut) { $result.TerminationFailed = $true }
+                if ([string]::IsNullOrWhiteSpace($result.Error)) {
+                    $result.Error = "Process output did not finish within 3 seconds of exit; a child may still hold the pipe."
+                }
+            }
+            $outTask = $null
+            $errTask = $null
+            break
+        }
+        Start-Sleep -Milliseconds 25
     }
-    # Descendants may hold redirected handles open after the process exits.
-    $readCompleted = $false
+
     try {
-        $readCompleted = [System.Threading.Tasks.Task]::WaitAll(
-            [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), 3000)
+        $proc.Refresh()
+        if ($proc.HasExited) { $result.ExitCode = [int]$proc.ExitCode }
     }
-    catch { $result.Error = "Failed reading process output: $($_.Exception.Message)" }
-    if ($stdoutTask.IsCompleted -and -not $stdoutTask.IsFaulted -and -not $stdoutTask.IsCanceled) {
-        try { $result.StdOut = [string]$stdoutTask.Result } catch {}
-    }
-    if ($stderrTask.IsCompleted -and -not $stderrTask.IsFaulted -and -not $stderrTask.IsCanceled) {
-        try { $result.StdErr = [string]$stderrTask.Result } catch {}
-    }
-    $result.Combined = "$($result.StdOut)$($result.StdErr)"
-    if (-not $readCompleted) {
-        $result.OutputReadTimedOut = $true
-        if ($result.TimedOut) { $result.TerminationFailed = $true }
-        if ([string]::IsNullOrWhiteSpace($result.Error)) {
-            $result.Error = "Process output did not finish within 3 seconds of exit; a child may still hold the pipe."
-        }
-        return $result
-    }
-    try { $result.ExitCode = [int]$proc.ExitCode } catch {}
+    catch {}
 }
-catch { $result.Error = $_.Exception.Message }
-finally { if ($proc) { try { $proc.Dispose() } catch {} } }
+catch {
+    $result.Error = $_.Exception.Message
+}
+finally {
+    try { if ($proc) { $proc.Dispose() } } catch {}
+}
+try {
+    $result.StdOut = $stdoutBuilder.ToString()
+    $result.StdErr = $stderrBuilder.ToString()
+}
+catch {}
+$stdoutBuilder = $null
+$stderrBuilder = $null
+if ($result.OutputTruncated -and [string]::IsNullOrWhiteSpace($result.Error)) {
+    $result.Error = "Process output exceeded $maxOutputChars characters per stream; capture was truncated to protect memory."
+}
 return $result
 }
 function Invoke-WmtCliText {
@@ -2216,7 +2296,9 @@ param(
 try {
     $result = Invoke-WmtProcess -FilePath $FilePath -Arguments $Arguments -TimeoutMs $TimeoutMs -Encoding $Encoding -KillTree
     $global:LASTEXITCODE = [int]$result.ExitCode
-    if (-not [string]::IsNullOrEmpty([string]$result.Combined)) { return ([string]$result.Combined).TrimEnd() }
+    if ($result.OutputTruncated) { return "" }
+    $combinedText = ([string]$result.StdOut) + ([string]$result.StdErr)
+    if (-not [string]::IsNullOrEmpty($combinedText)) { return $combinedText.TrimEnd() }
     return ""
 }
 catch { return "" }
