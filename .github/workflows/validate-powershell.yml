@@ -8,6 +8,7 @@ on:
     paths:
       - "WMT-GUI.ps1"
       - "PS2EXE/**/*.ps1"
+      - "tools/diagnostics/**/*.ps1"
       - ".github/workflows/validate-powershell.yml"
   pull_request:
     branches:
@@ -15,6 +16,7 @@ on:
     paths:
       - "WMT-GUI.ps1"
       - "PS2EXE/**/*.ps1"
+      - "tools/diagnostics/**/*.ps1"
       - ".github/workflows/validate-powershell.yml"
 
 permissions:
@@ -44,7 +46,8 @@ jobs:
 
           $files = @(
               ".\WMT-GUI.ps1",
-              ".\PS2EXE\Build-Exe.ps1"
+              ".\PS2EXE\Build-Exe.ps1",
+              ".\tools\diagnostics\Measure-WmtResources.ps1"
           )
 
           $failed = $false
