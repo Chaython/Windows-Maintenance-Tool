@@ -34771,7 +34771,6 @@ $btnToggleHibernate = Get-Ctrl "btnToggleHibernate"
 $btnMyDeviceHibernateToggle = Get-Ctrl "btnMyDeviceHibernateToggle"
 $btnToggleSuperfetch = Get-Ctrl "btnToggleSuperfetch"
 $btnToggleMemCompress = Get-Ctrl "btnToggleMemCompress"
-$btnTogglePagefile = Get-Ctrl "btnTogglePagefile"
 $btnMyDeviceMemCompressToggle = Get-Ctrl "btnMyDeviceMemCompressToggle"
 $btnToggleHags = Get-Ctrl "btnToggleHags"
 $btnMyDeviceHagsToggle = Get-Ctrl "btnMyDeviceHagsToggle"
@@ -36573,7 +36572,6 @@ $btnQuickFindClearSearch = Get-Ctrl "btnQuickFindClearSearch"
 $pnlQuickFind = Get-Ctrl "pnlQuickFind"
 $pnlQuickFindMatches = Get-Ctrl "pnlQuickFindMatches"
 $lblQuickFindSummary = Get-Ctrl "lblQuickFindSummary"
-$pnlNavButtons = Get-Ctrl "pnlNavButtons"
 $svLog = Get-Ctrl "svLog"
 $LogBox = Get-Ctrl "LogBox"
 $LogSearchHighlightLayer = Get-Ctrl "LogSearchHighlightLayer"
@@ -38230,7 +38228,7 @@ $script:WmtQuickFindMovedButtons = [System.Collections.ArrayList]::new()
 $script:WmtQuickFindUpdating = $false
 $script:WmtQuickFindStateLabels = @{}
 $script:WmtQuickFindRenderedReadiness = @{}
-function Refresh-WmtQuickFindStateLabels {
+function Update-WmtQuickFindStateLabels {
     if (-not $pnlQuickFind -or -not $pnlQuickFind.IsVisible) { return }
     foreach ($name in @($script:WmtQuickFindStateLabels.Keys)) {
         $label = $script:WmtQuickFindStateLabels[$name]
@@ -38268,7 +38266,7 @@ function Sync-WmtQuickFindStateAvailability {
         }
     }
     if ($requiresRebuild) { Update-WmtQuickFindResults }
-    else { Refresh-WmtQuickFindStateLabels }
+    else { Update-WmtQuickFindStateLabels }
 }
 function Restore-WmtQuickFindButtons {
     if (-not $script:WmtQuickFindMovedButtons -or $script:WmtQuickFindMovedButtons.Count -eq 0) { return }
@@ -38492,7 +38490,7 @@ function Update-WmtQuickFindResults {
         $lblQuickFindSummary.Text = "Loading the tool directory..."
         return
     }
-    $matches = [System.Collections.ArrayList]::new()
+    $quickFindMatches = [System.Collections.ArrayList]::new()
     $seen = @{}
     foreach ($entry in $script:WmtSearchIndexEntries) {
         if (-not $entry) { continue }
@@ -38519,9 +38517,9 @@ function Update-WmtQuickFindResults {
         $key = "$($entry.Item.Tab)/$($entry.Item.Button.Name)"
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
-        [void]$matches.Add($entry)
+        [void]$quickFindMatches.Add($entry)
     }
-    $matches = @($matches | Sort-Object @{ Expression = {
+    $quickFindMatches = @($quickFindMatches | Sort-Object @{ Expression = {
         $label = [string]$_.Text
         if ($label.Equals($query, [System.StringComparison]::OrdinalIgnoreCase)) { 0 }
         elseif ($label.StartsWith($query, [System.StringComparison]::OrdinalIgnoreCase)) { 1 }
@@ -38530,18 +38528,18 @@ function Update-WmtQuickFindResults {
     } }, @{ Expression = { [string]$_.Text } })
     # Limit expensive WPF reparenting for very broad search terms.
     $limit = 16
-    $lblQuickFindSummary.Text = if ($matches.Count -eq 0) {
+    $lblQuickFindSummary.Text = if ($quickFindMatches.Count -eq 0) {
         "No tools found for '$query'. Try another term."
-    } elseif ($matches.Count -gt $limit) {
-        "$($matches.Count) related tools found for '$query' (showing $limit). Refine your search."
-    } else { "$($matches.Count) related tools found for '$query'." }
+    } elseif ($quickFindMatches.Count -gt $limit) {
+        "$($quickFindMatches.Count) related tools found for '$query' (showing $limit). Refine your search."
+    } else { "$($quickFindMatches.Count) related tools found for '$query'." }
     # Apply the result limit after relevance ranking, not after section ordering.
     # Otherwise an unrelated early section can hide a more relevant result.
-    $matches = @($matches | Select-Object -First $limit)
+    $quickFindMatches = @($quickFindMatches | Select-Object -First $limit)
     $rendered = 0
     foreach ($section in $script:WmtQuickFindSections) {
         if ($rendered -ge $limit) { break }
-        $items = @($matches | Where-Object { $_.Item.Tab -eq $section.Tab })
+        $items = @($quickFindMatches | Where-Object { $_.Item.Tab -eq $section.Tab })
         if ($items.Count -eq 0) { continue }
         $heading = [System.Windows.Controls.TextBlock]::new()
         $heading.Text = [string]$section.Label
@@ -38635,7 +38633,7 @@ function Update-WmtQuickFindResults {
         }
         [void]$pnlQuickFindMatches.Children.Add($wrap)
     }
-    Refresh-WmtQuickFindStateLabels
+    Update-WmtQuickFindStateLabels
     }
     catch {
         Restore-WmtQuickFindButtons
@@ -38663,7 +38661,7 @@ $script:WmtQuickFindRenderTimer.Add_Tick({
 })
 if ($pnlQuickFind) {
     $pnlQuickFind.Add_IsVisibleChanged({
-        param($searchPage, $args)
+        param($searchPage, $a)
         if (-not $searchPage.IsVisible) {
             # Window-to-tray and navigation both release hosted buttons promptly.
             $script:WmtQuickFindRenderTimer.Stop()
@@ -53756,7 +53754,7 @@ if ($script:DriverCleanupPendingOpen) {
 }
 }
 
-function Schedule-DriverPoolRetry {
+function Register-DriverPoolRetry {
 # UiSupport pool opens asynchronously. Retry without blocking the dispatcher.
 if ($script:DriverPoolRetryTimer) { return }
 if (-not $script:DriverPoolRetryAtUtc) { $script:DriverPoolRetryAtUtc = [DateTime]::UtcNow }
@@ -53916,7 +53914,7 @@ catch {
         $script:DriverLoadPhase = ""
         if ($btnDrvReload) { $btnDrvReload.IsEnabled = $true }
         Set-DriverStatus "Driver usage worker is initializing..." -Visible $true
-        Schedule-DriverPoolRetry
+        Register-DriverPoolRetry
         return
     }
     Set-DriverStatus "Driver usage scan failed to start — package list remains available" -Visible $true
@@ -54090,7 +54088,7 @@ catch {
     Stop-DriverLoad
     if ($workerError -like '*pool is initializing*') {
         Set-DriverStatus "Driver worker pool is initializing..." -Visible $true
-        Schedule-DriverPoolRetry
+        Register-DriverPoolRetry
         return
     }
     Set-DriverStatus "Driver package load failed to start — click Reload" -Visible $true
@@ -57807,10 +57805,10 @@ Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $
         }
     } else {
         # Query must have succeeded before fallback; execution must also succeed.
-        $args = if ($disable) { @("/Online", "/Disable-Feature", "/FeatureName:$fn", "/NoRestart") } else {
+        $a = if ($disable) { @("/Online", "/Disable-Feature", "/FeatureName:$fn", "/NoRestart") } else {
             @("/Online", "/Enable-Feature", "/FeatureName:$fn", "/All", "/NoRestart")
         }
-        & dism.exe @args | Out-Null
+        & dism.exe @a | Out-Null
         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
             throw "DISM could not change $dn (exit code $LASTEXITCODE)."
         }

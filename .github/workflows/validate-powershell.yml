@@ -416,10 +416,10 @@ jobs:
               (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Start-DriverUsageLoad -Infs \$usageInfs') {
               throw 'Cleanup lost service-only protection or shared inventory usage-phase reuse.'
           }
-          $poolRetry = Find-FunctionText 'Schedule-DriverPoolRetry'
+          $poolRetry = Find-FunctionText 'Register-DriverPoolRetry'
           if ($poolRetry -notmatch 'DispatcherTimer' -or
-              (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Schedule-DriverPoolRetry' -or
-              (Find-FunctionText 'Start-DriverUsageLoad') -notmatch 'Schedule-DriverPoolRetry') {
+              (Find-FunctionText 'Start-DriverListLoad') -notmatch 'Register-DriverPoolRetry' -or
+              (Find-FunctionText 'Start-DriverUsageLoad') -notmatch 'Register-DriverPoolRetry') {
               throw 'Worker pool initialization can silently prevent driver loading.'
           }
           $driverStatuses = Find-FunctionText 'Set-DriverStatusFlags'
