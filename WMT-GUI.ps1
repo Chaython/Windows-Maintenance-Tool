@@ -291,7 +291,7 @@ $script:WmtUiBackgroundCommands = @{}
 .DESCRIPTION
     Dot-source after the application's runspace pool is available. Call
     Update-WmtBackgroundOperations from an existing UI-thread poller. Completion
-    callbacks run on the caller's thread. StopAsync is used for cancellation;
+    callbacks run on the caller's thread. BeginStop is used for asynchronous cancellation;
     no synchronous worker waits or disposal of active invocations occur.
     The caller owns its polling timer and must continue polling during shutdown.
 #>
@@ -360,7 +360,7 @@ function Start-WmtBackgroundOperation {
             $state.Operations[$id]=$record
         } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
         if ($record.CancelRequested) {
-            try { $ps.StopAsync(); $record.StopRequestedUtc=[DateTime]::UtcNow }
+            try { [void]$ps.BeginStop($null, $null); $record.StopRequestedUtc=[DateTime]::UtcNow }
             catch { $record.StopError=$_.Exception.Message }
         }
         Write-WmtBackgroundOperationLog ("[{0}/{1}] Started; timeout {2}s." -f $Name,$id,$TimeoutSeconds)
@@ -375,7 +375,7 @@ function Start-WmtBackgroundOperation {
                 CancelRequested=$true; TimeoutRequested=$false; StopRequestedUtc=[DateTime]::UtcNow
                 CompletionDelivered=$false; State='Cancelling'; Result=$null; Errors=@(); StopError=$_.Exception.Message
             }
-            try { $ps.StopAsync() } catch {}
+            try { [void]$ps.BeginStop($null, $null) } catch {}
             [System.Threading.Monitor]::Enter($state.SyncRoot)
             try { $state.Operations[$record.Id]=$record }
             finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
@@ -395,7 +395,7 @@ function Request-WmtBackgroundOperationCancellation {
         $record.CancelRequested=$true; $record.State='Cancelling'
     } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
     try {
-        $record.PowerShell.StopAsync(); $record.StopRequestedUtc=[DateTime]::UtcNow
+        [void]$record.PowerShell.BeginStop($null, $null); $record.StopRequestedUtc=[DateTime]::UtcNow
         Write-WmtBackgroundOperationLog "[$($record.Name)/$Id] $Reason; async stop requested."
         return $true
     } catch {
@@ -417,7 +417,7 @@ function Update-WmtBackgroundOperations {
         if (-not $record.CancelRequested -and -not $record.TimeoutRequested -and $now -ge $record.DeadlineUtc) {
             $record.TimeoutRequested=$true; $record.State='TimedOut'
             try {
-                $record.PowerShell.StopAsync(); $record.StopRequestedUtc=$now
+                [void]$record.PowerShell.BeginStop($null, $null); $record.StopRequestedUtc=$now
                 Write-WmtBackgroundOperationLog "[$($record.Name)/$($record.Id)] Timed out; async stop requested."
             } catch {
                 $record.StopError=$_.Exception.Message
