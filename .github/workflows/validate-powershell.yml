@@ -9,6 +9,7 @@ on:
       - "WMT-GUI.ps1"
       - "PS2EXE/**/*.ps1"
       - "tools/diagnostics/**/*.ps1"
+      - "WmtBackgroundOperationManager.ps1"
       - ".github/workflows/validate-powershell.yml"
   pull_request:
     branches:
@@ -17,6 +18,7 @@ on:
       - "WMT-GUI.ps1"
       - "PS2EXE/**/*.ps1"
       - "tools/diagnostics/**/*.ps1"
+      - "WmtBackgroundOperationManager.ps1"
       - ".github/workflows/validate-powershell.yml"
 
 permissions:
@@ -47,7 +49,8 @@ jobs:
           $files = @(
               ".\WMT-GUI.ps1",
               ".\PS2EXE\Build-Exe.ps1",
-              ".\tools\diagnostics\Measure-WmtResources.ps1"
+              ".\tools\diagnostics\Measure-WmtResources.ps1",
+              ".\WmtBackgroundOperationManager.ps1"
           )
 
           $failed = $false
@@ -2625,6 +2628,49 @@ jobs:
           finally {
               try { Remove-Item -LiteralPath $script:SettingsTestDataPath -Recurse -Force -ErrorAction SilentlyContinue } catch {}
           }
+
+
+      - name: Smoke test centralized background-operation manager
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\WmtBackgroundOperationManager.ps1
+          $script:managerCallbackState = $null
+          Initialize-WmtBackgroundOperationManager
+          $id = Start-WmtBackgroundOperation -Name 'ci-success' -ScriptBlock {
+              param($value)
+              Start-Sleep -Milliseconds 100
+              return ($value * 2)
+          } -ArgumentList @(21) -TimeoutSeconds 10 -OnCompleted {
+              param($record)
+              $script:managerCallbackState = $record
+          }
+          $deadline = [DateTime]::UtcNow.AddSeconds(10)
+          while (@(Get-WmtBackgroundOperationSnapshot).Count -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+              [void](Update-WmtBackgroundOperations)
+              Start-Sleep -Milliseconds 25
+          }
+          if (@(Get-WmtBackgroundOperationSnapshot).Count -ne 0) { throw 'Completed operation was not retired.' }
+          if (-not $script:managerCallbackState -or $script:managerCallbackState.Id -ne $id) { throw 'Completion callback was not delivered.' }
+          if ($script:managerCallbackState.State -ne 'Completed' -or @($script:managerCallbackState.Result).Count -ne 1 -or $script:managerCallbackState.Result[0] -ne 42) {
+              throw 'Successful operation result/state was not preserved.'
+          }
+
+          $cancelId = Start-WmtBackgroundOperation -Name 'ci-cancel' -ScriptBlock {
+              Start-Sleep -Seconds 20
+              return 'should-not-finish-normally'
+          } -TimeoutSeconds 30
+          if (-not (Request-WmtBackgroundOperationCancellation -Id $cancelId -Reason 'CI cancellation test')) {
+              throw 'Cancellation request was rejected.'
+          }
+          $deadline = [DateTime]::UtcNow.AddSeconds(10)
+          while (@(Get-WmtBackgroundOperationSnapshot).Count -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+              [void](Update-WmtBackgroundOperations)
+              Start-Sleep -Milliseconds 25
+          }
+          if (@(Get-WmtBackgroundOperationSnapshot).Count -ne 0) { throw 'Cancelled operation did not drain/retire.' }
+          if ($script:WmtBackgroundOperationState.Operations.Count -ne 0) { throw 'Manager retained completed PowerShell instances.' }
+          Write-Host 'Background-operation manager completion/cancellation checks passed.'
 
       - name: Smoke test shared runspace helpers
         shell: powershell
