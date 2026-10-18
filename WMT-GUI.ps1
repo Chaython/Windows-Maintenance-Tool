@@ -17487,14 +17487,18 @@ try {
                     Invoke-RobustClean -Path $rule.Path -Pattern $rule.Pattern -Recurse ([bool]$rule.Recurse) -RuleName $itemName -ExcludeKeys $excludeKeys
                     # Handle REMOVESELF: delete the directory itself after cleaning its contents
                     if ([bool]$rule.RemoveSelf -and -not [string]::IsNullOrWhiteSpace($rule.Path) -and (Test-Path -LiteralPath $rule.Path)) {
-                        try {
-                            Remove-Item -LiteralPath $rule.Path -Recurse -Force -ErrorAction Stop
-                            if ($isAnalyze) {
-                                $stats.Deleted++
-                            }
+                        if ($isAnalyze) {
+                            # Analyze is strictly read-only: preview the removal, never delete.
+                            # (This loop is also the fallback when the out-of-process analyzer fails.)
+                            $stats.Deleted++
                         }
-                        catch {
-                            if ($script:WmtDebug) { Write-GuiLog "REMOVESELF failed for $($rule.Path): $($_.Exception.Message)" }
+                        else {
+                            try {
+                                Remove-Item -LiteralPath $rule.Path -Recurse -Force -ErrorAction Stop
+                            }
+                            catch {
+                                if ($script:WmtDebug) { Write-GuiLog "REMOVESELF failed for $($rule.Path): $($_.Exception.Message)" }
+                            }
                         }
                     }
                 }
