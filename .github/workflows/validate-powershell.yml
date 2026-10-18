@@ -315,6 +315,22 @@ jobs:
           }
           Write-Host 'PASS: cleaner rule memory caches retain only the latest definition snapshot.'
 
+          # Installer output must be streamed/bounded rather than retained in full.
+          $pipCapture = Find-FunctionText 'Invoke-WmtPipDirect'
+          if ($pipCapture -match '(?m)^\\s*\$outTask\s*=\s*\$proc\.StandardOutput\.ReadToEndAsync\(\)' -or
+              $pipCapture -match '(?m)^\\s*\$errTask\s*=\s*\$proc\.StandardError\.ReadToEndAsync\(\)' -or
+              $pipCapture -notmatch '\$maxOutputLines = 2000' -or
+              $pipCapture -notmatch '\$maxOutputChars = 2 \* 1024 \* 1024' -or
+              $pipCapture -notmatch 'ReadLineAsync\(\)') {
+              throw 'Pip installer output can again accumulate unbounded stdout/stderr in memory.'
+          }
+          if ($source -notmatch '\$stderrCaptureLimit = 2 \* 1024 \* 1024' -or
+              $source -notmatch '\$stderrOverflowWriter' -or
+              $source -notmatch 'CLIXML decoding was skipped to avoid unbounded memory use') {
+              throw 'Custom PowerShell installer stderr is no longer bounded/spooled.'
+          }
+          Write-Host 'PASS: pip and custom PowerShell installer output is bounded.'
+
           Write-Host 'PASS: registry snapshots and UI cache lookups are safe.'
 
           # Exercise the actual My Device queue with an unavailable pool.
