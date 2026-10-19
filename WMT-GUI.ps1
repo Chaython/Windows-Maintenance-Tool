@@ -326,7 +326,8 @@ function Start-WmtBackgroundOperation {
         [ValidateRange(1,86400)][int]$TimeoutSeconds = 300,
         [System.Management.Automation.Runspaces.RunspacePool]$RunspacePool,
         [scriptblock]$OnCompleted,
-        [switch]$AllowDuplicateName
+        [switch]$AllowDuplicateName,
+        [switch]$Quiet
     )
     $state = $script:WmtBackgroundOperationState
     if ($state.ShuttingDown) { throw 'Background-operation manager is shutting down.' }
@@ -349,7 +350,7 @@ function Start-WmtBackgroundOperation {
         $started = [DateTime]::UtcNow
         $async = $ps.BeginInvoke()
         $record = [pscustomobject]@{
-            Id=$id; Name=$Name; PowerShell=$ps; AsyncResult=$async; OnCompleted=$OnCompleted
+            Id=$id; Name=$Name; PowerShell=$ps; AsyncResult=$async; OnCompleted=$OnCompleted; Quiet=[bool]$Quiet
             StartedUtc=$started; DeadlineUtc=$started.AddSeconds($TimeoutSeconds); TimeoutSeconds=$TimeoutSeconds
             CancelRequested=$false; TimeoutRequested=$false; StopRequestedUtc=$null
             CompletionDelivered=$false; State='Running'; Result=$null; Errors=@(); StopError=$null
@@ -363,7 +364,7 @@ function Start-WmtBackgroundOperation {
             try { [void]$ps.BeginStop($null, $null); $record.StopRequestedUtc=[DateTime]::UtcNow }
             catch { $record.StopError=$_.Exception.Message }
         }
-        Write-WmtBackgroundOperationLog ("[{0}/{1}] Started; timeout {2}s." -f $Name,$id,$TimeoutSeconds)
+        if (-not $Quiet) { Write-WmtBackgroundOperationLog ("[{0}/{1}] Started; timeout {2}s." -f $Name,$id,$TimeoutSeconds) }
         return $id
     } catch {
         if ($async) {
@@ -442,7 +443,10 @@ function Update-WmtBackgroundOperations {
         [System.Threading.Monitor]::Enter($state.SyncRoot)
         try { [void]$state.Operations.Remove($record.Id) }
         finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
-        Write-WmtBackgroundOperationLog "[$($record.Name)/$($record.Id)] Finished: $($record.State)."
+        # Quiet operations stay silent when they succeed; any other outcome is always logged.
+        if (-not ($record.Quiet -and $record.State -eq 'Completed')) {
+            Write-WmtBackgroundOperationLog "[$($record.Name)/$($record.Id)] Finished: $($record.State)."
+        }
         $completed++
     }
     return $completed
@@ -489,7 +493,8 @@ param(
     [ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background",
     [switch]$SuppressResultLog,
     $Progress,
-    [switch]$ShowProgress
+    [switch]$ShowProgress,
+    [switch]$Quiet
 )
 if (-not $script:WmtUiBackgroundCommands) { $script:WmtUiBackgroundCommands = @{} }
 if ([string]::IsNullOrWhiteSpace($Name)) { $Name = "UiCommand_" + [guid]::NewGuid().ToString("N") }
@@ -508,11 +513,11 @@ try {
         $Progress.Name = $Name
         Set-WmtAsyncProgressState -Progress $Progress -State Running -Message $Msg
     }
-    $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
+    $pool = Get-WmtReadyRunspacePool -PoolKind $PoolKind
     if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
         throw "The $PoolKind runspace pool is not available."
     }
-    Write-GuiLog $Msg
+    if (-not $Quiet) { Write-GuiLog $Msg }
     $timeoutSeconds = if ($TimeoutMs -gt 0) { [Math]::Max(1, [int][Math]::Ceiling($TimeoutMs / 1000.0)) } else { 86400 }
     $jobName = $Name
     $suppressLog = [bool]$SuppressResultLog
@@ -566,7 +571,7 @@ try {
         }
         finally { [void]$jobTable.Remove($jobName) }
     }.GetNewClosure()
-    $managerId = Start-WmtBackgroundOperation -Name $Name -ScriptBlock $Sb -ArgumentList $ArgumentList -TimeoutSeconds $timeoutSeconds -RunspacePool $pool -OnCompleted $managerCallback
+    $managerId = Start-WmtBackgroundOperation -Name $Name -ScriptBlock $Sb -ArgumentList $ArgumentList -TimeoutSeconds $timeoutSeconds -RunspacePool $pool -OnCompleted $managerCallback -Quiet:$Quiet
     $job = [PSCustomObject]@{
         Name = $Name; ManagerId = $managerId; PowerShell = $null; Async = $null
         OnComplete = $OnComplete; OnError = $OnError; SuppressResultLog = [bool]$SuppressResultLog; Progress = $Progress
@@ -3100,6 +3105,25 @@ return (Initialize-WmtRunspacePool -PoolKind Background)
 function Get-WmtUiSupportRunspacePool {
 return (Initialize-WmtRunspacePool -PoolKind UiSupport)
 }
+
+function Get-WmtReadyRunspacePool {
+# Returns an opened pool. Pools open asynchronously (BeginOpen), so the very first request after
+# startup (for example the pagefile status refresh that runs while the script is still loading)
+# sees "still opening". Wait briefly for that case instead of failing. If the pool is not
+# opening at all (closed/broken) return $null immediately rather than waiting.
+param(
+    [ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background",
+    [int]$TimeoutMs = 15000
+)
+$deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+while ($true) {
+    $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
+    if ($pool -is [System.Management.Automation.Runspaces.RunspacePool]) { return $pool }
+    $isOpening = [bool]($script:WmtPoolOpenAsync -and $script:WmtPoolOpenAsync.ContainsKey($PoolKind))
+    if (-not $isOpening -or [DateTime]::UtcNow -ge $deadline) { return $null }
+    Start-Sleep -Milliseconds 25
+}
+}
 function Stop-WmtBackgroundRunspacePool {
 Reset-WmtRunspacePool -PoolKind Background
 Reset-WmtRunspacePool -PoolKind UiSupport
@@ -3111,7 +3135,7 @@ param([ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background")
 $lastError = $null
 for ($attempt = 1; $attempt -le 2; $attempt++) {
     try {
-        $pool = if ($PoolKind -eq "UiSupport") { Get-WmtUiSupportRunspacePool } else { Get-WmtBackgroundRunspacePool }
+        $pool = Get-WmtReadyRunspacePool -PoolKind $PoolKind
         if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
             if ($null -eq $pool) {
                 throw "Runspace pool is initializing; retry shortly."
@@ -31806,6 +31830,9 @@ if (-not $button) { return }
 if (-not $script:WmtPagefileUiState) { $script:WmtPagefileUiState = @{ Busy = $false; Generation = 0; LastRequestState = '' } }
 $state = $script:WmtPagefileUiState
 if ($state.Busy) { return }
+# The startup status refresh (-RefreshOnly) is silent: other tweak states load without log lines.
+# Errors are still logged, and user-initiated clicks keep their messages.
+$quiet = [bool]$RefreshOnly
 $known = (-not $RefreshOnly) -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')
 $enable = $false
 if ($known) {
@@ -31832,7 +31859,7 @@ $complete = {
     $state.Busy = $false; $state.LastRequestState = 'Succeeded'
     Update-WmtPagefileButtonState -Enabled ([bool]$items[0].Enabled) -RefreshCache
     if ($known) { Write-GuiLog "Pagefile $(if ($items[0].Enabled) { 'enabled' } else { 'disabled' }). Restart Windows for the change to take effect." }
-    else { Write-GuiLog 'Pagefile status refreshed. Click again to change it.' }
+    elseif (-not $quiet) { Write-GuiLog 'Pagefile status refreshed. Click again to change it.' }
 }.GetNewClosure()
 try {
     if ($known) {
@@ -31844,7 +31871,7 @@ try {
     }
     else {
         $state.LastRequestState = 'Checking'
-        $job = Invoke-WmtUiBackgroundCommand -Name 'PagefileToggle' -Msg 'Checking pagefile configuration...' -TimeoutMs 30000 -SuppressResultLog -Sb {
+        $job = Invoke-WmtUiBackgroundCommand -Name 'PagefileToggle' -Msg 'Checking pagefile configuration...' -TimeoutMs 30000 -SuppressResultLog -Quiet:$quiet -Sb {
             $config = Get-WmtPagefileConfiguration
             [pscustomobject]@{ Success = $true; Enabled = (Get-WmtPagefileConfiguredState $config) }
         } -OnComplete $complete -OnError $failed

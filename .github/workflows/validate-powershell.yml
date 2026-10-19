@@ -2853,6 +2853,64 @@ jobs:
           if ($bad.Count -gt 0) { throw 'Variable names ending in ? found; wrap the variable in $( ) or ${ }.' }
           Write-Host 'OK: no variable swallows a trailing question mark.'
 
+      - name: Verify startup pool requests wait for an opening pool
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Pools open asynchronously, so the first request after startup (the pagefile status
+          # refresh runs while the script is still loading) can see "still opening". Callers must
+          # wait for that instead of failing with "The Background runspace pool is not available."
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          function Get-FirstFunction([string]$Name) {
+              @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $true))[0]
+          }
+
+          # 1) Both pool-acquisition points must go through the waiting helper.
+          foreach ($name in 'Invoke-WmtUiBackgroundCommand', 'New-WmtPooledPowerShell') {
+              $fn = Get-FirstFunction $name
+              if (-not $fn) { throw "Function not found: $name" }
+              $calls = @($fn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() })
+              if ($calls -notcontains 'Get-WmtReadyRunspacePool') { throw "$name must acquire its pool with Get-WmtReadyRunspacePool." }
+              if ($calls -contains 'Get-WmtBackgroundRunspacePool' -or $calls -contains 'Get-WmtUiSupportRunspacePool') {
+                  throw "$name must not call the non-waiting pool getters directly."
+              }
+          }
+
+          # 2) Helper behaviour, using controlled stand-ins for the pool getters.
+          $helper = Get-FirstFunction 'Get-WmtReadyRunspacePool'
+          if (-not $helper) { throw 'Get-WmtReadyRunspacePool not found.' }
+          Invoke-Expression $helper.Extent.Text
+          $script:fakePool = [runspacefactory]::CreateRunspacePool(1, 1)
+          try {
+              $script:getCalls = 0
+              function Get-WmtUiSupportRunspacePool { $null }
+              function Get-WmtBackgroundRunspacePool { $script:getCalls++; if ($script:getCalls -ge 4) { $script:fakePool } else { $null } }
+
+              # Still opening for the first 3 polls, then ready: must wait and return the pool.
+              $script:WmtPoolOpenAsync = @{ Background = 1 }
+              $pool = Get-WmtReadyRunspacePool -PoolKind Background -TimeoutMs 5000
+              if ($pool -isnot [System.Management.Automation.Runspaces.RunspacePool]) { throw 'Helper did not return the pool once it opened.' }
+              if ($script:getCalls -ne 4) { throw "Helper should have polled 4 times, polled $($script:getCalls)." }
+
+              # Not opening at all (closed/broken): must return $null immediately, not wait.
+              function Get-WmtBackgroundRunspacePool { $script:getCalls++; $null }
+              $script:getCalls = 0; $script:WmtPoolOpenAsync = @{}
+              $watch = [Diagnostics.Stopwatch]::StartNew()
+              $none = Get-WmtReadyRunspacePool -PoolKind Background -TimeoutMs 5000
+              if ($null -ne $none -or $script:getCalls -ne 1 -or $watch.ElapsedMilliseconds -gt 2000) { throw 'Helper waited on a pool that is not opening.' }
+
+              # Opening but never finishing: must honour the timeout.
+              $script:WmtPoolOpenAsync = @{ Background = 1 }
+              $watch.Restart()
+              $late = Get-WmtReadyRunspacePool -PoolKind Background -TimeoutMs 300
+              if ($null -ne $late -or $watch.ElapsedMilliseconds -lt 250 -or $watch.ElapsedMilliseconds -gt 5000) { throw "Helper did not honour its timeout ($($watch.ElapsedMilliseconds) ms)." }
+          }
+          finally { $script:fakePool.Dispose() }
+          Write-Host 'OK: startup pool requests wait for an opening pool.'
+
       - name: Smoke test shared runspace helpers
         shell: powershell
         run: |
