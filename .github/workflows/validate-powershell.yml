@@ -2751,6 +2751,108 @@ jobs:
           }
           Write-Host 'OK: REMOVESELF behaviour verified (Analyze preserves files; Clean removes directory).'
 
+      - name: Verify no calls to undefined functions
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Catches calls to helpers that were renamed, deleted or never written
+          # (they otherwise fail at runtime, often inside a swallowed catch block).
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+
+          $defined = @{}
+          foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $defined[$f.Name] = $true }
+          # Functions defined inside embedded here-string scripts are invisible to the AST.
+          foreach ($m in [regex]::Matches($source, '(?im)^\s*function\s+(?:(?:script|global|local):)?([A-Za-z][\w-]*)')) { $defined[$m.Groups[1].Value] = $true }
+
+          # Windows-only cmdlets that are not guaranteed to exist on every runner.
+          $windowsOnly = @(
+              'Add-WindowsCapability', 'Checkpoint-Computer', 'Clear-DnsClientCache',
+              'Disable-ComputerRestore', 'Disable-MMAgent', 'Disable-WindowsOptionalFeature',
+              'Enable-ComputerRestore', 'Enable-MMAgent', 'Enable-WindowsOptionalFeature', 'Get-Acl',
+              'Get-AppxPackage', 'Get-BitLockerVolume', 'Get-BitsTransfer', 'Get-CimInstance',
+              'Get-ComputerRestorePoint', 'Get-Disk', 'Get-MMAgent', 'Get-MpPreference', 'Get-NetAdapter',
+              'Get-NetFirewallPortFilter', 'Get-NetFirewallRule', 'Get-Partition', 'Get-PnpDevice',
+              'Get-Service', 'Get-StartApps', 'Get-Volume', 'Get-WindowsCapability', 'Get-WindowsDriver',
+              'Get-WindowsOptionalFeature', 'Get-WmiObject', 'Invoke-CimMethod', 'New-NetFirewallRule',
+              'Optimize-Volume', 'Register-DnsClient', 'Remove-AppxPackage', 'Remove-BitsTransfer',
+              'Remove-NetFirewallRule', 'Remove-WindowsCapability', 'Restart-NetAdapter', 'Restart-Service',
+              'Restore-Computer', 'Set-Acl', 'Set-CimInstance', 'Set-DnsClientServerAddress',
+              'Set-NetFirewallRule', 'Set-Service', 'Start-Service', 'Stop-Service'
+          )
+
+          $missing = @{}
+          $commands = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+          foreach ($c in $commands) {
+              $name = $c.GetCommandName()
+              if (-not $name -or $name -notmatch '^[A-Za-z]+-[A-Za-z0-9]+$') { continue }
+              if ($defined.ContainsKey($name) -or $windowsOnly -contains $name) { continue }
+              if (Get-Command $name -ErrorAction SilentlyContinue) { continue }
+              if (-not $missing.ContainsKey($name)) { $missing[$name] = $c.Extent.StartLineNumber }
+          }
+          if ($missing.Count -gt 0) {
+              $missing.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host ("Undefined command: {0} (first used at line {1})" -f $_.Name, $_.Value) }
+              throw 'WMT-GUI.ps1 calls commands that are not defined. Fix the name, define the function, or (for a Windows-only cmdlet) add it to $windowsOnly.'
+          }
+          Write-Host 'OK: every called command is defined or a known cmdlet.'
+
+      - name: Verify BAM NT path conversion
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Convert-BamNtToDos', 'Get-BamDeviceMap' }, $true))
+          if ($fn.Count -ne 2) { throw "Expected Convert-BamNtToDos and Get-BamDeviceMap, found $($fn.Count)." }
+          $convert = ($fn | Where-Object { $_.Name -eq 'Convert-BamNtToDos' }).Extent.Text
+          $real = ($fn | Where-Object { $_.Name -eq 'Get-BamDeviceMap' }).Extent.Text
+
+          # Conversion logic with a mocked device map: unmapped/ambiguous/network paths must yield $null.
+          function Get-BamDeviceMap { @{ '\device\harddiskvolume3' = 'C:'; '\device\harddiskvolume4' = 'D:'; '\device\harddiskvolume7' = $null } }
+          Invoke-Expression $convert
+          $cases = @(
+              @('\Device\HarddiskVolume3\Windows\System32\cmd.exe', 'C:\Windows\System32\cmd.exe'),
+              @('\DEVICE\HARDDISKVOLUME4\Games\a.exe', 'D:\Games\a.exe'),
+              @('\Device\HarddiskVolume3', 'C:'),
+              @('\Device\HarddiskVolume9\a.exe', $null),
+              @('\Device\HarddiskVolume7\a.exe', $null),
+              @('\Device\HarddiskVolume33\a.exe', $null),
+              @('\Device\Mup\srv\share\a.exe', $null),
+              @('C:\already\dos.exe', $null),
+              @('', $null)
+          )
+          foreach ($c in $cases) {
+              $got = Convert-BamNtToDos -NtPath $c[0]
+              if ($got -ne $c[1]) { throw "BAM conversion failed: '$($c[0])' => '$got' (expected '$($c[1])')" }
+          }
+
+          # The real QueryDosDevice-based map must see the system drive on Windows.
+          Remove-Item function:Get-BamDeviceMap
+          Invoke-Expression $real
+          $map = Get-BamDeviceMap
+          if ($env:OS -eq 'Windows_NT' -and $map.Values -notcontains $env:SystemDrive) {
+              throw "Get-BamDeviceMap did not map the system drive $env:SystemDrive."
+          }
+          Write-Host 'OK: BAM NT path conversion verified.'
+
+      - name: Verify no variable name swallows a trailing question mark
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # "$name?" reads a variable literally called "name?" (empty), so the name and the
+          # question mark both vanish from the message. Use "$($name)?" or "${name}?".
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '.\WMT-GUI.ps1').Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $bad = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -match '\w\?$' }, $true))
+          foreach ($v in $bad) { Write-Host ("Line {0}: `${1} swallows a trailing '?'" -f $v.Extent.StartLineNumber, $v.VariablePath.UserPath) }
+          if ($bad.Count -gt 0) { throw 'Variable names ending in ? found; wrap the variable in $( ) or ${ }.' }
+          Write-Host 'OK: no variable swallows a trailing question mark.'
+
       - name: Smoke test shared runspace helpers
         shell: powershell
         run: |

@@ -7892,7 +7892,7 @@ if ($source -in @("winget","msstore")) {
 $isInstalled = $false
 try { if ($Item.PSObject.Properties["IsInstalled"]) { $isInstalled = [bool]$Item.IsInstalled } } catch {}
 if ($source -in @("chocolatey","choco") -and $isInstalled) {
-    $localManifest = Find-ChocoPackageManifestPath -Item $Item
+    $localManifest = Get-ChocoManifestPath -Item $Item
     if (-not [string]::IsNullOrWhiteSpace([string]$localManifest)) {
         Show-ChocoPackageManifest -Item $Item
         return
@@ -20792,6 +20792,46 @@ if ($Action -eq "DeepClean") {
                 return $false
             }
 
+            # BAM/DAM value names are NT device paths (\Device\HarddiskVolumeN\...). Build a map of
+            # NT device name -> drive letter. Built per call (cheap) so it can never go stale when
+            # removable drives come and go.
+            function Get-BamDeviceMap {
+                $deviceMap = @{}
+                try {
+                    if (-not ('WmtBam.Native' -as [type])) {
+                        Add-Type -Namespace WmtBam -Name Native -ErrorAction Stop -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint QueryDosDevice(string lpDeviceName, System.Text.StringBuilder lpTargetPath, int ucchMax);'
+                    }
+                    foreach ($code in 65..90) {
+                        $letter = [string][char]$code + ':'
+                        $buffer = New-Object System.Text.StringBuilder 1024
+                        if ([WmtBam.Native]::QueryDosDevice($letter, $buffer, $buffer.Capacity) -eq 0) { continue }
+                        $target = $buffer.ToString()
+                        # Only plain volume devices; subst (\??\...) and network redirectors are ignored.
+                        if ($target -notmatch '^(?i)\\Device\\[^\\]+$') { continue }
+                        $key = $target.ToLowerInvariant()
+                        if ($deviceMap.ContainsKey($key)) { $deviceMap[$key] = $null }   # ambiguous: never guess
+                        else { $deviceMap[$key] = $letter }
+                    }
+                }
+                catch {}
+                return $deviceMap
+            }
+
+            # Converts \Device\HarddiskVolumeN\path to X:\path. Returns $null when there is no
+            # reliable mapping so callers skip the entry instead of guessing.
+            function Convert-BamNtToDos {
+                param([string]$NtPath)
+                if ([string]::IsNullOrWhiteSpace($NtPath)) { return $null }
+
+                $match = [regex]::Match($NtPath.Trim(), '^(?i)(?<Device>\\Device\\[^\\]+)(?<Rest>(?:\\.*)?)$')
+                if (-not $match.Success) { return $null }
+
+                $deviceMap = Get-BamDeviceMap
+                $mappedDrive = $deviceMap[$match.Groups['Device'].Value.ToLowerInvariant()]
+                if ([string]::IsNullOrWhiteSpace($mappedDrive)) { return $null }
+                return ($mappedDrive + $match.Groups['Rest'].Value)
+            }
+
             function Test-PathExists {
                 param(
                     $Path,
@@ -29714,7 +29754,7 @@ $btnEnable.Add_Click({
         catch { Show-WmtMessageBox -Owner $dialog -Message "Failed to enable protection.`n$($_.Exception.Message)" -Title "Error" -Image Error | Out-Null }
     }.GetNewClosure())
 $btnDisable.Add_Click({
-        $res = Show-WmtMessageBox -Owner $dialog -Message "Are you sure you want to disable System Restore on $env:SystemDrive?`n`nWARNING: This will immediately delete ALL existing restore points." -Title "Confirm Disable" -Button YesNo -Image Warning
+        $res = Show-WmtMessageBox -Owner $dialog -Message "Are you sure you want to disable System Restore on $($env:SystemDrive)?`n`nWARNING: This will immediately delete ALL existing restore points." -Title "Confirm Disable" -Button YesNo -Image Warning
         if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
         try {
             Disable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
@@ -56767,13 +56807,13 @@ function Show-WmtCompactManager {
         $algorithm = & $getCurrentAlgorithm
         $scopeText = if ([bool]$rbDrive.IsChecked) { "the entire drive $target" } else { "'$target' and all subfolders" }
         if ($Mode -eq "Compress") {
-            $detail = "Compress $scopeText using $algorithm?" + [Environment]::NewLine + [Environment]::NewLine + "The target will also be added to the tracker."
+            $detail = "Compress $scopeText using $($algorithm)?" + [Environment]::NewLine + [Environment]::NewLine + "The target will also be added to the tracker."
             if ([bool]$rbDrive.IsChecked -and -not [string]::IsNullOrWhiteSpace($env:SystemDrive) -and $target.StartsWith($env:SystemDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $detail += [Environment]::NewLine + [Environment]::NewLine + "WARNING: This is the Windows system drive. Whole-drive compression affects Windows and installed applications."
             }
         }
         else {
-            $detail = "Decompress $scopeText?" + [Environment]::NewLine + [Environment]::NewLine + "Automatic recompression will be disabled for this target."
+            $detail = "Decompress $($scopeText)?" + [Environment]::NewLine + [Environment]::NewLine + "Automatic recompression will be disabled for this target."
         }
 
         $confirm = Show-WmtMessageBox -Message $detail -Title "Compact Compression" -Button YesNo -Image Warning
