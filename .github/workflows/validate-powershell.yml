@@ -2911,6 +2911,81 @@ jobs:
           finally { $script:fakePool.Dispose() }
           Write-Host 'OK: startup pool requests wait for an opening pool.'
 
+      - name: Verify quiet background operations still report failures
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # -Quiet exists so routine status checks (e.g. the startup pagefile refresh) do not clutter
+          # the log. It must only hide success: failures and timeouts are always logged.
+          $source = [System.IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $startMarker = 'if (-not (Get-Variable -Name WmtBackgroundOperationState'
+          $endMarker = 'Initialize-WmtBackgroundOperationManager -Log {'
+          $start = $source.IndexOf($startMarker, [System.StringComparison]::Ordinal)
+          $end = $source.IndexOf($endMarker, [System.StringComparison]::Ordinal)
+          if ($start -lt 0 -or $end -le $start) { throw 'Background-operation manager block not found in WMT-GUI.ps1.' }
+          Invoke-Expression $source.Substring($start, $end - $start)
+
+          $script:logs = New-Object System.Collections.ArrayList
+          Initialize-WmtBackgroundOperationManager -Log { param($m) [void]$script:logs.Add([string]$m) } | Out-Null
+          $cases = @(
+              @{ Name = 'QuietOk';   Script = { 1 };                        Timeout = 10; Expect = 'silent' },
+              @{ Name = 'QuietFail'; Script = { throw 'boom' };             Timeout = 10; Expect = 'logged' },
+              @{ Name = 'QuietSlow'; Script = { Start-Sleep -Seconds 20 };  Timeout = 1;  Expect = 'logged' }
+          )
+          foreach ($case in $cases) {
+              $before = $script:logs.Count
+              $null = Start-WmtBackgroundOperation -Name $case.Name -ScriptBlock $case.Script -TimeoutSeconds $case.Timeout -Quiet
+              $deadline = [DateTime]::UtcNow.AddSeconds(30)
+              while (@($script:WmtBackgroundOperationState.Operations.Keys).Count -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+                  [void](Update-WmtBackgroundOperations)
+                  Start-Sleep -Milliseconds 50
+              }
+              if (@($script:WmtBackgroundOperationState.Operations.Keys).Count -gt 0) { throw "$($case.Name) did not finish." }
+              $new = @($script:logs | Select-Object -Skip $before)
+              if (@($new | Where-Object { $_ -like '*Started*' }).Count -gt 0) { throw "$($case.Name): -Quiet must suppress the Started line." }
+              if ($case.Expect -eq 'silent' -and $new.Count -gt 0) { throw "$($case.Name): a successful quiet operation must be silent." }
+              if ($case.Expect -eq 'logged' -and @($new | Where-Object { $_ -match 'Finished: (Failed|TimedOut)' }).Count -eq 0) {
+                  throw "$($case.Name): a failed or timed-out quiet operation must still be logged."
+              }
+          }
+          Write-Host 'OK: quiet operations hide success but still report failures and timeouts.'
+
+      - name: Verify worker errors are never reported blank
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Issue #167: Full Network Repair showed a bare "ERROR:". A native tool's stderr (even a blank
+          # line) became an error record with no message, which marks the whole operation failed.
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          function Get-FirstFunction([string]$Name) {
+              @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $true))[0]
+          }
+
+          # 1) The summary text must never be blank.
+          $summaryFn = Get-FirstFunction 'Get-WmtErrorSummary'
+          if (-not $summaryFn) { throw 'Get-WmtErrorSummary not found.' }
+          Invoke-Expression $summaryFn.Extent.Text
+          $blank = [System.Management.Automation.ErrorRecord]::new([System.Management.Automation.RemoteException]::new('   '), 'NativeCommandError', 'NotSpecified', $null)
+          $text = Get-WmtErrorSummary @($blank)
+          if ([string]::IsNullOrWhiteSpace($text) -or $text -notmatch 'NativeCommandError') { throw "Blank error was not described: '$text'" }
+          $real = [System.Management.Automation.ErrorRecord]::new([System.Exception]::new('The requested operation requires elevation.'), 'X', 'NotSpecified', $null)
+          if ((Get-WmtErrorSummary @($real)) -ne 'The requested operation requires elevation.') { throw 'A real error message must be passed through unchanged.' }
+          if ((Get-WmtErrorSummary @($blank, $real)) -notmatch "`n") { throw 'Multiple errors must be listed on separate lines.' }
+
+          # 2) The runner must use the summary rather than raw ToString() of each record.
+          $runner = Get-FirstFunction 'Invoke-WmtUiBackgroundCommand'
+          if (-not $runner -or $runner.Extent.Text -notmatch 'Get-WmtErrorSummary') { throw 'Invoke-WmtUiBackgroundCommand must build failure text with Get-WmtErrorSummary.' }
+
+          # 3) Full Network Repair must merge native stderr (2>&1) instead of leaking it as errors.
+          $repair = Get-FirstFunction 'Start-NetRepair'
+          if (-not $repair) { throw 'Start-NetRepair not found.' }
+          $merges = @($repair.FindAll({ param($n) $n -is [System.Management.Automation.Language.MergingRedirectionAst] }, $true))
+          if ($merges.Count -lt 1) { throw 'Start-NetRepair must merge native stderr with 2>&1.' }
+          Write-Host 'OK: worker errors are never blank and Network Repair does not leak stderr as errors.'
+
       - name: Smoke test shared runspace helpers
         shell: powershell
         run: |

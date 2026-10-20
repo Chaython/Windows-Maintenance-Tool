@@ -480,6 +480,29 @@ function Stop-WmtBackgroundOperationManager {
 
 Initialize-WmtBackgroundOperationManager -Log { param($line) try { Write-GuiLog $line } catch {} }
 
+function Get-WmtErrorSummary {
+# Turns a worker's error records into log text that is never blank. Native tools can write
+# whitespace-only text to stderr, which used to log as a bare "ERROR:" with no clue what failed.
+param($ErrorItems)
+$lines = @()
+foreach ($item in @($ErrorItems)) {
+    if ($null -eq $item) { continue }
+    $text = ''
+    try { $text = ([string]$item).Trim() } catch {}
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $parts = @()
+        if ($item -is [System.Management.Automation.ErrorRecord]) {
+            if ($item.FullyQualifiedErrorId) { $parts += [string]$item.FullyQualifiedErrorId }
+            if ($item.CategoryInfo -and $item.CategoryInfo.Activity) { $parts += ('activity: ' + [string]$item.CategoryInfo.Activity) }
+            if ($null -ne $item.TargetObject) { $parts += ('target: ' + ([string]$item.TargetObject).Trim()) }
+        }
+        $text = if ($parts.Count -gt 0) { 'Error with no message text (' + ($parts -join ', ') + ')' } else { 'Error with no message text' }
+    }
+    $lines += $text
+}
+return ($lines -join "`n")
+}
+
 function Invoke-WmtUiBackgroundCommand {
 param(
     [Parameter(Mandatory = $true)][scriptblock]$Sb,
@@ -550,7 +573,7 @@ try {
             else {
                 $message = if ($record.State -eq 'TimedOut') { "Background operation '$jobName' timed out." }
                     elseif ($record.State -eq 'Cancelled') { "Background operation '$jobName' was cancelled." }
-                    elseif (@($record.Errors).Count) { (@($record.Errors | ForEach-Object { $_.ToString() }) -join "`n") }
+                    elseif (@($record.Errors).Count) { Get-WmtErrorSummary $record.Errors }
                     else { "Background operation '$jobName' failed." }
                 if ($record.State -ne 'Cancelled') { Write-GuiLog "ERROR: $message" }
                 if ($progressRef) {
@@ -11472,12 +11495,24 @@ Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairQuick" -Msg "Repairing W
 
 function Start-NetRepair {
 Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Sb {
-    ipconfig /release | Out-Null
-    ipconfig /renew | Out-Null
-    ipconfig /flushdns | Out-Null
-    netsh winsock reset | Out-Null
-    netsh int ip reset | Out-Null
-    Write-Output "Network repair completed."
+    $ErrorActionPreference = 'Continue'
+    $steps = @(
+        @{ Exe = 'ipconfig'; Args = @('/release') },
+        @{ Exe = 'ipconfig'; Args = @('/renew') },
+        @{ Exe = 'ipconfig'; Args = @('/flushdns') },
+        @{ Exe = 'netsh'; Args = @('winsock', 'reset') },
+        @{ Exe = 'netsh'; Args = @('int', 'ip', 'reset') }
+    )
+    $warnings = @()
+    foreach ($step in $steps) {
+        # Merge stderr into the output and discard both: text a native tool writes to stderr (even a
+        # blank line) must not mark the whole repair as failed with an empty "ERROR:".
+        $argList = @($step.Args)
+        $null = & $step.Exe @argList 2>&1
+        if ($LASTEXITCODE -ne 0) { $warnings += ('{0} {1} (exit code {2})' -f $step.Exe, ($argList -join ' '), $LASTEXITCODE) }
+    }
+    if ($warnings.Count -gt 0) { Write-Output ('Network repair completed with warnings: ' + ($warnings -join '; ') + '.') }
+    else { Write-Output "Network repair completed." }
 } | Out-Null
 }
 
