@@ -11609,24 +11609,33 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
             & $writeDiagnostic ('Step {0}/{1} START: {2} ({3})' -f $stepNumber, $steps.Count, $step.Label, $commandLine)
 
             try {
-                # Native tools may write diagnostics to either stream. Capture both; preserve the
-                # actual text instead of throwing it away, and flush each line to the diagnostic file.
+                # A zero native exit code is necessary but not sufficient: preserve output and
+                # inspect it for explicit failures or missing diagnostics before reporting success.
+                $stepOutput = [System.Collections.Generic.List[string]]::new()
                 & $step.Exe @argList 2>&1 | ForEach-Object {
                     $outputText = [string]$_
                     if ([string]::IsNullOrWhiteSpace($outputText)) { $outputText = '(blank output line)' }
+                    [void]$stepOutput.Add($outputText)
                     & $writeDiagnostic ('  OUTPUT: {0}' -f $outputText)
                 }
                 $exitCode = $LASTEXITCODE
                 if ($null -eq $exitCode) { $exitCode = -1 }
                 $duration = [Math]::Round(((Get-Date) - $stepStartedAt).TotalSeconds, 2)
+                $joinedOutput = $stepOutput -join "`n"
+                $outputIndicatesFailure = $joinedOutput -match '(?im)\b(failed|failure|unable to|could not|cannot|access is denied|requested operation requires elevation|no operation can be performed)\b'
+                $noDiagnosticOutput = $stepOutput.Count -eq 0
 
-                if ($exitCode -ne 0) {
-                    $warning = '{0} ({1}; exit code {2})' -f $commandLine, $step.Label, $exitCode
+                if ($exitCode -ne 0 -or $outputIndicatesFailure -or $noDiagnosticOutput) {
+                    $reasons = [System.Collections.Generic.List[string]]::new()
+                    if ($exitCode -ne 0) { [void]$reasons.Add("exit code $exitCode") }
+                    if ($outputIndicatesFailure) { [void]$reasons.Add('command output contains a failure indication') }
+                    if ($noDiagnosticOutput) { [void]$reasons.Add('no command output was available to verify the operation') }
+                    $warning = '{0} ({1}; {2})' -f $commandLine, $step.Label, ($reasons -join ', ')
                     [void]$warnings.Add($warning)
-                    & $writeDiagnostic ('Step {0} FAILED: exit code {1}; duration {2}s' -f $stepNumber, $exitCode, $duration)
+                    & $writeDiagnostic ('Step {0} WARNING/FAILED: {1}; duration {2}s' -f $stepNumber, ($reasons -join '; '), $duration)
                 }
                 else {
-                    & $writeDiagnostic ('Step {0} OK: exit code 0; duration {1}s' -f $stepNumber, $duration)
+                    & $writeDiagnostic ('Step {0} passed basic checks: exit code 0, diagnostic output present, no recognized failure text; duration {1}s. This does not prove end-to-end connectivity.' -f $stepNumber, $duration)
                 }
             }
             catch {
@@ -11635,6 +11644,29 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 [void]$warnings.Add($warning)
                 & $writeDiagnostic ('Step {0} EXCEPTION: {1}; duration {2}s' -f $stepNumber, ($_ | Out-String).Trim(), $duration)
             }
+        }
+
+        if ($netshDetailLogPath -and [System.IO.File]::Exists($netshDetailLogPath)) {
+            try {
+                $detailFailures = @(Get-Content -LiteralPath $netshDetailLogPath -ErrorAction Stop |
+                    Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
+                foreach ($detailFailure in $detailFailures) {
+                    $warning = "TCP/IP reset detail log reports a failed operation: $detailFailure"
+                    [void]$warnings.Add($warning)
+                    & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                }
+                if ($detailFailures.Count -eq 0) {
+                    & $writeDiagnostic 'TCP/IP reset detail log check: no explicit failure markers found.'
+                }
+            }
+            catch {
+                [void]$warnings.Add('Could not inspect the netsh TCP/IP reset detail log: ' + $_.Exception.Message)
+                & $writeDiagnostic ('WARNING: Could not inspect netsh TCP/IP reset detail log: {0}' -f $_.Exception.Message)
+            }
+        }
+        else {
+            [void]$warnings.Add('The netsh TCP/IP reset detail log was not created, so individual reset operations could not be checked.')
+            & $writeDiagnostic 'WARNING: netsh TCP/IP reset detail log was not created; individual reset operations could not be checked.'
         }
 
         $totalDuration = [Math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
@@ -11656,7 +11688,28 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
             try { $logWriter.Dispose() } catch {}
         }
     }
-} -SuppressResultLog | Out-Null
+} -SuppressResultLog -OnComplete ({
+    # Winsock and TCP/IP resets need a Windows restart to take full effect.
+    $restartChoice = [System.Windows.MessageBox]::Show(
+        "Network repair has finished. Some reset operations (especially Winsock and TCP/IP) require a Windows restart before their changes take full effect.`r`n`r`nSave your work first. Restart Windows now?",
+        "Restart Recommended",
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Question
+    )
+    if ($restartChoice -eq [System.Windows.MessageBoxResult]::Yes) {
+        try {
+            Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList @("/r", "/t", "0") -WindowStyle Hidden
+        }
+        catch {
+            [System.Windows.MessageBox]::Show(
+                "Windows could not be restarted automatically. Please restart manually.`r`n`r`n$($_.Exception.Message)",
+                "Restart Failed",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Warning
+            ) | Out-Null
+        }
+    }
+}.GetNewClosure()) | Out-Null
 }
 
 function Start-RegClean {
