@@ -11497,7 +11497,7 @@ function Start-NetRepair {
 # Resolve the data directory on the UI runspace before dispatching work. WMT helper
 # functions such as Get-DataPath are not automatically imported into background runspaces.
 $dataDirectory = Get-DataPath
-Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -ArgumentList @($dataDirectory) -Sb {
+Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -ShowProgress -ArgumentList @($dataDirectory) -Sb {
     param([string]$dataDirectory)
     $ErrorActionPreference = 'Continue'
     $steps = @(
