@@ -11494,7 +11494,11 @@ Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairQuick" -Msg "Repairing W
 }
 
 function Start-NetRepair {
-Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Sb {
+# Resolve the data directory on the UI runspace before dispatching work. WMT helper
+# functions such as Get-DataPath are not automatically imported into background runspaces.
+$dataDirectory = Get-DataPath
+Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -ArgumentList @($dataDirectory) -Sb {
+    param([string]$dataDirectory)
     $ErrorActionPreference = 'Continue'
     $steps = @(
         @{ Exe = 'ipconfig'; Args = @('/release'); Label = 'Release IP address' },
@@ -11511,9 +11515,14 @@ Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network R
     $logPath = $null
 
     try {
-        $logDirectory = Join-Path (Get-DataPath) 'network-repair-logs'
+        $logDirectory = Join-Path $dataDirectory 'network-repair-logs'
         [void][System.IO.Directory]::CreateDirectory($logDirectory)
-        $logPath = Join-Path $logDirectory ('NetworkRepair_{0}.log' -f $startedAt.ToString('yyyyMMdd_HHmmss'))
+        $timestamp = $startedAt.ToString('yyyyMMdd_HHmmss')
+        $logPath = Join-Path $logDirectory ('NetworkRepair_{0}.log' -f $timestamp)
+        $netshDetailLogPath = Join-Path $logDirectory ('NetworkRepair_NetshTcpIp_{0}.log' -f $timestamp)
+        # netsh's optional reset log records individual registry operations and is more
+        # useful than its console output for diagnosing unnamed "Resetting , failed" errors.
+        $steps[4].Args = @('int', 'ip', 'reset', $netshDetailLogPath)
         $logWriter = [System.IO.StreamWriter]::new($logPath, $false, [System.Text.UTF8Encoding]::new($false))
     }
     catch {
@@ -11542,6 +11551,7 @@ Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network R
         $isElevated = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
         & $writeDiagnostic ('Full Network Repair started. Elevated={0}; User={1}; Computer={2}' -f $isElevated, $identity.Name, $env:COMPUTERNAME)
         & $writeDiagnostic ('Diagnostic log: {0}' -f $(if ($logPath) { $logPath } else { '(file unavailable; output retained in WMT log)' }))
+        if ($netshDetailLogPath) { & $writeDiagnostic ('netsh TCP/IP reset detail log: {0}' -f $netshDetailLogPath) }
         if (-not $isElevated) {
             & $writeDiagnostic 'WARNING: WMT is not running elevated. Some network reset operations may fail or be incomplete.'
         }
