@@ -11670,6 +11670,7 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 }
             }
             catch {
+                $nativeDetailLogAvailable = $false
                 [void]$warnings.Add('Could not inspect the netsh TCP/IP reset detail log: ' + $_.Exception.Message)
                 & $writeDiagnostic ('WARNING: Could not inspect netsh TCP/IP reset detail log: {0}' -f $_.Exception.Message)
             }
@@ -11691,12 +11692,12 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                     ('Command: netsh int ip reset {0}' -f $(if ($netshDetailLogPath) { $netshDetailLogPath } else { '(native log path unavailable)' }))
                     ('Exit code: {0}' -f $(if ($null -ne $netshResetExitCode) { $netshResetExitCode } else { '(not captured)' }))
                     ('Native detail log: {0}' -f $(if ($netshDetailLogPath) { $netshDetailLogPath } else { '(path unavailable)' }))
-                    'Native detail log was missing or empty; captured command output follows.'
+                    'Native detail log was missing, empty, or unreadable; captured command output follows.'
                     ''
                     'Captured netsh output:'
                 ) + @($netshResetOutput)
                 Set-Content -LiteralPath $fallbackLogPath -Value $fallbackLines -Encoding UTF8 -ErrorAction Stop
-                & $writeDiagnostic ('WARNING: Native netsh TCP/IP reset detail log was missing or empty. Captured output saved to fallback log: {0}' -f $fallbackLogPath)
+                & $writeDiagnostic ('WARNING: Native netsh TCP/IP reset detail log was missing, empty, or unreadable. Captured output saved to fallback log: {0}' -f $fallbackLogPath)
                 $fallbackFailures = @($netshResetOutput | Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
                 foreach ($fallbackFailure in $fallbackFailures) {
                     $warning = "TCP/IP reset fallback log reports a failed operation: $fallbackFailure"
@@ -11705,7 +11706,7 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 }
             }
             catch {
-                $warning = 'Native netsh TCP/IP reset detail log was missing or empty, and fallback log creation failed: ' + $_.Exception.Message
+                $warning = 'Native netsh TCP/IP reset detail log was missing, empty, or unreadable, and fallback log creation failed: ' + $_.Exception.Message
                 [void]$warnings.Add($warning)
                 & $writeDiagnostic ('WARNING: {0}' -f $warning)
             }
