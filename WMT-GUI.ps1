@@ -5397,19 +5397,29 @@ param(
     [System.Windows.Controls.Control[]]$BusyControls = @()
 )
 $view = [System.Windows.Controls.Grid]::new()
-[void]$view.RowDefinitions.Add([System.Windows.Controls.RowDefinition]::new())
-foreach ($unused in 1..2) {
+$view.RowDefinitions.Add([System.Windows.Controls.RowDefinition]::new()) | Out-Null
+foreach ($unused in 1..3) {
     $row = [System.Windows.Controls.RowDefinition]::new()
     $row.Height = [System.Windows.GridLength]::Auto
-    [void]$view.RowDefinitions.Add($row)
+    $view.RowDefinitions.Add($row) | Out-Null
 }
+$view.RowDefinitions[0].Height = [System.Windows.GridLength]::Auto
+$view.RowDefinitions[1].Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
 $status = [System.Windows.Controls.TextBlock]::new()
 $status.TextWrapping = 'Wrap'
 $status.Margin = '0,0,0,8'
-$statusScroll = [System.Windows.Controls.ScrollViewer]::new()
-$statusScroll.VerticalScrollBarVisibility = 'Auto'
-$statusScroll.HorizontalScrollBarVisibility = 'Disabled'
-$statusScroll.Content = $status
+$output = [System.Windows.Controls.TextBox]::new()
+$output.IsReadOnly = $true
+$output.AcceptsReturn = $true
+$output.TextWrapping = 'NoWrap'
+$output.VerticalScrollBarVisibility = 'Auto'
+$output.HorizontalScrollBarVisibility = 'Auto'
+$output.FontFamily = 'Consolas'
+$output.FontSize = 11
+$output.MinHeight = 110
+$output.Margin = '0,0,0,8'
+$output.SetResourceReference([System.Windows.Controls.Control]::BackgroundProperty, 'BgPanel')
+$output.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, 'TextPrimary')
 $bar = [System.Windows.Controls.ProgressBar]::new()
 $bar.Minimum = 0
 $bar.Maximum = 100
@@ -5419,13 +5429,16 @@ $cancel.Content = 'Cancel'
 $cancel.HorizontalAlignment = 'Right'
 $cancel.Margin = '0,12,0,0'
 $cancel.IsEnabled = $false
-[System.Windows.Controls.Grid]::SetRow($bar, 1)
-[System.Windows.Controls.Grid]::SetRow($cancel, 2)
-[void]$view.Children.Add($statusScroll)
-[void]$view.Children.Add($bar)
-[void]$view.Children.Add($cancel)
+[System.Windows.Controls.Grid]::SetRow($status, 0)
+[System.Windows.Controls.Grid]::SetRow($output, 1)
+[System.Windows.Controls.Grid]::SetRow($bar, 2)
+[System.Windows.Controls.Grid]::SetRow($cancel, 3)
+$view.Children.Add($status) | Out-Null
+$view.Children.Add($output) | Out-Null
+$view.Children.Add($bar) | Out-Null
+$view.Children.Add($cancel) | Out-Null
 $progress = [PSCustomObject]@{
-    View=$view; Status=$status; Bar=$bar; CancelButton=$cancel
+    View=$view; Status=$status; Output=$output; Bar=$bar; CancelButton=$cancel
     State='Idle'; Name=''; Owner=$Owner; OwnsWindow=$false
     BusyControls=@($BusyControls); SavedStates=@(); ClosedHandler=$null
 }
@@ -5437,8 +5450,8 @@ return $progress
 }
 
 function New-WmtAsyncProgressDialog {
-param([string]$Title = 'Processing...')
-$dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml '<ContentControl Name="ProgressHost" Margin="20"/>' -Width 540 -Height 210 -MinWidth 420 -MinHeight 190
+param([string]$Title = 'Processing...', [double]$Width = 620, [double]$Height = 390)
+$dialog = New-WmtWindowFromXaml -Title $Title -ContentXaml '<ContentControl Name="ProgressHost" Margin="20"/>' -Width $Width -Height $Height -MinWidth 420 -MinHeight 300
 $progress = New-WmtAsyncProgress -Owner $dialog
 $progress.OwnsWindow = $true
 $dialog.FindName('ProgressHost').Content = $progress.View
@@ -5455,6 +5468,7 @@ param(
     [double]$Percent = [double]::NaN
 )
 if ($State -eq 'Running' -and $Progress.State -ne 'Running') {
+    if ($Progress.Output -and [string]::IsNullOrWhiteSpace($Progress.Output.Text)) { $Progress.Output.Text = $Message + [Environment]::NewLine }
     $Progress.SavedStates = @(foreach ($control in $Progress.BusyControls) {
         [PSCustomObject]@{ Control=$control; IsEnabled=$control.IsEnabled }
         $control.SetCurrentValue([System.Windows.UIElement]::IsEnabledProperty, $false)
@@ -11494,11 +11508,32 @@ Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairQuick" -Msg "Repairing W
 }
 
 function Start-NetRepair {
-# Resolve the data directory on the UI runspace before dispatching work. WMT helper
-# functions such as Get-DataPath are not automatically imported into background runspaces.
+# Resolve UI-runspace helpers before dispatch. A thread-safe queue carries diagnostics
+# back to the UI thread; the worker never touches WPF controls.
 $dataDirectory = Get-DataPath
-Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -ShowProgress -ArgumentList @($dataDirectory) -Sb {
-    param([string]$dataDirectory)
+$liveOutput = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$progress = New-WmtAsyncProgressDialog -Title "Full Network Repair" -Width 760 -Height 520
+$progress.Output.Text = "Preparing network repair..." + [Environment]::NewLine
+$progress.Output.ScrollToEnd()
+$liveTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$liveTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+$liveTimer.Add_Tick({
+    $line = $null
+    while ($liveOutput.TryDequeue([ref]$line)) {
+        if ($null -ne $line) { $progress.Output.AppendText([string]$line + [Environment]::NewLine); $line = $null }
+    }
+    $progress.Output.ScrollToEnd()
+    if ($progress.State -ne "Running") {
+        while ($liveOutput.TryDequeue([ref]$line)) {
+            if ($null -ne $line) { $progress.Output.AppendText([string]$line + [Environment]::NewLine); $line = $null }
+        }
+        $progress.Output.ScrollToEnd()
+        $liveTimer.Stop()
+    }
+}.GetNewClosure())
+$liveTimer.Start()
+$job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Progress $progress -ArgumentList @($dataDirectory, $liveOutput) -Sb {
+    param([string]$dataDirectory, $liveOutput)
     $ErrorActionPreference = 'Continue'
     $steps = @(
         @{ Exe = 'ipconfig'; Args = @('/release'); Label = 'Release IP address' },
@@ -11534,6 +11569,7 @@ Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network R
         param([string]$Message)
         $entry = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message
         [void]$report.Add($entry)
+        try { $liveOutput.Enqueue($entry) } catch {}
         if ($logWriter) {
             try {
                 $logWriter.WriteLine($entry)
@@ -11612,7 +11648,7 @@ Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network R
             try { $logWriter.Dispose() } catch {}
         }
     }
-} | Out-Null
+} -SuppressResultLog | Out-Null
 }
 
 function Start-RegClean {
