@@ -11600,6 +11600,8 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
             & $writeDiagnostic 'WARNING: WMT is not running elevated. Some network reset operations may fail or be incomplete.'
         }
 
+        $netshResetExitCode = $null
+        $netshResetOutput = @()
         $stepNumber = 0
         foreach ($step in $steps) {
             $stepNumber++
@@ -11620,6 +11622,10 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 }
                 $exitCode = $LASTEXITCODE
                 if ($null -eq $exitCode) { $exitCode = -1 }
+                if ($step.Label -eq 'Reset TCP/IP stack') {
+                    $netshResetExitCode = $exitCode
+                    $netshResetOutput = @($stepOutput.ToArray())
+                }
                 $duration = [Math]::Round(((Get-Date) - $stepStartedAt).TotalSeconds, 2)
                 $joinedOutput = $stepOutput -join "`n"
                 $outputIndicatesFailure = $joinedOutput -match '(?im)\b(failed|failure|unable to|could not|cannot|access is denied|requested operation requires elevation|no operation can be performed)\b'
@@ -11646,17 +11652,21 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
             }
         }
 
+        $nativeDetailLogAvailable = $false
         if ($netshDetailLogPath -and [System.IO.File]::Exists($netshDetailLogPath)) {
             try {
-                $detailFailures = @(Get-Content -LiteralPath $netshDetailLogPath -ErrorAction Stop |
-                    Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
-                foreach ($detailFailure in $detailFailures) {
-                    $warning = "TCP/IP reset detail log reports a failed operation: $detailFailure"
-                    [void]$warnings.Add($warning)
-                    & $writeDiagnostic ('WARNING: {0}' -f $warning)
-                }
-                if ($detailFailures.Count -eq 0) {
-                    & $writeDiagnostic 'TCP/IP reset detail log check: no explicit failure markers found.'
+                $nativeDetailLogAvailable = (Get-Item -LiteralPath $netshDetailLogPath -ErrorAction Stop).Length -gt 0
+                if ($nativeDetailLogAvailable) {
+                    $detailFailures = @(Get-Content -LiteralPath $netshDetailLogPath -ErrorAction Stop |
+                        Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
+                    foreach ($detailFailure in $detailFailures) {
+                        $warning = "TCP/IP reset detail log reports a failed operation: $detailFailure"
+                        [void]$warnings.Add($warning)
+                        & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                    }
+                    if ($detailFailures.Count -eq 0) {
+                        & $writeDiagnostic 'TCP/IP reset detail log check: no explicit failure markers found.'
+                    }
                 }
             }
             catch {
@@ -11664,9 +11674,41 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 & $writeDiagnostic ('WARNING: Could not inspect netsh TCP/IP reset detail log: {0}' -f $_.Exception.Message)
             }
         }
-        else {
-            [void]$warnings.Add('The netsh TCP/IP reset detail log was not created, so individual reset operations could not be checked.')
-            & $writeDiagnostic 'WARNING: netsh TCP/IP reset detail log was not created; individual reset operations could not be checked.'
+
+        if (-not $nativeDetailLogAvailable) {
+            # netsh may report individual reset operations on its output streams but fail to
+            # create its optional native log. Preserve that output in a distinct fallback file.
+            $fallbackLogPath = if ($netshDetailLogPath) {
+                [System.IO.Path]::ChangeExtension($netshDetailLogPath, '.fallback.log')
+            }
+            else {
+                Join-Path $dataDirectory ('NetworkRepair_NetshTcpIp_{0}.fallback.log' -f $startedAt.ToString('yyyyMMdd_HHmmss'))
+            }
+            try {
+                $fallbackLines = @(
+                    'WMT TCP/IP reset fallback diagnostic log'
+                    ('Timestamp: {0}' -f (Get-Date -Format o))
+                    ('Command: netsh int ip reset {0}' -f $(if ($netshDetailLogPath) { $netshDetailLogPath } else { '(native log path unavailable)' }))
+                    ('Exit code: {0}' -f $(if ($null -ne $netshResetExitCode) { $netshResetExitCode } else { '(not captured)' }))
+                    ('Native detail log: {0}' -f $(if ($netshDetailLogPath) { $netshDetailLogPath } else { '(path unavailable)' }))
+                    'Native detail log was missing or empty; captured command output follows.'
+                    ''
+                    'Captured netsh output:'
+                ) + @($netshResetOutput)
+                Set-Content -LiteralPath $fallbackLogPath -Value $fallbackLines -Encoding UTF8 -ErrorAction Stop
+                & $writeDiagnostic ('WARNING: Native netsh TCP/IP reset detail log was missing or empty. Captured output saved to fallback log: {0}' -f $fallbackLogPath)
+                $fallbackFailures = @($netshResetOutput | Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
+                foreach ($fallbackFailure in $fallbackFailures) {
+                    $warning = "TCP/IP reset fallback log reports a failed operation: $fallbackFailure"
+                    [void]$warnings.Add($warning)
+                    & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                }
+            }
+            catch {
+                $warning = 'Native netsh TCP/IP reset detail log was missing or empty, and fallback log creation failed: ' + $_.Exception.Message
+                [void]$warnings.Add($warning)
+                & $writeDiagnostic ('WARNING: {0}' -f $warning)
+            }
         }
 
         $totalDuration = [Math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
