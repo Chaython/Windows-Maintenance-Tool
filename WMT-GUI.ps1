@@ -11556,15 +11556,31 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
     $startedAt = Get-Date
     $logWriter = $null
     $logPath = $null
+    $netshLogDirectoryWritable = $false
+    $netshLogDirectoryWriteError = $null
+    $netshDetailLogPath = $null
+    $netshResetOutput = @()
+    $netshResetExitCode = $null
 
     try {
         $logDirectory = Join-Path $dataDirectory 'network-repair-logs'
         [void][System.IO.Directory]::CreateDirectory($logDirectory)
-        $timestamp = $startedAt.ToString('yyyyMMdd_HHmmss')
+        $timestamp = $startedAt.ToString('yyyyMMdd_HHmmss_fff')
         $logPath = Join-Path $logDirectory ('NetworkRepair_{0}.log' -f $timestamp)
         $netshDetailLogPath = Join-Path $logDirectory ('NetworkRepair_NetshTcpIp_{0}.log' -f $timestamp)
-        # netsh's optional reset log records individual registry operations and is more
-        # useful than its console output for diagnosing unnamed "Resetting , failed" errors.
+
+        # Test directory write access independently of netsh's native log creation.
+        $netshLogProbePath = Join-Path $logDirectory ('.wmt-netsh-write-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            [System.IO.File]::WriteAllText($netshLogProbePath, 'WMT network repair write test')
+            Remove-Item -LiteralPath $netshLogProbePath -Force -ErrorAction Stop
+            $netshLogDirectoryWritable = $true
+        }
+        catch {
+            $netshLogDirectoryWriteError = $_.Exception.Message
+        }
+
+        # The path is passed as one argument through the array below.
         $steps[4].Args = @('int', 'ip', 'reset', $netshDetailLogPath)
         $logWriter = [System.IO.StreamWriter]::new($logPath, $false, [System.Text.UTF8Encoding]::new($false))
     }
@@ -11595,7 +11611,15 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
         $isElevated = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
         & $writeDiagnostic ('Full Network Repair started. Elevated={0}; User={1}; Computer={2}' -f $isElevated, $identity.Name, $env:COMPUTERNAME)
         & $writeDiagnostic ('Diagnostic log: {0}' -f $(if ($logPath) { $logPath } else { '(file unavailable; output retained in WMT log)' }))
-        if ($netshDetailLogPath) { & $writeDiagnostic ('netsh TCP/IP reset detail log: {0}' -f $netshDetailLogPath) }
+        if ($netshDetailLogPath) {
+            & $writeDiagnostic ('netsh TCP/IP reset detail log target: {0}' -f $netshDetailLogPath)
+            & $writeDiagnostic ('netsh log directory writable preflight: {0}' -f $netshLogDirectoryWritable)
+            if ($netshLogDirectoryWriteError) {
+                & $writeDiagnostic ('WARNING: netsh log directory write preflight failed: {0}' -f $netshLogDirectoryWriteError)
+            }
+            $quotedNetshArgs = @($steps[4].Args | ForEach-Object { '"' + ([string]$_).Replace('"', '\"') + '"' })
+            & $writeDiagnostic ('netsh argument list (each quoted item is one argument): {0}' -f ($quotedNetshArgs -join ' '))
+        }
         if (-not $isElevated) {
             & $writeDiagnostic 'WARNING: WMT is not running elevated. Some network reset operations may fail or be incomplete.'
         }
@@ -11614,13 +11638,54 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 # A zero native exit code is necessary but not sufficient: preserve output and
                 # inspect it for explicit failures or missing diagnostics before reporting success.
                 $stepOutput = [System.Collections.Generic.List[string]]::new()
-                & $step.Exe @argList 2>&1 | ForEach-Object {
-                    $outputText = [string]$_
-                    if ([string]::IsNullOrWhiteSpace($outputText)) { $outputText = '(blank output line)' }
-                    [void]$stepOutput.Add($outputText)
-                    & $writeDiagnostic ('  OUTPUT: {0}' -f $outputText)
+                if ($step.Exe -eq 'ipconfig' -and $argList.Count -gt 0 -and $argList[0] -in @('/release', '/renew')) {
+                    # Scope release/renew to connected DHCP-enabled IPv4 adapters only.
+                    # Disconnected Ethernet, old Wi-Fi, Bluetooth and inactive VPN adapters
+                    # should not make a successful operation on the active adapter look failed.
+                    $activeDhcpAdapters = @()
+                    try {
+                        $activeAdapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' })
+                        foreach ($adapter in $activeAdapters) {
+                            $ipInterface = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Dhcp -eq 'Enabled' } | Select-Object -First 1
+                            if ($ipInterface) { $activeDhcpAdapters += $adapter }
+                        }
+                    }
+                    catch {
+                        throw ('Could not identify active DHCP-enabled adapters: ' + $_.Exception.Message)
+                    }
+
+                    if ($activeDhcpAdapters.Count -eq 0) {
+                        & $writeDiagnostic ('Step {0} SKIPPED: no connected IPv4 adapter with DHCP enabled; {1} is not applicable.' -f $stepNumber, $step.Label)
+                        continue
+                    }
+
+                    foreach ($adapter in $activeDhcpAdapters) {
+                        & $writeDiagnostic ('  Target adapter: {0} (ifIndex {1}; {2})' -f $adapter.Name, $adapter.ifIndex, $adapter.InterfaceDescription)
+                        $adapterArgs = @($argList[0], $adapter.Name)
+                        & $step.Exe @adapterArgs 2>&1 | ForEach-Object {
+                            $outputText = [string]$_
+                            if ([string]::IsNullOrWhiteSpace($outputText)) { $outputText = '(blank output line)' }
+                            [void]$stepOutput.Add(('[{0}] {1}' -f $adapter.Name, $outputText))
+                            & $writeDiagnostic ('  OUTPUT: [{0}] {1}' -f $adapter.Name, $outputText)
+                        }
+                        $adapterExitCode = $LASTEXITCODE
+                        if ($null -eq $adapterExitCode) { $adapterExitCode = -1 }
+                        if ($adapterExitCode -ne 0) {
+                            [void]$stepOutput.Add(('[{0}] ipconfig exit code {1}' -f $adapter.Name, $adapterExitCode))
+                        }
+                    }
+                    $exitCode = if (@($stepOutput | Where-Object { $_ -match 'ipconfig exit code [1-9]' }).Count -gt 0) { 1 } else { 0 }
                 }
-                $exitCode = $LASTEXITCODE
+                else {
+                    & $step.Exe @argList 2>&1 | ForEach-Object {
+                        $outputText = [string]$_
+                        if ([string]::IsNullOrWhiteSpace($outputText)) { $outputText = '(blank output line)' }
+                        [void]$stepOutput.Add($outputText)
+                        & $writeDiagnostic ('  OUTPUT: {0}' -f $outputText)
+                    }
+                    $exitCode = $LASTEXITCODE
+                }
                 if ($null -eq $exitCode) { $exitCode = -1 }
                 if ($step.Label -eq 'Reset TCP/IP stack') {
                     $netshResetExitCode = $exitCode
@@ -11653,24 +11718,45 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
         }
 
         $nativeDetailLogAvailable = $false
-        if ($netshDetailLogPath -and [System.IO.File]::Exists($netshDetailLogPath)) {
+        $nativeLogExists = $false
+        $nativeLogSizeBytes = 0L
+        $nativeLogAccessError = $null
+        try {
+            if ($netshDetailLogPath) {
+                $nativeLogExists = [System.IO.File]::Exists($netshDetailLogPath)
+                if ($nativeLogExists) {
+                    $nativeLogItem = Get-Item -LiteralPath $netshDetailLogPath -ErrorAction Stop
+                    $nativeLogSizeBytes = [long]$nativeLogItem.Length
+                    $nativeDetailLogAvailable = $nativeLogSizeBytes -gt 0
+                    if ($nativeDetailLogAvailable) {
+                        $nativeLogReader = [System.IO.File]::OpenText($netshDetailLogPath)
+                        try { $null = $nativeLogReader.ReadLine() } finally { $nativeLogReader.Dispose() }
+                    }
+                }
+            }
+        }
+        catch {
+            $nativeDetailLogAvailable = $false
+            $nativeLogAccessError = $_.Exception.Message
+        }
+        & $writeDiagnostic ('Native netsh log verification: exists={0}; size={1} bytes; readable={2}; access error={3}' -f $nativeLogExists, $nativeLogSizeBytes, $nativeDetailLogAvailable, $(if ($nativeLogAccessError) { $nativeLogAccessError } else { '(none)' }))
+
+        if ($nativeDetailLogAvailable) {
             try {
-                $nativeDetailLogAvailable = (Get-Item -LiteralPath $netshDetailLogPath -ErrorAction Stop).Length -gt 0
-                if ($nativeDetailLogAvailable) {
-                    $detailFailures = @(Get-Content -LiteralPath $netshDetailLogPath -ErrorAction Stop |
-                        Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
-                    foreach ($detailFailure in $detailFailures) {
-                        $warning = "TCP/IP reset detail log reports a failed operation: $detailFailure"
-                        [void]$warnings.Add($warning)
-                        & $writeDiagnostic ('WARNING: {0}' -f $warning)
-                    }
-                    if ($detailFailures.Count -eq 0) {
-                        & $writeDiagnostic 'TCP/IP reset detail log check: no explicit failure markers found.'
-                    }
+                $detailFailures = @(Get-Content -LiteralPath $netshDetailLogPath -ErrorAction Stop |
+                    Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
+                foreach ($detailFailure in $detailFailures) {
+                    $warning = "TCP/IP reset detail log reports a failed operation: $detailFailure"
+                    [void]$warnings.Add($warning)
+                    & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                }
+                if ($detailFailures.Count -eq 0) {
+                    & $writeDiagnostic 'TCP/IP reset detail log check: no explicit failure markers found.'
                 }
             }
             catch {
                 $nativeDetailLogAvailable = $false
+                $nativeLogAccessError = $_.Exception.Message
                 [void]$warnings.Add('Could not inspect the netsh TCP/IP reset detail log: ' + $_.Exception.Message)
                 & $writeDiagnostic ('WARNING: Could not inspect netsh TCP/IP reset detail log: {0}' -f $_.Exception.Message)
             }
@@ -11734,7 +11820,7 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
 } -SuppressResultLog -OnComplete ({
     # Winsock and TCP/IP resets need a Windows restart to take full effect.
     $restartChoice = [System.Windows.MessageBox]::Show(
-        "Network repair has finished. Some reset operations (especially Winsock and TCP/IP) require a Windows restart before their changes take full effect.`r`n`r`nSave your work first. Restart Windows now?",
+        "Network repair has finished. Restarting completes the Winsock and TCP/IP resets; until you restart, some changes may not take full effect. Restarting may temporarily interrupt your network or VPN connection.`r`n`r`nSave your work first. Restart Windows now?",
         "Restart Recommended",
         [System.Windows.MessageBoxButton]::YesNo,
         [System.Windows.MessageBoxImage]::Question
