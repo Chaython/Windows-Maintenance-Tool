@@ -5439,7 +5439,7 @@ $view.Children.Add($bar) | Out-Null
 $view.Children.Add($cancel) | Out-Null
 $progress = [PSCustomObject]@{
     View=$view; Status=$status; Output=$output; Bar=$bar; CancelButton=$cancel
-    State='Idle'; Name=''; Owner=$Owner; OwnsWindow=$false
+    State='Idle'; Name=''; Owner=$Owner; OwnsWindow=$false; KeepOpenOnSuccess=$false
     BusyControls=@($BusyControls); SavedStates=@(); ClosedHandler=$null
 }
 $cancel.Add_Click({
@@ -5492,7 +5492,7 @@ if ($State -ne 'Running') {
     foreach ($saved in $Progress.SavedStates) { $saved.Control.SetCurrentValue([System.Windows.UIElement]::IsEnabledProperty, $saved.IsEnabled) }
     $Progress.SavedStates = @()
     if ($Progress.Owner -and $Progress.ClosedHandler) { $Progress.Owner.Remove_Closed($Progress.ClosedHandler); $Progress.ClosedHandler = $null }
-    if ($State -eq 'Succeeded' -and $Progress.OwnsWindow -and $Progress.Owner) { $Progress.Owner.Close() }
+    if ($State -eq 'Succeeded' -and $Progress.OwnsWindow -and $Progress.Owner -and -not $Progress.KeepOpenOnSuccess) { $Progress.Owner.Close() }
 }
 }
 
@@ -11513,6 +11513,8 @@ function Start-NetRepair {
 $dataDirectory = Get-DataPath
 $liveOutput = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $progress = New-WmtAsyncProgressDialog -Title "Full Network Repair" -Width 760 -Height 520
+$progress.KeepOpenOnSuccess = $true
+$progress.Status.Text = "Preparing network repair..."
 $progress.Output.Text = "Preparing network repair..." + [Environment]::NewLine
 $progress.Output.ScrollToEnd()
 $liveTimer = [System.Windows.Threading.DispatcherTimer]::new()
@@ -11520,7 +11522,13 @@ $liveTimer.Interval = [TimeSpan]::FromMilliseconds(150)
 $liveTimer.Add_Tick({
     $line = $null
     while ($liveOutput.TryDequeue([ref]$line)) {
-        if ($null -ne $line) { $progress.Output.AppendText([string]$line + [Environment]::NewLine); $line = $null }
+        if ($null -ne $line) {
+            $visibleLine = [string]$line
+            if ($visibleLine -match 'Step (\d+/\d+) START: (.+?)( \(|$)') { $progress.Status.Text = ('Step {0}: {1}' -f $matches[1], $matches[2]) }
+            elseif ($visibleLine -match 'RESULT:') { $progress.Status.Text = 'Network repair finished; review the output below.' }
+            $progress.Output.AppendText($visibleLine + [Environment]::NewLine)
+            $line = $null
+        }
     }
     $progress.Output.ScrollToEnd()
     if ($progress.State -ne "Running") {
