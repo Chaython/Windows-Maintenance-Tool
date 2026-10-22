@@ -11497,22 +11497,111 @@ function Start-NetRepair {
 Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Sb {
     $ErrorActionPreference = 'Continue'
     $steps = @(
-        @{ Exe = 'ipconfig'; Args = @('/release') },
-        @{ Exe = 'ipconfig'; Args = @('/renew') },
-        @{ Exe = 'ipconfig'; Args = @('/flushdns') },
-        @{ Exe = 'netsh'; Args = @('winsock', 'reset') },
-        @{ Exe = 'netsh'; Args = @('int', 'ip', 'reset') }
+        @{ Exe = 'ipconfig'; Args = @('/release'); Label = 'Release IP address' },
+        @{ Exe = 'ipconfig'; Args = @('/renew'); Label = 'Renew IP address' },
+        @{ Exe = 'ipconfig'; Args = @('/flushdns'); Label = 'Flush DNS cache' },
+        @{ Exe = 'netsh'; Args = @('winsock', 'reset'); Label = 'Reset Winsock' },
+        @{ Exe = 'netsh'; Args = @('int', 'ip', 'reset'); Label = 'Reset TCP/IP stack' }
     )
-    $warnings = @()
-    foreach ($step in $steps) {
-        # Merge stderr into the output and discard both: text a native tool writes to stderr (even a
-        # blank line) must not mark the whole repair as failed with an empty "ERROR:".
-        $argList = @($step.Args)
-        $null = & $step.Exe @argList 2>&1
-        if ($LASTEXITCODE -ne 0) { $warnings += ('{0} {1} (exit code {2})' -f $step.Exe, ($argList -join ' '), $LASTEXITCODE) }
+
+    $warnings = [System.Collections.Generic.List[string]]::new()
+    $report = [System.Collections.Generic.List[string]]::new()
+    $startedAt = Get-Date
+    $logWriter = $null
+    $logPath = $null
+
+    try {
+        $logDirectory = Join-Path (Get-DataPath) 'network-repair-logs'
+        [void][System.IO.Directory]::CreateDirectory($logDirectory)
+        $logPath = Join-Path $logDirectory ('NetworkRepair_{0}.log' -f $startedAt.ToString('yyyyMMdd_HHmmss'))
+        $logWriter = [System.IO.StreamWriter]::new($logPath, $false, [System.Text.UTF8Encoding]::new($false))
     }
-    if ($warnings.Count -gt 0) { Write-Output ('Network repair completed with warnings: ' + ($warnings -join '; ') + '.') }
-    else { Write-Output "Network repair completed." }
+    catch {
+        $logPath = $null
+        [void]$report.Add(('[{0}] WARNING: Could not create persistent diagnostic log: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message))
+    }
+
+    $writeDiagnostic = {
+        param([string]$Message)
+        $entry = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message
+        [void]$report.Add($entry)
+        if ($logWriter) {
+            try {
+                $logWriter.WriteLine($entry)
+                $logWriter.Flush()
+            }
+            catch {
+                # Keep the repair running even if the diagnostic file becomes unavailable.
+            }
+        }
+    }
+
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+        $isElevated = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+        & $writeDiagnostic ('Full Network Repair started. Elevated={0}; User={1}; Computer={2}' -f $isElevated, $identity.Name, $env:COMPUTERNAME)
+        & $writeDiagnostic ('Diagnostic log: {0}' -f $(if ($logPath) { $logPath } else { '(file unavailable; output retained in WMT log)' }))
+        if (-not $isElevated) {
+            & $writeDiagnostic 'WARNING: WMT is not running elevated. Some network reset operations may fail or be incomplete.'
+        }
+
+        $stepNumber = 0
+        foreach ($step in $steps) {
+            $stepNumber++
+            $argList = @($step.Args)
+            $commandLine = '{0} {1}' -f $step.Exe, ($argList -join ' ')
+            $stepStartedAt = Get-Date
+            & $writeDiagnostic ('Step {0}/{1} START: {2} ({3})' -f $stepNumber, $steps.Count, $step.Label, $commandLine)
+
+            try {
+                # Native tools may write diagnostics to either stream. Capture both; preserve the
+                # actual text instead of throwing it away, and flush each line to the diagnostic file.
+                & $step.Exe @argList 2>&1 | ForEach-Object {
+                    $outputText = [string]$_
+                    if ([string]::IsNullOrWhiteSpace($outputText)) { $outputText = '(blank output line)' }
+                    & $writeDiagnostic ('  OUTPUT: {0}' -f $outputText)
+                }
+                $exitCode = $LASTEXITCODE
+                if ($null -eq $exitCode) { $exitCode = -1 }
+                $duration = [Math]::Round(((Get-Date) - $stepStartedAt).TotalSeconds, 2)
+
+                if ($exitCode -ne 0) {
+                    $warning = '{0} ({1}; exit code {2})' -f $commandLine, $step.Label, $exitCode
+                    [void]$warnings.Add($warning)
+                    & $writeDiagnostic ('Step {0} FAILED: exit code {1}; duration {2}s' -f $stepNumber, $exitCode, $duration)
+                }
+                else {
+                    & $writeDiagnostic ('Step {0} OK: exit code 0; duration {1}s' -f $stepNumber, $duration)
+                }
+            }
+            catch {
+                $duration = [Math]::Round(((Get-Date) - $stepStartedAt).TotalSeconds, 2)
+                $warning = '{0} ({1}; launch/capture exception: {2})' -f $commandLine, $step.Label, $_.Exception.Message
+                [void]$warnings.Add($warning)
+                & $writeDiagnostic ('Step {0} EXCEPTION: {1}; duration {2}s' -f $stepNumber, ($_ | Out-String).Trim(), $duration)
+            }
+        }
+
+        $totalDuration = [Math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
+        if ($warnings.Count -gt 0) {
+            & $writeDiagnostic ('RESULT: Completed with {0} failed step(s) out of {1}; duration {2}s' -f $warnings.Count, $steps.Count, $totalDuration)
+            & $writeDiagnostic ('Failed steps: {0}' -f ($warnings -join '; '))
+            Write-Output ('Network repair completed with warnings: ' + ($warnings -join '; ') + '.')
+        }
+        else {
+            & $writeDiagnostic ('RESULT: All {0} steps completed successfully; duration {1}s' -f $steps.Count, $totalDuration)
+            Write-Output 'Network repair completed.'
+        }
+
+        if ($logPath) { Write-Output ('Full Network Repair diagnostic log: ' + $logPath) }
+        foreach ($line in $report) { Write-Output $line }
+    }
+    finally {
+        if ($logWriter) {
+            try { $logWriter.Dispose() } catch {}
+        }
+    }
 } | Out-Null
 }
 
