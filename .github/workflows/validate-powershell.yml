@@ -2773,7 +2773,7 @@ jobs:
               'Disable-ComputerRestore', 'Disable-MMAgent', 'Disable-WindowsOptionalFeature',
               'Enable-ComputerRestore', 'Enable-MMAgent', 'Enable-WindowsOptionalFeature', 'Get-Acl',
               'Get-AppxPackage', 'Get-BitLockerVolume', 'Get-BitsTransfer', 'Get-CimInstance',
-              'Get-ComputerRestorePoint', 'Get-Disk', 'Get-MMAgent', 'Get-MpPreference', 'Get-NetAdapter',
+              'Get-ComputerRestorePoint', 'Get-Disk', 'Get-MMAgent', 'Get-MpPreference', 'Get-NetAdapter', 'Get-NetIPInterface',
               'Get-NetFirewallPortFilter', 'Get-NetFirewallRule', 'Get-Partition', 'Get-PnpDevice',
               'Get-Service', 'Get-StartApps', 'Get-Volume', 'Get-WindowsCapability', 'Get-WindowsDriver',
               'Get-WindowsOptionalFeature', 'Get-WmiObject', 'Invoke-CimMethod', 'New-NetFirewallRule',
@@ -2985,6 +2985,95 @@ jobs:
           $merges = @($repair.FindAll({ param($n) $n -is [System.Management.Automation.Language.MergingRedirectionAst] }, $true))
           if ($merges.Count -lt 1) { throw 'Start-NetRepair must merge native stderr with 2>&1.' }
           Write-Host 'OK: worker errors are never blank and Network Repair does not leak stderr as errors.'
+
+      - name: Verify tweak toggles use one on/off convention
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Convention: for on/off tweak toggles the blue ("on") state means the feature is ENABLED. Pairs that
+          # are a choice between two modes (not on/off) are listed below and exempt.
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $modePairs = @('Dark Mode | Light Mode', 'Drive Letters Last | Drive Letters First', 'Diag Data Optional | Diag Data Required',
+              'Open to This PC | Open to Quick Access', 'Single-Click Folders | Double-Click Folders', 'Classic Right-Click | Modern Right-Click',
+              'Reduce Indexing | Default Indexing', 'Disable FS Optimizations | Default FS Optimizations', 'Never Combine | Always Combine',
+              'Align Taskbar Left | Align Taskbar Center', '12-Hour Clock | 24-Hour Clock', 'Plain Lock Screen | Default Lock Screen')
+          $problems = New-Object System.Collections.Generic.List[string]
+          $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Update-WmtTweakToggle' }, $true)
+          $checked = 0
+          foreach ($c in $calls) {
+              $els = @($c.CommandElements | Select-Object -Skip 1)
+              if ($els.Count -lt 4 -or $els[2].Extent.Text -notmatch '^["'']' -or $els[3].Extent.Text -notmatch '^["'']') { continue }
+              $on = $els[2].Extent.Text.Trim('"', "'"); $off = $els[3].Extent.Text.Trim('"', "'")
+              if ("$on | $off" -in $modePairs) { continue }
+              $checked++
+              # (1) label order: the blue label must say the feature is on (state labels) or offer the disabling action (verb labels)
+              $offWord = '(?i)\b(Off|Disabled)\b'
+              $onIsOff = [bool]($on -match $offWord); $offIsOff = [bool]($off -match $offWord)
+              if ($onIsOff -xor $offIsOff) {
+                  if ($onIsOff) { $problems.Add("Line $($c.Extent.StartLineNumber): blue label '$on' reads as off; blue means on.") }
+              }
+              elseif ($on -match '^(Show|Enable|Add|Restore)\b' -and $off -match '^(Hide|Disable|Remove)\b') {
+                  $problems.Add("Line $($c.Extent.StartLineNumber): blue label '$on' offers to enable, so blue would mean off.")
+              }
+              # (2) in a click handler, the new state must come from a variable the handler assigns
+              $inClick = $false; $handler = $null; $p = $c.Parent
+              while ($p) { if ($p -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $p.Member.Extent.Text -eq 'Add_Click') { $inClick = $true; $handler = $p; break }; $p = $p.Parent }
+              if ($inClick) {
+                  $assigned = @{}
+                  foreach ($a in $handler.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+                      foreach ($v in $a.Left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) { $assigned[$v.VariablePath.UserPath.ToLowerInvariant()] = $true }
+                  }
+                  foreach ($pa in $handler.FindAll({ param($n) $n -is [System.Management.Automation.Language.ParameterAst] }, $true)) { $assigned[$pa.Name.VariablePath.UserPath.ToLowerInvariant()] = $true }
+                  foreach ($v in $els[1].FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+                      $name = $v.VariablePath.UserPath.ToLowerInvariant()
+                      if ($name -in 'true', 'false', 'null', '_') { continue }
+                      if (-not $assigned.ContainsKey($name)) { $problems.Add("Line $($c.Extent.StartLineNumber): click handler passes `$$($v.VariablePath.UserPath) as the new state but never assigns it.") }
+                  }
+              }
+          }
+          if ($checked -lt 100) { throw "Only $checked toggle call sites were checked; the guard is stale." }
+          if ($problems.Count -gt 0) { $problems | ForEach-Object { Write-Host $_ }; throw "$($problems.Count) toggle convention problem(s)." }
+          Write-Host "OK: $checked toggle call sites follow the blue = on convention."
+
+      - name: Verify Tweaks import migrates old export files
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $src=[IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $t=$null;$e=$null;$ast=[System.Management.Automation.Language.Parser]::ParseInput($src,[ref]$t,[ref]$e)
+          foreach($n in 'New-WmtTweaksExportPayload','Get-WmtTweaksImportPlan'){ $f=$ast.FindAll({param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n},$true)[0]; if(-not $f){throw "missing $n"}; Invoke-Expression $f.Extent.Text }
+          $a=$ast.FindAll({param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -eq '$script:WmtTweakExportV1InvertedNames'},$true)[0]
+          if(-not $a){ throw 'inverted-names list not found' }; Invoke-Expression $a.Extent.Text
+          function Get-Ctrl { param($n) [pscustomobject]@{ IsEnabled=$true; Name=$n } }
+          $script:TweakCurrentStates=[ordered]@{
+            'btnToggleCopilot'=[pscustomobject]@{On=$true;OnLabel='Copilot On';OffLabel='Copilot Off'}     # new meaning: Copilot enabled
+            'btnToggleGameBarIntegration'=[pscustomobject]@{On=$true;OnLabel='x';OffLabel='y'}
+            'btnToggleSpatialAudio'=[pscustomobject]@{On=$true;OnLabel='x';OffLabel='y'}                   # NOT in the inverted list (already blue = on)
+            'btnMyDeviceCopilotToggle'=[pscustomobject]@{On=$true;OnLabel='x';OffLabel='y'} }
+          $script:TweakToggleMirrorNames=@('btnMyDeviceCopilotToggle'); $script:TweakToggleSiblingNames=@{ 'btnMyDeviceCopilotToggle'='btnToggleCopilot' }
+          function Make($ver,$tweaks){ $conv=[ordered]@{}; foreach($k in $tweaks.Keys){ $conv[$k]=[pscustomobject]$tweaks[$k] }; $o=[ordered]@{type='wmt-tweaks';tweaks=([pscustomobject]$conv)}; if($null -ne $ver){$o.version=$ver}; [pscustomobject]$o }
+          function Check($label,$cond){ if(-not $cond){ throw "FAILED: $label" }; "  ok: $label" }
+          "inverted-names list: $($script:WmtTweakExportV1InvertedNames.Count) buttons"
+          Check 'list contains Copilot, HAGS, Pagefile, Update ASAP' ((@('btnToggleCopilot','btnToggleHags','btnTogglePagefile','btnToggleUpdateASAP') | ? { $script:WmtTweakExportV1InvertedNames -notcontains $_ }).Count -eq 0)
+          Check 'list does NOT contain already-correct toggles' ((@('btnToggleSpatialAudio','btnToggleGameMode','btnToggleMemCompression') | ? { $script:WmtTweakExportV1InvertedNames -contains $_ }).Count -eq 0)
+          # v1 (no version) file saved when Copilot was OFF (old meaning on=true). Copilot is currently enabled (On=true) => must be turned OFF
+          $p=Get-WmtTweaksImportPlan (Make $null @{ btnToggleCopilot=@{on=$true} })
+          Check 'v1 Copilot on=true is inverted (desired=false, pending)' ($p.Pending.Count -eq 1 -and $p.Pending[0].Desired -eq $false)
+          $p=Get-WmtTweaksImportPlan (Make 1 @{ btnToggleCopilot=@{on=$false} })
+          Check 'v1 Copilot on=false (Copilot was enabled) matches current => already ok' ($p.Pending.Count -eq 0 -and $p.AlreadyOk -eq 1)
+          $p=Get-WmtTweaksImportPlan (Make 2 @{ btnToggleCopilot=@{on=$true} })
+          Check 'v2 Copilot on=true is NOT inverted (already enabled)' ($p.Pending.Count -eq 0 -and $p.AlreadyOk -eq 1)
+          $p=Get-WmtTweaksImportPlan (Make 1 @{ btnToggleSpatialAudio=@{on=$true} })
+          Check 'v1 toggle that is not in the list keeps its value' ($p.Pending.Count -eq 0 -and $p.AlreadyOk -eq 1)
+          $p=Get-WmtTweaksImportPlan (Make 1 @{ btnMyDeviceCopilotToggle=@{on=$true} })
+          Check 'v1 mirror button follows its twin (inverted, applied to the twin)' ($p.Pending.Count -eq 1 -and $p.Pending[0].Name -eq 'btnToggleCopilot' -and $p.Pending[0].Desired -eq $false)
+          $x=New-WmtTweaksExportPayload
+          Check 'new exports are version 2' ($x.version -eq 2)
+          Check 'export writes the current meaning unchanged' ($x.tweaks['btnToggleCopilot'].on -eq $true)
+          "import migration: all checks passed"
 
       - name: Smoke test shared runspace helpers
         shell: powershell

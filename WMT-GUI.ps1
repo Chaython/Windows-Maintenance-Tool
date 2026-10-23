@@ -32171,9 +32171,8 @@ if (-not $button) { return }
 if ($script:WmtPagefileUiState -and $script:WmtPagefileUiState.Busy) { $button.IsEnabled = $false; return }
 $button.IsEnabled = $true
 if ($Enabled -is [bool]) {
-    # The shared toggle labels describe the current configuration. The applied
-    # tweak is disabling the pagefile; Windows' default enabled state stays gray.
-    Update-WmtTweakToggle $button (-not $Enabled) 'Pagefile Disabled' 'Pagefile Enabled'
+    # Blue = pagefile enabled (on), gray = pagefile disabled (off), like every other toggle.
+    Update-WmtTweakToggle $button $Enabled 'Pagefile Enabled' 'Pagefile Disabled'
 }
 else {
     if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')) { $script:TweakCurrentStates.Remove('btnTogglePagefile') }
@@ -35588,6 +35587,31 @@ catch {
 # The payload builder and the import planner are separate pure functions so
 # the harness can exercise them without WPF dialogs.
 
+# Tweaks export format 2 uses ONE meaning for "on": the feature is enabled (blue button). Format 1 stored
+# each button's old value, where blue meant "feature off" for the buttons below, so importing a format 1
+# file inverts exactly these (a mirror button follows its Tweaks-page twin).
+$script:WmtTweakExportV1InvertedNames = @(
+    'btnMyDeviceHagsToggle', 'btnMyDeviceHibernateToggle', 'btnToggle3DObjects', 'btnToggleAISvcAutoStart',
+    'btnToggleActivity', 'btnToggleAds', 'btnToggleAnimations', 'btnToggleAppDiagnostics',
+    'btnToggleAppLaunch', 'btnToggleAutoWifi', 'btnToggleBackgroundApps', 'btnToggleBitlocker',
+    'btnToggleCEIP', 'btnToggleChat', 'btnToggleClickToDo', 'btnToggleCompatTelemetry', 'btnToggleCopilot',
+    'btnToggleDVR', 'btnToggleDeliveryOpt', 'btnToggleDeviceAutoApp', 'btnToggleDeviceSound',
+    'btnToggleDrvMeta', 'btnToggleDrvUpdates', 'btnToggleDupDrive', 'btnToggleEdgeAI', 'btnToggleFastStartup',
+    'btnToggleFeedbackNotify', 'btnToggleFindMyDevice', 'btnToggleGallery', 'btnToggleGameBarIntegration',
+    'btnToggleGameCapture', 'btnToggleHags', 'btnToggleHibernate', 'btnToggleHomeExplorer', 'btnToggleIPv6',
+    'btnToggleInkingPersonal', 'btnToggleLocationSvc', 'btnToggleLockFacts', 'btnToggleLockSpotlight',
+    'btnToggleLockscreenTips', 'btnToggleModernStandby', 'btnToggleNTFS83', 'btnToggleNTFSLastAccess',
+    'btnToggleNetLocationWizard', 'btnToggleNetThrottling', 'btnToggleNotepadAI', 'btnToggleNotifySound',
+    'btnToggleOneDriveFolder', 'btnTogglePagefile', 'btnTogglePaintAI', 'btnTogglePhoneLink',
+    'btnToggleRecall', 'btnToggleRecents', 'btnToggleRemoveCast', 'btnToggleRemovePrint',
+    'btnToggleSearchHighlights', 'btnToggleSearchHistory', 'btnToggleSetupPrompts', 'btnToggleSnapAssist',
+    'btnToggleSnapLayouts', 'btnToggleSpeechOnline', 'btnToggleStartAllApps', 'btnToggleStartRecommended',
+    'btnToggleStartupSound', 'btnToggleStickyKeys', 'btnToggleSuggested', 'btnToggleSuperfetch',
+    'btnToggleTailored', 'btnToggleTaskView', 'btnToggleThumbCache', 'btnToggleTips', 'btnToggleTransparency',
+    'btnToggleUpdateASAP', 'btnToggleWSH', 'btnToggleWebSearch', 'btnToggleWidgets', 'btnToggleWifiSense',
+    'btnToggleWindowSnapping'
+)
+
 function New-WmtTweaksExportPayload {
 # Pure: builds the versioned export payload from the recorded toggle states.
 # Returns $null when no states have been recorded yet.
@@ -35606,7 +35630,7 @@ foreach ($name in @($script:TweakCurrentStates.Keys)) {
 
 return [ordered]@{
     type     = "wmt-tweaks"
-    version  = 1
+    version  = 2
     exported = (Get-Date).ToString("o")
     count    = $tweaks.Count
     tweaks   = $tweaks
@@ -35666,7 +35690,7 @@ foreach ($name in $Names) {
                 $btn = Get-Ctrl $name
                 if ($btn) {
                     $v = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager" "AllowNonSignedDrivers" 0) 0)
-                    Update-WmtTweakToggle $btn ($v -eq 1) "Test Mode Off" "Test Mode On"
+                    Update-WmtTweakToggle $btn ($v -eq 1) "Test Mode On" "Test Mode Off"
                 }
             }
         }
@@ -35695,6 +35719,10 @@ $plan = [PSCustomObject]@{
 }
 if (-not $Data -or -not $Data.PSObject.Properties["tweaks"]) { return $plan }
 
+# Files written before format 2 used the old per-button meaning of "on"; see the list above.
+$formatVersion = 1
+try { if ($Data.PSObject.Properties["version"]) { $formatVersion = [int]$Data.version } } catch { $formatVersion = 1 }
+
 # First pass: index entries by name so My Device mirror entries can be
 # resolved against their main Tweaks-page twin.
 $entryByName = @{}
@@ -35709,6 +35737,11 @@ foreach ($prop in @($Data.tweaks.PSObject.Properties)) {
     if (-not $entry -or -not $entry.PSObject.Properties["on"]) { $plan.Skipped++; $plan.SkippedNames.Add("$name (malformed entry)"); continue }
     $desired = $false
     try { $desired = [bool]$entry.on } catch { $plan.Skipped++; $plan.SkippedNames.Add("$name (unreadable on/off value)"); continue }
+    if ($formatVersion -lt 2) {
+        $twinName = $null
+        try { if ($script:TweakToggleSiblingNames) { $twinName = [string]$script:TweakToggleSiblingNames[$name] } } catch { }
+        if (($script:WmtTweakExportV1InvertedNames -contains $name) -or ($twinName -and ($script:WmtTweakExportV1InvertedNames -contains $twinName))) { $desired = -not $desired }
+    }
 
     # My Device toggle buttons are delegated mirrors of their Tweaks-page twin
     # (clicking one re-raises the twin's Click), so a pair must be applied
@@ -36090,7 +36123,7 @@ try {
 
     $h = & $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode"
     if ($null -ne $h) {
-        $hagsOn = ($h -ne 2)
+        $hagsOn = ($h -eq 2)
         Update-WmtTweakToggle $btnToggleHags $hagsOn "Disable HAGS" "Enable HAGS"
         Update-WmtTweakToggle $btnMyDeviceHagsToggle $hagsOn "Disable HAGS" "Enable HAGS"
     }
@@ -36099,14 +36132,14 @@ try {
 
     if ($null -ne $smStartType) {
         $superfetchDisabled = ($smStartType -eq 'Disabled')
-        Update-WmtTweakToggle $btnToggleSuperfetch $superfetchDisabled "Enable Superfetch" "Disable Superfetch"
+        Update-WmtTweakToggle $btnToggleSuperfetch (-not $superfetchDisabled) "Disable Superfetch" "Enable Superfetch"
     }
 
     $hibernate = & $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled"
     if ($null -ne $hibernate) {
         $hibernateEnabled = ([int]$hibernate -ne 0)
-        $hibernateOff = (-not $hibernateEnabled); Update-WmtTweakToggle $btnToggleHibernate $hibernateOff "Enable Hibernation" "Disable Hibernation"
-        Update-WmtTweakToggle $btnMyDeviceHibernateToggle $hibernateOff "Enable Hibernation" "Disable Hibernation"
+        $hibernateOff = (-not $hibernateEnabled); Update-WmtTweakToggle $btnToggleHibernate (-not $hibernateOff) "Disable Hibernation" "Enable Hibernation"
+        Update-WmtTweakToggle $btnMyDeviceHibernateToggle (-not $hibernateOff) "Disable Hibernation" "Enable Hibernation"
     }
 
     # Get-MMAgent is a slow CIM operation; only consume the worker snapshot.
@@ -36128,18 +36161,18 @@ try {
     $btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"; $searchHidden = ($smode -eq 0); $searchIcon = ($smode -eq 1); $searchState = if ($searchHidden) { 2 } elseif ($searchIcon) { 1 } else { 0 }; if ($searchState -eq 2) { $btnToggleSearchDisplay.Content = "Show Search Box"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) } elseif ($searchState -eq 1) { $btnToggleSearchDisplay.Content = "Hide Search"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) } else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
     $widgetsHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarDa" 1) 0) -eq 0))
 
-    $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"; Update-WmtTweakToggle $btnToggleWidgets $widgetsHidden "Show Widgets" "Hide Widgets"
-    $taskViewHidden = (((ConvertTo-Int (& $getRegValue $ap "ShowTaskViewButton" 1) 0) -eq 0)); $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"; Update-WmtTweakToggle $btnToggleTaskView $taskViewHidden "Show Task View" "Hide Task View"
-    $chatHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarMn" 1) 0) -eq 0)); $btnToggleChat = Get-Ctrl "btnToggleChat"; Update-WmtTweakToggle $btnToggleChat $chatHidden "Show Chat" "Hide Chat"
+    $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"; Update-WmtTweakToggle $btnToggleWidgets (-not $widgetsHidden) "Hide Widgets" "Show Widgets"
+    $taskViewHidden = (((ConvertTo-Int (& $getRegValue $ap "ShowTaskViewButton" 1) 0) -eq 0)); $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"; Update-WmtTweakToggle $btnToggleTaskView (-not $taskViewHidden) "Hide Task View" "Show Task View"
+    $chatHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarMn" 1) 0) -eq 0)); $btnToggleChat = Get-Ctrl "btnToggleChat"; Update-WmtTweakToggle $btnToggleChat (-not $chatHidden) "Hide Chat" "Show Chat"
 
     $cabinetPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState"
     $explorerPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
     $hideExt = (ConvertTo-Int (& $getRegValue $ap "HideFileExt" 1) 0)
     $btnToggleExtensions = Get-Ctrl "btnToggleExtensions"
-    Update-WmtTweakToggle $btnToggleExtensions ($hideExt -eq 0) "Show Extensions" "Hide Extensions"
+    Update-WmtTweakToggle $btnToggleExtensions ($hideExt -eq 0) "Hide Extensions" "Show Extensions"
     $hidden = (ConvertTo-Int (& $getRegValue $ap "Hidden" 2) 0)
     $btnToggleHiddenFiles = Get-Ctrl "btnToggleHiddenFiles"
-    Update-WmtTweakToggle $btnToggleHiddenFiles ($hidden -eq 1) "Show Hidden Files" "Hide Hidden Files"
+    Update-WmtTweakToggle $btnToggleHiddenFiles ($hidden -eq 1) "Hide Hidden Files" "Show Hidden Files"
     $fullPath = (ConvertTo-Int (& $getRegValue $cabinetPath "FullPath" 0) 0)
     $btnToggleFullPath = Get-Ctrl "btnToggleFullPath"
     Update-WmtTweakToggle $btnToggleFullPath ($fullPath -eq 1) "Full Path On" "Full Path Off"
@@ -36148,7 +36181,7 @@ try {
     Update-WmtTweakToggle $btnToggleExplorerLaunch ($launchTo -eq 1) "Open to This PC" "Open to Quick Access"
     $recentsHidden = ((ConvertTo-Int (& $getRegValue $explorerPath "ShowRecent" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $explorerPath "ShowFrequent" 1) 0) -eq 0)
     $btnToggleRecents = Get-Ctrl "btnToggleRecents"
-    Update-WmtTweakToggle $btnToggleRecents $recentsHidden "Show Recents" "Hide Recents"
+    Update-WmtTweakToggle $btnToggleRecents (-not $recentsHidden) "Hide Recents" "Show Recents"
 
     $mousePath = "HKCU:\Control Panel\Mouse"
     $mouseSpeed = (ConvertTo-Int (& $getRegValue $mousePath "MouseSensitivity" 10) 0)
@@ -36179,55 +36212,55 @@ try {
     $copilotBtn = Get-Ctrl "btnToggleCopilot"
     if ($copilotBtn) {
         $copilotOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue $polAI "DisableAIDataAnalysis" 0) 0) -eq 1))
-        Update-WmtTweakToggle $copilotBtn $copilotOff "Copilot On" "Copilot Off"
+        Update-WmtTweakToggle $copilotBtn (-not $copilotOff) "Copilot On" "Copilot Off"
     }
     $recallBtn = Get-Ctrl "btnToggleRecall"
     if ($recallBtn) {
         $recallOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue $polAI "DisableAIDataAnalysis" 0) 0) -eq 1))
-        Update-WmtTweakToggle $recallBtn $recallOff "Recall On" "Recall Off"
+        Update-WmtTweakToggle $recallBtn (-not $recallOff) "Recall On" "Recall Off"
     }
     $ctdBtn = Get-Ctrl "btnToggleClickToDo"
-    if ($ctdBtn) { $v = (ConvertTo-Int (& $getRegValue $polAI "DisableClickToDo" 0) 0); Update-WmtTweakToggle $ctdBtn ($v -eq 1) "Click To Do On" "Click To Do Off" }
+    if ($ctdBtn) { $v = (ConvertTo-Int (& $getRegValue $polAI "DisableClickToDo" 0) 0); Update-WmtTweakToggle $ctdBtn (-not ($v -eq 1)) "Click To Do On" "Click To Do Off" }
     $aisvcBtn = Get-Ctrl "btnToggleAISvcAutoStart"
     if ($aisvcBtn) {
         $aiSvcOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 0) 0) -eq 1))
-        Update-WmtTweakToggle $aisvcBtn $aiSvcOff "AI Svc AutoStart On" "AI Svc AutoStart Off"
+        Update-WmtTweakToggle $aisvcBtn (-not $aiSvcOff) "AI Svc AutoStart On" "AI Svc AutoStart Off"
     }
     $edgeAiBtn = Get-Ctrl "btnToggleEdgeAI"
     if ($edgeAiBtn) {
         $edgeAiOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "HubsSidebarEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $edgeAiBtn $edgeAiOff "Edge AI On" "Edge AI Off"
+        Update-WmtTweakToggle $edgeAiBtn (-not $edgeAiOff) "Edge AI On" "Edge AI Off"
     }
     $paintAiBtn = Get-Ctrl "btnTogglePaintAI"
     if ($paintAiBtn) {
         $paintAiOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Paint\App" "EnableCopilot" 1) 0) -eq 0))
-        Update-WmtTweakToggle $paintAiBtn $paintAiOff "Paint AI On" "Paint AI Off"
+        Update-WmtTweakToggle $paintAiBtn (-not $paintAiOff) "Paint AI On" "Paint AI Off"
     }
     $notepadAiBtn = Get-Ctrl "btnToggleNotepadAI"
     if ($notepadAiBtn) {
         $notepadAiOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Notepad" "CocreatorEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $notepadAiBtn $notepadAiOff "Notepad AI On" "Notepad AI Off"
+        Update-WmtTweakToggle $notepadAiBtn (-not $notepadAiOff) "Notepad AI On" "Notepad AI Off"
     }
 
     $fmdBtn = Get-Ctrl "btnToggleFindMyDevice"
     if ($fmdBtn) {
         $fmdOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\FindMyDevice\LocationSync" "Enabled" 0) 0) -eq 0))
-        Update-WmtTweakToggle $fmdBtn $fmdOff "Find My Device On" "Find My Device Off"
+        Update-WmtTweakToggle $fmdBtn (-not $fmdOff) "Find My Device On" "Find My Device Off"
     }
     $locBtn = Get-Ctrl "btnToggleLocationSvc"
     if ($locBtn) {
         $locOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location" "Value" 1) 0) -eq 0))
-        Update-WmtTweakToggle $locBtn $locOff "Location On" "Location Off"
+        Update-WmtTweakToggle $locBtn (-not $locOff) "Location On" "Location Off"
     }
     $msBtn = Get-Ctrl "btnToggleModernStandby"
     if ($msBtn) {
         $msOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "EnableAwakeNetworkOnDisconnect" 1) 0) -eq 0) -and ((ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "EnforceConnectedStandby" 1) 0) -eq 0))
-        Update-WmtTweakToggle $msBtn $msOff "Modern Standby Net On" "Modern Standby Net Off"
+        Update-WmtTweakToggle $msBtn (-not $msOff) "Modern Standby Net On" "Modern Standby Net Off"
     }
     $daaBtn = Get-Ctrl "btnToggleDeviceAutoApp"
     if ($daaBtn) {
         $daaOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceInstall\Settings" "DisableDeviceAutoInstall" 0) 0) -eq 1))
-        Update-WmtTweakToggle $daaBtn $daaOff "Device Auto-Apps On" "Device Auto-Apps Off"
+        Update-WmtTweakToggle $daaBtn (-not $daaOff) "Device Auto-Apps On" "Device Auto-Apps Off"
     }
 
     $etBtn = Get-Ctrl "btnToggleEndTask"
@@ -36238,49 +36271,49 @@ try {
     $lacBtn = Get-Ctrl "btnToggleLastActiveClick"
     if ($lacBtn) {
         $lacOn = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LastActiveClick" 0) 0) -eq 1))
-        Update-WmtTweakToggle $lacBtn $lacOn "Last Active Click Off" "Last Active Click"
+        Update-WmtTweakToggle $lacBtn $lacOn "Last Active Click" "Last Active Click Off"
     }
 
     $galBtn = Get-Ctrl "btnToggleGallery"
     if ($galBtn) {
         $galHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "GalleryEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $galBtn $galHidden "Show Gallery" "Hide Gallery"
+        Update-WmtTweakToggle $galBtn (-not $galHidden) "Hide Gallery" "Show Gallery"
     }
     $homeBtn = Get-Ctrl "btnToggleHomeExplorer"
     if ($homeBtn) {
         $homeHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowHomeFolder" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_HomeClassicMode" 0) 0) -eq 1))
-        Update-WmtTweakToggle $homeBtn $homeHidden "Show Home" "Hide Home"
+        Update-WmtTweakToggle $homeBtn (-not $homeHidden) "Hide Home" "Show Home"
     }
     $odBtn = Get-Ctrl "btnToggleOneDriveFolder"
     if ($odBtn) {
         $odHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" "System.IsPinnedToNameSpaceTree" 1) 0) -eq 0))
-        Update-WmtTweakToggle $odBtn $odHidden "Show OneDrive" "Hide OneDrive"
+        Update-WmtTweakToggle $odBtn (-not $odHidden) "Hide OneDrive" "Show OneDrive"
     }
     $tdoBtn = Get-Ctrl "btnToggle3DObjects"
     if ($tdoBtn) {
-        $tdoHidden = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag" "ThisPCPolicy" "Show") 0) -ne "Show"))
-        Update-WmtTweakToggle $tdoBtn $tdoHidden "Show 3D Objects" "Hide 3D Objects"
+        $tdoHidden = (((ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag" "ThisPCPolicy" "Show") "") -ne "Show"))
+        Update-WmtTweakToggle $tdoBtn (-not $tdoHidden) "Hide 3D Objects" "Show 3D Objects"
     }
     $ddBtn = Get-Ctrl "btnToggleDupDrive"
     if ($ddBtn) {
         $ddHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideDuplicatedRemovableDrives" 0) 0) -eq 1))
-        Update-WmtTweakToggle $ddBtn $ddHidden "Show Dup Drive" "Hide Dup Drive"
+        Update-WmtTweakToggle $ddBtn (-not $ddHidden) "Hide Dup Drive" "Show Dup Drive"
     }
 
     $saBtn = Get-Ctrl "btnToggleSnapAssist"
     if ($saBtn) {
         $saOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 1) 0) -eq 0))
-        Update-WmtTweakToggle $saBtn $saOff "Snap Assist On" "Snap Assist Off"
+        Update-WmtTweakToggle $saBtn (-not $saOff) "Snap Assist On" "Snap Assist Off"
     }
     $slBtn = Get-Ctrl "btnToggleSnapLayouts"
     if ($slBtn) {
         $slOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "EnableSnapLayouts" 1) 0) -eq 0))
-        Update-WmtTweakToggle $slBtn $slOff "Snap Layouts On" "Snap Layouts Off"
+        Update-WmtTweakToggle $slBtn (-not $slOff) "Snap Layouts On" "Snap Layouts Off"
     }
     $wsBtn = Get-Ctrl "btnToggleWindowSnapping"
     if ($wsBtn) {
         $wsOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Desktop" "WindowArrangementActive" 1) 0) -eq 0))
-        Update-WmtTweakToggle $wsBtn $wsOff "Window Snapping On" "Window Snapping Off"
+        Update-WmtTweakToggle $wsBtn (-not $wsOff) "Window Snapping On" "Window Snapping Off"
     }
 
     $dmBtn = Get-Ctrl "btnToggleDarkMode"
@@ -36291,119 +36324,119 @@ try {
     $trBtn = Get-Ctrl "btnToggleTransparency"
     if ($trBtn) {
         $trOff = (((ConvertTo-Int (& $getRegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 1) 0) -eq 0))
-        Update-WmtTweakToggle $trBtn $trOff "Transparency On" "Transparency Off"
+        Update-WmtTweakToggle $trBtn (-not $trOff) "Transparency On" "Transparency Off"
     }
     $anBtn = Get-Ctrl "btnToggleAnimations"
     if ($anBtn) {
         $anOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Desktop\WindowMetrics" "MinAnimate" 1) 0) -eq 0))
-        Update-WmtTweakToggle $anBtn $anOff "Animations On" "Animations Off"
+        Update-WmtTweakToggle $anBtn (-not $anOff) "Animations On" "Animations Off"
     }
 
     $ltBtn = Get-Ctrl "btnToggleLockscreenTips"
     if ($ltBtn) {
         $ltOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Toast" "Enabled" 0) 0) -eq 0) -and ((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Tips" "Enabled" 0) 0) -eq 0))
-        Update-WmtTweakToggle $ltBtn $ltOff "Lockscreen Tips On" "Lockscreen Tips Off"
+        Update-WmtTweakToggle $ltBtn (-not $ltOff) "Lockscreen Tips On" "Lockscreen Tips Off"
     }
     $shBtn = Get-Ctrl "btnToggleSearchHighlights"
     if ($shBtn) {
         $shOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings" "IsDynamicSearchBoxEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $shBtn $shOff "Search Highlights On" "Search Highlights Off"
+        Update-WmtTweakToggle $shBtn (-not $shOff) "Search Highlights On" "Search Highlights Off"
     }
 
     $sh2Btn = Get-Ctrl "btnToggleSearchHistory"
     if ($sh2Btn) {
         $shOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings" "IsDeviceSearchHistoryEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $sh2Btn $shOff "Search History On" "Search History Off"
+        Update-WmtTweakToggle $sh2Btn (-not $shOff) "Search History On" "Search History Off"
     }
 
     $gbiBtn = Get-Ctrl "btnToggleGameBarIntegration"
     if ($gbiBtn) {
         $gbiOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $gbiBtn $gbiOff "Game Bar Int. On" "Game Bar Int. Off"
+        Update-WmtTweakToggle $gbiBtn (-not $gbiOff) "Game Bar Int. On" "Game Bar Int. Off"
     }
     $dvrBtn = Get-Ctrl "btnToggleDVR"
     if ($dvrBtn) {
         $dvrOff = (((ConvertTo-Int (& $getRegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $dvrBtn $dvrOff "DVR On" "DVR Off"
+        Update-WmtTweakToggle $dvrBtn (-not $dvrOff) "DVR On" "DVR Off"
     }
 
     $blBtn = Get-Ctrl "btnToggleBitlocker"
     if ($blBtn) {
         $blOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker" "PreventDeviceEncryption" 0) 0) -eq 1))
-        Update-WmtTweakToggle $blBtn $blOff "Bitlocker Auto On" "Bitlocker Auto Off"
+        Update-WmtTweakToggle $blBtn (-not $blOff) "Bitlocker Auto On" "Bitlocker Auto Off"
     }
 
     $skBtn = Get-Ctrl "btnToggleStickyKeys"
     if ($skBtn) {
         $skOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Accessibility\StickyKeys" "Flags" "510") 0) -ne "510"))
-        Update-WmtTweakToggle $skBtn $skOff "Sticky Keys On" "Sticky Keys Off"
+        Update-WmtTweakToggle $skBtn (-not $skOff) "Sticky Keys On" "Sticky Keys Off"
     }
 
     $doBtn = Get-Ctrl "btnToggleDeliveryOpt"
     if ($doBtn) {
         $doOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config" "DODownloadMode" 1) 0) -eq 0))
-        Update-WmtTweakToggle $doBtn $doOff "Delivery Opt On" "Delivery Opt Off"
+        Update-WmtTweakToggle $doBtn (-not $doOff) "Delivery Opt On" "Delivery Opt Off"
     }
     $uaBtn = Get-Ctrl "btnToggleUpdateASAP"
     if ($uaBtn) {
         $uaOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" "AllowAutoWindowsUpdateDownloadOverMeteredNetwork" 0) 0) -eq 0))
-        Update-WmtTweakToggle $uaBtn $uaOff "Update ASAP On" "Update ASAP Off"
+        Update-WmtTweakToggle $uaBtn (-not $uaOff) "Update ASAP On" "Update ASAP Off"
     }
 
     $srBtn = Get-Ctrl "btnToggleStartRecommended"
     if ($srBtn) {
         $srHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_TrackProgs" 1) 0) -eq 0))
-        Update-WmtTweakToggle $srBtn $srHidden "Show Recommended" "Hide Recommended"
+        Update-WmtTweakToggle $srBtn (-not $srHidden) "Hide Recommended" "Show Recommended"
     }
     $saBtn2 = Get-Ctrl "btnToggleStartAllApps"
     if ($saBtn2) {
         $saHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_ShowAllApps" 0) 0) -eq 1) -or ((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "HideStartAllApps" 0) 0) -eq 1))
-        Update-WmtTweakToggle $saBtn2 $saHidden "Show All Apps" "Hide All Apps"
+        Update-WmtTweakToggle $saBtn2 (-not $saHidden) "Hide All Apps" "Show All Apps"
     }
     $plBtn = Get-Ctrl "btnTogglePhoneLink"
     if ($plBtn) {
         $plHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_ShowAccountBadges" 1) 0) -eq 0))
-        Update-WmtTweakToggle $plBtn $plHidden "Show Phone Link" "Hide Phone Link"
+        Update-WmtTweakToggle $plBtn (-not $plHidden) "Hide Phone Link" "Show Phone Link"
 
         # --- EXPANDED TWEAK STATE DETECTION (round 2) ---
 
         # Network Tweaks
         $ipv6Btn = Get-Ctrl "btnToggleIPv6"
-        if ($ipv6Btn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0) 0); Update-WmtTweakToggle $ipv6Btn (($v -band 0xFF) -ne 0) "Enable IPv6" "Disable IPv6" }
+        if ($ipv6Btn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0) 0); Update-WmtTweakToggle $ipv6Btn (-not (($v -band 0xFF) -ne 0)) "Disable IPv6" "Enable IPv6" }
         $ntBtn = Get-Ctrl "btnToggleNetThrottling"
-        if ($ntBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 10) 0); Update-WmtTweakToggle $ntBtn ($v -eq 0xFFFFFFFF) "Enable Net Throttling" "Disable Net Throttling" }
+        if ($ntBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 10) 0); Update-WmtTweakToggle $ntBtn (-not ($v -eq 0xFFFFFFFF)) "Disable Net Throttling" "Enable Net Throttling" }
         $nlwBtn = Get-Ctrl "btnToggleNetLocationWizard"
-        if ($nlwBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters" "ShowNetworkLocationWizard" 1) 0); Update-WmtTweakToggle $nlwBtn ($v -eq 0) "Net Location Wizard On" "Net Location Wizard Off" }
+        if ($nlwBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters" "ShowNetworkLocationWizard" 1) 0); Update-WmtTweakToggle $nlwBtn (-not ($v -eq 0)) "Net Location Wizard On" "Net Location Wizard Off" }
         $wfsBtn = Get-Ctrl "btnToggleWifiSense"
-        if ($wfsBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $wfsBtn ($v -eq 0) "Wi-Fi Sense On" "Wi-Fi Sense Off" }
+        if ($wfsBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $wfsBtn (-not ($v -eq 0)) "Wi-Fi Sense On" "Wi-Fi Sense Off" }
         $awBtn = Get-Ctrl "btnToggleAutoWifi"
-        if ($awBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $awBtn ($v -eq 0) "Suggested WiFi On" "Suggested WiFi Off" }
+        if ($awBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $awBtn (-not ($v -eq 0)) "Suggested WiFi On" "Suggested WiFi Off" }
 
         # Privacy (round 2)
         $ddBtn = Get-Ctrl "btnToggleDiagData"
         if ($ddBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 3) 0); Update-WmtTweakToggle $ddBtn ($v -le 1) "Diag Data Optional" "Diag Data Required" }
         $ipBtn = Get-Ctrl "btnToggleInkingPersonal"
-        if ($ipBtn) { $v1 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0) 0); $v2 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0) 0); Update-WmtTweakToggle $ipBtn ($v1 -eq 1 -and $v2 -eq 1) "Inking Personal On" "Inking Personal Off" }
+        if ($ipBtn) { $v1 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0) 0); $v2 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0) 0); Update-WmtTweakToggle $ipBtn (-not ($v1 -eq 1 -and $v2 -eq 1)) "Inking Personal On" "Inking Personal Off" }
         $soBtn = Get-Ctrl "btnToggleSpeechOnline"
-        if ($soBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Speech_OneSet" "AcceptPrivacyNotice" 1) 0); Update-WmtTweakToggle $soBtn ($v -eq 0) "Speech Online On" "Speech Online Off" }
+        if ($soBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Speech_OneSet" "AcceptPrivacyNotice" 1) 0); Update-WmtTweakToggle $soBtn (-not ($v -eq 0)) "Speech Online On" "Speech Online Off" }
         $adBtn = Get-Ctrl "btnToggleAppDiagnostics"
-        if ($adBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics" "Value" "Allow") ""); Update-WmtTweakToggle $adBtn ($v -ne "Allow") "App Diagnostics On" "App Diagnostics Off" }
+        if ($adBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics" "Value" "Allow") ""); Update-WmtTweakToggle $adBtn (-not ($v -ne "Allow")) "App Diagnostics On" "App Diagnostics Off" }
         $baBtn = Get-Ctrl "btnToggleBackgroundApps"
-        if ($baBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 0) 0); Update-WmtTweakToggle $baBtn ($v -eq 1) "Background Apps On" "Background Apps Off" }
+        if ($baBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 0) 0); Update-WmtTweakToggle $baBtn (-not ($v -eq 1)) "Background Apps On" "Background Apps Off" }
         $fnBtn = Get-Ctrl "btnToggleFeedbackNotify"
-        if ($fnBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" -1) 0); Update-WmtTweakToggle $fnBtn ($v -eq 0) "Feedback Notify On" "Feedback Notify Off" }
+        if ($fnBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" -1) 0); Update-WmtTweakToggle $fnBtn (-not ($v -eq 0)) "Feedback Notify On" "Feedback Notify Off" }
         $ctBtn = Get-Ctrl "btnToggleCompatTelemetry"
-        if ($ctBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable" 1) 0); Update-WmtTweakToggle $ctBtn ($v -eq 0) "Compat Telemetry On" "Compat Telemetry Off" }
+        if ($ctBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable" 1) 0); Update-WmtTweakToggle $ctBtn (-not ($v -eq 0)) "Compat Telemetry On" "Compat Telemetry Off" }
         $ceBtn = Get-Ctrl "btnToggleCEIP"
-        if ($ceBtn) { $v = (ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" "1") ""); Update-WmtTweakToggle $ceBtn ($v -ne "1") "CEIP On" "CEIP Off" }
+        if ($ceBtn) { $v = (ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" "1") ""); Update-WmtTweakToggle $ceBtn (-not ($v -ne "1")) "CEIP On" "CEIP Off" }
 
         # Explorer (round 2)
         $ntlaBtn = Get-Ctrl "btnToggleNTFSLastAccess"
-        if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn $off "Enable NTFS Last Access" "Disable NTFS Last Access" } }
+        if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn (-not $off) "Disable NTFS Last Access" "Enable NTFS Last Access" } }
         $n83Btn = Get-Ctrl "btnToggleNTFS83"
-        if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn $off "Enable NTFS 8.3" "Disable NTFS 8.3" } }
+        if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn (-not $off) "Disable NTFS 8.3" "Enable NTFS 8.3" } }
         $tcBtn = Get-Ctrl "btnToggleThumbCache"
-        if ($tcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisableThumbnails" 0) 0); Update-WmtTweakToggle $tcBtn ($v -eq 1) "Thumbnail Cache On" "Thumbnail Cache Off" }
+        if ($tcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisableThumbnails" 0) 0); Update-WmtTweakToggle $tcBtn (-not ($v -eq 1)) "Thumbnail Cache On" "Thumbnail Cache Off" }
         $dlfBtn = Get-Ctrl "btnToggleDriveLettersFirst"
         if ($dlfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer" "ShowDriveLettersFirst" 0) 0); Update-WmtTweakToggle $dlfBtn ($v -eq 1) "Drive Letters Last" "Drive Letters First" }
 
@@ -36413,39 +36446,39 @@ try {
         $npBtn = Get-Ctrl "btnToggleNotepadCtx"
         if ($npBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"; Update-WmtTweakToggle $npBtn $exists "Remove Notepad" "Add Notepad" }
         $prBtn = Get-Ctrl "btnToggleRemovePrint"
-        if ($prBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn $exists "Restore Print" "Remove Print" }
+        if ($prBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn (-not $exists) "Remove Print" "Restore Print" }
         $castBtn = Get-Ctrl "btnToggleRemoveCast"
-        if ($castBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn $exists "Restore Cast to Device" "Remove Cast to Device" }
+        if ($castBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn (-not $exists) "Remove Cast to Device" "Restore Cast to Device" }
 
         # Sound
         $ssBtn = Get-Ctrl "btnToggleStartupSound"
-        if ($ssBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound" "Enabled" 1) 0); Update-WmtTweakToggle $ssBtn ($v -eq 0) "Startup Sound On" "Startup Sound Off" }
+        if ($ssBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound" "Enabled" 1) 0); Update-WmtTweakToggle $ssBtn (-not ($v -eq 0)) "Startup Sound On" "Startup Sound Off" }
         $nsBtn = Get-Ctrl "btnToggleNotifySound"
-        if ($nsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $nsBtn ($v -eq "") "Notification Sound On" "Notification Sound Off" }
+        if ($nsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $nsBtn (-not ($v -eq "")) "Notification Sound On" "Notification Sound Off" }
         $dsBtn = Get-Ctrl "btnToggleDeviceSound"
-        if ($dsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $dsBtn ($v -eq "") "Device Connect Sound On" "Device Connect Sound Off" }
+        if ($dsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $dsBtn (-not ($v -eq "")) "Device Connect Sound On" "Device Connect Sound Off" }
         $saBtn = Get-Ctrl "btnToggleSpatialAudio"
         if ($saBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound" "SpatialAudioFormat" "") ""); Update-WmtTweakToggle $saBtn ($v -ne "") "Spatial Audio On" "Spatial Audio Off" }
 
         # Display
         $nlBtn = Get-Ctrl "btnToggleNightLight"
-        if ($nlBtn) { $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate"; $v = (ConvertTo-Int (& $getRegValue $p "Data" 0) 0); Update-WmtTweakToggle $nlBtn ($v -ne 0) "Night Light Off" "Night Light On" }
+        if ($nlBtn) { $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate"; $v = (ConvertTo-Int (& $getRegValue $p "Data" 0) 0); Update-WmtTweakToggle $nlBtn ($v -ne 0) "Night Light On" "Night Light Off" }
 
         # Keyboard
         $fkBtn = Get-Ctrl "btnToggleFilterKeys"
-        if ($fkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\Keyboard Response" "Flags" "122") ""); Update-WmtTweakToggle $fkBtn ($v -match "63") "Filter Keys Off" "Filter Keys On" }
+        if ($fkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\Keyboard Response" "Flags" "122") ""); Update-WmtTweakToggle $fkBtn ($v -match "63") "Filter Keys On" "Filter Keys Off" }
         $tkBtn = Get-Ctrl "btnToggleToggleKeys"
-        if ($tkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\ToggleKeys" "Flags" "58") ""); Update-WmtTweakToggle $tkBtn ($v -match "63") "Toggle Keys Off" "Toggle Keys On" }
+        if ($tkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\ToggleKeys" "Flags" "58") ""); Update-WmtTweakToggle $tkBtn ($v -match "63") "Toggle Keys On" "Toggle Keys Off" }
         $nlkBtn = Get-Ctrl "btnToggleNumLockStartup"
-        if ($nlkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $nlkBtn ($v -eq "2") "NumLock Startup Off" "NumLock at Startup" }
+        if ($nlkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $nlkBtn ($v -eq "2") "NumLock at Startup" "NumLock Startup Off" }
         $clkBtn = Get-Ctrl "btnToggleCapsLockStartup"
-        if ($clkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $clkBtn ($v -eq "2147483650") "CapsLock Startup Off" "CapsLock at Startup" }
+        if ($clkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $clkBtn ($v -eq "2147483650") "CapsLock at Startup" "CapsLock Startup Off" }
 
         # Accessibility
         $hcBtn = Get-Ctrl "btnToggleHighContrast"
-        if ($hcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Accessibility\HighContrast" "Flags" 0) 0); Update-WmtTweakToggle $hcBtn (($v -band 1) -ne 0) "High Contrast Off" "High Contrast On" }
+        if ($hcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Accessibility\HighContrast" "Flags" 0) 0); Update-WmtTweakToggle $hcBtn (($v -band 1) -ne 0) "High Contrast On" "High Contrast Off" }
         $cfBtn = Get-Ctrl "btnToggleColorFilter"
-        if ($cfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\ColorFiltering" "Active" 0) 0); Update-WmtTweakToggle $cfBtn ($v -eq 1) "Color Filter Off" "Color Filter On" }
+        if ($cfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\ColorFiltering" "Active" 0) 0); Update-WmtTweakToggle $cfBtn ($v -eq 1) "Color Filter On" "Color Filter Off" }
 
         # Developer (round 2)
         $psBtn = Get-Ctrl "btnTogglePSExec"
@@ -36453,19 +36486,19 @@ try {
         $sdBtn = Get-Ctrl "btnToggleSudo"
         if ($sdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" "Enabled" 0) 0); Update-WmtTweakToggle $sdBtn ($v -ne 0) "Disable Sudo" "Enable Sudo" }
         $wshBtn = Get-Ctrl "btnToggleWSH"
-        if ($wshBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows Script Host\Settings" "Enabled" 1) 0); Update-WmtTweakToggle $wshBtn ($v -eq 0) "Enable WSH" "Disable WSH" }
+        if ($wshBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows Script Host\Settings" "Enabled" 1) 0); Update-WmtTweakToggle $wshBtn (-not ($v -eq 0)) "Disable WSH" "Enable WSH" }
 
         # Power User
         $hdBtn = Get-Ctrl "btnPowerUserShowDevices"
         if ($hdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager" "ShowHiddenDevices" 0) 0); Update-WmtTweakToggle $hdBtn ($v -eq 1) "Hide Devices" "Show Hidden Devices" }
         $tmBtn = Get-Ctrl "btnPowerUserSigDriver"
-        if ($tmBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager" "AllowNonSignedDrivers" 0) 0); Update-WmtTweakToggle $tmBtn ($v -eq 1) "Test Mode Off" "Test Mode On" }
+        if ($tmBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager" "AllowNonSignedDrivers" 0) 0); Update-WmtTweakToggle $tmBtn ($v -eq 1) "Test Mode On" "Test Mode Off" }
 
     }
 
     $adEnabled = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 1) 0)
     $btnToggleAds = Get-Ctrl "btnToggleAds"
-    Update-WmtTweakToggle $btnToggleAds ($adEnabled -eq 0) "Ad ID Off" "Ad ID On"
+    Update-WmtTweakToggle $btnToggleAds (-not ($adEnabled -eq 0)) "Ad ID On" "Ad ID Off"
     $contentDeliveryPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
     $suggestionNames = @("ContentDeliveryAllowed", "FeatureManagementEnabled", "OemPreInstalledAppsEnabled", "PreInstalledAppsEnabled", "PreInstalledAppsEverEnabled", "SilentInstalledAppsEnabled", "SoftLandingEnabled", "SubscribedContent-310093Enabled", "SubscribedContent-338388Enabled", "SubscribedContent-338389Enabled", "SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled", "SystemPaneSuggestionsEnabled")
     $suggestionsOff = $true
@@ -36473,21 +36506,21 @@ try {
         if ((ConvertTo-Int (& $getRegValue $contentDeliveryPath $name 1) 0) -ne 0) { $suggestionsOff = $false; break }
     }
     $btnToggleSuggested = Get-Ctrl "btnToggleSuggested"
-    Update-WmtTweakToggle $btnToggleSuggested $suggestionsOff "Suggestions Off" "Suggestions On"
+    Update-WmtTweakToggle $btnToggleSuggested (-not $suggestionsOff) "Suggestions On" "Suggestions Off"
     $tailoredOff = ((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" 1) 0) -eq 0 -or (ConvertTo-Int (& $getRegValue "HKCU:\Software\Policies\Microsoft\Windows\CloudContent" "DisableTailoredExperiencesWithDiagnosticData" 0) 0) -eq 1)
     $btnToggleTailored = Get-Ctrl "btnToggleTailored"
-    Update-WmtTweakToggle $btnToggleTailored $tailoredOff "Tailored Off" "Tailored On"
+    Update-WmtTweakToggle $btnToggleTailored (-not $tailoredOff) "Tailored On" "Tailored Off"
     $activityPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
     $activityOff = ((ConvertTo-Int (& $getRegValue $activityPolicy "EnableActivityFeed" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $activityPolicy "PublishUserActivities" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $activityPolicy "UploadUserActivities" 1) 0) -eq 0)
     $btnToggleActivity = Get-Ctrl "btnToggleActivity"
-    Update-WmtTweakToggle $btnToggleActivity $activityOff "Activity History Off" "Activity History On"
+    Update-WmtTweakToggle $btnToggleActivity (-not $activityOff) "Activity History On" "Activity History Off"
     $launchTrackingOff = ((ConvertTo-Int (& $getRegValue $ap "Start_TrackProgs" 1) 0) -eq 0)
     $btnToggleAppLaunch = Get-Ctrl "btnToggleAppLaunch"
-    Update-WmtTweakToggle $btnToggleAppLaunch $launchTrackingOff "Launch Tracking Off" "Launch Tracking On"
+    Update-WmtTweakToggle $btnToggleAppLaunch (-not $launchTrackingOff) "Launch Tracking On" "Launch Tracking Off"
 
     $webSearchOff = ((ConvertTo-Int (& $getRegValue "HKCU:\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 0) 0) -eq 1 -or (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 1) 0) -eq 0)
     $btnToggleWebSearch = Get-Ctrl "btnToggleWebSearch"
-    Update-WmtTweakToggle $btnToggleWebSearch $webSearchOff "Web Search Off" "Web Search On"
+    Update-WmtTweakToggle $btnToggleWebSearch (-not $webSearchOff) "Web Search On" "Web Search Off"
     $wsStartType = $nrd["WSearchStartType"]
 
     if ($null -ne $wsStartType) {
@@ -36507,7 +36540,7 @@ try {
     Update-WmtTweakToggle $btnToggleGameBar $gameBarOn "Game Bar On" "Game Bar Off"
     $captureOn = ((ConvertTo-Int (& $getRegValue $gameDvrPath "HistoricalCaptureEnabled" 1) 0) -ne 0)
     $btnToggleGameCapture = Get-Ctrl "btnToggleGameCapture"
-    Update-WmtTweakToggle $btnToggleGameCapture (-not $captureOn) "Capture Off" "Capture On"
+    Update-WmtTweakToggle $btnToggleGameCapture $captureOn "Capture On" "Capture Off"
     $fsoOff = ((ConvertTo-Int (& $getRegValue $gameCfgPath "GameDVR_FSEBehaviorMode" 0) 0) -eq 2 -and (ConvertTo-Int (& $getRegValue $gameCfgPath "GameDVR_HonorUserFSEBehaviorMode" 0) 0) -eq 1)
     $btnToggleFso = Get-Ctrl "btnToggleFso"
     Update-WmtTweakToggle $btnToggleFso $fsoOff "Disable FS Optimizations" "Default FS Optimizations"
@@ -36519,21 +36552,21 @@ try {
 
     $tipsOff = ((ConvertTo-Int (& $getRegValue $contentDeliveryPath "SoftLandingEnabled" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $contentDeliveryPath "SubscribedContent-338389Enabled" 1) 0) -eq 0)
     $btnToggleTips = Get-Ctrl "btnToggleTips"
-    Update-WmtTweakToggle $btnToggleTips $tipsOff "Tips Off" "Tips On"
+    Update-WmtTweakToggle $btnToggleTips (-not $tipsOff) "Tips On" "Tips Off"
     $setupOff = ((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1) 0) -eq 0)
-    $btnToggleSetupPrompts = Get-Ctrl "btnToggleSetupPrompts"; Update-WmtTweakToggle $btnToggleSetupPrompts $setupOff "Setup Prompts On" "Setup Prompts Off"
+    $btnToggleSetupPrompts = Get-Ctrl "btnToggleSetupPrompts"; Update-WmtTweakToggle $btnToggleSetupPrompts (-not $setupOff) "Setup Prompts On" "Setup Prompts Off"
     $lockFactsOff = ((ConvertTo-Int (& $getRegValue $contentDeliveryPath "RotatingLockScreenOverlayEnabled" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $contentDeliveryPath "SubscribedContent-338387Enabled" 1) 0) -eq 0)
     $spotlightOff = ((ConvertTo-Int (& $getRegValue $contentDeliveryPath "RotatingLockScreenEnabled" 1) 0) -eq 0 -or (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0) -eq 1)
     $btnToggleLockFacts = Get-Ctrl "btnToggleLockFacts"
-    Update-WmtTweakToggle $btnToggleLockFacts $lockFactsOff "Lock Facts Off" "Lock Facts On"
+    Update-WmtTweakToggle $btnToggleLockFacts (-not $lockFactsOff) "Lock Facts On" "Lock Facts Off"
     $btnToggleLockSpotlight = Get-Ctrl "btnToggleLockSpotlight"
-    Update-WmtTweakToggle $btnToggleLockSpotlight $spotlightOff "Spotlight Off" "Spotlight On"
+    Update-WmtTweakToggle $btnToggleLockSpotlight (-not $spotlightOff) "Spotlight On" "Spotlight Off"
     $btnToggleLockScreen = Get-Ctrl "btnToggleLockScreen"
     Update-WmtTweakToggle $btnToggleLockScreen ($lockFactsOff -and $spotlightOff) "Plain Lock Screen" "Default Lock Screen"
 
     $fastStartupOn = ((ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1) 0) -ne 0)
     $btnToggleFastStartup = Get-Ctrl "btnToggleFastStartup"
-    Update-WmtTweakToggle $btnToggleFastStartup (-not $fastStartupOn) "Fast Startup Off" "Fast Startup On"
+    Update-WmtTweakToggle $btnToggleFastStartup $fastStartupOn "Fast Startup On" "Fast Startup Off"
     $restoreFoldersOn = ((ConvertTo-Int (& $getRegValue $ap "PersistBrowsers" 0) 0) -ne 0)
     $btnToggleRestoreFolders = Get-Ctrl "btnToggleRestoreFolders"
     Update-WmtTweakToggle $btnToggleRestoreFolders $restoreFoldersOn "Restore Folders On" "Restore Folders Off"
@@ -36573,13 +36606,13 @@ try {
 
     if ($null -ne $drvMetaVal) { $drvMetaDisabled = ([int]$drvMetaVal -eq 1) }
     $btnToggleDrvMeta = Get-Ctrl "btnToggleDrvMeta"
-    Update-WmtTweakToggle $btnToggleDrvMeta $drvMetaDisabled "Enable Metadata" "Disable Metadata" "Toggle device metadata downloads (icons/info) from the internet."
+    Update-WmtTweakToggle $btnToggleDrvMeta (-not $drvMetaDisabled) "Disable Metadata" "Enable Metadata" "Toggle device metadata downloads (icons/info) from the internet."
     $drvWUDisabled = $false
     $drvWUVal = $nrd["DrvSearchOrder"]
 
     if ($null -ne $drvWUVal) { $drvWUDisabled = ([int]$drvWUVal -eq 1) }
     $btnToggleDrvUpdates = Get-Ctrl "btnToggleDrvUpdates"
-    Update-WmtTweakToggle $btnToggleDrvUpdates $drvWUDisabled "Enable Auto-Drivers" "Disable Auto-Drivers" "Toggle automatic driver updates via Windows Update."
+    Update-WmtTweakToggle $btnToggleDrvUpdates (-not $drvWUDisabled) "Disable Auto-Drivers" "Enable Auto-Drivers" "Toggle automatic driver updates via Windows Update."
 
     # ── Unsupported-tweak support checks ──────────────────────────
     # Disable buttons whose target registry key / feature no longer
@@ -37327,7 +37360,7 @@ $btnToggleCopilot.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $adv "ShowCopilotButton" 0; Set-WmtRegDword $polUser "TurnOffWindowsCopilot" 1; Set-WmtRegDword $polMachine "TurnOffWindowsCopilot" 1; Write-GuiLog "Copilot disabled." } "Disabling Copilot..."
         }
-        Update-WmtTweakToggle $btnToggleCopilot (-not $currentlyOff) "Copilot On" "Copilot Off"
+        Update-WmtTweakToggle $btnToggleCopilot $currentlyOff "Copilot On" "Copilot Off"
     })
 }
 
@@ -37344,7 +37377,7 @@ $btnToggleRecall.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polUser "DisableAIDataAnalysis" 1; Set-WmtRegDword $polMachine "AllowRecallEnablement" 0; Set-WmtRegDword $polMachine "TurnOffSavingSnapshots" 1; Write-GuiLog "Recall disabled." } "Disabling Recall..."
         }
-        Update-WmtTweakToggle $btnToggleRecall (-not $currentlyOff) "Recall On" "Recall Off"
+        Update-WmtTweakToggle $btnToggleRecall $currentlyOff "Recall On" "Recall Off"
     })
 }
 
@@ -37361,7 +37394,7 @@ $btnToggleClickToDo.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polUser "DisableClickToDo" 1; Set-WmtRegDword $polMachine "DisableClickToDo" 1; Write-GuiLog "Click To Do disabled." } "Disabling Click To Do..."
         }
-        Update-WmtTweakToggle $btnToggleClickToDo (-not $currentlyOff) "Click To Do On" "Click To Do Off"
+        Update-WmtTweakToggle $btnToggleClickToDo $currentlyOff "Click To Do On" "Click To Do Off"
     })
 }
 
@@ -37377,7 +37410,7 @@ $btnToggleAISvcAutoStart.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polMachine "DisableAIDataAnalysis" 1; Write-GuiLog "Windows AI service autostart disabled." } "Disabling AI service autostart..."
         }
-        Update-WmtTweakToggle $btnToggleAISvcAutoStart (-not $currentlyOff) "AI Svc AutoStart On" "AI Svc AutoStart Off"
+        Update-WmtTweakToggle $btnToggleAISvcAutoStart $currentlyOff "AI Svc AutoStart On" "AI Svc AutoStart Off"
     })
 }
 
@@ -37393,7 +37426,7 @@ $btnToggleEdgeAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 0; Write-GuiLog "Edge AI features disabled." } "Disabling Edge AI..."
         }
-        Update-WmtTweakToggle $btnToggleEdgeAI (-not $currentlyOff) "Edge AI On" "Edge AI Off"
+        Update-WmtTweakToggle $btnToggleEdgeAI $currentlyOff "Edge AI On" "Edge AI Off"
     })
 }
 
@@ -37409,7 +37442,7 @@ $btnTogglePaintAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableCopilot" 0; Write-GuiLog "Paint AI disabled." } "Disabling Paint AI..."
         }
-        Update-WmtTweakToggle $btnTogglePaintAI (-not $currentlyOff) "Paint AI On" "Paint AI Off"
+        Update-WmtTweakToggle $btnTogglePaintAI $currentlyOff "Paint AI On" "Paint AI Off"
     })
 }
 
@@ -37425,7 +37458,7 @@ $btnToggleNotepadAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "CocreatorEnabled" 0; Write-GuiLog "Notepad AI disabled." } "Disabling Notepad AI..."
         }
-        Update-WmtTweakToggle $btnToggleNotepadAI (-not $currentlyOff) "Notepad AI On" "Notepad AI Off"
+        Update-WmtTweakToggle $btnToggleNotepadAI $currentlyOff "Notepad AI On" "Notepad AI Off"
     })
 }
 
@@ -37441,7 +37474,7 @@ $btnToggleFindMyDevice.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Find My Device disabled." } "Disabling Find My Device..."
         }
-        Update-WmtTweakToggle $btnToggleFindMyDevice (-not $currentlyOff) "Find My Device On" "Find My Device Off"
+        Update-WmtTweakToggle $btnToggleFindMyDevice $currentlyOff "Find My Device On" "Find My Device Off"
     })
 }
 
@@ -37457,7 +37490,7 @@ $btnToggleLocationSvc.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Value" 0; Write-GuiLog "Location services disabled." } "Disabling location services..."
         }
-        Update-WmtTweakToggle $btnToggleLocationSvc (-not $currentlyOff) "Location On" "Location Off"
+        Update-WmtTweakToggle $btnToggleLocationSvc $currentlyOff "Location On" "Location Off"
     })
 }
 
@@ -37473,7 +37506,7 @@ $btnToggleModernStandby.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "EnableAwakeNetworkOnDisconnect" 0; Set-WmtRegDword $p1 "EnforceConnectedStandby" 0; Write-GuiLog "Modern Standby networking disabled." } "Disabling Modern Standby networking..."
         }
-        Update-WmtTweakToggle $btnToggleModernStandby (-not $currentlyOff) "Modern Standby Net On" "Modern Standby Net Off"
+        Update-WmtTweakToggle $btnToggleModernStandby $currentlyOff "Modern Standby Net On" "Modern Standby Net Off"
     })
 }
 
@@ -37489,7 +37522,7 @@ $btnToggleDeviceAutoApp.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisableDeviceAutoInstall" 1; Write-GuiLog "Device auto-app download disabled." } "Disabling device auto-apps..."
         }
-        Update-WmtTweakToggle $btnToggleDeviceAutoApp (-not $currentlyOff) "Device Auto-Apps On" "Device Auto-Apps Off"
+        Update-WmtTweakToggle $btnToggleDeviceAutoApp $currentlyOff "Device Auto-Apps On" "Device Auto-Apps Off"
     })
 }
 
@@ -37521,7 +37554,7 @@ $btnToggleLastActiveClick.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "LastActiveClick" 1; Write-GuiLog "Last Active Click enabled." } "Enabling Last Active Click..."
         }
-        Update-WmtTweakToggle $btnToggleLastActiveClick (-not $currentlyOn) "Last Active Click Off" "Last Active Click"
+        Update-WmtTweakToggle $btnToggleLastActiveClick (-not $currentlyOn) "Last Active Click" "Last Active Click Off"
     })
 }
 
@@ -37537,7 +37570,7 @@ $btnToggleGallery.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "GalleryEnabled" 0; Write-GuiLog "File Explorer Gallery hidden." } "Hiding Gallery..."
         }
-        Update-WmtTweakToggle $btnToggleGallery (-not $currentlyHidden) "Show Gallery" "Hide Gallery"
+        Update-WmtTweakToggle $btnToggleGallery $currentlyHidden "Hide Gallery" "Show Gallery"
     })
 }
 
@@ -37554,7 +37587,7 @@ $btnToggleHomeExplorer.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $pUser "ShowHomeFolder" 0; Set-WmtRegDword $pMachine "Start_HomeClassicMode" 1; Write-GuiLog "File Explorer Home hidden." } "Hiding Home..."
         }
-        Update-WmtTweakToggle $btnToggleHomeExplorer (-not $currentlyHidden) "Show Home" "Hide Home"
+        Update-WmtTweakToggle $btnToggleHomeExplorer $currentlyHidden "Hide Home" "Show Home"
     })
 }
 
@@ -37570,7 +37603,7 @@ $btnToggleOneDriveFolder.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "System.IsPinnedToNameSpaceTree" 0; Write-GuiLog "OneDrive folder hidden from Explorer." } "Hiding OneDrive folder..."
         }
-        Update-WmtTweakToggle $btnToggleOneDriveFolder (-not $currentlyHidden) "Show OneDrive" "Hide OneDrive"
+        Update-WmtTweakToggle $btnToggleOneDriveFolder $currentlyHidden "Hide OneDrive" "Show OneDrive"
     })
 }
 
@@ -37587,7 +37620,7 @@ $btnToggle3DObjects.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "ThisPCPolicy" "Hide"; Write-GuiLog "3D Objects folder hidden." } "Hiding 3D Objects..."
         }
-        Update-WmtTweakToggle $btnToggle3DObjects (-not $currentlyHidden) "Show 3D Objects" "Hide 3D Objects"
+        Update-WmtTweakToggle $btnToggle3DObjects $currentlyHidden "Hide 3D Objects" "Show 3D Objects"
     })
 }
 
@@ -37603,7 +37636,7 @@ $btnToggleDupDrive.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "HideDuplicatedRemovableDrives" 1; Write-GuiLog "Duplicate removable drives hidden." } "Hiding duplicate drive..."
         }
-        Update-WmtTweakToggle $btnToggleDupDrive (-not $currentlyHidden) "Show Dup Drive" "Hide Dup Drive"
+        Update-WmtTweakToggle $btnToggleDupDrive $currentlyHidden "Hide Dup Drive" "Show Dup Drive"
     })
 }
 
@@ -37619,7 +37652,7 @@ $btnToggleSnapAssist.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "SnapAssist" 0; Write-GuiLog "Snap Assist disabled." } "Disabling Snap Assist..."
         }
-        Update-WmtTweakToggle $btnToggleSnapAssist (-not $currentlyOff) "Snap Assist On" "Snap Assist Off"
+        Update-WmtTweakToggle $btnToggleSnapAssist $currentlyOff "Snap Assist On" "Snap Assist Off"
     })
 }
 
@@ -37635,7 +37668,7 @@ $btnToggleSnapLayouts.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableSnapLayouts" 0; Write-GuiLog "Snap Layouts disabled." } "Disabling Snap Layouts..."
         }
-        Update-WmtTweakToggle $btnToggleSnapLayouts (-not $currentlyOff) "Snap Layouts On" "Snap Layouts Off"
+        Update-WmtTweakToggle $btnToggleSnapLayouts $currentlyOff "Snap Layouts On" "Snap Layouts Off"
     })
 }
 
@@ -37651,7 +37684,7 @@ $btnToggleWindowSnapping.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "WindowArrangementActive" 0; Write-GuiLog "Window snapping disabled." } "Disabling window snapping..."
         }
-        Update-WmtTweakToggle $btnToggleWindowSnapping (-not $currentlyOff) "Window Snapping On" "Window Snapping Off"
+        Update-WmtTweakToggle $btnToggleWindowSnapping $currentlyOff "Window Snapping On" "Window Snapping Off"
     })
 }
 
@@ -37683,7 +37716,7 @@ $btnToggleTransparency.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableTransparency" 0; Write-GuiLog "Transparency disabled." } "Disabling transparency..."
         }
-        Update-WmtTweakToggle $btnToggleTransparency (-not $currentlyOff) "Transparency On" "Transparency Off"
+        Update-WmtTweakToggle $btnToggleTransparency $currentlyOff "Transparency On" "Transparency Off"
     })
 }
 
@@ -37699,7 +37732,7 @@ $btnToggleAnimations.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "MinAnimate" 0; Write-GuiLog "Window animations disabled." } "Disabling animations..."
         }
-        Update-WmtTweakToggle $btnToggleAnimations (-not $currentlyOff) "Animations On" "Animations Off"
+        Update-WmtTweakToggle $btnToggleAnimations $currentlyOff "Animations On" "Animations Off"
     })
 }
 
@@ -37716,7 +37749,7 @@ $btnToggleLockscreenTips.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "Enabled" 0; Set-WmtRegDword $p2 "Enabled" 0; Write-GuiLog "Lockscreen tips disabled." } "Disabling lockscreen tips..."
         }
-        Update-WmtTweakToggle $btnToggleLockscreenTips (-not $currentlyOff) "Lockscreen Tips On" "Lockscreen Tips Off"
+        Update-WmtTweakToggle $btnToggleLockscreenTips $currentlyOff "Lockscreen Tips On" "Lockscreen Tips Off"
     })
 }
 
@@ -37732,7 +37765,7 @@ $btnToggleSearchHighlights.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "IsDynamicSearchBoxEnabled" 0; Write-GuiLog "Search highlights disabled." } "Disabling search highlights..."
         }
-        Update-WmtTweakToggle $btnToggleSearchHighlights (-not $currentlyOff) "Search Highlights On" "Search Highlights Off"
+        Update-WmtTweakToggle $btnToggleSearchHighlights $currentlyOff "Search Highlights On" "Search Highlights Off"
     })
 }
 
@@ -37748,7 +37781,7 @@ $btnToggleSearchHistory.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "IsDeviceSearchHistoryEnabled" 0; Write-GuiLog "Search history disabled." } "Disabling search history..."
         }
-        Update-WmtTweakToggle $btnToggleSearchHistory (-not $currentlyOff) "Search History On" "Search History Off"
+        Update-WmtTweakToggle $btnToggleSearchHistory $currentlyOff "Search History On" "Search History Off"
     })
 }
 
@@ -37765,7 +37798,7 @@ $btnToggleGameBarIntegration.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "AllowAutoGameMode" 0; Set-WmtRegDword $p1 "AutoGameModeEnabled" 0; Set-WmtRegDword $p2 "GameDVR_Enabled" 0; Write-GuiLog "Game Bar integration disabled." } "Disabling Game Bar integration..."
         }
-        Update-WmtTweakToggle $btnToggleGameBarIntegration (-not $currentlyOff) "Game Bar Int. On" "Game Bar Int. Off"
+        Update-WmtTweakToggle $btnToggleGameBarIntegration $currentlyOff "Game Bar Int. On" "Game Bar Int. Off"
     })
 }
 
@@ -37782,7 +37815,7 @@ $btnToggleDVR.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "GameDVR_Enabled" 0; Set-WmtRegDword $p2 "AllowGameDVR" 0; Write-GuiLog "Game DVR disabled." } "Disabling Game DVR..."
         }
-        Update-WmtTweakToggle $btnToggleDVR (-not $currentlyOff) "DVR On" "DVR Off"
+        Update-WmtTweakToggle $btnToggleDVR $currentlyOff "DVR On" "DVR Off"
     })
 }
 
@@ -37798,7 +37831,7 @@ $btnToggleBitlocker.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "PreventDeviceEncryption" 1; Write-GuiLog "Bitlocker auto-encryption disabled for new OS installs." } "Disabling Bitlocker auto..."
         }
-        Update-WmtTweakToggle $btnToggleBitlocker (-not $currentlyOff) "Bitlocker Auto On" "Bitlocker Auto Off"
+        Update-WmtTweakToggle $btnToggleBitlocker $currentlyOff "Bitlocker Auto On" "Bitlocker Auto Off"
     })
 }
 
@@ -37814,7 +37847,7 @@ $btnToggleStickyKeys.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "58"; Write-GuiLog "Sticky Keys shortcut disabled." } "Disabling Sticky Keys..."
         }
-        Update-WmtTweakToggle $btnToggleStickyKeys (-not $currentlyOff) "Sticky Keys On" "Sticky Keys Off"
+        Update-WmtTweakToggle $btnToggleStickyKeys $currentlyOff "Sticky Keys On" "Sticky Keys Off"
     })
 }
 
@@ -37830,7 +37863,7 @@ $btnToggleDeliveryOpt.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DODownloadMode" 0; Write-GuiLog "Delivery Optimization disabled." } "Disabling Delivery Optimization..."
         }
-        Update-WmtTweakToggle $btnToggleDeliveryOpt (-not $currentlyOff) "Delivery Opt On" "Delivery Opt Off"
+        Update-WmtTweakToggle $btnToggleDeliveryOpt $currentlyOff "Delivery Opt On" "Delivery Opt Off"
     })
 }
 
@@ -37846,7 +37879,7 @@ $btnToggleUpdateASAP.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AllowAutoWindowsUpdateDownloadOverMeteredNetwork" 0; Write-GuiLog "Update ASAP disabled (no auto-download over metered connections)." } "Disabling Update ASAP..."
         }
-        Update-WmtTweakToggle $btnToggleUpdateASAP (-not $currentlyOff) "Update ASAP On" "Update ASAP Off"
+        Update-WmtTweakToggle $btnToggleUpdateASAP $currentlyOff "Update ASAP On" "Update ASAP Off"
     })
 }
 
@@ -37862,7 +37895,7 @@ $btnToggleStartRecommended.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 0; Write-GuiLog "Start menu Recommended section hidden." } "Hiding Recommended..."
         }
-        Update-WmtTweakToggle $btnToggleStartRecommended (-not $currentlyHidden) "Show Recommended" "Hide Recommended"
+        Update-WmtTweakToggle $btnToggleStartRecommended $currentlyHidden "Hide Recommended" "Show Recommended"
     })
 }
 
@@ -37879,7 +37912,7 @@ $btnToggleStartAllApps.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $pUser "Start_ShowAllApps" 1; Set-WmtRegDword $pPol "HideStartAllApps" 1; Write-GuiLog "Start menu All Apps list hidden." } "Hiding All Apps..."
         }
-        Update-WmtTweakToggle $btnToggleStartAllApps (-not $currentlyHidden) "Show All Apps" "Hide All Apps"
+        Update-WmtTweakToggle $btnToggleStartAllApps $currentlyHidden "Hide All Apps" "Show All Apps"
     })
 }
 
@@ -37895,7 +37928,7 @@ $btnTogglePhoneLink.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_ShowAccountBadges" 0; Write-GuiLog "Phone Link hidden from Start menu." } "Hiding Phone Link..."
         }
-        Update-WmtTweakToggle $btnTogglePhoneLink (-not $currentlyHidden) "Show Phone Link" "Hide Phone Link"
+        Update-WmtTweakToggle $btnTogglePhoneLink $currentlyHidden "Hide Phone Link" "Show Phone Link"
     })
 }
 
@@ -37930,7 +37963,7 @@ $btnToggleIPv6.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisabledComponents" 255; Write-GuiLog "IPv6 disabled (reboot required)." } "Disabling IPv6..."
         }
-        Update-WmtTweakToggle $btnToggleIPv6 (-not $currentlyOff) "Enable IPv6" "Disable IPv6"
+        Update-WmtTweakToggle $btnToggleIPv6 $currentlyOff "Disable IPv6" "Enable IPv6"
     })
 }
 
@@ -37946,7 +37979,7 @@ $btnToggleNetThrottling.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "NetworkThrottlingIndex" 0xFFFFFFFF; Write-GuiLog "Network throttling disabled (unlimited)." } "Disabling network throttling..."
         }
-        Update-WmtTweakToggle $btnToggleNetThrottling (-not $currentlyOff) "Enable Net Throttling" "Disable Net Throttling"
+        Update-WmtTweakToggle $btnToggleNetThrottling $currentlyOff "Disable Net Throttling" "Enable Net Throttling"
     })
 }
 
@@ -37962,7 +37995,7 @@ $btnToggleNetLocationWizard.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowNetworkLocationWizard" 0; Write-GuiLog "Network Location Wizard disabled." } "Disabling network location wizard..."
         }
-        Update-WmtTweakToggle $btnToggleNetLocationWizard (-not $currentlyOff) "Net Location Wizard On" "Net Location Wizard Off"
+        Update-WmtTweakToggle $btnToggleNetLocationWizard $currentlyOff "Net Location Wizard On" "Net Location Wizard Off"
     })
 }
 
@@ -37978,7 +38011,7 @@ $btnToggleWifiSense.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AutoConnectAllowedOEM" 0; Set-WmtRegDword $p "WiFISenseAllowed" 0; Write-GuiLog "Wi-Fi Sense disabled." } "Disabling Wi-Fi Sense..."
         }
-        Update-WmtTweakToggle $btnToggleWifiSense (-not $currentlyOff) "Wi-Fi Sense On" "Wi-Fi Sense Off"
+        Update-WmtTweakToggle $btnToggleWifiSense $currentlyOff "Wi-Fi Sense On" "Wi-Fi Sense Off"
     })
 }
 
@@ -37994,7 +38027,7 @@ $btnToggleAutoWifi.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AutoConnectAllowedOEM" 0; Write-GuiLog "Suggested WiFi auto-connect disabled." } "Disabling suggested WiFi..."
         }
-        Update-WmtTweakToggle $btnToggleAutoWifi (-not $currentlyOff) "Suggested WiFi On" "Suggested WiFi Off"
+        Update-WmtTweakToggle $btnToggleAutoWifi $currentlyOff "Suggested WiFi On" "Suggested WiFi Off"
     })
 }
 
@@ -38028,7 +38061,7 @@ $btnToggleInkingPersonal.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "RestrictImplicitInkCollection" 1; Set-WmtRegDword $p "RestrictImplicitTextCollection" 1; Write-GuiLog "Inking personalization disabled." } "Disabling inking personalization..."
         }
-        Update-WmtTweakToggle $btnToggleInkingPersonal (-not $currentlyOff) "Inking Personal On" "Inking Personal Off"
+        Update-WmtTweakToggle $btnToggleInkingPersonal $currentlyOff "Inking Personal On" "Inking Personal Off"
     })
 }
 
@@ -38045,7 +38078,7 @@ $btnToggleSpeechOnline.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AcceptPrivacyNotice" 0; Write-GuiLog "Online speech recognition disabled." } "Disabling online speech recognition..."
         }
-        Update-WmtTweakToggle $btnToggleSpeechOnline (-not $currentlyOff) "Speech Online On" "Speech Online Off"
+        Update-WmtTweakToggle $btnToggleSpeechOnline $currentlyOff "Speech Online On" "Speech Online Off"
     })
 }
 
@@ -38061,7 +38094,7 @@ $btnToggleAppDiagnostics.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "Value" "Deny"; Write-GuiLog "App diagnostics access disabled." } "Disabling app diagnostics..."
         }
-        Update-WmtTweakToggle $btnToggleAppDiagnostics (-not $currentlyOff) "App Diagnostics On" "App Diagnostics Off"
+        Update-WmtTweakToggle $btnToggleAppDiagnostics $currentlyOff "App Diagnostics On" "App Diagnostics Off"
     })
 }
 
@@ -38077,7 +38110,7 @@ $btnToggleBackgroundApps.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "GlobalUserDisabled" 1; Write-GuiLog "Background apps disabled." } "Disabling background apps..."
         }
-        Update-WmtTweakToggle $btnToggleBackgroundApps (-not $currentlyOff) "Background Apps On" "Background Apps Off"
+        Update-WmtTweakToggle $btnToggleBackgroundApps $currentlyOff "Background Apps On" "Background Apps Off"
     })
 }
 
@@ -38093,7 +38126,7 @@ $btnToggleFeedbackNotify.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "NumberOfSIUFInPeriod" 0; Set-WmtRegDword $p "PeriodInNanoSeconds" 0; Write-GuiLog "Feedback notifications disabled." } "Disabling feedback notifications..."
         }
-        Update-WmtTweakToggle $btnToggleFeedbackNotify (-not $currentlyOff) "Feedback Notify On" "Feedback Notify Off"
+        Update-WmtTweakToggle $btnToggleFeedbackNotify $currentlyOff "Feedback Notify On" "Feedback Notify Off"
     })
 }
 
@@ -38109,7 +38142,7 @@ $btnToggleCompatTelemetry.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AITEnable" 0; Write-GuiLog "Compatibility telemetry disabled." } "Disabling compatibility telemetry..."
         }
-        Update-WmtTweakToggle $btnToggleCompatTelemetry (-not $currentlyOff) "Compat Telemetry On" "Compat Telemetry Off"
+        Update-WmtTweakToggle $btnToggleCompatTelemetry $currentlyOff "Compat Telemetry On" "Compat Telemetry Off"
     })
 }
 
@@ -38126,7 +38159,7 @@ $btnToggleCEIP.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "CEIPEnable" "0"; Write-GuiLog "Customer Experience Improvement Program disabled." } "Disabling CEIP..."
         }
-        Update-WmtTweakToggle $btnToggleCEIP (-not $currentlyOff) "CEIP On" "CEIP Off"
+        Update-WmtTweakToggle $btnToggleCEIP $currentlyOff "CEIP On" "CEIP Off"
     })
 }
 
@@ -38141,7 +38174,7 @@ $btnToggleNTFSLastAccess.Add_Click({
         else {
             Invoke-UiCommand { & fsutil behavior set DisableLastAccess 1 | Out-Null; Write-GuiLog "NTFS Last Access time updates disabled." } "Disabling NTFS Last Access..."
         }
-        Update-WmtTweakToggle $btnToggleNTFSLastAccess (-not $currentlyOff) "Enable NTFS Last Access" "Disable NTFS Last Access"
+        Update-WmtTweakToggle $btnToggleNTFSLastAccess $currentlyOff "Disable NTFS Last Access" "Enable NTFS Last Access"
     })
 }
 
@@ -38155,7 +38188,7 @@ $btnToggleNTFS83.Add_Click({
         else {
             Invoke-UiCommand { & fsutil behavior set Disable8dot3 1 | Out-Null; Write-GuiLog "NTFS 8.3 short names disabled." } "Disabling NTFS 8.3..."
         }
-        Update-WmtTweakToggle $btnToggleNTFS83 (-not $currentlyOff) "Enable NTFS 8.3" "Disable NTFS 8.3"
+        Update-WmtTweakToggle $btnToggleNTFS83 $currentlyOff "Disable NTFS 8.3" "Enable NTFS 8.3"
     })
 }
 
@@ -38171,7 +38204,7 @@ $btnToggleThumbCache.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisableThumbnails" 1; Write-GuiLog "Thumbnail cache disabled." } "Disabling thumbnail cache..."
         }
-        Update-WmtTweakToggle $btnToggleThumbCache (-not $currentlyOff) "Thumbnail Cache On" "Thumbnail Cache Off"
+        Update-WmtTweakToggle $btnToggleThumbCache $currentlyOff "Thumbnail Cache On" "Thumbnail Cache Off"
     })
 }
 
@@ -38254,7 +38287,7 @@ $btnToggleRemovePrint.Add_Click({
                 Write-GuiLog "Print restored to image context menu."
             } "Restoring Print..."
         }
-        Update-WmtTweakToggle $btnToggleRemovePrint $exists "Restore Print" "Remove Print"
+        Update-WmtTweakToggle $btnToggleRemovePrint (-not $exists) "Remove Print" "Restore Print"
     })
 }
 
@@ -38269,7 +38302,7 @@ $btnToggleRemoveCast.Add_Click({
         else {
             Invoke-UiCommand { New-WmtRegKey $p; Write-GuiLog "Cast to Device restored." } "Restoring Cast to Device..."
         }
-        Update-WmtTweakToggle $btnToggleRemoveCast $exists "Restore Cast to Device" "Remove Cast to Device"
+        Update-WmtTweakToggle $btnToggleRemoveCast (-not $exists) "Remove Cast to Device" "Restore Cast to Device"
     })
 }
 
@@ -38286,7 +38319,7 @@ $btnToggleStartupSound.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Startup sound disabled." } "Disabling startup sound..."
         }
-        Update-WmtTweakToggle $btnToggleStartupSound (-not $currentlyOff) "Startup Sound On" "Startup Sound Off"
+        Update-WmtTweakToggle $btnToggleStartupSound $currentlyOff "Startup Sound On" "Startup Sound Off"
     })
 }
 
@@ -38302,7 +38335,7 @@ $btnToggleNotifySound.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDefaultValue $p ""; Write-GuiLog "Notification sounds disabled." } "Disabling notification sounds..."
         }
-        Update-WmtTweakToggle $btnToggleNotifySound (-not $currentlyOff) "Notification Sound On" "Notification Sound Off"
+        Update-WmtTweakToggle $btnToggleNotifySound $currentlyOff "Notification Sound On" "Notification Sound Off"
     })
 }
 
@@ -38318,7 +38351,7 @@ $btnToggleDeviceSound.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDefaultValue $p ""; Write-GuiLog "Device connect sounds disabled." } "Disabling device connect sounds..."
         }
-        Update-WmtTweakToggle $btnToggleDeviceSound (-not $currentlyOff) "Device Connect Sound On" "Device Connect Sound Off"
+        Update-WmtTweakToggle $btnToggleDeviceSound $currentlyOff "Device Connect Sound On" "Device Connect Sound Off"
     })
 }
 
@@ -38357,7 +38390,7 @@ $btnToggleNightLight.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Data" 1; Write-GuiLog "Night Light enabled." } "Enabling Night Light..."
         }
-        Update-WmtTweakToggle $btnToggleNightLight (-not $currentlyOn) "Night Light Off" "Night Light On"
+        Update-WmtTweakToggle $btnToggleNightLight (-not $currentlyOn) "Night Light On" "Night Light Off"
     })
 }
 
@@ -38387,7 +38420,7 @@ $btnToggleFilterKeys.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "63"; Write-GuiLog "Filter Keys enabled." } "Enabling Filter Keys..."
         }
-        Update-WmtTweakToggle $btnToggleFilterKeys (-not $currentlyOn) "Filter Keys Off" "Filter Keys On"
+        Update-WmtTweakToggle $btnToggleFilterKeys (-not $currentlyOn) "Filter Keys On" "Filter Keys Off"
     })
 }
 
@@ -38403,7 +38436,7 @@ $btnToggleToggleKeys.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "63"; Write-GuiLog "Toggle Keys enabled." } "Enabling Toggle Keys..."
         }
-        Update-WmtTweakToggle $btnToggleToggleKeys (-not $currentlyOn) "Toggle Keys Off" "Toggle Keys On"
+        Update-WmtTweakToggle $btnToggleToggleKeys (-not $currentlyOn) "Toggle Keys On" "Toggle Keys Off"
     })
 }
 
@@ -38420,7 +38453,7 @@ $btnToggleNumLockStartup.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p1 "InitialKeyboardIndicators" "2"; Set-WmtRegString $p2 "InitialKeyboardIndicators" "2"; Write-GuiLog "NumLock at startup enabled." } "Enabling NumLock at startup..."
         }
-        Update-WmtTweakToggle $btnToggleNumLockStartup (-not $currentlyOn) "NumLock Startup Off" "NumLock at Startup"
+        Update-WmtTweakToggle $btnToggleNumLockStartup (-not $currentlyOn) "NumLock at Startup" "NumLock Startup Off"
     })
 }
 
@@ -38437,7 +38470,7 @@ $btnToggleCapsLockStartup.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p1 "InitialKeyboardIndicators" "2147483650"; Set-WmtRegString $p2 "InitialKeyboardIndicators" "2147483650"; Write-GuiLog "CapsLock at startup enabled." } "Enabling CapsLock at startup..."
         }
-        Update-WmtTweakToggle $btnToggleCapsLockStartup (-not $currentlyOn) "CapsLock Startup Off" "CapsLock at Startup"
+        Update-WmtTweakToggle $btnToggleCapsLockStartup (-not $currentlyOn) "CapsLock at Startup" "CapsLock Startup Off"
     })
 }
 
@@ -38456,7 +38489,7 @@ $btnToggleHighContrast.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Flags" 1; Write-GuiLog "High contrast mode enabled." } "Enabling high contrast..."
         }
-        Update-WmtTweakToggle $btnToggleHighContrast (-not $currentlyOn) "High Contrast Off" "High Contrast On"
+        Update-WmtTweakToggle $btnToggleHighContrast (-not $currentlyOn) "High Contrast On" "High Contrast Off"
     })
 }
 
@@ -38472,7 +38505,7 @@ $btnToggleColorFilter.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Active" 1; Set-WmtRegDword $p "FilterType" 1; Write-GuiLog "Color filter enabled (default red-green filter)." } "Enabling color filter..."
         }
-        Update-WmtTweakToggle $btnToggleColorFilter (-not $currentlyOn) "Color Filter Off" "Color Filter On"
+        Update-WmtTweakToggle $btnToggleColorFilter (-not $currentlyOn) "Color Filter On" "Color Filter Off"
     })
 }
 
@@ -38491,7 +38524,7 @@ $btnTogglePSExec.Add_Click({
         else {
             Invoke-UiCommand { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Restricted -Force; Write-GuiLog "PowerShell execution set to Restricted (no scripts)." } "Disabling script execution..."
         }
-        Update-WmtTweakToggle $btnTogglePSExec (-not $currentlyOn) "Disable PS Execution" "Enable PS Execution"
+        Update-WmtTweakToggle $btnTogglePSExec ($current -eq "Restricted" -or $current -eq "AllSigned") "Disable PS Execution" "Enable PS Execution"
     })
 }
 
@@ -38523,7 +38556,7 @@ $btnToggleWSH.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Windows Script Host disabled (blocks .vbs/.js)." } "Disabling WSH..."
         }
-        Update-WmtTweakToggle $btnToggleWSH (-not $currentlyOff) "Enable WSH" "Disable WSH"
+        Update-WmtTweakToggle $btnToggleWSH $currentlyOff "Disable WSH" "Enable WSH"
     })
 }
 
@@ -38589,7 +38622,7 @@ $btnPowerUserSigDriver.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "AllowNonSignedDrivers" 1; Write-GuiLog "Test mode enabled - unsigned drivers allowed (reboot required)." } "Enabling test mode..."
         }
-        Update-WmtTweakToggle $btnPowerUserSigDriver (-not $currentlyOn) "Test Mode Off" "Test Mode On"
+        Update-WmtTweakToggle $btnPowerUserSigDriver (-not $currentlyOn) "Test Mode On" "Test Mode Off"
     })
 }
 
@@ -53701,7 +53734,7 @@ $btnToggleDrvUpdates.Add_Click({
         }
         $currentlyDisabled = $false
         try { $val = Get-ItemProperty -Path $drvWUPath -Name "SearchOrderConfig" -ErrorAction SilentlyContinue; if ($val -and [int]$val.SearchOrderConfig -eq 1) { $currentlyDisabled = $true } } catch {}
-        Update-WmtTweakToggle $btnToggleDrvUpdates $currentlyDisabled "Enable Auto-Drivers" "Disable Auto-Drivers" "Toggle automatic driver updates via Windows Update."
+        Update-WmtTweakToggle $btnToggleDrvUpdates (-not $currentlyDisabled) "Disable Auto-Drivers" "Enable Auto-Drivers" "Toggle automatic driver updates via Windows Update."
     })
 }
 $btnToggleDrvMeta = Get-Ctrl "btnToggleDrvMeta"
@@ -53718,7 +53751,7 @@ $btnToggleDrvMeta.Add_Click({
         }
         $currentlyDisabled = $false
         try { $val = Get-ItemProperty -Path $drvMetaPath -Name "PreventDeviceMetadataFromNetwork" -ErrorAction SilentlyContinue; if ($val -and [int]$val.PreventDeviceMetadataFromNetwork -eq 1) { $currentlyDisabled = $true } } catch {}
-        Update-WmtTweakToggle $btnToggleDrvMeta $currentlyDisabled "Enable Metadata" "Disable Metadata" "Toggle device metadata downloads (icons/info) from the internet."
+        Update-WmtTweakToggle $btnToggleDrvMeta (-not $currentlyDisabled) "Disable Metadata" "Enable Metadata" "Toggle device metadata downloads (icons/info) from the internet."
     })
 }
 
@@ -57916,7 +57949,7 @@ $btnPerfServicesRevert.Add_Click({
         param($results)
         if ($btnToggleSuperfetch) {
             $sm = Get-Service "SysMain" -ErrorAction SilentlyContinue
-            if ($sm) { Update-WmtTweakToggle $btnToggleSuperfetch ($sm.StartType -ne 'Disabled') "Enable Superfetch" "Disable Superfetch" }
+            if ($sm) { Update-WmtTweakToggle $btnToggleSuperfetch ($sm.StartType -ne 'Disabled') "Disable Superfetch" "Enable Superfetch" }
         }
     }.GetNewClosure()
     Invoke-WmtUiBackgroundCommand -Name "RestoreServicesDefault" -Msg "Reverting services..." -Sb {
@@ -57943,7 +57976,7 @@ $btnToggleHibernate.Add_Click({
             param($results)
             Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
             $actual = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0)
-            Update-WmtTweakToggle $btnToggleHibernate ($actual -ne 0) "Enable Hibernation" "Disable Hibernation"
+            Update-WmtTweakToggle $btnToggleHibernate ($actual -ne 0) "Disable Hibernation" "Enable Hibernation"
         }.GetNewClosure()
         if ($enabling) {
             Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb { powercfg /hibernate on | Out-Null; Write-Output "Hibernation enabled." } -OnComplete $done | Out-Null
@@ -57971,7 +58004,7 @@ if ($btnToggleSuperfetch) { $btnToggleSuperfetch.Add_Click({
             Write-Output "Superfetch/SysMain disabled."
         } | Out-Null
     }
-    Update-WmtTweakToggle $btnToggleSuperfetch (-not $wasDisabled) "Enable Superfetch" "Disable Superfetch"
+    Update-WmtTweakToggle $btnToggleSuperfetch $wasDisabled "Disable Superfetch" "Enable Superfetch"
 }) }
 
 if ($btnPerfUltimatePower) { $btnPerfUltimatePower.Add_Click({
@@ -57980,7 +58013,7 @@ if ($btnPerfUltimatePower) { $btnPerfUltimatePower.Add_Click({
         powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
         Write-Output "Ultimate Performance power plan enabled."
     } | Out-Null
-    Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power"); $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0); if ($btnToggleHibernate) { Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Enable Hibernation" "Disable Hibernation" }
+    Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power"); $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0); if ($btnToggleHibernate) { Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Disable Hibernation" "Enable Hibernation" }
 }) }
 
 function Get-WmtRemovableAppxPackages {
@@ -58403,7 +58436,7 @@ $btnToggleExtensions.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $ap "HideFileExt" 1; Write-GuiLog "File extensions hidden." } "Hiding file extensions..."
         }
-        Update-WmtTweakToggle $btnToggleExtensions (-not $currentlyHidden) "Show Extensions" "Hide Extensions"
+        Update-WmtTweakToggle $btnToggleExtensions $currentlyHidden "Hide Extensions" "Show Extensions"
     })
 }
 
@@ -58419,7 +58452,7 @@ $btnToggleHiddenFiles.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $ap "Hidden" 2; Write-GuiLog "Hidden files hidden." } "Hiding hidden files..."
         }
-        Update-WmtTweakToggle $btnToggleHiddenFiles (-not $currentlyHidden) "Show Hidden Files" "Hide Hidden Files"
+        Update-WmtTweakToggle $btnToggleHiddenFiles $currentlyHidden "Hide Hidden Files" "Show Hidden Files"
     })
 }
 
@@ -58467,7 +58500,7 @@ $btnToggleRecents.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowRecent" 0; Set-WmtRegDword $p "ShowFrequent" 0; Write-GuiLog "Recent files hidden." } "Hiding recents..."
         }
-        Update-WmtTweakToggle $btnToggleRecents (-not $currentlyHidden) "Show Recents" "Hide Recents"
+        Update-WmtTweakToggle $btnToggleRecents $currentlyHidden "Hide Recents" "Show Recents"
     })
 }
 
@@ -58600,7 +58633,7 @@ $btnToggleAds.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 1; Write-GuiLog "Advertising ID enabled." } "Enabling advertising ID..."
         }
-        Update-WmtTweakToggle $btnToggleAds (-not $currentlyOn) "Ad ID Off" "Ad ID On"
+        Update-WmtTweakToggle $btnToggleAds (-not $currentlyOn) "Ad ID On" "Ad ID Off"
     })
 }
 
@@ -58618,7 +58651,7 @@ $btnToggleSuggested.Add_Click({
         else {
             Invoke-UiCommand { foreach ($n in $names) { Set-WmtRegDword $p $n 1 }; Write-GuiLog "Suggested content enabled." } "Enabling suggestions..."
         }
-        Update-WmtTweakToggle $btnToggleSuggested (-not $anyOn) "Suggestions Off" "Suggestions On"
+        Update-WmtTweakToggle $btnToggleSuggested (-not $anyOn) "Suggestions On" "Suggestions Off"
     })
 }
 
@@ -58635,7 +58668,7 @@ $btnToggleTailored.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "TailoredExperiencesWithDiagnosticDataEnabled" 1; Set-WmtRegDword $p2 "DisableTailoredExperiencesWithDiagnosticData" 0; Write-GuiLog "Tailored experiences enabled." } "Enabling tailored experiences..."
         }
-        Update-WmtTweakToggle $btnToggleTailored (-not $currentlyOn) "Tailored Off" "Tailored On"
+        Update-WmtTweakToggle $btnToggleTailored (-not $currentlyOn) "Tailored On" "Tailored Off"
     })
 }
 
@@ -58652,7 +58685,7 @@ $btnToggleActivity.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableActivityFeed" 0; Set-WmtRegDword $p "PublishUserActivities" 0; Set-WmtRegDword $p "UploadUserActivities" 0; Write-GuiLog "Activity history disabled." } "Disabling activity history..."
         }
-        Update-WmtTweakToggle $btnToggleActivity (-not $currentlyOff) "Activity History Off" "Activity History On"
+        Update-WmtTweakToggle $btnToggleActivity $currentlyOff "Activity History On" "Activity History Off"
     })
 }
 
@@ -58668,7 +58701,7 @@ $btnToggleAppLaunch.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 1; Write-GuiLog "App launch tracking enabled." } "Enabling app launch tracking..."
         }
-        Update-WmtTweakToggle $btnToggleAppLaunch (-not $currentlyOn) "Launch Tracking Off" "Launch Tracking On"
+        Update-WmtTweakToggle $btnToggleAppLaunch (-not $currentlyOn) "Launch Tracking On" "Launch Tracking Off"
     })
 }
 
@@ -58685,7 +58718,7 @@ $btnToggleWebSearch.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "DisableSearchBoxSuggestions" 0; Set-WmtRegDword $p2 "BingSearchEnabled" 1; Write-GuiLog "Web search in Start Menu enabled." } "Enabling web search..."
         }
-        Update-WmtTweakToggle $btnToggleWebSearch (-not $currentlyOn) "Web Search Off" "Web Search On"
+        Update-WmtTweakToggle $btnToggleWebSearch (-not $currentlyOn) "Web Search On" "Web Search Off"
     })
 }
 
@@ -58763,7 +58796,7 @@ $btnToggleGameCapture.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 0; Write-GuiLog "Background capture disabled." } "Disabling background capture..."
         }
-        Update-WmtTweakToggle $btnToggleGameCapture (-not $currentlyOn) "Capture Off" "Capture On"
+        Update-WmtTweakToggle $btnToggleGameCapture $currentlyOn "Capture On" "Capture Off"
     })
 }
 $btnToggleFso = Get-Ctrl "btnToggleFso"
@@ -58820,7 +58853,7 @@ $btnToggleTips.Add_Click({
                 Write-GuiLog "Windows tips and suggestions disabled."
             } "Disabling notification tips..."
         }
-        Update-WmtTweakToggle $btnToggleTips (-not $currentlyOn) "Tips Off" "Tips On"
+        Update-WmtTweakToggle $btnToggleTips $currentlyOn "Tips On" "Tips Off"
     })
 }
 $btnToggleSetupPrompts = Get-Ctrl "btnToggleSetupPrompts"
@@ -58834,7 +58867,7 @@ $btnToggleSetupPrompts.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0; Write-GuiLog "Finish setup prompts disabled." } "Disabling setup prompts..."
         }
-        Update-WmtTweakToggle $btnToggleSetupPrompts (-not $setupOff) "Setup Prompts On" "Setup Prompts Off"
+        Update-WmtTweakToggle $btnToggleSetupPrompts $setupOff "Setup Prompts On" "Setup Prompts Off"
     })
 }
 $btnToggleLockFacts = Get-Ctrl "btnToggleLockFacts"
@@ -58856,7 +58889,7 @@ $btnToggleLockFacts.Add_Click({
                 Write-GuiLog "Lock screen fun facts disabled."
             } "Disabling lock screen fun facts..."
         }
-        Update-WmtTweakToggle $btnToggleLockFacts (-not $currentlyOn) "Lock Facts Off" "Lock Facts On"
+        Update-WmtTweakToggle $btnToggleLockFacts $currentlyOn "Lock Facts On" "Lock Facts Off"
     })
 }
 $btnToggleLockSpotlight = Get-Ctrl "btnToggleLockSpotlight"
@@ -58878,7 +58911,7 @@ $btnToggleLockSpotlight.Add_Click({
                 Write-GuiLog "Lock screen Spotlight disabled."
             } "Disabling lock screen Spotlight..."
         }
-        Update-WmtTweakToggle $btnToggleLockSpotlight (-not $currentlyOn) "Spotlight Off" "Spotlight On"
+        Update-WmtTweakToggle $btnToggleLockSpotlight $currentlyOn "Spotlight On" "Spotlight Off"
     })
 }
 $btnToggleLockScreen = Get-Ctrl "btnToggleLockScreen"
@@ -58908,9 +58941,9 @@ $btnToggleLockScreen.Add_Click({
         }
         Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
         $lfOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
-        if ($btnToggleLockFacts) { Update-WmtTweakToggle $btnToggleLockFacts $lfOff "Lock Facts Off" "Lock Facts On" }
+        if ($btnToggleLockFacts) { Update-WmtTweakToggle $btnToggleLockFacts (-not $lfOff) "Lock Facts On" "Lock Facts Off" }
         $spOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
-        if ($btnToggleLockSpotlight) { Update-WmtTweakToggle $btnToggleLockSpotlight $spOff "Spotlight Off" "Spotlight On" }
+        if ($btnToggleLockSpotlight) { Update-WmtTweakToggle $btnToggleLockSpotlight (-not $spOff) "Spotlight On" "Spotlight Off" }
     })
 }
 
@@ -58929,7 +58962,7 @@ $btnToggleFastStartup.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0; Write-GuiLog "Fast Startup disabled." } "Disabling Fast Startup..."
         }
-        Update-WmtTweakToggle $btnToggleFastStartup (-not $currentlyOn) "Fast Startup Off" "Fast Startup On"
+        Update-WmtTweakToggle $btnToggleFastStartup $currentlyOn "Fast Startup On" "Fast Startup Off"
     })
 }
 $btnToggleRestoreFolders = Get-Ctrl "btnToggleRestoreFolders"
@@ -62708,7 +62741,7 @@ $btnToggleWidgets.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0; Write-GuiLog "Widgets hidden." } "Hiding widgets..."
         }
-        Update-WmtTweakToggle $btnToggleWidgets (-not $currentlyHidden) "Show Widgets" "Hide Widgets"
+        Update-WmtTweakToggle $btnToggleWidgets $currentlyHidden "Hide Widgets" "Show Widgets"
     })
 }
 
@@ -62723,7 +62756,7 @@ $btnToggleTaskView.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0; Write-GuiLog "Task View hidden." } "Hiding Task View..."
         }
-        Update-WmtTweakToggle $btnToggleTaskView (-not $currentlyHidden) "Show Task View" "Hide Task View"
+        Update-WmtTweakToggle $btnToggleTaskView $currentlyHidden "Hide Task View" "Show Task View"
     })
 }
 
@@ -62739,7 +62772,7 @@ $btnToggleChat.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0; Write-GuiLog "Chat hidden." } "Hiding Chat..."
         }
-        Update-WmtTweakToggle $btnToggleChat (-not $currentlyHidden) "Show Chat" "Hide Chat"
+        Update-WmtTweakToggle $btnToggleChat $currentlyHidden "Hide Chat" "Show Chat"
     })
 }
 
