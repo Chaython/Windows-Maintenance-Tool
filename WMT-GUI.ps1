@@ -36386,8 +36386,8 @@ try {
     $script:WmtMouseSpeedValue = [int]$mouseSpeed
     & $setButtonEnabled "btnMouseSpeedSlow" ($mouseSpeed -ne 6); & $setButtonEnabled "btnMouseSpeedDefault" ($mouseSpeed -ne 10); & $setButtonEnabled "btnMouseSpeedFast" ($mouseSpeed -ne 15)
     $mouseAccelSpeed = ConvertTo-Str (& $getRegValue $mousePath "MouseSpeed" "1") ""
-    $mouseAccelT1 = ConvertTo-Str (& $getRegValue $mousePath "MouseThreshold1" "0") ""
-    $mouseAccelT2 = ConvertTo-Str (& $getRegValue $mousePath "MouseThreshold2" "0") ""
+    $mouseAccelT1 = ConvertTo-Str (& $getRegValue $mousePath "MouseThreshold1" "6") ""
+    $mouseAccelT2 = ConvertTo-Str (& $getRegValue $mousePath "MouseThreshold2" "10") ""
     $mouseAccelOn = ($mouseAccelSpeed -eq "1" -and $mouseAccelT1 -ne "0" -and $mouseAccelT2 -ne "0")
     $btnToggleMouseAccel = Get-Ctrl "btnToggleMouseAccel"
     Update-WmtTweakToggle $btnToggleMouseAccel $mouseAccelOn "Acceleration On" "Acceleration Off"
@@ -58850,8 +58850,8 @@ $btnToggleMouseAccel.Add_Click({
         $p = "HKCU:\Control Panel\Mouse"
         Clear-WmtRegCache @($p)
         $accelSpeed = ConvertTo-Str (Get-WmtRegValue $p "MouseSpeed" "1") ""
-        $accelT1 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold1" "0") ""
-        $accelT2 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold2" "0") ""
+        $accelT1 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold1" "6") ""
+        $accelT2 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold2" "10") ""
         $currentlyOn = ($accelSpeed -eq "1" -and $accelT1 -ne "0" -and $accelT2 -ne "0")
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtMouseAcceleration $false; Write-GuiLog "Mouse acceleration disabled." } "Disabling mouse acceleration..."
