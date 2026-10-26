@@ -35619,9 +35619,25 @@ function Set-WmtTweakUnknownState {
         if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($ButtonName)) {
             [void]$script:TweakCurrentStates.Remove($ButtonName)
         }
-        $button.Content = $Label
+        # Keep the functional button label visible. The separate Quick Find
+        # state line shows "Not set"; replacing the button text with that status
+        # hides what the button actually does and makes the feature hard to find.
+        $buttonContent = ([string]$button.Content -replace '\s+\(Not set\)$', '').Trim()
+        if ([string]::IsNullOrWhiteSpace($buttonContent) -or $buttonContent -eq $Label) {
+            $buttonContent = switch ($ButtonName) {
+                'btnToggleCopilot' { 'Copilot Off' }
+                'btnToggleRecall' { 'Recall Off' }
+                'btnToggleClickToDo' { 'Click To Do Off' }
+                'btnToggleAISvcAutoStart' { 'AI Svc AutoStart Off' }
+                'btnToggleEdgeAI' { 'Edge AI Off' }
+                'btnTogglePaintAI' { 'Paint AI Off' }
+                'btnToggleNotepadAI' { 'Notepad AI Off' }
+                default { $ButtonName -replace '^btnToggle', '' }
+            }
+        }
+        $button.Content = "$buttonContent ($Label)"
         $button.Style = ($window.FindResource('ActionBtn') -as [System.Windows.Style])
-        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'Click to explicitly set this option.')
+        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'The feature remains available; click to change its setting.')
     }
     catch {}
 }
