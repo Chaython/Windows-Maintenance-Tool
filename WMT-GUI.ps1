@@ -31672,10 +31672,41 @@ param(
 if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
 
 $item = Get-WmtRegistryKeyValuesCached -Path $Path
-if ($item -and $item.PSObject.Properties[$Name]) {
-    return $item.$Name
+if ($null -ne $item) {
+    # Registry snapshots may be dictionaries or legacy PSObjects. Read named
+    # entries correctly without converting the dictionary (default value uses "").
+    if ($item -is [System.Collections.IDictionary]) {
+        if ($item.Contains($Name)) { return $item[$Name] }
+        if ($Name -eq "(Default)" -and $item.Contains("")) { return $item[""] }
+        return $Default
+    }
+    $property = $item.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $Default
 }
-return $Default
+
+# Clear-WmtRegCache deliberately removes a path snapshot before click handlers
+# inspect the current value. A cache miss must therefore read that one registry
+# value live; returning $Default here makes toggles such as HideFileExt think the
+# setting is always at its Windows default and can flip the wrong way.
+$parts = $null
+$baseKey = $null
+$key = $null
+try {
+    $parts = Convert-WmtRegistryPath -Path $Path
+    if (-not $parts) { return $Default }
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
+    $key = $baseKey.OpenSubKey($parts.SubPath, $false)
+    if (-not $key) { return $Default }
+    $registryName = if ($Name -eq "(Default)") { "" } else { $Name }
+    return $key.GetValue($registryName, $Default, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+}
+catch {
+    return $Default
+}
+finally {
+    if ($key) { try { $key.Close() } catch {} }
+    if ($baseKey) { try { $baseKey.Close() } catch {} }
 }
 
 # --- Registry write helpers (pure .NET Microsoft.Win32.Registry API) ---
@@ -38930,7 +38961,12 @@ function Update-WmtQuickFindStateLabels {
         } elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
             $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
         } elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
-            $label.Text = if ($script:TweakCurrentStates[$name].On) { "State: Enabled" } else { "State: Disabled" }
+            # Show the actual represented setting (e.g. "Hide Extensions" or
+            # "Show Extensions"), not a generic Enabled/Disabled label that can
+            # be misread as the opposite of a hide/show toggle.
+            $state = $script:TweakCurrentStates[$name]
+            $stateLabelText = if ($state.On) { [string]$state.OnLabel } else { [string]$state.OffLabel }
+            $label.Text = "State: $stateLabelText"
         } elseif (-not $optional -and $script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($name)) {
             $unknown = $script:TweakCurrentUnknownStates[$name]
             $label.Text = "State: $($unknown.Label)"
