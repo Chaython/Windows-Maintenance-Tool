@@ -31708,6 +31708,7 @@ finally {
     if ($key) { try { $key.Close() } catch {} }
     if ($baseKey) { try { $baseKey.Close() } catch {} }
 }
+}
 
 # --- Registry write helpers (pure .NET Microsoft.Win32.Registry API) ---
 # Every tweak write goes through these instead of the PowerShell registry provider.
