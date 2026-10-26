@@ -38828,8 +38828,8 @@ function Update-WmtSearchIndexEntries {
             if ($item.Button -and $item.Button.ToolTip -is [string]) { $tooltip = [string]$item.Button.ToolTip }
         } catch {}
         $description = $tooltip
-        if ($item.Group -eq "MouseControls") {
-            $description = "Pointer speed presets, mouse acceleration, folder click mode, and Windows mouse settings."
+        if ($item.Group -eq "MouseSpeed") {
+            $description = "Set cursor pointer speed to slow, default, or fast."
         }
         [void]$entries.Add([PSCustomObject]@{
             Text = [string]$entry.Key
@@ -38886,11 +38886,8 @@ function Update-WmtQuickFindStateLabels {
     foreach ($name in @($script:WmtQuickFindStateLabels.Keys)) {
         $label = $script:WmtQuickFindStateLabels[$name]
         if (-not $label) { continue }
-        if ($name -eq "__MouseControls") {
-            $speedKnown = $null -ne $script:WmtMouseSpeedValue
-            $accelKnown = $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains("btnToggleMouseAccel")
-            $clickKnown = $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains("btnToggleClickMode")
-            if (-not $script:TweakStatesReady -or -not $speedKnown -or -not $accelKnown -or -not $clickKnown) {
+        if ($name -eq "__MouseSpeed") {
+            if (-not $script:TweakStatesReady -or $null -eq $script:WmtMouseSpeedValue) {
                 $label.Text = "State: Checking..."
             }
             else {
@@ -38901,9 +38898,7 @@ function Update-WmtQuickFindStateLabels {
                     15 { "Fast (15)" }
                     default { "Custom ($speed)" }
                 }
-                $accelState = if ($script:TweakCurrentStates["btnToggleMouseAccel"].On) { "On" } else { "Off" }
-                $clickState = if ($script:TweakCurrentStates["btnToggleClickMode"].On) { "Single-click" } else { "Double-click" }
-                $label.Text = "State: Speed $speedLabel; acceleration $accelState; $clickState folders"
+                $label.Text = "Current cursor speed: $speedLabel"
             }
             continue
         }
@@ -38929,10 +38924,8 @@ function Sync-WmtQuickFindStateAvailability {
     if (-not $pnlQuickFind -or -not $pnlQuickFind.IsVisible) { return }
     $requiresRebuild = $false
     foreach ($name in @($script:WmtQuickFindRenderedReadiness.Keys)) {
-        if ($name -eq "__MouseControls") {
-            $ready = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue -and
-                $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains("btnToggleMouseAccel") -and
-                $script:TweakCurrentStates.Contains("btnToggleClickMode"))
+        if ($name -eq "__MouseSpeed") {
+            $ready = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue)
             if ($ready -ne $script:WmtQuickFindRenderedReadiness[$name]) {
                 $requiresRebuild = $true
                 break
@@ -39268,25 +39261,30 @@ function Update-WmtQuickFindResults {
                 $description.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
                 [void]$body.Children.Add($description)
             }
-            if ($entry.Item.Tab -eq "btnTabTweaks") {
+            $isMouseSpeedGroup = ($entry.Item.Group -eq "MouseSpeed")
+            $isMouseSettingsAction = ([string]$entry.Item.Button.Name -eq "btnMouseSettings")
+            if ($entry.Item.Tab -eq "btnTabTweaks" -and -not $isMouseSettingsAction) {
                 $stateLabel = [System.Windows.Controls.TextBlock]::new()
                 $stateLabel.FontSize = 12
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
                 $stateLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
-                $stateName = if ($entry.Item.Group -eq "MouseControls") { "__MouseControls" } else { [string]$entry.Item.Button.Name }
+                $stateName = if ($isMouseSpeedGroup) { "__MouseSpeed" } else { [string]$entry.Item.Button.Name }
                 $script:WmtQuickFindStateLabels[$stateName] = $stateLabel
                 [void]$body.Children.Add($stateLabel)
             }
             # Reparent the actual original Button, retaining its existing handlers,
             # state, styling, icon, and dynamic label. This is not a proxy/auto-click.
             $original = $entry.Item.Button
-            $isMouseGroup = ($entry.Item.Group -eq "MouseControls")
+            $isMouseSpeedGroup = ($entry.Item.Group -eq "MouseSpeed")
+            $isMouseSettingsAction = ([string]$original.Name -eq "btnMouseSettings")
             $tweakReady = $true
             if ($entry.Item.Tab -eq "btnTabTweaks") {
-                if ($isMouseGroup) {
-                    $tweakReady = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue -and
-                        $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains("btnToggleMouseAccel") -and
-                        $script:TweakCurrentStates.Contains("btnToggleClickMode"))
+                if ($isMouseSpeedGroup) {
+                    $tweakReady = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue)
+                }
+                elseif ($isMouseSettingsAction) {
+                    # Opening the Windows Mouse control panel is an action, not a toggle.
+                    $tweakReady = [bool]$original.IsEnabled
                 }
                 else {
                     $isOptional = ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $original.Name)
@@ -39301,22 +39299,21 @@ function Update-WmtQuickFindResults {
                     }
                 }
             }
-            if ($entry.Item.Tab -eq "btnTabTweaks") {
-                $readinessName = if ($isMouseGroup) { "__MouseControls" } else { [string]$original.Name }
+            if ($entry.Item.Tab -eq "btnTabTweaks" -and -not $isMouseSettingsAction) {
+                $readinessName = if ($isMouseSpeedGroup) { "__MouseSpeed" } else { [string]$original.Name }
                 $script:WmtQuickFindRenderedReadiness[$readinessName] = [bool]$tweakReady
             }
             $canHost = ($original -is [System.Windows.Controls.Button]) -and
-                       (-not $isMouseGroup) -and
+                       (-not $isMouseSpeedGroup) -and
                        ($original.Name -notin @("btnShowCatalog", "btnShowLibrary", "btnBackToUpdates")) -and
                        $tweakReady
             $hosted = $false
-            if ($isMouseGroup) {
-                # Keep native controls in their original panel and proxy their existing
-                # click handlers into this single search card.
+            if ($isMouseSpeedGroup) {
+                # Keep native speed buttons in their original panel and proxy their
+                # existing click handlers into this single cursor-speed card.
                 $hosted = $true
                 foreach ($mouseControlName in @(
-                    "btnMouseSpeedSlow", "btnMouseSpeedDefault", "btnMouseSpeedFast",
-                    "btnToggleMouseAccel", "btnToggleClickMode", "btnMouseSettings"
+                    "btnMouseSpeedSlow", "btnMouseSpeedDefault", "btnMouseSpeedFast"
                 )) {
                     $mouseTarget = $window.FindName($mouseControlName)
                     if (-not $mouseTarget) { $mouseTarget = Get-Ctrl $mouseControlName }
@@ -39585,7 +39582,10 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnToggleCombine" "Taskbar Combine" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleFullPath" "Full Path Title" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleRecents" "Recent Files" "btnTabTweaks"
-    Add-SearchIndexEntry "btnMouseSettings" "Mouse & Clicking" "btnTabTweaks" "MouseControls" "mouse pointer cursor speed slow fast default acceleration enhanced precision click clicking single double settings"
+    Add-SearchIndexEntry "btnMouseSpeedSlow" "Mouse Cursor Speed" "btnTabTweaks" "MouseSpeed" "cursor pointer speed mouse speed slow fast default dpi"
+    Add-SearchIndexEntry "btnToggleMouseAccel" "Mouse Acceleration" "btnTabTweaks"
+    Add-SearchIndexEntry "btnToggleClickMode" "Folder Click Mode" "btnTabTweaks" "" "folder click single double"
+    Add-SearchIndexEntry "btnMouseSettings" "Mouse Settings" "btnTabTweaks" "" "open control panel main.cpl"
     Add-SearchIndexEntry "btnTogglePsHere" "PowerShell Here" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleAds" "Advertising ID" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleTailored" "Tailored Experiences" "btnTabTweaks"
