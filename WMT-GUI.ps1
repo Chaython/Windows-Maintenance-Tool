@@ -33320,7 +33320,7 @@ catch { & $failed $_ }
                             <WrapPanel>
                                 <Button Name="btnToggleStartRecommended" Content="Hide Recommended" Style="{StaticResource ActionBtn}" ToolTip="Toggle the 'Recommended' section on the Start menu. Blue = hidden."/>
                                 <Button Name="btnToggleStartAllApps" Content="Hide All Apps" Style="{StaticResource ActionBtn}" ToolTip="Toggle the 'All apps' list on the Start menu. Blue = hidden."/>
-                                <Button Name="btnTogglePhoneLink" Content="Hide Phone Link" Style="{StaticResource ActionBtn}" ToolTip="Toggle the Phone Link shortcut on the Start menu. Blue = hidden."/>
+                                <Button Name="btnTogglePhoneLink" Content="Hide Phone Link" Style="{StaticResource ActionBtn}" ToolTip="Toggle the Phone Link mobile-device companion in the Start menu. Blue = hidden."/>
                             </WrapPanel>
                         </StackPanel>
                     </Grid>
@@ -35461,7 +35461,7 @@ $script:TweakMetaData = @{
 # Start Menu
 "btnToggleStartRecommended"   = @{ Description = "The Start menu Recommended section shows recently installed and used apps. Hiding it gives more space for pinned apps."; RestartHint = "No restart needed - applies instantly." }
 "btnToggleStartAllApps"       = @{ Description = "The All Apps list shows every installed app alphabetically. Hiding it means you can only launch pinned apps from Start."; RestartHint = "No restart needed - applies instantly." }
-"btnTogglePhoneLink"          = @{ Description = "The Phone Link badge on Start shows your phone's battery and notifications. Hiding it removes the badge but Phone Link still works."; RestartHint = "No restart needed - applies instantly." }
+"btnTogglePhoneLink"          = @{ Description = "Controls whether the Phone Link mobile-device companion is enabled in the Start menu. Disabling it hides the companion panel without uninstalling Phone Link."; RestartHint = "No restart needed - applies instantly." }
 
 # Network Tweaks
 "btnToggleIPv6"               = @{ Description = "IPv6 is the next-generation internet protocol. Some older networks and VPNs have issues with IPv6. Disabling it forces all connections to use IPv4 only."; RestartHint = "Restart to apply." }
@@ -36618,106 +36618,114 @@ try {
     }
     $plBtn = Get-Ctrl "btnTogglePhoneLink"
     if ($plBtn) {
-        $plHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_ShowAccountBadges" 1) 0) -eq 0))
-        Update-WmtTweakToggle $plBtn $plHidden "Hide Phone Link" "Show Phone Link"
-
-        # --- EXPANDED TWEAK STATE DETECTION (round 2) ---
-
-        # Network Tweaks
-        $ipv6Btn = Get-Ctrl "btnToggleIPv6"
-        if ($ipv6Btn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0) 0); Update-WmtTweakToggle $ipv6Btn (-not (($v -band 0xFF) -ne 0)) "Disable IPv6" "Enable IPv6" }
-        $ntBtn = Get-Ctrl "btnToggleNetThrottling"
-        if ($ntBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 10) 0); Update-WmtTweakToggle $ntBtn (-not ($v -eq 0xFFFFFFFF)) "Disable Net Throttling" "Enable Net Throttling" }
-        $nlwBtn = Get-Ctrl "btnToggleNetLocationWizard"
-        if ($nlwBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters" "ShowNetworkLocationWizard" 1) 0); Update-WmtTweakToggle $nlwBtn (-not ($v -eq 0)) "Net Location Wizard On" "Net Location Wizard Off" }
-        $wfsBtn = Get-Ctrl "btnToggleWifiSense"
-        if ($wfsBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $wfsBtn (-not ($v -eq 0)) "Wi-Fi Sense On" "Wi-Fi Sense Off" }
-        $awBtn = Get-Ctrl "btnToggleAutoWifi"
-        if ($awBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $awBtn (-not ($v -eq 0)) "Suggested WiFi On" "Suggested WiFi Off" }
-
-        # Privacy (round 2)
-        $ddBtn = Get-Ctrl "btnToggleDiagData"
-        if ($ddBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 3) 0); Update-WmtTweakToggle $ddBtn ($v -le 1) "Diag Data Optional" "Diag Data Required" }
-        $ipBtn = Get-Ctrl "btnToggleInkingPersonal"
-        if ($ipBtn) { $v1 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0) 0); $v2 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0) 0); Update-WmtTweakToggle $ipBtn (-not ($v1 -eq 1 -and $v2 -eq 1)) "Inking Personal On" "Inking Personal Off" }
-        $soBtn = Get-Ctrl "btnToggleSpeechOnline"
-        if ($soBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Speech_OneSet" "AcceptPrivacyNotice" 1) 0); Update-WmtTweakToggle $soBtn (-not ($v -eq 0)) "Speech Online On" "Speech Online Off" }
-        $adBtn = Get-Ctrl "btnToggleAppDiagnostics"
-        if ($adBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics" "Value" "Allow") ""); Update-WmtTweakToggle $adBtn (-not ($v -ne "Allow")) "App Diagnostics On" "App Diagnostics Off" }
-        $baBtn = Get-Ctrl "btnToggleBackgroundApps"
-        if ($baBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 0) 0); Update-WmtTweakToggle $baBtn (-not ($v -eq 1)) "Background Apps On" "Background Apps Off" }
-        $fnBtn = Get-Ctrl "btnToggleFeedbackNotify"
-        if ($fnBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" -1) 0); Update-WmtTweakToggle $fnBtn (-not ($v -eq 0)) "Feedback Notify On" "Feedback Notify Off" }
-        $ctBtn = Get-Ctrl "btnToggleCompatTelemetry"
-        if ($ctBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable" 1) 0); Update-WmtTweakToggle $ctBtn (-not ($v -eq 0)) "Compat Telemetry On" "Compat Telemetry Off" }
-        $ceBtn = Get-Ctrl "btnToggleCEIP"
-        if ($ceBtn) { $v = (ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" "1") ""); Update-WmtTweakToggle $ceBtn (-not ($v -ne "1")) "CEIP On" "CEIP Off" }
-
-        # Explorer (round 2)
-        $ntlaBtn = Get-Ctrl "btnToggleNTFSLastAccess"
-        if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn (-not $off) "Disable NTFS Last Access" "Enable NTFS Last Access" } }
-        $n83Btn = Get-Ctrl "btnToggleNTFS83"
-        if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn (-not $off) "Disable NTFS 8.3" "Enable NTFS 8.3" } }
-        $tcBtn = Get-Ctrl "btnToggleThumbCache"
-        if ($tcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisableThumbnails" 0) 0); Update-WmtTweakToggle $tcBtn (-not ($v -eq 1)) "Thumbnail Cache On" "Thumbnail Cache Off" }
-        $dlfBtn = Get-Ctrl "btnToggleDriveLettersFirst"
-        if ($dlfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer" "ShowDriveLettersFirst" 0) 0); Update-WmtTweakToggle $dlfBtn ($v -eq 1) "Drive Letters Last" "Drive Letters First" }
-
-        # Context Menu (round 2)
-        $cmdBtn = Get-Ctrl "btnToggleCmdHere"
-        if ($cmdBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\Directory\shell\WmtCmdHere"; Update-WmtTweakToggle $cmdBtn $exists "Remove CMD Here" "Add CMD Here" }
-        $npBtn = Get-Ctrl "btnToggleNotepadCtx"
-        if ($npBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"; Update-WmtTweakToggle $npBtn $exists "Remove Notepad" "Add Notepad" }
-        $prBtn = Get-Ctrl "btnToggleRemovePrint"
-        if ($prBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn (-not $exists) "Remove Print" "Restore Print" }
-        $castBtn = Get-Ctrl "btnToggleRemoveCast"
-        if ($castBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn (-not $exists) "Remove Cast to Device" "Restore Cast to Device" }
-
-        # Sound
-        $ssBtn = Get-Ctrl "btnToggleStartupSound"
-        if ($ssBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound" "Enabled" 1) 0); Update-WmtTweakToggle $ssBtn (-not ($v -eq 0)) "Startup Sound On" "Startup Sound Off" }
-        $nsBtn = Get-Ctrl "btnToggleNotifySound"
-        if ($nsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $nsBtn (-not ($v -eq "")) "Notification Sound On" "Notification Sound Off" }
-        $dsBtn = Get-Ctrl "btnToggleDeviceSound"
-        if ($dsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $dsBtn (-not ($v -eq "")) "Device Connect Sound On" "Device Connect Sound Off" }
-        $saBtn = Get-Ctrl "btnToggleSpatialAudio"
-        if ($saBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound" "SpatialAudioFormat" "") ""); Update-WmtTweakToggle $saBtn ($v -ne "") "Spatial Audio On" "Spatial Audio Off" }
-
-        # Display
-        $nlBtn = Get-Ctrl "btnToggleNightLight"
-        if ($nlBtn) { $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate"; $v = (ConvertTo-Int (& $getRegValue $p "Data" 0) 0); Update-WmtTweakToggle $nlBtn ($v -ne 0) "Night Light On" "Night Light Off" }
-
-        # Keyboard
-        $fkBtn = Get-Ctrl "btnToggleFilterKeys"
-        if ($fkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\Keyboard Response" "Flags" "122") ""); Update-WmtTweakToggle $fkBtn ($v -match "63") "Filter Keys On" "Filter Keys Off" }
-        $tkBtn = Get-Ctrl "btnToggleToggleKeys"
-        if ($tkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\ToggleKeys" "Flags" "58") ""); Update-WmtTweakToggle $tkBtn ($v -match "63") "Toggle Keys On" "Toggle Keys Off" }
-        $nlkBtn = Get-Ctrl "btnToggleNumLockStartup"
-        if ($nlkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $nlkBtn ($v -eq "2") "NumLock at Startup" "NumLock Startup Off" }
-        $clkBtn = Get-Ctrl "btnToggleCapsLockStartup"
-        if ($clkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $clkBtn ($v -eq "2147483650") "CapsLock at Startup" "CapsLock Startup Off" }
-
-        # Accessibility
-        $hcBtn = Get-Ctrl "btnToggleHighContrast"
-        if ($hcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Accessibility\HighContrast" "Flags" 0) 0); Update-WmtTweakToggle $hcBtn (($v -band 1) -ne 0) "High Contrast On" "High Contrast Off" }
-        $cfBtn = Get-Ctrl "btnToggleColorFilter"
-        if ($cfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\ColorFiltering" "Active" 0) 0); Update-WmtTweakToggle $cfBtn ($v -eq 1) "Color Filter On" "Color Filter Off" }
-
-        # Developer (round 2)
-        $psBtn = Get-Ctrl "btnTogglePSExec"
-        if ($psBtn) { $v = $nrd["ExecutionPolicy"]; if ($null -eq $v) { try { $v = (Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue) } catch {} }; if ($null -ne $v) { Update-WmtTweakToggle $psBtn ($v -ne "Restricted" -and $v -ne "AllSigned") "Disable PS Execution" "Enable PS Execution" } }
-        $sdBtn = Get-Ctrl "btnToggleSudo"
-        if ($sdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" "Enabled" 0) 0); Update-WmtTweakToggle $sdBtn ($v -ne 0) "Disable Sudo" "Enable Sudo" }
-        $wshBtn = Get-Ctrl "btnToggleWSH"
-        if ($wshBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows Script Host\Settings" "Enabled" 1) 0); Update-WmtTweakToggle $wshBtn (-not ($v -eq 0)) "Disable WSH" "Enable WSH" }
-
-        # Power User
-        $hdBtn = Get-Ctrl "btnPowerUserShowDevices"
-        if ($hdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager" "ShowHiddenDevices" 0) 0); Update-WmtTweakToggle $hdBtn ($v -eq 1) "Hide Devices" "Show Hidden Devices" }
-        $tmBtn = Get-Ctrl "btnPowerUserSigDriver"
-        if ($tmBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager" "AllowNonSignedDrivers" 0) 0); Update-WmtTweakToggle $tmBtn ($v -eq 1) "Test Mode On" "Test Mode Off" }
-
+        $phoneLinkStartPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Start\Companions\Microsoft.YourPhone_8wekyb3d8bbwe"
+        $phoneLinkStartEnabled = & $getRegValue $phoneLinkStartPath "IsEnabled" $null
+        if ($null -eq $phoneLinkStartEnabled) {
+            Set-WmtTweakUnknownState "btnTogglePhoneLink" "Not set" "No IsEnabled value is stored for the Phone Link Start-menu companion, so WMT cannot confirm whether the component is present or enabled."
+        }
+        else {
+            $plHidden = ((ConvertTo-Int $phoneLinkStartEnabled 1) -eq 0)
+            Update-WmtTweakToggle $plBtn $plHidden "Hide Phone Link" "Show Phone Link"
+        }
     }
+
+    # --- EXPANDED TWEAK STATE DETECTION (round 2) ---
+
+    # Network Tweaks
+    $ipv6Btn = Get-Ctrl "btnToggleIPv6"
+    if ($ipv6Btn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0) 0); Update-WmtTweakToggle $ipv6Btn (-not (($v -band 0xFF) -ne 0)) "Disable IPv6" "Enable IPv6" }
+    $ntBtn = Get-Ctrl "btnToggleNetThrottling"
+    if ($ntBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 10) 0); Update-WmtTweakToggle $ntBtn (-not ($v -eq 0xFFFFFFFF)) "Disable Net Throttling" "Enable Net Throttling" }
+    $nlwBtn = Get-Ctrl "btnToggleNetLocationWizard"
+    if ($nlwBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters" "ShowNetworkLocationWizard" 1) 0); Update-WmtTweakToggle $nlwBtn (-not ($v -eq 0)) "Net Location Wizard On" "Net Location Wizard Off" }
+    $wfsBtn = Get-Ctrl "btnToggleWifiSense"
+    if ($wfsBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $wfsBtn (-not ($v -eq 0)) "Wi-Fi Sense On" "Wi-Fi Sense Off" }
+    $awBtn = Get-Ctrl "btnToggleAutoWifi"
+    if ($awBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $awBtn (-not ($v -eq 0)) "Suggested WiFi On" "Suggested WiFi Off" }
+
+    # Privacy (round 2)
+    $ddBtn = Get-Ctrl "btnToggleDiagData"
+    if ($ddBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 3) 0); Update-WmtTweakToggle $ddBtn ($v -le 1) "Diag Data Optional" "Diag Data Required" }
+    $ipBtn = Get-Ctrl "btnToggleInkingPersonal"
+    if ($ipBtn) { $v1 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0) 0); $v2 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0) 0); Update-WmtTweakToggle $ipBtn (-not ($v1 -eq 1 -and $v2 -eq 1)) "Inking Personal On" "Inking Personal Off" }
+    $soBtn = Get-Ctrl "btnToggleSpeechOnline"
+    if ($soBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Speech_OneSet" "AcceptPrivacyNotice" 1) 0); Update-WmtTweakToggle $soBtn (-not ($v -eq 0)) "Speech Online On" "Speech Online Off" }
+    $adBtn = Get-Ctrl "btnToggleAppDiagnostics"
+    if ($adBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics" "Value" "Allow") ""); Update-WmtTweakToggle $adBtn (-not ($v -ne "Allow")) "App Diagnostics On" "App Diagnostics Off" }
+    $baBtn = Get-Ctrl "btnToggleBackgroundApps"
+    if ($baBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 0) 0); Update-WmtTweakToggle $baBtn (-not ($v -eq 1)) "Background Apps On" "Background Apps Off" }
+    $fnBtn = Get-Ctrl "btnToggleFeedbackNotify"
+    if ($fnBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" -1) 0); Update-WmtTweakToggle $fnBtn (-not ($v -eq 0)) "Feedback Notify On" "Feedback Notify Off" }
+    $ctBtn = Get-Ctrl "btnToggleCompatTelemetry"
+    if ($ctBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable" 1) 0); Update-WmtTweakToggle $ctBtn (-not ($v -eq 0)) "Compat Telemetry On" "Compat Telemetry Off" }
+    $ceBtn = Get-Ctrl "btnToggleCEIP"
+    if ($ceBtn) { $v = (ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" "1") ""); Update-WmtTweakToggle $ceBtn (-not ($v -ne "1")) "CEIP On" "CEIP Off" }
+
+    # Explorer (round 2)
+    $ntlaBtn = Get-Ctrl "btnToggleNTFSLastAccess"
+    if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn (-not $off) "Disable NTFS Last Access" "Enable NTFS Last Access" } }
+    $n83Btn = Get-Ctrl "btnToggleNTFS83"
+    if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn (-not $off) "Disable NTFS 8.3" "Enable NTFS 8.3" } }
+    $tcBtn = Get-Ctrl "btnToggleThumbCache"
+    if ($tcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisableThumbnails" 0) 0); Update-WmtTweakToggle $tcBtn (-not ($v -eq 1)) "Thumbnail Cache On" "Thumbnail Cache Off" }
+    $dlfBtn = Get-Ctrl "btnToggleDriveLettersFirst"
+    if ($dlfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer" "ShowDriveLettersFirst" 0) 0); Update-WmtTweakToggle $dlfBtn ($v -eq 1) "Drive Letters Last" "Drive Letters First" }
+
+    # Context Menu (round 2)
+    $cmdBtn = Get-Ctrl "btnToggleCmdHere"
+    if ($cmdBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\Directory\shell\WmtCmdHere"; Update-WmtTweakToggle $cmdBtn $exists "Remove CMD Here" "Add CMD Here" }
+    $npBtn = Get-Ctrl "btnToggleNotepadCtx"
+    if ($npBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"; Update-WmtTweakToggle $npBtn $exists "Remove Notepad" "Add Notepad" }
+    $prBtn = Get-Ctrl "btnToggleRemovePrint"
+    if ($prBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn (-not $exists) "Remove Print" "Restore Print" }
+    $castBtn = Get-Ctrl "btnToggleRemoveCast"
+    if ($castBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn (-not $exists) "Remove Cast to Device" "Restore Cast to Device" }
+
+    # Sound
+    $ssBtn = Get-Ctrl "btnToggleStartupSound"
+    if ($ssBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound" "Enabled" 1) 0); Update-WmtTweakToggle $ssBtn (-not ($v -eq 0)) "Startup Sound On" "Startup Sound Off" }
+    $nsBtn = Get-Ctrl "btnToggleNotifySound"
+    if ($nsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $nsBtn (-not ($v -eq "")) "Notification Sound On" "Notification Sound Off" }
+    $dsBtn = Get-Ctrl "btnToggleDeviceSound"
+    if ($dsBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current" "(Default)" ".default") ""); Update-WmtTweakToggle $dsBtn (-not ($v -eq "")) "Device Connect Sound On" "Device Connect Sound Off" }
+    $saBtn = Get-Ctrl "btnToggleSpatialAudio"
+    if ($saBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound" "SpatialAudioFormat" "") ""); Update-WmtTweakToggle $saBtn ($v -ne "") "Spatial Audio On" "Spatial Audio Off" }
+
+    # Display
+    $nlBtn = Get-Ctrl "btnToggleNightLight"
+    if ($nlBtn) { $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate"; $v = (ConvertTo-Int (& $getRegValue $p "Data" 0) 0); Update-WmtTweakToggle $nlBtn ($v -ne 0) "Night Light On" "Night Light Off" }
+
+    # Keyboard
+    $fkBtn = Get-Ctrl "btnToggleFilterKeys"
+    if ($fkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\Keyboard Response" "Flags" "122") ""); Update-WmtTweakToggle $fkBtn ($v -match "63") "Filter Keys On" "Filter Keys Off" }
+    $tkBtn = Get-Ctrl "btnToggleToggleKeys"
+    if ($tkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Accessibility\ToggleKeys" "Flags" "58") ""); Update-WmtTweakToggle $tkBtn ($v -match "63") "Toggle Keys On" "Toggle Keys Off" }
+    $nlkBtn = Get-Ctrl "btnToggleNumLockStartup"
+    if ($nlkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $nlkBtn ($v -eq "2") "NumLock at Startup" "NumLock Startup Off" }
+    $clkBtn = Get-Ctrl "btnToggleCapsLockStartup"
+    if ($clkBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\Keyboard" "InitialKeyboardIndicators" "2") ""); Update-WmtTweakToggle $clkBtn ($v -eq "2147483650") "CapsLock at Startup" "CapsLock Startup Off" }
+
+    # Accessibility
+    $hcBtn = Get-Ctrl "btnToggleHighContrast"
+    if ($hcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Control Panel\Accessibility\HighContrast" "Flags" 0) 0); Update-WmtTweakToggle $hcBtn (($v -band 1) -ne 0) "High Contrast On" "High Contrast Off" }
+    $cfBtn = Get-Ctrl "btnToggleColorFilter"
+    if ($cfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\ColorFiltering" "Active" 0) 0); Update-WmtTweakToggle $cfBtn ($v -eq 1) "Color Filter On" "Color Filter Off" }
+
+    # Developer (round 2)
+    $psBtn = Get-Ctrl "btnTogglePSExec"
+    if ($psBtn) { $v = $nrd["ExecutionPolicy"]; if ($null -eq $v) { try { $v = (Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue) } catch {} }; if ($null -ne $v) { Update-WmtTweakToggle $psBtn ($v -ne "Restricted" -and $v -ne "AllSigned") "Disable PS Execution" "Enable PS Execution" } }
+    $sdBtn = Get-Ctrl "btnToggleSudo"
+    if ($sdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" "Enabled" 0) 0); Update-WmtTweakToggle $sdBtn ($v -ne 0) "Disable Sudo" "Enable Sudo" }
+    $wshBtn = Get-Ctrl "btnToggleWSH"
+    if ($wshBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows Script Host\Settings" "Enabled" 1) 0); Update-WmtTweakToggle $wshBtn (-not ($v -eq 0)) "Disable WSH" "Enable WSH" }
+
+    # Power User
+    $hdBtn = Get-Ctrl "btnPowerUserShowDevices"
+    if ($hdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager" "ShowHiddenDevices" 0) 0); Update-WmtTweakToggle $hdBtn ($v -eq 1) "Hide Devices" "Show Hidden Devices" }
+    $tmBtn = Get-Ctrl "btnPowerUserSigDriver"
+    if ($tmBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager" "AllowNonSignedDrivers" 0) 0); Update-WmtTweakToggle $tmBtn ($v -eq 1) "Test Mode On" "Test Mode Off" }
+
+
 
     $adEnabled = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 1) 0)
     $btnToggleAds = Get-Ctrl "btnToggleAds"
@@ -38142,19 +38150,18 @@ $btnToggleStartAllApps.Add_Click({
 $btnTogglePhoneLink = Get-Ctrl "btnTogglePhoneLink"
 if ($btnTogglePhoneLink) {
 $btnTogglePhoneLink.Add_Click({
-        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
-        $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $p "Start_ShowAccountBadges" 1) 0) -eq 0))
+        $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Start\Companions\Microsoft.YourPhone_8wekyb3d8bbwe"
+        Clear-WmtRegCache @($p)
+        $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $p "IsEnabled" 1) 0) -eq 0)
         if ($currentlyHidden) {
-            Invoke-UiCommand { Set-WmtRegDword $p "Start_ShowAccountBadges" 1; Write-GuiLog "Phone Link shown on Start menu." } "Showing Phone Link..."
+            Invoke-UiCommand { Set-WmtRegDword $p "IsEnabled" 1; Write-GuiLog "Phone Link mobile-device companion enabled in Start menu." } "Showing Phone Link..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword $p "Start_ShowAccountBadges" 0; Write-GuiLog "Phone Link hidden from Start menu." } "Hiding Phone Link..."
+            Invoke-UiCommand { Set-WmtRegDword $p "IsEnabled" 0; Write-GuiLog "Phone Link mobile-device companion disabled in Start menu." } "Hiding Phone Link..."
         }
         Update-WmtTweakToggle $btnTogglePhoneLink (-not $currentlyHidden) "Hide Phone Link" "Show Phone Link"
     })
 }
-
 function Register-WmtTweakButton {
 param(
     [Parameter(Mandatory = $true, Position = 0)][string]$ButtonName,
@@ -63532,6 +63539,7 @@ catch {
         # Pre-loading them in background means the UI thread never blocks on registry I/O.
         $paths = @(
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Start\Companions\Microsoft.YourPhone_8wekyb3d8bbwe",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState",

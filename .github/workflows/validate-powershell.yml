@@ -335,6 +335,19 @@ jobs:
               (Find-FunctionText 'Get-WmtRegistryKeyValuesCached') -match 'Read-WmtRegValuesFast|OpenSubKey|Get-ItemProperty') {
               throw 'Registry cache fallback can block on WPF or lose unnamed registry values.'
           }
+          # Phone Link must read the actual Start-menu companion setting, not the
+          # unrelated Start_ShowAccountBadges account-badge setting.
+          $phoneLinkPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start\Companions\Microsoft.YourPhone_8wekyb3d8bbwe'
+          $phoneHandlerStart = $source.IndexOf('$btnTogglePhoneLink = Get-Ctrl "btnTogglePhoneLink"')
+          $phoneHandlerEnd = $source.IndexOf('function Register-WmtTweakButton', $phoneHandlerStart)
+          if ($phoneHandlerStart -lt 0 -or $phoneHandlerEnd -le $phoneHandlerStart) { throw 'Cannot locate Phone Link click handler.' }
+          $phoneHandler = $source.Substring($phoneHandlerStart, $phoneHandlerEnd - $phoneHandlerStart)
+          if ($phoneHandler -match 'Start_ShowAccountBadges' -or
+              $phoneHandler -notmatch 'Get-WmtRegValue \$p "IsEnabled" 1' -or
+              -not $source.Contains($phoneLinkPath) -or
+              $source -notmatch 'Set-WmtTweakUnknownState "btnTogglePhoneLink" "Not set"') {
+              throw 'Phone Link state detection must use the Start-menu companion IsEnabled value and preserve unknown status.'
+          }
           # Cleaner rule definitions can be large. Cache only the active signature
           # so repeated refreshes never retain every prior parsed object graph.
           function Test-WmtCleanerRuleMemoryCacheEnabled { return $true }
