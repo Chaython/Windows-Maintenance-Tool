@@ -35508,6 +35508,9 @@ try {
             OnLabel  = [string]$OnLabel
             OffLabel = [string]$OffLabel
         }
+        if ($script:TweakCurrentUnknownStates) {
+            [void]$script:TweakCurrentUnknownStates.Remove([string]$Button.Name)
+        }
     }
 }
 catch { }
@@ -35598,6 +35601,29 @@ if (-not $isSupported) {
 }
 
 return $isSupported
+}
+
+# Mark a toggle as unknown when its stored value is absent. This is not On or Off
+# and must not be serialized as a binary tweak state.
+function Set-WmtTweakUnknownState {
+    param(
+        [Parameter(Mandatory = $true)][string]$ButtonName,
+        [string]$Label = 'Not set',
+        [string]$Reason = 'The relevant registry value is absent. WMT cannot confirm the effective state.'
+    )
+    $button = Get-Ctrl $ButtonName
+    if (-not $button) { return }
+    try {
+        if (-not $script:TweakCurrentUnknownStates) { $script:TweakCurrentUnknownStates = @{} }
+        $script:TweakCurrentUnknownStates[$ButtonName] = @{ Label = $Label; Reason = $Reason }
+        if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($ButtonName)) {
+            [void]$script:TweakCurrentStates.Remove($ButtonName)
+        }
+        $button.Content = $Label
+        $button.Style = ($window.FindResource('ActionBtn') -as [System.Windows.Style])
+        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'Click to explicitly set this option.')
+    }
+    catch {}
 }
 
 # Fast .NET registry reader — uses Microsoft.Win32.Registry instead of Get-ItemProperty
@@ -36314,39 +36340,63 @@ try {
     $btnTogglePsHere = Get-Ctrl "btnTogglePsHere"
     Update-WmtTweakToggle $btnTogglePsHere $psHereInstalled "Remove PowerShell Here" "Add PowerShell Here"
 
-    # --- NEW TOGGLE STATE DETECTION ---
-    $polAI = "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"
+    # --- AI TOGGLE STATE DETECTION ---
+    # Missing values are unconfigured/unknown, never implicit "On". Match the
+    # Copilot detector to the same policy values used by its click handler.
+    $copilotAdvanced = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    $copilotUserPolicy = "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot"
+    $copilotMachinePolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
     $copilotBtn = Get-Ctrl "btnToggleCopilot"
     if ($copilotBtn) {
-        $copilotOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue $polAI "DisableAIDataAnalysis" 0) 0) -eq 1))
-        Update-WmtTweakToggle $copilotBtn (-not $copilotOff) "Copilot On" "Copilot Off"
+        $showCopilot = & $getRegValue $copilotAdvanced "ShowCopilotButton" $null
+        $turnOffCopilotUser = & $getRegValue $copilotUserPolicy "TurnOffWindowsCopilot" $null
+        $turnOffCopilotMachine = & $getRegValue $copilotMachinePolicy "TurnOffWindowsCopilot" $null
+        $copilotPolicyOff = (($null -ne $turnOffCopilotUser -and (ConvertTo-Int $turnOffCopilotUser 0) -eq 1) -or ($null -ne $turnOffCopilotMachine -and (ConvertTo-Int $turnOffCopilotMachine 0) -eq 1))
+        if ($copilotPolicyOff) { Update-WmtTweakToggle $copilotBtn $false "Copilot On" "Copilot Off" }
+        elseif ($null -ne $showCopilot) { Update-WmtTweakToggle $copilotBtn ((ConvertTo-Int $showCopilot 1) -ne 0) "Copilot On" "Copilot Off" }
+        else { Set-WmtTweakUnknownState "btnToggleCopilot" }
     }
     $recallBtn = Get-Ctrl "btnToggleRecall"
     if ($recallBtn) {
-        $recallOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue $polAI "DisableAIDataAnalysis" 0) 0) -eq 1))
-        Update-WmtTweakToggle $recallBtn (-not $recallOff) "Recall On" "Recall Off"
+        $allowRecall = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement" $null
+        $turnOffSnapshots = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "TurnOffSavingSnapshots" $null
+        $disableAiUser = & $getRegValue "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" $null
+        $disableAiMachine = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" $null
+        $recallExplicitOff = (($null -ne $allowRecall -and (ConvertTo-Int $allowRecall 1) -eq 0) -or ($null -ne $turnOffSnapshots -and (ConvertTo-Int $turnOffSnapshots 0) -eq 1) -or ($null -ne $disableAiUser -and (ConvertTo-Int $disableAiUser 0) -eq 1) -or ($null -ne $disableAiMachine -and (ConvertTo-Int $disableAiMachine 0) -eq 1))
+        if ($recallExplicitOff) { Update-WmtTweakToggle $recallBtn $false "Recall On" "Recall Off" }
+        elseif ($null -ne $allowRecall -and (ConvertTo-Int $allowRecall 0) -eq 1) { Update-WmtTweakToggle $recallBtn $true "Recall On" "Recall Off" }
+        else { Set-WmtTweakUnknownState "btnToggleRecall" "Not set" "Recall is not explicitly allowed or disabled by these policy values. This does not prove Recall is installed or active." }
     }
     $ctdBtn = Get-Ctrl "btnToggleClickToDo"
-    if ($ctdBtn) { $v = (ConvertTo-Int (& $getRegValue $polAI "DisableClickToDo" 0) 0); Update-WmtTweakToggle $ctdBtn (-not ($v -eq 1)) "Click To Do On" "Click To Do Off" }
+    if ($ctdBtn) {
+        $disableClickUser = & $getRegValue "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI" "DisableClickToDo" $null
+        $disableClickMachine = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableClickToDo" $null
+        if ($null -eq $disableClickUser -and $null -eq $disableClickMachine) { Set-WmtTweakUnknownState "btnToggleClickToDo" }
+        else { $clickToDoOff = (($null -ne $disableClickUser -and (ConvertTo-Int $disableClickUser 0) -eq 1) -or ($null -ne $disableClickMachine -and (ConvertTo-Int $disableClickMachine 0) -eq 1)); Update-WmtTweakToggle $ctdBtn (-not $clickToDoOff) "Click To Do On" "Click To Do Off" }
+    }
     $aisvcBtn = Get-Ctrl "btnToggleAISvcAutoStart"
     if ($aisvcBtn) {
-        $aiSvcOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 0) 0) -eq 1))
-        Update-WmtTweakToggle $aisvcBtn (-not $aiSvcOff) "AI Svc AutoStart On" "AI Svc AutoStart Off"
+        $disableAiService = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" $null
+        if ($null -eq $disableAiService) { Set-WmtTweakUnknownState "btnToggleAISvcAutoStart" }
+        else { Update-WmtTweakToggle $aisvcBtn ((ConvertTo-Int $disableAiService 0) -ne 1) "AI Svc AutoStart On" "AI Svc AutoStart Off" }
     }
     $edgeAiBtn = Get-Ctrl "btnToggleEdgeAI"
     if ($edgeAiBtn) {
-        $edgeAiOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "HubsSidebarEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $edgeAiBtn (-not $edgeAiOff) "Edge AI On" "Edge AI Off"
+        $edgeAiValue = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "HubsSidebarEnabled" $null
+        if ($null -eq $edgeAiValue) { Set-WmtTweakUnknownState "btnToggleEdgeAI" }
+        else { Update-WmtTweakToggle $edgeAiBtn ((ConvertTo-Int $edgeAiValue 0) -ne 0) "Edge AI On" "Edge AI Off" }
     }
     $paintAiBtn = Get-Ctrl "btnTogglePaintAI"
     if ($paintAiBtn) {
-        $paintAiOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Paint\App" "EnableCopilot" 1) 0) -eq 0))
-        Update-WmtTweakToggle $paintAiBtn (-not $paintAiOff) "Paint AI On" "Paint AI Off"
+        $paintAiValue = & $getRegValue "HKCU:\Software\Microsoft\Paint\App" "EnableCopilot" $null
+        if ($null -eq $paintAiValue) { Set-WmtTweakUnknownState "btnTogglePaintAI" }
+        else { Update-WmtTweakToggle $paintAiBtn ((ConvertTo-Int $paintAiValue 0) -ne 0) "Paint AI On" "Paint AI Off" }
     }
     $notepadAiBtn = Get-Ctrl "btnToggleNotepadAI"
     if ($notepadAiBtn) {
-        $notepadAiOff = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Notepad" "CocreatorEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $notepadAiBtn (-not $notepadAiOff) "Notepad AI On" "Notepad AI Off"
+        $notepadAiValue = & $getRegValue "HKCU:\Software\Microsoft\Notepad" "CocreatorEnabled" $null
+        if ($null -eq $notepadAiValue) { Set-WmtTweakUnknownState "btnToggleNotepadAI" }
+        else { Update-WmtTweakToggle $notepadAiBtn ((ConvertTo-Int $notepadAiValue 0) -ne 0) "Notepad AI On" "Notepad AI Off" }
     }
 
     $fmdBtn = Get-Ctrl "btnToggleFindMyDevice"
@@ -38867,6 +38917,9 @@ function Update-WmtQuickFindStateLabels {
             $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
         } elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
             $label.Text = if ($script:TweakCurrentStates[$name].On) { "State: Enabled" } else { "State: Disabled" }
+        } elseif (-not $optional -and $script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($name)) {
+            $unknown = $script:TweakCurrentUnknownStates[$name]
+            $label.Text = "State: $($unknown.Label)"
         } else {
             $label.Text = "State: Unknown / not detected"
         }
@@ -38891,8 +38944,9 @@ function Sync-WmtQuickFindStateAvailability {
             [bool]($script:OptionalFeaturesReady -and $script:OptionalFeatureStateCache -and
                 $script:OptionalFeatureStateCache.ContainsKey($name))
         } else {
-            [bool]($script:TweakStatesReady -and $script:TweakCurrentStates -and
-                $script:TweakCurrentStates.Contains($name))
+            [bool]($script:TweakStatesReady -and (
+                ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) -or
+                ($script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($name))))
         }
         if ($ready -ne $script:WmtQuickFindRenderedReadiness[$name]) {
             $requiresRebuild = $true
@@ -39241,8 +39295,9 @@ function Update-WmtQuickFindResults {
                         $tweakReady = $tweakReady -and $script:OptionalFeatureStateCache -and
                             $script:OptionalFeatureStateCache.ContainsKey($original.Name)
                     } else {
-                        $tweakReady = $tweakReady -and $script:TweakCurrentStates -and
-                            $script:TweakCurrentStates.Contains($original.Name)
+                        $tweakReady = $tweakReady -and (
+                            ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($original.Name)) -or
+                            ($script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($original.Name)))
                     }
                 }
             }
