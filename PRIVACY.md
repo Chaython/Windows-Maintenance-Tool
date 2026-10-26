@@ -1,7 +1,7 @@
 # Privacy Policy for WMT (Windows Maintenance Tool / WMT-GUI)
 
 **Effective Date:** October 26, 2026  
-**Privacy Policy URL (`PrivacyUrl`):** `https://github.com/ios12checker/WMT-GUI/blob/main/PRIVACY.md`
+**Privacy Policy URL (`PrivacyUrl`):** `https://raw.githubusercontent.com/Chaython/Windows-Maintenance-Tool/refs/heads/Main/PRIVACY.md`
 
 ---
 
