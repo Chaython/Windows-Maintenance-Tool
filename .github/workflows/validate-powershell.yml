@@ -293,6 +293,41 @@ jobs:
               if ($testKey) { $testKey.Dispose() }
               [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($smokePath, $false)
           }
+          # Regression guard: click handlers clear the registry snapshot and then
+          # immediately read the selected value. The helper must read the actual
+          # registry value on cache miss and refresh every value in that key.
+          Invoke-Expression (Find-FunctionText 'Convert-WmtRegistryPath')
+          Invoke-Expression (Find-FunctionText 'Get-WmtRegistryKeyValuesCached')
+          Invoke-Expression (Find-FunctionText 'Get-WmtRegValue')
+          $cacheTestSubPath = 'Software\WMT-RegValue-Cache-Test-' + [Guid]::NewGuid().ToString('N')
+          $cacheTestFullPath = "HKCU:\$cacheTestSubPath"
+          $cacheTestKey = $null
+          $script:TweakButtonStatesCache = @{}
+          try {
+              $cacheTestKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($cacheTestSubPath)
+              if (-not $cacheTestKey) { throw 'Unable to create temporary registry cache test key.' }
+              $cacheTestKey.SetValue('HideFileExt', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+              $cacheTestKey.SetValue('Hidden', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+              $firstRead = Get-WmtRegValue -Path $cacheTestFullPath -Name 'HideFileExt' -Default 1
+              if ($firstRead -ne 0) {
+                  throw "Get-WmtRegValue returned $firstRead instead of the live HideFileExt value 0 on cache miss."
+              }
+              $cacheTestKey.SetValue('HideFileExt', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+              $cacheTestKey.SetValue('Hidden', 2, [Microsoft.Win32.RegistryValueKind]::DWord)
+              [void]$script:TweakButtonStatesCache.Remove($cacheTestFullPath)
+              $freshRead = Get-WmtRegValue -Path $cacheTestFullPath -Name 'HideFileExt' -Default 0
+              $freshSnapshot = $script:TweakButtonStatesCache[$cacheTestFullPath]
+              if ($freshRead -ne 1 -or -not $freshSnapshot -or
+                  $freshSnapshot['HideFileExt'] -ne 1 -or $freshSnapshot['Hidden'] -ne 2) {
+                  throw 'Clearing the registry snapshot did not read the new HideFileExt value and refresh sibling values.'
+              }
+              Write-Host 'PASS: registry-cache invalidation re-reads HideFileExt and refreshes the whole key.'
+          }
+          finally {
+              if ($cacheTestKey) { $cacheTestKey.Dispose() }
+              [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($cacheTestSubPath, $false)
+              $script:TweakButtonStatesCache = @{}
+          }
           if ($source -match '\\$regCache\\[\\$path\\]\\s*=\\s*\\[PSCustomObject\\]\\$values') {
               throw 'Registry snapshot once again casts unnamed values to PSCustomObject.'
           }
