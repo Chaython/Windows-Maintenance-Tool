@@ -31698,8 +31698,23 @@ try {
     $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
     $key = $baseKey.OpenSubKey($parts.SubPath, $false)
     if (-not $key) { return $Default }
+
+    # Refresh the complete snapshot after invalidation so later state renders
+    # cannot fall back to defaults for the other values in this same registry key.
+    $values = @{}
+    foreach ($valueName in $key.GetValueNames()) {
+        $values[$valueName] = $key.GetValue(
+            $valueName,
+            $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+        )
+    }
+    if (-not $script:TweakButtonStatesCache) { $script:TweakButtonStatesCache = @{} }
+    $script:TweakButtonStatesCache[$Path] = $values
+
     $registryName = if ($Name -eq "(Default)") { "" } else { $Name }
-    return $key.GetValue($registryName, $Default, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if ($values.ContainsKey($registryName)) { return $values[$registryName] }
+    return $Default
 }
 catch {
     return $Default
