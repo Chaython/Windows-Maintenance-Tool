@@ -326,6 +326,10 @@ jobs:
               Invoke-Expression (Find-FunctionText 'Clear-WmtRegCache')
               Invoke-Expression (Find-FunctionText 'Set-WmtRegDword')
               Set-WmtRegDword -Path $cacheTestFullPath -Name 'HideFileExt' -Value 0
+              $snapshotAfterWrite = $script:TweakButtonStatesCache[$cacheTestFullPath]
+              if (-not $snapshotAfterWrite -or $snapshotAfterWrite['HideFileExt'] -ne 0 -or $snapshotAfterWrite['Hidden'] -ne 2) {
+                  throw 'Set-WmtRegDword did not repopulate the registry snapshot before the next UI state refresh.'
+              }
               $afterWrite = Get-WmtRegValue -Path $cacheTestFullPath -Name 'HideFileExt' -Default 1
               if ($afterWrite -ne 0) {
                   throw "A registry write left the cached HideFileExt state stale; expected 0, got $afterWrite."

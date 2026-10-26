@@ -31725,6 +31725,22 @@ finally {
 }
 }
 
+# Refresh or invalidate the registry snapshot after a registry write. Clearing only
+# is insufficient because the next UI renderer uses snapshots and cannot probe live.
+# Refresh the whole key now so every sibling toggle reflects the committed values too.
+function Sync-WmtRegCacheAfterWrite {
+    param(
+        [string]$Path,
+        [AllowNull()][string]$Name,
+        $Default = $null,
+        [switch]$KeyTreeRemoved
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try { Clear-WmtRegCache @($Path) } catch {}
+    if ($KeyTreeRemoved -or [string]::IsNullOrWhiteSpace($Name)) { return }
+    try { $null = Get-WmtRegValue -Path $Path -Name $Name -Default $Default } catch {}
+}
+
 # --- Registry write helpers (pure .NET Microsoft.Win32.Registry API) ---
 # Every tweak write goes through these instead of the PowerShell registry provider.
 # Benefits: no provider path parsing, no glob expansion of literal subkey names like
@@ -31751,9 +31767,7 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
-    # Registry writes must invalidate the cached pre-write snapshot, otherwise
-    # a later Tweaks/Quick Find refresh can show the old state again.
-    try { Clear-WmtRegCache @($Path) } catch {}
+Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $Value
 }
 
 function Set-WmtRegString {
@@ -31777,9 +31791,7 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
-    # Registry writes must invalidate the cached pre-write snapshot, otherwise
-    # a later Tweaks/Quick Find refresh can show the old state again.
-    try { Clear-WmtRegCache @($Path) } catch {}
+Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $Value
 }
 
 function Set-WmtRegBinary {
@@ -31803,9 +31815,7 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
-    # Registry writes must invalidate the cached pre-write snapshot, otherwise
-    # a later Tweaks/Quick Find refresh can show the old state again.
-    try { Clear-WmtRegCache @($Path) } catch {}
+Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $Value
 }
 
 function Remove-WmtRegValue {
@@ -31828,9 +31838,7 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
-    # Registry writes must invalidate the cached pre-write snapshot, otherwise
-    # a later Tweaks/Quick Find refresh can show the old state again.
-    try { Clear-WmtRegCache @($Path) } catch {}
+Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $null
 }
 
 function New-WmtRegKey {
@@ -31875,9 +31883,7 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
-    # Registry writes must invalidate the cached pre-write snapshot, otherwise
-    # a later Tweaks/Quick Find refresh can show the old state again.
-    try { Clear-WmtRegCache @($Path) } catch {}
+Sync-WmtRegCacheAfterWrite -Path $Path -Name "(Default)" -Default $text
 }
 
 function Remove-WmtRegKeyTree {
@@ -31895,9 +31901,7 @@ catch {}
 finally {
     if ($baseKey) { $baseKey.Close() }
 }
-    # Registry writes must invalidate the cached pre-write snapshot, otherwise
-    # a later Tweaks/Quick Find refresh can show the old state again.
-    try { Clear-WmtRegCache @($Path) } catch {}
+Sync-WmtRegCacheAfterWrite -Path $Path -KeyTreeRemoved
 }
 
 function Restart-WmtExplorer {
