@@ -31751,6 +31751,9 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
+    # Registry writes must invalidate the cached pre-write snapshot, otherwise
+    # a later Tweaks/Quick Find refresh can show the old state again.
+    try { Clear-WmtRegCache @($Path) } catch {}
 }
 
 function Set-WmtRegString {
@@ -31774,6 +31777,9 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
+    # Registry writes must invalidate the cached pre-write snapshot, otherwise
+    # a later Tweaks/Quick Find refresh can show the old state again.
+    try { Clear-WmtRegCache @($Path) } catch {}
 }
 
 function Set-WmtRegBinary {
@@ -31797,6 +31803,9 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
+    # Registry writes must invalidate the cached pre-write snapshot, otherwise
+    # a later Tweaks/Quick Find refresh can show the old state again.
+    try { Clear-WmtRegCache @($Path) } catch {}
 }
 
 function Remove-WmtRegValue {
@@ -31819,6 +31828,9 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
+    # Registry writes must invalidate the cached pre-write snapshot, otherwise
+    # a later Tweaks/Quick Find refresh can show the old state again.
+    try { Clear-WmtRegCache @($Path) } catch {}
 }
 
 function New-WmtRegKey {
@@ -31863,6 +31875,9 @@ finally {
     if ($key) { $key.Close() }
     if ($baseKey) { $baseKey.Close() }
 }
+    # Registry writes must invalidate the cached pre-write snapshot, otherwise
+    # a later Tweaks/Quick Find refresh can show the old state again.
+    try { Clear-WmtRegCache @($Path) } catch {}
 }
 
 function Remove-WmtRegKeyTree {
@@ -31880,6 +31895,9 @@ catch {}
 finally {
     if ($baseKey) { $baseKey.Close() }
 }
+    # Registry writes must invalidate the cached pre-write snapshot, otherwise
+    # a later Tweaks/Quick Find refresh can show the old state again.
+    try { Clear-WmtRegCache @($Path) } catch {}
 }
 
 function Restart-WmtExplorer {
@@ -36138,10 +36156,16 @@ return $null
 # Get-WmtRegValue call reads fresh data from the registry instead of stale cache.
 function Clear-WmtRegCache {
 param([string[]]$Paths)
-if ($script:TweakButtonStatesCache) {
-    foreach ($p in $Paths) {
-        if ($p -and $script:TweakButtonStatesCache.ContainsKey($p)) {
-            $script:TweakButtonStatesCache.Remove($p)
+if (-not $script:TweakButtonStatesCache) { return }
+foreach ($p in $Paths) {
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
+    # Clear the exact key and cached descendants. Removing a key tree can affect
+    # preloaded child paths too; invalidating descendants avoids stale UI states.
+    $prefix = $p.TrimEnd([char]92) + [char]92
+    foreach ($cachePath in @($script:TweakButtonStatesCache.Keys)) {
+        if ([string]::Equals([string]$cachePath, $p, [StringComparison]::OrdinalIgnoreCase) -or
+            ([string]$cachePath).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            [void]$script:TweakButtonStatesCache.Remove($cachePath)
         }
     }
 }

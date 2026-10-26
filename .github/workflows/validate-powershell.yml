@@ -321,6 +321,16 @@ jobs:
                   $freshSnapshot['HideFileExt'] -ne 1 -or $freshSnapshot['Hidden'] -ne 2) {
                   throw 'Clearing the registry snapshot did not read the new HideFileExt value and refresh sibling values.'
               }
+              # A WMT click handler reads and caches the original state, then writes.
+              # The writer must invalidate that now-stale snapshot before any later UI refresh.
+              Invoke-Expression (Find-FunctionText 'Clear-WmtRegCache')
+              Invoke-Expression (Find-FunctionText 'Set-WmtRegDword')
+              Set-WmtRegDword -Path $cacheTestFullPath -Name 'HideFileExt' -Value 0
+              $afterWrite = Get-WmtRegValue -Path $cacheTestFullPath -Name 'HideFileExt' -Default 1
+              if ($afterWrite -ne 0) {
+                  throw "A registry write left the cached HideFileExt state stale; expected 0, got $afterWrite."
+              }
+              Write-Host 'PASS: registry writes invalidate the cached snapshot before the next state read.'
               Write-Host 'PASS: registry-cache invalidation re-reads HideFileExt and refreshes the whole key.'
           }
           finally {
