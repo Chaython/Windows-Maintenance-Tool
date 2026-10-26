@@ -38984,12 +38984,18 @@ function Update-WmtQuickFindStateLabels {
         } elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
             $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
         } elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
-            # Show the actual represented setting (e.g. "Hide Extensions" or
-            # "Show Extensions"), not a generic Enabled/Disabled label that can
-            # be misread as the opposite of a hide/show toggle.
+            # Match Update-WmtTweakToggle's tooltip convention. Many labels are
+            # action-style or describe the applied tweak (e.g. "Disable HAGS",
+            # "Hide Extensions"), so repeating them as a status can misstate the
+            # current state. Only true two-mode toggles display their selected mode.
             $state = $script:TweakCurrentStates[$name]
-            $stateLabelText = if ($state.On) { [string]$state.OnLabel } else { [string]$state.OffLabel }
-            $label.Text = "State: $stateLabelText"
+            if (("$($state.OnLabel) | $($state.OffLabel)") -in $script:WmtTweakModeTogglePairs) {
+                $modeLabel = if ($state.On) { [string]$state.OnLabel } else { [string]$state.OffLabel }
+                $label.Text = "State: $modeLabel"
+            }
+            else {
+                $label.Text = if ($state.On) { "State: ON (blue)" } else { "State: OFF (gray)" }
+            }
         } elseif (-not $optional -and $script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($name)) {
             $unknown = $script:TweakCurrentUnknownStates[$name]
             $label.Text = "State: $($unknown.Label)"
