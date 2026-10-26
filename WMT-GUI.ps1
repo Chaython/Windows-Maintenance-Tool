@@ -37575,8 +37575,8 @@ $btnToggleCopilot.Add_Click({
         $adv = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
         $polUser = "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot"
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot")
-        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $adv "ShowCopilotButton" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "TurnOffWindowsCopilot" 0) 0) -eq 1))
+        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot")
+        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $adv "ShowCopilotButton" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "TurnOffWindowsCopilot" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "TurnOffWindowsCopilot" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $adv "ShowCopilotButton" 1; Remove-WmtRegValue $polUser "TurnOffWindowsCopilot"; Remove-WmtRegValue $polMachine "TurnOffWindowsCopilot"; Write-GuiLog "Copilot enabled." } "Enabling Copilot..."
         }
@@ -37593,7 +37593,7 @@ $btnToggleRecall.Add_Click({
         $polUser = "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI"
         Clear-WmtRegCache @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
-        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polMachine "AllowRecallEnablement" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "DisableAIDataAnalysis" 0) 0) -eq 1))
+        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polMachine "AllowRecallEnablement" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "TurnOffSavingSnapshots" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "DisableAIDataAnalysis" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $polMachine "AllowRecallEnablement"; Remove-WmtRegValue $polMachine "TurnOffSavingSnapshots"; Remove-WmtRegValue $polUser "DisableAIDataAnalysis"; Write-GuiLog "Recall enabled (user must turn it on in Settings)." } "Enabling Recall..."
         }
@@ -37609,8 +37609,8 @@ if ($btnToggleClickToDo) {
 $btnToggleClickToDo.Add_Click({
         $polUser = "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI"
-        Clear-WmtRegCache @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI")
-        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polUser "DisableClickToDo" 0) 0) -eq 1))
+        Clear-WmtRegCache @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
+        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polUser "DisableClickToDo" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableClickToDo" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $polUser "DisableClickToDo"; Remove-WmtRegValue $polMachine "DisableClickToDo"; Write-GuiLog "Click To Do enabled." } "Enabling Click To Do..."
         }
