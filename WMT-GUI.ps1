@@ -36426,7 +36426,27 @@ try {
     $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"; Update-WmtTweakToggle $btnToggleClockFormat (-not $is24) "12-Hour Clock" "24-Hour Clock"
     $cs = & $getRegValue $ap "ShowSecondsInSystemClock"; $clockSecsHidden = ($cs -ne 1); Update-WmtTweakToggle $btnToggleClockSecs $clockSecsHidden "Hide Clock Seconds" "Show Clock Seconds"
     $smode = & $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode"
-    $btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"; $searchHidden = ($smode -eq 0); $searchIcon = ($smode -eq 1); $searchState = if ($searchHidden) { 2 } elseif ($searchIcon) { 1 } else { 0 }; if ($searchState -eq 2) { $btnToggleSearchDisplay.Content = "Show Search Box"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) } elseif ($searchState -eq 1) { $btnToggleSearchDisplay.Content = "Hide Search"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) } else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
+    $script:WmtSearchDisplayMode = $null
+    if ($null -ne $smode) {
+        $searchModeValue = ConvertTo-Int $smode -1
+        if ($searchModeValue -in @(0, 1, 2)) { $script:WmtSearchDisplayMode = [int]$searchModeValue }
+    }
+    $btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"
+    if ($btnToggleSearchDisplay) {
+        if ($null -eq $script:WmtSearchDisplayMode) {
+            $btnToggleSearchDisplay.Content = "Cycle Search Display"
+            $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style])
+            $btnToggleSearchDisplay.ToolTip = "The current mode could not be detected. Click to cycle through hidden, icon, and box modes."
+        }
+        else {
+            $searchHidden = ($script:WmtSearchDisplayMode -eq 0)
+            $searchIcon = ($script:WmtSearchDisplayMode -eq 1)
+            $searchState = if ($searchHidden) { 2 } elseif ($searchIcon) { 1 } else { 0 }
+            if ($searchState -eq 2) { $btnToggleSearchDisplay.Content = "Show Search Box"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
+            elseif ($searchState -eq 1) { $btnToggleSearchDisplay.Content = "Hide Search"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
+            else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
+        }
+    }
     $widgetsHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarDa" 1) 0) -eq 0))
 
     $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"; Update-WmtTweakToggle $btnToggleWidgets $widgetsHidden "Hide Widgets" "Show Widgets"
@@ -39046,6 +39066,23 @@ function Update-WmtQuickFindStateLabels {
             }
             continue
         }
+        if ($name -eq "btnToggleSearchDisplay") {
+            if (-not $script:TweakStatesReady) {
+                $label.Text = "State: Checking..."
+            }
+            elseif ($null -eq $script:WmtSearchDisplayMode) {
+                $label.Text = "State: Unknown / not detected"
+            }
+            else {
+                $label.Text = switch ([int]$script:WmtSearchDisplayMode) {
+                    0 { "State: Search hidden" }
+                    1 { "State: Search displayed as an icon" }
+                    2 { "State: Search box displayed" }
+                    default { "State: Unknown / not detected" }
+                }
+            }
+            continue
+        }
         $optional = [bool]($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $name)
         if (($optional -and -not $script:OptionalFeaturesReady) -or
             (-not $optional -and -not $script:TweakStatesReady)) {
@@ -39085,6 +39122,14 @@ function Sync-WmtQuickFindStateAvailability {
     if (-not $pnlQuickFind -or -not $pnlQuickFind.IsVisible) { return }
     $requiresRebuild = $false
     foreach ($name in @($script:WmtQuickFindRenderedReadiness.Keys)) {
+        if ($name -eq "btnToggleSearchDisplay") {
+            $ready = [bool]$script:TweakStatesReady
+            if ($ready -ne $script:WmtQuickFindRenderedReadiness[$name]) {
+                $requiresRebuild = $true
+                break
+            }
+            continue
+        }
         if ($name -eq "__MouseSpeed") {
             $ready = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue)
             if ($ready -ne $script:WmtQuickFindRenderedReadiness[$name]) {
@@ -39446,6 +39491,10 @@ function Update-WmtQuickFindResults {
                 elseif ($isMouseSettingsAction) {
                     # Opening the Windows Mouse control panel is an action, not a toggle.
                     $tweakReady = [bool]$original.IsEnabled
+                }
+                elseif ([string]$original.Name -eq "btnToggleSearchDisplay") {
+                    # The control has three modes and is tracked outside binary toggle state.
+                    $tweakReady = [bool]$script:TweakStatesReady
                 }
                 else {
                     $isOptional = ($script:OptionalFeaturesMap -and $script:OptionalFeaturesMap.Values -contains $original.Name)
@@ -63288,11 +63337,13 @@ $btnToggleSearchDisplay.Add_Click({
         }
         Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
         $newMode = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1) 0)
+        $script:WmtSearchDisplayMode = if ($newMode -in @(0, 1, 2)) { [int]$newMode } else { $null }
         try {
             if ($newMode -eq 0) { $btnToggleSearchDisplay.Content = "Show Search Box"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
             elseif ($newMode -eq 1) { $btnToggleSearchDisplay.Content = "Hide Search"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) }
             else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
         } catch {}
+        try { if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindStateLabels } } catch {}
     })
 }
 
