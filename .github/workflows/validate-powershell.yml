@@ -2996,10 +2996,11 @@ jobs:
           $tokens = $null; $errors = $null
           $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw ($errors.Message -join '; ') }
-          $modePairs = @('Dark Mode | Light Mode', 'Drive Letters Last | Drive Letters First', 'Diag Data Optional | Diag Data Required',
-              'Open to This PC | Open to Quick Access', 'Single-Click Folders | Double-Click Folders', 'Classic Right-Click | Modern Right-Click',
-              'Reduce Indexing | Default Indexing', 'Disable FS Optimizations | Default FS Optimizations', 'Never Combine | Always Combine',
-              'Align Taskbar Left | Align Taskbar Center', '12-Hour Clock | 24-Hour Clock', 'Plain Lock Screen | Default Lock Screen')
+          # Two-mode toggles are exempt; the list lives in the script so the tooltip logic and this check agree.
+          $modeAssign = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:WmtTweakModeTogglePairs' }, $true) | Select-Object -First 1
+          if (-not $modeAssign) { throw '$script:WmtTweakModeTogglePairs not found in WMT-GUI.ps1.' }
+          $modePairs = @($modeAssign.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+          if ($modePairs.Count -lt 10) { throw "Only $($modePairs.Count) two-mode toggles were read from the script; the list is stale." }
           $problems = New-Object System.Collections.Generic.List[string]
           $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Update-WmtTweakToggle' }, $true)
           $checked = 0
@@ -3045,8 +3046,9 @@ jobs:
           $src=[IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
           $t=$null;$e=$null;$ast=[System.Management.Automation.Language.Parser]::ParseInput($src,[ref]$t,[ref]$e)
           foreach($n in 'New-WmtTweaksExportPayload','Get-WmtTweaksImportPlan'){ $f=$ast.FindAll({param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n},$true)[0]; if(-not $f){throw "missing $n"}; Invoke-Expression $f.Extent.Text }
-          $a=$ast.FindAll({param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -eq '$script:WmtTweakExportV1InvertedNames'},$true)[0]
-          if(-not $a){ throw 'inverted-names list not found' }; Invoke-Expression $a.Extent.Text
+          foreach($listName in '$script:WmtTweakExportV1InvertedNames','$script:WmtTweakExportV1AmbiguousNames'){
+            $a=$ast.FindAll({param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -eq $listName},$true)[0]
+            if(-not $a){ throw "$listName not found" }; Invoke-Expression $a.Extent.Text }
           function Get-Ctrl { param($n) [pscustomobject]@{ IsEnabled=$true; Name=$n } }
           $script:TweakCurrentStates=[ordered]@{
             'btnToggleCopilot'=[pscustomobject]@{On=$true;OnLabel='Copilot On';OffLabel='Copilot Off'}     # new meaning: Copilot enabled
@@ -3057,7 +3059,9 @@ jobs:
           function Make($ver,$tweaks){ $conv=[ordered]@{}; foreach($k in $tweaks.Keys){ $conv[$k]=[pscustomobject]$tweaks[$k] }; $o=[ordered]@{type='wmt-tweaks';tweaks=([pscustomobject]$conv)}; if($null -ne $ver){$o.version=$ver}; [pscustomobject]$o }
           function Check($label,$cond){ if(-not $cond){ throw "FAILED: $label" }; "  ok: $label" }
           "inverted-names list: $($script:WmtTweakExportV1InvertedNames.Count) buttons"
-          Check 'list contains Copilot, HAGS, Pagefile, Update ASAP' ((@('btnToggleCopilot','btnToggleHags','btnTogglePagefile','btnToggleUpdateASAP') | ? { $script:WmtTweakExportV1InvertedNames -notcontains $_ }).Count -eq 0)
+          Check 'invert list contains Copilot, Pagefile, Update ASAP' ((@('btnToggleCopilot','btnTogglePagefile','btnToggleUpdateASAP') | ? { $script:WmtTweakExportV1InvertedNames -notcontains $_ }).Count -eq 0)
+          Check 'ambiguous toggles are NOT in the invert list' ((@($script:WmtTweakExportV1AmbiguousNames) | ? { $script:WmtTweakExportV1InvertedNames -contains $_ }).Count -eq 0)
+          Check 'ambiguous list covers Ad ID, HAGS, Hibernation and their mirrors' ((@('btnToggleAds','btnToggleHags','btnMyDeviceHagsToggle','btnToggleHibernate','btnMyDeviceHibernateToggle') | ? { $script:WmtTweakExportV1AmbiguousNames -notcontains $_ }).Count -eq 0)
           Check 'list does NOT contain already-correct toggles' ((@('btnToggleSpatialAudio','btnToggleGameMode','btnToggleMemCompression') | ? { $script:WmtTweakExportV1InvertedNames -contains $_ }).Count -eq 0)
           # v1 (no version) file saved when Copilot was OFF (old meaning on=true). Copilot is currently enabled (On=true) => must be turned OFF
           $p=Get-WmtTweaksImportPlan (Make $null @{ btnToggleCopilot=@{on=$true} })
@@ -3070,10 +3074,72 @@ jobs:
           Check 'v1 toggle that is not in the list keeps its value' ($p.Pending.Count -eq 0 -and $p.AlreadyOk -eq 1)
           $p=Get-WmtTweaksImportPlan (Make 1 @{ btnMyDeviceCopilotToggle=@{on=$true} })
           Check 'v1 mirror button follows its twin (inverted, applied to the twin)' ($p.Pending.Count -eq 1 -and $p.Pending[0].Name -eq 'btnToggleCopilot' -and $p.Pending[0].Desired -eq $false)
+          $script:TweakCurrentStates['btnToggleAds']=[pscustomobject]@{On=$true;OnLabel='x';OffLabel='y'}
+          $script:TweakCurrentStates['btnMyDeviceHibernateToggle']=[pscustomobject]@{On=$true;OnLabel='x';OffLabel='y'}
+          $script:TweakToggleSiblingNames['btnMyDeviceHibernateToggle']='btnToggleHibernate'
+          $p=Get-WmtTweaksImportPlan (Make 1 @{ btnToggleAds=@{on=$true} })
+          Check 'v1 ambiguous toggle is skipped, not guessed' ($p.Pending.Count -eq 0 -and $p.AlreadyOk -eq 0 -and $p.Skipped -eq 1 -and ($p.SkippedNames -join ' ') -match 'saved by an older version')
+          $p=Get-WmtTweaksImportPlan (Make 1 @{ btnMyDeviceHibernateToggle=@{on=$false} })
+          Check 'v1 ambiguous mirror is skipped through its twin' ($p.Pending.Count -eq 0 -and $p.Skipped -eq 1)
+          $p=Get-WmtTweaksImportPlan (Make 2 @{ btnToggleAds=@{on=$true} })
+          Check 'v2 file with the same toggle is applied normally' ($p.Skipped -eq 0 -and $p.AlreadyOk -eq 1)
           $x=New-WmtTweaksExportPayload
           Check 'new exports are version 2' ($x.version -eq 2)
+          Check 'new exports use the wmt-tweaks-2 type so older builds refuse them' ($x.type -eq 'wmt-tweaks-2')
           Check 'export writes the current meaning unchanged' ($x.tweaks['btnToggleCopilot'].on -eq $true)
           "import migration: all checks passed"
+
+      - name: Verify Network Repair reporting and restart rules
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Full Network Repair reporting rules. Nothing here runs ipconfig/netsh: it inspects the code and tests the
+          # completion callback with the message box and Start-Process replaced by recorders.
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          $fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-NetRepair' }, $true))[0]
+          if (-not $fn) { throw 'Start-NetRepair not found.' }
+          $fnText = $fn.Extent.Text
+          function Require([string]$what, [bool]$ok) { if (-not $ok) { throw "Network Repair rule violated: $what" } }
+
+          # 1) reporting rules
+          Require 'the worker must return a WmtNetworkRepairSummary object' ($fnText -match 'WmtNetworkRepairSummary')
+          Require 'the failed-step count must come from the failed steps, not from every warning' ($fnText -match '\$failedStepLabels\.Count' -and $fnText -notmatch '-f \$warnings\.Count')
+          Require 'the configuration must be recorded before any change' ($fnText -match 'Configuration before repair')
+          Require 'the result must not be assigned (it is piped to Out-Null)' ($fnText -notmatch '\$job\s*=')
+          Require 'the restart must use a countdown, not an immediate restart' ($fnText -match '/r /t 20 ' -and $fnText -notmatch '"/t",\s*"0"')
+          Require 'the confirmation must warn that static IP settings are cleared' ($source -match 'clears manually configured static IP')
+
+          # 2) the restart prompt only appears when a reset was applied
+          $call = @($fn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-WmtUiBackgroundCommand' }, $true))[0]
+          $els = @($call.CommandElements); $idx = -1
+          for ($k = 0; $k -lt $els.Count; $k++) { if ($els[$k] -is [System.Management.Automation.Language.CommandParameterAst] -and $els[$k].ParameterName -eq 'OnComplete') { $idx = $k + 1 } }
+          if ($idx -lt 0) { throw 'Start-NetRepair has no -OnComplete callback.' }
+          $cbText = $els[$idx].Extent.Text
+          $cbText = $cbText.Replace('[System.Windows.MessageBox]::Show(', 'MockShow(').Replace('[System.Windows.MessageBoxButton]::YesNo', '"YesNo"').Replace('[System.Windows.MessageBoxButton]::OK', '"OK"').Replace('[System.Windows.MessageBoxImage]::Question', '"Question"').Replace('[System.Windows.MessageBoxImage]::Warning', '"Warning"').Replace('[System.Windows.MessageBoxResult]::Yes', '"Yes"')
+          $script:shown = @(); $script:started = @(); $script:answer = 'Yes'
+          function MockShow { param($a) $script:shown += [string]$a[0]; return $script:answer }
+          function Start-Process { param($FilePath, $ArgumentList, $WindowStyle) $script:started += $ArgumentList }
+          $callback = & ([scriptblock]::Create($cbText))
+          function Summary($failed, $restart) { [pscustomobject]@{ WmtNetworkRepairSummary = $true; FailedSteps = $failed; RestartRecommended = $restart } }
+
+          & $callback @('Network repair completed.', (Summary 0 $true))
+          Require 'a restart must be offered when a reset was applied' ($script:shown.Count -eq 1 -and $script:started.Count -eq 1)
+          Require 'the restart must count down and tell the user how to cancel' ($script:started[0] -match '/r /t 20 ' -and $script:shown[0] -match 'shutdown /a')
+          $script:shown = @(); $script:started = @()
+          & $callback @((Summary 2 $true))
+          Require 'failed steps must be mentioned in the prompt' ($script:shown[0] -match '2 step\(s\) reported problems')
+          $script:shown = @(); $script:started = @()
+          & $callback @('Network repair completed with warnings: x.', (Summary 2 $false))
+          Require 'no restart prompt when neither reset was applied' ($script:shown.Count -eq 0 -and $script:started.Count -eq 0)
+          & $callback @('no summary object here')
+          Require 'no restart prompt when the summary is missing' ($script:shown.Count -eq 0)
+          $script:answer = 'No'
+          & $callback @((Summary 0 $true))
+          Require 'declining the prompt must not restart Windows' ($script:started.Count -eq 0)
+          Write-Host 'OK: Network Repair reports failures once, records the configuration, and offers a restart only when a reset was applied.'
 
       - name: Smoke test shared runspace helpers
         shell: powershell

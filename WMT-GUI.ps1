@@ -3136,7 +3136,7 @@ function Get-WmtReadyRunspacePool {
 # opening at all (closed/broken) return $null immediately rather than waiting.
 param(
     [ValidateSet("Background", "UiSupport")][string]$PoolKind = "Background",
-    [int]$TimeoutMs = 15000
+    [int]$TimeoutMs = 10000
 )
 $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
 while ($true) {
@@ -11540,7 +11540,7 @@ $liveTimer.Add_Tick({
     }
 }.GetNewClosure())
 $liveTimer.Start()
-$job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Progress $progress -ArgumentList @($dataDirectory, $liveOutput) -Sb {
+Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network Repair..." -Progress $progress -ArgumentList @($dataDirectory, $liveOutput) -Sb {
     param([string]$dataDirectory, $liveOutput)
     $ErrorActionPreference = 'Continue'
     $steps = @(
@@ -11551,7 +11551,10 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
         @{ Exe = 'netsh'; Args = @('int', 'ip', 'reset'); Label = 'Reset TCP/IP stack' }
     )
 
-    $warnings = [System.Collections.Generic.List[string]]::new()
+    $warnings = [System.Collections.Generic.List[string]]::new()          # one entry per FAILED step
+    $notes = [System.Collections.Generic.List[string]]::new()             # findings that do not fail a step
+    $failedStepLabels = [System.Collections.Generic.List[string]]::new()
+    $stepResults = @{}                                                    # step label -> passed | failed | skipped
     $report = [System.Collections.Generic.List[string]]::new()
     $startedAt = Get-Date
     $logWriter = $null
@@ -11605,6 +11608,16 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
         }
     }
 
+    $writeLogOnly = {
+        param([string]$Line)
+        if ($logWriter) {
+            try { $logWriter.WriteLine($Line); $logWriter.Flush() }
+            catch {
+                # Diagnostics must never stop the repair.
+            }
+        }
+    }
+
     try {
         $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
         $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
@@ -11622,6 +11635,31 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
         }
         if (-not $isElevated) {
             & $writeDiagnostic 'WARNING: WMT is not running elevated. Some network reset operations may fail or be incomplete.'
+        }
+
+        # Record the configuration as it is BEFORE any change. 'netsh int ip reset' clears manually
+        # configured IP, DNS, gateway and route settings, so this is the only record of what to restore.
+        # File only: the output is long and would drown the live progress window.
+        foreach ($snapshot in @(
+                @{ Exe = 'netsh'; Args = @('interface', 'ip', 'show', 'config') },
+                @{ Exe = 'ipconfig'; Args = @('/all') })) {
+            $snapshotArgs = @($snapshot.Args)
+            $snapshotTitle = '{0} {1}' -f $snapshot.Exe, ($snapshotArgs -join ' ')
+            try {
+                $snapshotLines = @(& $snapshot.Exe @snapshotArgs 2>&1 | ForEach-Object { [string]$_ })
+                if ($logWriter) {
+                    & $writeLogOnly ('--- Configuration before repair: {0} ---' -f $snapshotTitle)
+                    foreach ($snapshotLine in $snapshotLines) { & $writeLogOnly $snapshotLine }
+                    & $writeLogOnly '--- end ---'
+                    & $writeDiagnostic ('Recorded "{0}" in the diagnostic log before making changes.' -f $snapshotTitle)
+                }
+                else {
+                    & $writeDiagnostic ('NOTE: Could not record "{0}" because the diagnostic log file is unavailable.' -f $snapshotTitle)
+                }
+            }
+            catch {
+                & $writeDiagnostic ('NOTE: Could not record "{0}": {1}' -f $snapshotTitle, $_.Exception.Message)
+            }
         }
 
         $netshResetExitCode = $null
@@ -11657,6 +11695,7 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
 
                     if ($activeDhcpAdapters.Count -eq 0) {
                         & $writeDiagnostic ('Step {0} SKIPPED: no connected IPv4 adapter with DHCP enabled; {1} is not applicable.' -f $stepNumber, $step.Label)
+                        $stepResults[$step.Label] = 'skipped'
                         continue
                     }
 
@@ -11695,17 +11734,29 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 $joinedOutput = $stepOutput -join "`n"
                 $outputIndicatesFailure = $joinedOutput -match '(?im)\b(failed|failure|unable to|could not|cannot|access is denied|requested operation requires elevation|no operation can be performed)\b'
                 $noDiagnosticOutput = $stepOutput.Count -eq 0
+                # 'netsh int ip reset' routinely prints "failed" for entries Windows protects, and may write only to
+                # its native log. For that step, output text is a NOTE and only a non-zero exit code fails it; every
+                # other step fails on any of the three signals.
+                $isResetStep = ($step.Label -eq 'Reset TCP/IP stack')
+                $stepFailed = ($exitCode -ne 0) -or (-not $isResetStep -and ($outputIndicatesFailure -or $noDiagnosticOutput))
 
-                if ($exitCode -ne 0 -or $outputIndicatesFailure -or $noDiagnosticOutput) {
+                if ($stepFailed) {
                     $reasons = [System.Collections.Generic.List[string]]::new()
                     if ($exitCode -ne 0) { [void]$reasons.Add("exit code $exitCode") }
                     if ($outputIndicatesFailure) { [void]$reasons.Add('command output contains a failure indication') }
                     if ($noDiagnosticOutput) { [void]$reasons.Add('no command output was available to verify the operation') }
                     $warning = '{0} ({1}; {2})' -f $commandLine, $step.Label, ($reasons -join ', ')
                     [void]$warnings.Add($warning)
-                    & $writeDiagnostic ('Step {0} WARNING/FAILED: {1}; duration {2}s' -f $stepNumber, ($reasons -join '; '), $duration)
+                    [void]$failedStepLabels.Add($step.Label)
+                    $stepResults[$step.Label] = 'failed'
+                    & $writeDiagnostic ('Step {0} FAILED: {1}; duration {2}s' -f $stepNumber, ($reasons -join '; '), $duration)
                 }
                 else {
+                    $stepResults[$step.Label] = 'passed'
+                    if ($isResetStep -and $outputIndicatesFailure) {
+                        [void]$notes.Add('Reset TCP/IP stack printed "failed" for some entries; these are often entries Windows protects (see the detail log)')
+                        & $writeDiagnostic 'NOTE: the TCP/IP reset output mentions failures but the command exited with code 0; see the detail log for which entries.'
+                    }
                     & $writeDiagnostic ('Step {0} passed basic checks: exit code 0, diagnostic output present, no recognized failure text; duration {1}s. This does not prove end-to-end connectivity.' -f $stepNumber, $duration)
                 }
             }
@@ -11713,6 +11764,8 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 $duration = [Math]::Round(((Get-Date) - $stepStartedAt).TotalSeconds, 2)
                 $warning = '{0} ({1}; launch/capture exception: {2})' -f $commandLine, $step.Label, $_.Exception.Message
                 [void]$warnings.Add($warning)
+                [void]$failedStepLabels.Add($step.Label)
+                $stepResults[$step.Label] = 'failed'
                 & $writeDiagnostic ('Step {0} EXCEPTION: {1}; duration {2}s' -f $stepNumber, ($_ | Out-String).Trim(), $duration)
             }
         }
@@ -11746,9 +11799,10 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 $detailFailures = @(Get-Content -LiteralPath $netshDetailLogPath -ErrorAction Stop |
                     Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
                 foreach ($detailFailure in $detailFailures) {
-                    $warning = "TCP/IP reset detail log reports a failed operation: $detailFailure"
-                    [void]$warnings.Add($warning)
-                    & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                    & $writeDiagnostic ('NOTE: TCP/IP reset detail log entry: {0}' -f $detailFailure)
+                }
+                if ($detailFailures.Count -gt 0) {
+                    [void]$notes.Add(('{0} line(s) in the TCP/IP reset detail log mention a failure; these are often entries Windows protects, so review the log if the network still misbehaves' -f $detailFailures.Count))
                 }
                 if ($detailFailures.Count -eq 0) {
                     & $writeDiagnostic 'TCP/IP reset detail log check: no explicit failure markers found.'
@@ -11757,7 +11811,7 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
             catch {
                 $nativeDetailLogAvailable = $false
                 $nativeLogAccessError = $_.Exception.Message
-                [void]$warnings.Add('Could not inspect the netsh TCP/IP reset detail log: ' + $_.Exception.Message)
+                [void]$notes.Add('Could not inspect the netsh TCP/IP reset detail log: ' + $_.Exception.Message)
                 & $writeDiagnostic ('WARNING: Could not inspect netsh TCP/IP reset detail log: {0}' -f $_.Exception.Message)
             }
         }
@@ -11786,31 +11840,49 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
                 & $writeDiagnostic ('WARNING: Native netsh TCP/IP reset detail log was missing, empty, or unreadable. Captured output saved to fallback log: {0}' -f $fallbackLogPath)
                 $fallbackFailures = @($netshResetOutput | Where-Object { $_ -match '(?i)\b(failed|failure|unable to|access is denied)\b' })
                 foreach ($fallbackFailure in $fallbackFailures) {
-                    $warning = "TCP/IP reset fallback log reports a failed operation: $fallbackFailure"
-                    [void]$warnings.Add($warning)
-                    & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                    & $writeDiagnostic ('NOTE: TCP/IP reset fallback log entry: {0}' -f $fallbackFailure)
+                }
+                if ($fallbackFailures.Count -gt 0) {
+                    [void]$notes.Add(('{0} line(s) in the captured TCP/IP reset output mention a failure; these are often entries Windows protects' -f $fallbackFailures.Count))
+                }
+                if (@($netshResetOutput).Count -eq 0 -and $stepResults['Reset TCP/IP stack'] -eq 'passed') {
+                    [void]$notes.Add('Reset TCP/IP stack exited with code 0 but printed nothing and wrote no native log, so it could not be verified; restart and re-test the network')
+                    & $writeDiagnostic 'NOTE: the TCP/IP reset produced no output and no native log; it could not be verified.'
                 }
             }
             catch {
                 $warning = 'Native netsh TCP/IP reset detail log was missing, empty, or unreadable, and fallback log creation failed: ' + $_.Exception.Message
-                [void]$warnings.Add($warning)
-                & $writeDiagnostic ('WARNING: {0}' -f $warning)
+                [void]$notes.Add($warning)
+                & $writeDiagnostic ('NOTE: {0}' -f $warning)
             }
         }
 
         $totalDuration = [Math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
-        if ($warnings.Count -gt 0) {
-            & $writeDiagnostic ('RESULT: Completed with {0} failed step(s) out of {1}; duration {2}s' -f $warnings.Count, $steps.Count, $totalDuration)
+        $failedCount = $failedStepLabels.Count
+        $skippedCount = @($stepResults.Values | Where-Object { $_ -eq 'skipped' }).Count
+        $applicableCount = $steps.Count - $skippedCount
+        $skippedText = if ($skippedCount -gt 0) { ' ({0} skipped as not applicable)' -f $skippedCount } else { '' }
+        if ($failedCount -gt 0) {
+            & $writeDiagnostic ('RESULT: {0} of {1} step(s) failed: {2}; duration {3}s' -f $failedCount, $applicableCount, ($failedStepLabels -join ', '), $totalDuration)
             & $writeDiagnostic ('Failed steps: {0}' -f ($warnings -join '; '))
             Write-Output ('Network repair completed with warnings: ' + ($warnings -join '; ') + '.')
         }
         else {
-            & $writeDiagnostic ('RESULT: All {0} steps completed successfully; duration {1}s' -f $steps.Count, $totalDuration)
+            & $writeDiagnostic ('RESULT: All {0} applicable step(s) completed{1}; duration {2}s' -f $applicableCount, $skippedText, $totalDuration)
             Write-Output 'Network repair completed.'
+        }
+        if ($notes.Count -gt 0) {
+            & $writeDiagnostic ('Notes ({0}): {1}' -f $notes.Count, ($notes -join '; '))
         }
 
         if ($logPath) { Write-Output ('Full Network Repair diagnostic log: ' + $logPath) }
-        foreach ($line in $report) { Write-Output $line }
+        # The caller offers a restart from this object, so the prompt only appears when a reset was applied.
+        $appliedResets = @(@('Reset Winsock', 'Reset TCP/IP stack') | Where-Object { $stepResults[$_] -eq 'passed' })
+        Write-Output ([pscustomobject]@{
+                WmtNetworkRepairSummary = $true
+                FailedSteps             = $failedCount
+                RestartRecommended      = ($appliedResets.Count -gt 0)
+            })
     }
     finally {
         if ($logWriter) {
@@ -11818,16 +11890,20 @@ $job = Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Ne
         }
     }
 } -SuppressResultLog -OnComplete ({
-    # Winsock and TCP/IP resets need a Windows restart to take full effect.
+    # Winsock and TCP/IP resets need a Windows restart to take full effect, so only offer one when at
+    # least one of them was actually applied.
+    $summary = @($args[0]) | Where-Object { $null -ne $_ -and $_.PSObject.Properties['WmtNetworkRepairSummary'] } | Select-Object -Last 1
+    if (-not $summary -or -not $summary.RestartRecommended) { return }
+    $problemText = if ([int]$summary.FailedSteps -gt 0) { "`r`n`r`n$($summary.FailedSteps) step(s) reported problems; review the output window first." } else { '' }
     $restartChoice = [System.Windows.MessageBox]::Show(
-        "Network repair has finished. Restarting completes the Winsock and TCP/IP resets; until you restart, some changes may not take full effect. Restarting may temporarily interrupt your network or VPN connection.`r`n`r`nSave your work first. Restart Windows now?",
+        "Network repair has finished. Restarting completes the Winsock and TCP/IP resets; until you restart, some changes may not take full effect. Restarting may temporarily interrupt your network or VPN connection.$problemText`r`n`r`nSave your work first. Windows restarts after a 20-second countdown (run 'shutdown /a' to cancel it). Restart Windows now?",
         "Restart Recommended",
         [System.Windows.MessageBoxButton]::YesNo,
         [System.Windows.MessageBoxImage]::Question
     )
     if ($restartChoice -eq [System.Windows.MessageBoxResult]::Yes) {
         try {
-            Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList @("/r", "/t", "0") -WindowStyle Hidden
+            Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList '/r /t 20 /c "Windows Maintenance Tool: restarting to finish the network reset. Run shutdown /a to cancel."' -WindowStyle Hidden
         }
         catch {
             [System.Windows.MessageBox]::Show(
@@ -35401,6 +35477,15 @@ $script:TweakToggleMirrorNames = @(
 )
 $script:TweakToggleSyncing = $false
 
+# Toggles that choose between two modes (not on/off). Blue means the alternative mode is applied, so they are
+# exempt from the "blue = on" convention; the tooltip logic and the CI convention check both read this list.
+$script:WmtTweakModeTogglePairs = @(
+    'Dark Mode | Light Mode', 'Drive Letters Last | Drive Letters First', 'Diag Data Optional | Diag Data Required',
+    'Open to This PC | Open to Quick Access', 'Single-Click Folders | Double-Click Folders', 'Classic Right-Click | Modern Right-Click',
+    'Reduce Indexing | Default Indexing', 'Disable FS Optimizations | Default FS Optimizations', 'Never Combine | Always Combine',
+    'Align Taskbar Left | Align Taskbar Center', '12-Hour Clock | 24-Hour Clock', 'Plain Lock Screen | Default Lock Screen'
+)
+
 function Update-WmtTweakToggle {
 param(
     $Button,
@@ -35438,9 +35523,18 @@ if ([string]::IsNullOrWhiteSpace($Description) -and [string]::IsNullOrWhiteSpace
     }
 }
 # Line 1: Current state + color indicator
-$stateDesc = if ($IsOn) { "Current state: $OnLabel (Blue = active/applied)" } else { "Current state: $OffLabel (Gray = inactive/default)" }
-# Line 2: Action + color logic
-$actionDesc = if ($IsOn) { "Click to switch to: $OffLabel (Gray)" } else { "Click to switch to: $OnLabel (Blue)" }
+# On/off toggles: blue = on, gray = off (labels may be verbs such as "Hide X", so they are not repeated here).
+# Two-mode toggles keep the label-based wording because "on" has no meaning for them.
+if (("$OnLabel | $OffLabel") -in $script:WmtTweakModeTogglePairs) {
+    $stateDesc = if ($IsOn) { "Current state: $OnLabel (Blue = active/applied)" } else { "Current state: $OffLabel (Gray = inactive/default)" }
+    # Line 2: Action + color logic
+    $actionDesc = if ($IsOn) { "Click to switch to: $OffLabel (Gray)" } else { "Click to switch to: $OnLabel (Blue)" }
+}
+else {
+    $stateDesc = if ($IsOn) { "Current state: ON (blue)" } else { "Current state: OFF (gray)" }
+    # Line 2: Action + color logic
+    $actionDesc = if ($IsOn) { "Click to turn it OFF (gray)" } else { "Click to turn it ON (blue)" }
+}
 # Build tooltip: state, action, restart hint, description
 $lines = @($stateDesc, $actionDesc)
 if (-not [string]::IsNullOrWhiteSpace($RestartHint)) { $lines += $RestartHint }
@@ -35591,25 +35685,31 @@ catch {
 # each button's old value, where blue meant "feature off" for the buttons below, so importing a format 1
 # file inverts exactly these (a mirror button follows its Tweaks-page twin).
 $script:WmtTweakExportV1InvertedNames = @(
-    'btnMyDeviceHagsToggle', 'btnMyDeviceHibernateToggle', 'btnToggle3DObjects', 'btnToggleAISvcAutoStart',
-    'btnToggleActivity', 'btnToggleAds', 'btnToggleAnimations', 'btnToggleAppDiagnostics',
-    'btnToggleAppLaunch', 'btnToggleAutoWifi', 'btnToggleBackgroundApps', 'btnToggleBitlocker',
+    'btnToggle3DObjects', 'btnToggleAISvcAutoStart', 'btnToggleActivity', 'btnToggleAnimations',
+    'btnToggleAppDiagnostics', 'btnToggleAutoWifi', 'btnToggleBackgroundApps', 'btnToggleBitlocker',
     'btnToggleCEIP', 'btnToggleChat', 'btnToggleClickToDo', 'btnToggleCompatTelemetry', 'btnToggleCopilot',
     'btnToggleDVR', 'btnToggleDeliveryOpt', 'btnToggleDeviceAutoApp', 'btnToggleDeviceSound',
     'btnToggleDrvMeta', 'btnToggleDrvUpdates', 'btnToggleDupDrive', 'btnToggleEdgeAI', 'btnToggleFastStartup',
     'btnToggleFeedbackNotify', 'btnToggleFindMyDevice', 'btnToggleGallery', 'btnToggleGameBarIntegration',
-    'btnToggleGameCapture', 'btnToggleHags', 'btnToggleHibernate', 'btnToggleHomeExplorer', 'btnToggleIPv6',
-    'btnToggleInkingPersonal', 'btnToggleLocationSvc', 'btnToggleLockFacts', 'btnToggleLockSpotlight',
-    'btnToggleLockscreenTips', 'btnToggleModernStandby', 'btnToggleNTFS83', 'btnToggleNTFSLastAccess',
-    'btnToggleNetLocationWizard', 'btnToggleNetThrottling', 'btnToggleNotepadAI', 'btnToggleNotifySound',
-    'btnToggleOneDriveFolder', 'btnTogglePagefile', 'btnTogglePaintAI', 'btnTogglePhoneLink',
-    'btnToggleRecall', 'btnToggleRecents', 'btnToggleRemoveCast', 'btnToggleRemovePrint',
-    'btnToggleSearchHighlights', 'btnToggleSearchHistory', 'btnToggleSetupPrompts', 'btnToggleSnapAssist',
-    'btnToggleSnapLayouts', 'btnToggleSpeechOnline', 'btnToggleStartAllApps', 'btnToggleStartRecommended',
-    'btnToggleStartupSound', 'btnToggleStickyKeys', 'btnToggleSuggested', 'btnToggleSuperfetch',
-    'btnToggleTailored', 'btnToggleTaskView', 'btnToggleThumbCache', 'btnToggleTips', 'btnToggleTransparency',
-    'btnToggleUpdateASAP', 'btnToggleWSH', 'btnToggleWebSearch', 'btnToggleWidgets', 'btnToggleWifiSense',
+    'btnToggleGameCapture', 'btnToggleHomeExplorer', 'btnToggleIPv6', 'btnToggleInkingPersonal',
+    'btnToggleLocationSvc', 'btnToggleLockFacts', 'btnToggleLockSpotlight', 'btnToggleLockscreenTips',
+    'btnToggleModernStandby', 'btnToggleNTFS83', 'btnToggleNTFSLastAccess', 'btnToggleNetLocationWizard',
+    'btnToggleNetThrottling', 'btnToggleNotepadAI', 'btnToggleNotifySound', 'btnToggleOneDriveFolder',
+    'btnTogglePagefile', 'btnTogglePaintAI', 'btnTogglePhoneLink', 'btnToggleRecall', 'btnToggleRecents',
+    'btnToggleRemoveCast', 'btnToggleRemovePrint', 'btnToggleSearchHighlights', 'btnToggleSearchHistory',
+    'btnToggleSetupPrompts', 'btnToggleSnapAssist', 'btnToggleSnapLayouts', 'btnToggleSpeechOnline',
+    'btnToggleStartAllApps', 'btnToggleStartRecommended', 'btnToggleStartupSound', 'btnToggleStickyKeys',
+    'btnToggleSuperfetch', 'btnToggleTaskView', 'btnToggleThumbCache', 'btnToggleTips',
+    'btnToggleTransparency', 'btnToggleUpdateASAP', 'btnToggleWSH', 'btnToggleWidgets', 'btnToggleWifiSense',
     'btnToggleWindowSnapping'
+)
+
+# These toggles' startup and click code disagreed in older versions, so a saved format 1 value may have been
+# recorded under either meaning. They are skipped (with a note) when importing a format 1 file instead of
+# guessing, because a wrong guess would apply a privacy setting backwards.
+$script:WmtTweakExportV1AmbiguousNames = @(
+    'btnToggleAds', 'btnToggleAppLaunch', 'btnToggleSuggested', 'btnToggleTailored', 'btnToggleWebSearch',
+    'btnToggleHags', 'btnMyDeviceHagsToggle', 'btnToggleHibernate', 'btnMyDeviceHibernateToggle'
 )
 
 function New-WmtTweaksExportPayload {
@@ -35629,7 +35729,7 @@ foreach ($name in @($script:TweakCurrentStates.Keys)) {
 }
 
 return [ordered]@{
-    type     = "wmt-tweaks"
+    type     = "wmt-tweaks-2"   # older builds reject this type rather than apply on/off values inverted
     version  = 2
     exported = (Get-Date).ToString("o")
     count    = $tweaks.Count
@@ -35740,6 +35840,11 @@ foreach ($prop in @($Data.tweaks.PSObject.Properties)) {
     if ($formatVersion -lt 2) {
         $twinName = $null
         try { if ($script:TweakToggleSiblingNames) { $twinName = [string]$script:TweakToggleSiblingNames[$name] } } catch { }
+        if (($script:WmtTweakExportV1AmbiguousNames -contains $name) -or ($twinName -and ($script:WmtTweakExportV1AmbiguousNames -contains $twinName))) {
+            $plan.Skipped++
+            $plan.SkippedNames.Add("$name (saved by an older version; its on/off meaning cannot be converted reliably, so set it manually)")
+            continue
+        }
         if (($script:WmtTweakExportV1InvertedNames -contains $name) -or ($twinName -and ($script:WmtTweakExportV1InvertedNames -contains $twinName))) { $desired = -not $desired }
     }
 
@@ -35820,7 +35925,7 @@ try {
         Show-WmtMessageBox -Message "This file is not a WMT tweaks export (the 'tweaks' section is missing). Please pick a file created by 'Export JSON'." -Title "Import Tweaks" -Image Error | Out-Null
         return
     }
-    if ($data.PSObject.Properties["type"] -and [string]$data.type -ne "wmt-tweaks") {
+    if ($data.PSObject.Properties["type"] -and [string]$data.type -notin @("wmt-tweaks", "wmt-tweaks-2")) {
         Show-WmtMessageBox -Message "This file has type '$([string]$data.type)', not 'wmt-tweaks'. Please pick a file created by 'Export JSON'." -Title "Import Tweaks" -Image Error | Out-Null
         return
     }
@@ -52945,11 +53050,11 @@ $btnResetWifi.Add_Click({
 
 $btnNetRepair.Add_Click({
     $msg = "Full Network Repair will:" +
-    "`n- Release/Renew IP" +
+    "`n- Release/Renew IP (connected DHCP adapters only)" +
     "`n- Flush DNS cache" +
-    "`n- Reset Winsock" +
-    "`n- Reset IP stack" +
-    "`n`nAdapters may briefly disconnect. Continue?"
+    "`n- Reset Winsock (removes custom Winsock providers; can affect some VPN or security software)" +
+    "`n- Reset the TCP/IP stack (clears manually configured static IP, DNS, gateway and route settings)" +
+    "`n`nYour current settings are recorded in the diagnostic log first. Adapters may briefly disconnect and a restart is needed to finish. Continue?"
 
     $res = [System.Windows.MessageBox]::Show($msg, "Full Network Repair", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
 
