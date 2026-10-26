@@ -35577,6 +35577,9 @@ if (-not $script:TweakToggleSyncing) {
         }
     }
 }
+    # A result card in Quick Find has a separate state label; refresh it as soon
+    # as the native toggle records its new state.
+    try { if ($pnlQuickFind -and $pnlQuickFind.IsVisible) { Update-WmtQuickFindStateLabels } } catch {}
 }
 
 # Disables a tweak button and sets a tooltip explaining why it is unsupported
@@ -36302,24 +36305,24 @@ try {
     $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"; $taskbarLeft = ($ta -eq 0); Update-WmtTweakToggle $btnToggleTaskbarAlign $taskbarLeft "Align Taskbar Left" "Align Taskbar Center"
     $tc = & $getRegValue $ap "TaskbarGlomLevel"; $neverCombine = ($tc -eq 2); Update-WmtTweakToggle $btnToggleCombine $neverCombine "Never Combine" "Always Combine"
     $is24 = ((ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\International" "sShortTime") "") -cmatch "H")
-    $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"; Update-WmtTweakToggle $btnToggleClockFormat $is24 "12-Hour Clock" "24-Hour Clock"
-    $cs = & $getRegValue $ap "ShowSecondsInSystemClock"; $clockSecsOn = ($cs -eq 1); Update-WmtTweakToggle $btnToggleClockSecs $clockSecsOn "Hide Clock Seconds" "Show Clock Seconds"
+    $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"; Update-WmtTweakToggle $btnToggleClockFormat (-not $is24) "12-Hour Clock" "24-Hour Clock"
+    $cs = & $getRegValue $ap "ShowSecondsInSystemClock"; $clockSecsHidden = ($cs -ne 1); Update-WmtTweakToggle $btnToggleClockSecs $clockSecsHidden "Hide Clock Seconds" "Show Clock Seconds"
     $smode = & $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode"
     $btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"; $searchHidden = ($smode -eq 0); $searchIcon = ($smode -eq 1); $searchState = if ($searchHidden) { 2 } elseif ($searchIcon) { 1 } else { 0 }; if ($searchState -eq 2) { $btnToggleSearchDisplay.Content = "Show Search Box"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) } elseif ($searchState -eq 1) { $btnToggleSearchDisplay.Content = "Hide Search"; $btnToggleSearchDisplay.Style = ($window.FindResource("AccentBtn") -as [System.Windows.Style]) } else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
     $widgetsHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarDa" 1) 0) -eq 0))
 
-    $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"; Update-WmtTweakToggle $btnToggleWidgets (-not $widgetsHidden) "Hide Widgets" "Show Widgets"
-    $taskViewHidden = (((ConvertTo-Int (& $getRegValue $ap "ShowTaskViewButton" 1) 0) -eq 0)); $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"; Update-WmtTweakToggle $btnToggleTaskView (-not $taskViewHidden) "Hide Task View" "Show Task View"
-    $chatHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarMn" 1) 0) -eq 0)); $btnToggleChat = Get-Ctrl "btnToggleChat"; Update-WmtTweakToggle $btnToggleChat (-not $chatHidden) "Hide Chat" "Show Chat"
+    $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"; Update-WmtTweakToggle $btnToggleWidgets $widgetsHidden "Hide Widgets" "Show Widgets"
+    $taskViewHidden = (((ConvertTo-Int (& $getRegValue $ap "ShowTaskViewButton" 1) 0) -eq 0)); $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"; Update-WmtTweakToggle $btnToggleTaskView $taskViewHidden "Hide Task View" "Show Task View"
+    $chatHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarMn" 1) 0) -eq 0)); $btnToggleChat = Get-Ctrl "btnToggleChat"; Update-WmtTweakToggle $btnToggleChat $chatHidden "Hide Chat" "Show Chat"
 
     $cabinetPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState"
     $explorerPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
     $hideExt = (ConvertTo-Int (& $getRegValue $ap "HideFileExt" 1) 0)
     $btnToggleExtensions = Get-Ctrl "btnToggleExtensions"
-    Update-WmtTweakToggle $btnToggleExtensions ($hideExt -eq 0) "Hide Extensions" "Show Extensions"
+    Update-WmtTweakToggle $btnToggleExtensions ($hideExt -ne 0) "Hide Extensions" "Show Extensions"
     $hidden = (ConvertTo-Int (& $getRegValue $ap "Hidden" 2) 0)
     $btnToggleHiddenFiles = Get-Ctrl "btnToggleHiddenFiles"
-    Update-WmtTweakToggle $btnToggleHiddenFiles ($hidden -eq 1) "Hide Hidden Files" "Show Hidden Files"
+    Update-WmtTweakToggle $btnToggleHiddenFiles ($hidden -eq 2) "Hide Hidden Files" "Show Hidden Files"
     $fullPath = (ConvertTo-Int (& $getRegValue $cabinetPath "FullPath" 0) 0)
     $btnToggleFullPath = Get-Ctrl "btnToggleFullPath"
     Update-WmtTweakToggle $btnToggleFullPath ($fullPath -eq 1) "Full Path On" "Full Path Off"
@@ -36328,7 +36331,7 @@ try {
     Update-WmtTweakToggle $btnToggleExplorerLaunch ($launchTo -eq 1) "Open to This PC" "Open to Quick Access"
     $recentsHidden = ((ConvertTo-Int (& $getRegValue $explorerPath "ShowRecent" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $explorerPath "ShowFrequent" 1) 0) -eq 0)
     $btnToggleRecents = Get-Ctrl "btnToggleRecents"
-    Update-WmtTweakToggle $btnToggleRecents (-not $recentsHidden) "Hide Recents" "Show Recents"
+    Update-WmtTweakToggle $btnToggleRecents $recentsHidden "Hide Recents" "Show Recents"
 
     $mousePath = "HKCU:\Control Panel\Mouse"
     $mouseSpeedValue = & $getRegValue $mousePath "MouseSensitivity" 10
@@ -36450,27 +36453,27 @@ try {
     $galBtn = Get-Ctrl "btnToggleGallery"
     if ($galBtn) {
         $galHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "GalleryEnabled" 1) 0) -eq 0))
-        Update-WmtTweakToggle $galBtn (-not $galHidden) "Hide Gallery" "Show Gallery"
+        Update-WmtTweakToggle $galBtn $galHidden "Hide Gallery" "Show Gallery"
     }
     $homeBtn = Get-Ctrl "btnToggleHomeExplorer"
     if ($homeBtn) {
         $homeHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowHomeFolder" 1) 0) -eq 0) -or ((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_HomeClassicMode" 0) 0) -eq 1))
-        Update-WmtTweakToggle $homeBtn (-not $homeHidden) "Hide Home" "Show Home"
+        Update-WmtTweakToggle $homeBtn $homeHidden "Hide Home" "Show Home"
     }
     $odBtn = Get-Ctrl "btnToggleOneDriveFolder"
     if ($odBtn) {
         $odHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}" "System.IsPinnedToNameSpaceTree" 1) 0) -eq 0))
-        Update-WmtTweakToggle $odBtn (-not $odHidden) "Hide OneDrive" "Show OneDrive"
+        Update-WmtTweakToggle $odBtn $odHidden "Hide OneDrive" "Show OneDrive"
     }
     $tdoBtn = Get-Ctrl "btnToggle3DObjects"
     if ($tdoBtn) {
         $tdoHidden = (((ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag" "ThisPCPolicy" "Show") "") -ne "Show"))
-        Update-WmtTweakToggle $tdoBtn (-not $tdoHidden) "Hide 3D Objects" "Show 3D Objects"
+        Update-WmtTweakToggle $tdoBtn $tdoHidden "Hide 3D Objects" "Show 3D Objects"
     }
     $ddBtn = Get-Ctrl "btnToggleDupDrive"
     if ($ddBtn) {
         $ddHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideDuplicatedRemovableDrives" 0) 0) -eq 1))
-        Update-WmtTweakToggle $ddBtn (-not $ddHidden) "Hide Dup Drive" "Show Dup Drive"
+        Update-WmtTweakToggle $ddBtn $ddHidden "Hide Dup Drive" "Show Dup Drive"
     }
 
     $saBtn = Get-Ctrl "btnToggleSnapAssist"
@@ -36559,17 +36562,17 @@ try {
     $srBtn = Get-Ctrl "btnToggleStartRecommended"
     if ($srBtn) {
         $srHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_TrackProgs" 1) 0) -eq 0))
-        Update-WmtTweakToggle $srBtn (-not $srHidden) "Hide Recommended" "Show Recommended"
+        Update-WmtTweakToggle $srBtn $srHidden "Hide Recommended" "Show Recommended"
     }
     $saBtn2 = Get-Ctrl "btnToggleStartAllApps"
     if ($saBtn2) {
         $saHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_ShowAllApps" 0) 0) -eq 1) -or ((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "HideStartAllApps" 0) 0) -eq 1))
-        Update-WmtTweakToggle $saBtn2 (-not $saHidden) "Hide All Apps" "Show All Apps"
+        Update-WmtTweakToggle $saBtn2 $saHidden "Hide All Apps" "Show All Apps"
     }
     $plBtn = Get-Ctrl "btnTogglePhoneLink"
     if ($plBtn) {
         $plHidden = (((ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_ShowAccountBadges" 1) 0) -eq 0))
-        Update-WmtTweakToggle $plBtn (-not $plHidden) "Hide Phone Link" "Show Phone Link"
+        Update-WmtTweakToggle $plBtn $plHidden "Hide Phone Link" "Show Phone Link"
 
         # --- EXPANDED TWEAK STATE DETECTION (round 2) ---
 
@@ -37743,7 +37746,7 @@ $btnToggleGallery.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "GalleryEnabled" 0; Write-GuiLog "File Explorer Gallery hidden." } "Hiding Gallery..."
         }
-        Update-WmtTweakToggle $btnToggleGallery $currentlyHidden "Hide Gallery" "Show Gallery"
+        Update-WmtTweakToggle $btnToggleGallery (-not $currentlyHidden) "Hide Gallery" "Show Gallery"
     })
 }
 
@@ -37760,7 +37763,7 @@ $btnToggleHomeExplorer.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $pUser "ShowHomeFolder" 0; Set-WmtRegDword $pMachine "Start_HomeClassicMode" 1; Write-GuiLog "File Explorer Home hidden." } "Hiding Home..."
         }
-        Update-WmtTweakToggle $btnToggleHomeExplorer $currentlyHidden "Hide Home" "Show Home"
+        Update-WmtTweakToggle $btnToggleHomeExplorer (-not $currentlyHidden) "Hide Home" "Show Home"
     })
 }
 
@@ -37776,7 +37779,7 @@ $btnToggleOneDriveFolder.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "System.IsPinnedToNameSpaceTree" 0; Write-GuiLog "OneDrive folder hidden from Explorer." } "Hiding OneDrive folder..."
         }
-        Update-WmtTweakToggle $btnToggleOneDriveFolder $currentlyHidden "Hide OneDrive" "Show OneDrive"
+        Update-WmtTweakToggle $btnToggleOneDriveFolder (-not $currentlyHidden) "Hide OneDrive" "Show OneDrive"
     })
 }
 
@@ -37793,7 +37796,7 @@ $btnToggle3DObjects.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegString $p "ThisPCPolicy" "Hide"; Write-GuiLog "3D Objects folder hidden." } "Hiding 3D Objects..."
         }
-        Update-WmtTweakToggle $btnToggle3DObjects $currentlyHidden "Hide 3D Objects" "Show 3D Objects"
+        Update-WmtTweakToggle $btnToggle3DObjects (-not $currentlyHidden) "Hide 3D Objects" "Show 3D Objects"
     })
 }
 
@@ -37809,7 +37812,7 @@ $btnToggleDupDrive.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "HideDuplicatedRemovableDrives" 1; Write-GuiLog "Duplicate removable drives hidden." } "Hiding duplicate drive..."
         }
-        Update-WmtTweakToggle $btnToggleDupDrive $currentlyHidden "Hide Dup Drive" "Show Dup Drive"
+        Update-WmtTweakToggle $btnToggleDupDrive (-not $currentlyHidden) "Hide Dup Drive" "Show Dup Drive"
     })
 }
 
@@ -38068,7 +38071,7 @@ $btnToggleStartRecommended.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 0; Write-GuiLog "Start menu Recommended section hidden." } "Hiding Recommended..."
         }
-        Update-WmtTweakToggle $btnToggleStartRecommended $currentlyHidden "Hide Recommended" "Show Recommended"
+        Update-WmtTweakToggle $btnToggleStartRecommended (-not $currentlyHidden) "Hide Recommended" "Show Recommended"
     })
 }
 
@@ -38085,7 +38088,7 @@ $btnToggleStartAllApps.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $pUser "Start_ShowAllApps" 1; Set-WmtRegDword $pPol "HideStartAllApps" 1; Write-GuiLog "Start menu All Apps list hidden." } "Hiding All Apps..."
         }
-        Update-WmtTweakToggle $btnToggleStartAllApps $currentlyHidden "Hide All Apps" "Show All Apps"
+        Update-WmtTweakToggle $btnToggleStartAllApps (-not $currentlyHidden) "Hide All Apps" "Show All Apps"
     })
 }
 
@@ -38101,7 +38104,7 @@ $btnTogglePhoneLink.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_ShowAccountBadges" 0; Write-GuiLog "Phone Link hidden from Start menu." } "Hiding Phone Link..."
         }
-        Update-WmtTweakToggle $btnTogglePhoneLink $currentlyHidden "Hide Phone Link" "Show Phone Link"
+        Update-WmtTweakToggle $btnTogglePhoneLink (-not $currentlyHidden) "Hide Phone Link" "Show Phone Link"
     })
 }
 
@@ -58721,7 +58724,7 @@ $btnToggleExtensions.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $ap "HideFileExt" 1; Write-GuiLog "File extensions hidden." } "Hiding file extensions..."
         }
-        Update-WmtTweakToggle $btnToggleExtensions $currentlyHidden "Hide Extensions" "Show Extensions"
+        Update-WmtTweakToggle $btnToggleExtensions (-not $currentlyHidden) "Hide Extensions" "Show Extensions"
     })
 }
 
@@ -58737,7 +58740,7 @@ $btnToggleHiddenFiles.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $ap "Hidden" 2; Write-GuiLog "Hidden files hidden." } "Hiding hidden files..."
         }
-        Update-WmtTweakToggle $btnToggleHiddenFiles $currentlyHidden "Hide Hidden Files" "Show Hidden Files"
+        Update-WmtTweakToggle $btnToggleHiddenFiles (-not $currentlyHidden) "Hide Hidden Files" "Show Hidden Files"
     })
 }
 
@@ -58785,7 +58788,7 @@ $btnToggleRecents.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowRecent" 0; Set-WmtRegDword $p "ShowFrequent" 0; Write-GuiLog "Recent files hidden." } "Hiding recents..."
         }
-        Update-WmtTweakToggle $btnToggleRecents $currentlyHidden "Hide Recents" "Show Recents"
+        Update-WmtTweakToggle $btnToggleRecents (-not $currentlyHidden) "Hide Recents" "Show Recents"
     })
 }
 
@@ -63026,7 +63029,7 @@ $btnToggleWidgets.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0; Write-GuiLog "Widgets hidden." } "Hiding widgets..."
         }
-        Update-WmtTweakToggle $btnToggleWidgets $currentlyHidden "Hide Widgets" "Show Widgets"
+        Update-WmtTweakToggle $btnToggleWidgets (-not $currentlyHidden) "Hide Widgets" "Show Widgets"
     })
 }
 
@@ -63041,7 +63044,7 @@ $btnToggleTaskView.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0; Write-GuiLog "Task View hidden." } "Hiding Task View..."
         }
-        Update-WmtTweakToggle $btnToggleTaskView $currentlyHidden "Hide Task View" "Show Task View"
+        Update-WmtTweakToggle $btnToggleTaskView (-not $currentlyHidden) "Hide Task View" "Show Task View"
     })
 }
 
@@ -63057,7 +63060,7 @@ $btnToggleChat.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0; Write-GuiLog "Chat hidden." } "Hiding Chat..."
         }
-        Update-WmtTweakToggle $btnToggleChat $currentlyHidden "Hide Chat" "Show Chat"
+        Update-WmtTweakToggle $btnToggleChat (-not $currentlyHidden) "Hide Chat" "Show Chat"
     })
 }
 
@@ -63162,7 +63165,7 @@ $btnToggleClockSecs.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" 1; Write-GuiLog "Enabled seconds on the system clock." } "Enabling seconds on the system clock..."
         }
-        Update-WmtTweakToggle $btnToggleClockSecs ($cs -ne 1) "Hide Clock Seconds" "Show Clock Seconds"
+        Update-WmtTweakToggle $btnToggleClockSecs ($cs -eq 1) "Hide Clock Seconds" "Show Clock Seconds"
     })
 }
 
