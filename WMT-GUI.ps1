@@ -35555,6 +35555,45 @@ $script:WmtTweakModeTogglePairs = @(
     'Align Taskbar Left | Align Taskbar Center', '12-Hour Clock | 24-Hour Clock', 'Plain Lock Screen | Default Lock Screen'
 )
 
+# Human-readable status for controls where generic On/Off can misdescribe the system setting.
+$script:WmtQuickFindStateTextOverrides = @{
+    "btnToggleExtensions"       = @{ On = "File extensions hidden"; Off = "File extensions shown" }
+    "btnToggleHiddenFiles"      = @{ On = "Hidden files hidden"; Off = "Hidden files shown" }
+    "btnToggleClockSecs"        = @{ On = "Clock seconds hidden"; Off = "Clock seconds shown" }
+    "btnToggleWidgets"          = @{ On = "Widgets hidden"; Off = "Widgets shown" }
+    "btnToggleTaskView"         = @{ On = "Task View button hidden"; Off = "Task View button shown" }
+    "btnToggleChat"             = @{ On = "Chat button hidden"; Off = "Chat button shown" }
+    "btnToggleRecents"          = @{ On = "Recent files and folders hidden"; Off = "Recent files and folders shown" }
+    "btnToggleGallery"          = @{ On = "Gallery entry hidden"; Off = "Gallery entry shown" }
+    "btnToggleHomeExplorer"     = @{ On = "Home entry hidden"; Off = "Home entry shown" }
+    "btnToggleOneDriveFolder"   = @{ On = "OneDrive entry hidden"; Off = "OneDrive entry shown" }
+    "btnToggle3DObjects"        = @{ On = "3D Objects entry hidden"; Off = "3D Objects entry shown" }
+    "btnToggleDupDrive"         = @{ On = "Duplicate drive entries hidden"; Off = "Duplicate drive entries shown" }
+    "btnToggleStartRecommended" = @{ On = "Start recommendations hidden"; Off = "Start recommendations shown" }
+    "btnToggleStartAllApps"     = @{ On = "Start menu All apps hidden"; Off = "Start menu All apps shown" }
+    "btnTogglePhoneLink"        = @{ On = "Phone Link Start-menu entry hidden"; Off = "Phone Link Start-menu entry shown" }
+    "btnToggleFullPath"         = @{ On = "Full path shown in title bar"; Off = "Full path not shown in title bar" }
+    "btnToggleHags"             = @{ On = "Hardware-accelerated GPU scheduling enabled"; Off = "Hardware-accelerated GPU scheduling disabled" }
+    "btnToggleMemCompress"      = @{ On = "Memory compression enabled"; Off = "Memory compression disabled" }
+    "btnMyDeviceMemCompressToggle" = @{ On = "Memory compression enabled"; Off = "Memory compression disabled" }
+    "btnToggleHibernate"        = @{ On = "Hibernation enabled"; Off = "Hibernation disabled" }
+    "btnMyDeviceHibernateToggle" = @{ On = "Hibernation enabled"; Off = "Hibernation disabled" }
+    "btnToggleSuperfetch"       = @{ On = "SysMain (Superfetch) not disabled"; Off = "SysMain (Superfetch) disabled" }
+    "btnToggleIPv6"             = @{ On = "IPv6 enabled"; Off = "IPv6 disabled" }
+    "btnToggleNetThrottling"    = @{ On = "Network throttling enabled"; Off = "Network throttling disabled" }
+    "btnToggleSudo"             = @{ On = "Windows Sudo enabled"; Off = "Windows Sudo disabled" }
+    "btnToggleWSH"              = @{ On = "Windows Script Host enabled"; Off = "Windows Script Host disabled" }
+    "btnToggleDrvMeta"          = @{ On = "Device metadata downloads enabled"; Off = "Device metadata downloads disabled" }
+    "btnToggleDrvUpdates"       = @{ On = "Automatic driver updates enabled"; Off = "Automatic driver updates disabled" }
+    "btnToggleFso"              = @{ On = "Fullscreen optimizations disabled"; Off = "Fullscreen optimizations enabled (default)" }
+    "btnToggleTakeOwnership"    = @{ On = "Take Ownership context-menu entry installed"; Off = "Take Ownership context-menu entry absent" }
+    "btnTogglePsHere"           = @{ On = "PowerShell Here context-menu entry installed"; Off = "PowerShell Here context-menu entry absent" }
+    "btnToggleCmdHere"          = @{ On = "CMD Here context-menu entry installed"; Off = "CMD Here context-menu entry absent" }
+    "btnToggleNotepadCtx"       = @{ On = "Open with Notepad context-menu entry installed"; Off = "Open with Notepad context-menu entry absent" }
+    "btnToggleRemovePrint"      = @{ On = "Print context-menu entry installed"; Off = "Print context-menu entry absent" }
+    "btnToggleRemoveCast"       = @{ On = "Cast to Device context-menu entry installed"; Off = "Cast to Device context-menu entry absent" }
+}
+
 function Update-WmtTweakToggle {
 param(
     $Button,
@@ -35691,25 +35730,29 @@ function Set-WmtTweakUnknownState {
         if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($ButtonName)) {
             [void]$script:TweakCurrentStates.Remove($ButtonName)
         }
-        # Keep the functional button label visible. The separate Quick Find
-        # state line shows "Not set"; replacing the button text with that status
-        # hides what the button actually does and makes the feature hard to find.
-        $buttonContent = ([string]$button.Content -replace '\s+\(Not set\)$', '').Trim()
-        if ([string]::IsNullOrWhiteSpace($buttonContent) -or $buttonContent -eq $Label) {
-            $buttonContent = switch ($ButtonName) {
-                'btnToggleCopilot' { 'Copilot Off' }
-                'btnToggleRecall' { 'Recall Off' }
-                'btnToggleClickToDo' { 'Click To Do Off' }
-                'btnToggleAISvcAutoStart' { 'AI Svc AutoStart Off' }
-                'btnToggleEdgeAI' { 'Edge AI Off' }
-                'btnTogglePaintAI' { 'Paint AI Off' }
-                'btnToggleNotepadAI' { 'Notepad AI Off' }
-                default { $ButtonName -replace '^btnToggle', '' }
+        # Keep "Not set" in the tooltip and separate Quick Find state line,
+        # not in the button caption. The setting remains actionable.
+        $functionLabel = switch ($ButtonName) {
+            'btnToggleCopilot' { 'Toggle Copilot' }
+            'btnToggleRecall' { 'Toggle Recall' }
+            'btnToggleClickToDo' { 'Toggle Click To Do' }
+            'btnToggleAISvcAutoStart' { 'Toggle AI Service AutoStart' }
+            'btnToggleEdgeAI' { 'Toggle Edge AI' }
+            'btnTogglePaintAI' { 'Toggle Paint AI' }
+            'btnToggleNotepadAI' { 'Toggle Notepad AI' }
+            'btnTogglePhoneLink' { 'Toggle Phone Link Start Menu Entry' }
+            default {
+                $existingLabel = ([string]$button.Content -replace '\s+\(Not set\)$', '').Trim()
+                if ([string]::IsNullOrWhiteSpace($existingLabel) -or $existingLabel -eq $Label) {
+                    'Toggle ' + ($ButtonName -replace '^btnToggle', '')
+                } else {
+                    $existingLabel
+                }
             }
         }
-        $button.Content = "$buttonContent ($Label)"
+        $button.Content = $functionLabel
         $button.Style = ($window.FindResource('ActionBtn') -as [System.Windows.Style])
-        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'The feature remains available; click to change its setting.')
+        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'The setting is not detected, but the control remains available. Click to explicitly change it.')
     }
     catch {}
 }
@@ -39007,27 +39050,33 @@ function Update-WmtQuickFindStateLabels {
         if (($optional -and -not $script:OptionalFeaturesReady) -or
             (-not $optional -and -not $script:TweakStatesReady)) {
             $label.Text = "State: Checking..."
-        } elseif ($optional -and $script:OptionalFeatureUnavailableCache -and $script:OptionalFeatureUnavailableCache.ContainsKey($name)) {
+        }
+        elseif ($optional -and $script:OptionalFeatureUnavailableCache -and $script:OptionalFeatureUnavailableCache.ContainsKey($name)) {
             $label.Text = "State: $($script:OptionalFeatureUnavailableCache[$name])"
-        } elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
+        }
+        elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
             $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
-        } elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
-            # Match Update-WmtTweakToggle's tooltip convention. Many labels are
-            # action-style or describe the applied tweak (e.g. "Disable HAGS",
-            # "Hide Extensions"), so repeating them as a status can misstate the
-            # current state. Only true two-mode toggles display their selected mode.
+        }
+        elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
             $state = $script:TweakCurrentStates[$name]
-            if (("$($state.OnLabel) | $($state.OffLabel)") -in $script:WmtTweakModeTogglePairs) {
+            if ($script:WmtQuickFindStateTextOverrides -and $script:WmtQuickFindStateTextOverrides.ContainsKey($name)) {
+                $status = $script:WmtQuickFindStateTextOverrides[$name]
+                $statusText = if ($state.On) { [string]$status.On } else { [string]$status.Off }
+                $label.Text = "State: $statusText"
+            }
+            elseif (("$($state.OnLabel) | $($state.OffLabel)") -in $script:WmtTweakModeTogglePairs) {
                 $modeLabel = if ($state.On) { [string]$state.OnLabel } else { [string]$state.OffLabel }
                 $label.Text = "State: $modeLabel"
             }
             else {
                 $label.Text = if ($state.On) { "State: ON (blue)" } else { "State: OFF (gray)" }
             }
-        } elseif (-not $optional -and $script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($name)) {
+        }
+        elseif (-not $optional -and $script:TweakCurrentUnknownStates -and $script:TweakCurrentUnknownStates.ContainsKey($name)) {
             $unknown = $script:TweakCurrentUnknownStates[$name]
             $label.Text = "State: $($unknown.Label)"
-        } else {
+        }
+        else {
             $label.Text = "State: Unknown / not detected"
         }
     }
