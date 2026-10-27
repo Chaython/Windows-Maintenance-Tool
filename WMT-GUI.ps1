@@ -59138,7 +59138,12 @@ $btnToggleExtensions.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $ap "HideFileExt" 1; Write-GuiLog "File extensions hidden." } "Hiding file extensions..."
         }
-        Update-WmtTweakToggle $btnToggleExtensions (-not $currentlyHidden) "Hide Extensions" "Show Extensions"
+        $actualHideExt = ConvertTo-Int (Get-WmtRegValue $ap "HideFileExt" $null) -1
+        if ($actualHideExt -in @(0,1)) {
+            Update-WmtTweakToggle $btnToggleExtensions ($actualHideExt -eq 1) "Hide Extensions" "Show Extensions"
+        } else {
+            Set-WmtTweakUnknownState "btnToggleExtensions" "Not set" "WMT could not verify the stored HideFileExt value after the change."
+        }
     })
 }
 
@@ -59154,7 +59159,12 @@ $btnToggleHiddenFiles.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $ap "Hidden" 2; Write-GuiLog "Hidden files hidden." } "Hiding hidden files..."
         }
-        Update-WmtTweakToggle $btnToggleHiddenFiles (-not $currentlyHidden) "Hide Hidden Files" "Show Hidden Files"
+        $actualHiddenFiles = ConvertTo-Int (Get-WmtRegValue $ap "Hidden" $null) -1
+        if ($actualHiddenFiles -in @(1,2)) {
+            Update-WmtTweakToggle $btnToggleHiddenFiles ($actualHiddenFiles -eq 2) "Hide Hidden Files" "Show Hidden Files"
+        } else {
+            Set-WmtTweakUnknownState "btnToggleHiddenFiles" "Not set" "WMT could not verify the stored Hidden value after the change."
+        }
     })
 }
 
@@ -59221,7 +59231,16 @@ $btnToggleMouseAccel.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtMouseAcceleration $true; Write-GuiLog "Mouse acceleration enabled." } "Enabling mouse acceleration..."
         }
-        Update-WmtTweakToggle $btnToggleMouseAccel (-not $currentlyOn) "Acceleration On" "Acceleration Off"
+        Clear-WmtRegCache @($p)
+        $actualAccelSpeed = ConvertTo-Str (Get-WmtRegValue $p "MouseSpeed" $null) ""
+        $actualAccelT1 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold1" $null) ""
+        $actualAccelT2 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold2" $null) ""
+        if ($actualAccelSpeed -in @("0","1") -and $actualAccelT1 -match '^\d+$' -and $actualAccelT2 -match '^\d+$') {
+            $actualAccelOn = ($actualAccelSpeed -eq "1" -and [int]$actualAccelT1 -gt 0 -and [int]$actualAccelT2 -gt 0)
+            Update-WmtTweakToggle $btnToggleMouseAccel $actualAccelOn "Acceleration On" "Acceleration Off"
+        } else {
+            Set-WmtTweakUnknownState "btnToggleMouseAccel" "Not set" "WMT could not verify mouse acceleration values after the change."
+        }
     })
 }
 
@@ -59238,7 +59257,14 @@ $btnToggleClickMode.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtExplorerClickMode $true; Write-GuiLog "Single-click folder opening enabled." } "Enabling single-click..."
         }
-        Update-WmtTweakToggle $btnToggleClickMode (-not $singleClick) "Single-Click Folders" "Double-Click Folders"
+        Clear-WmtRegCache @($p)
+        $actualShellState = Get-WmtRegValue $p "ShellState" $null
+        if ($actualShellState -and $actualShellState.Length -gt 4 -and ([int]$actualShellState[4] -eq 0x1E -or [int]$actualShellState[4] -eq 0x3E)) {
+            $actualSingleClick = ([int]$actualShellState[4] -eq 0x1E)
+            Update-WmtTweakToggle $btnToggleClickMode $actualSingleClick "Single-Click Folders" "Double-Click Folders"
+        } else {
+            Set-WmtTweakUnknownState "btnToggleClickMode" "Not set" "WMT could not verify the ShellState folder-click setting after the change."
+        }
     })
 }
 
