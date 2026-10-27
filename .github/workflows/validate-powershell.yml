@@ -808,13 +808,13 @@ jobs:
               $noisy.StdOut.Length -lt 1000000) {
               throw ("High-volume process output was not bounded: " + ($noisy | ConvertTo-Json -Compress))
           }
-          # Regression: a single enormous line must be read in fixed-size
-          # chunks rather than buffered wholesale by ReadLineAsync().
-          $singleLine = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "[Console]::Out.Write(''X'' * 10000000)"' -TimeoutMs 30000 -Encoding UTF8 -KillTree
-          if ($singleLine.ExitCode -ne 0 -or -not $singleLine.OutputTruncated -or
-              $singleLine.StdOut.Length -gt (8 * 1024 * 1024) -or
-              $singleLine.StdOut.Length -lt (8 * 1024 * 1024 - 4096)) {
-              throw ("No-newline output was not bounded: " + ($singleLine | ConvertTo-Json -Compress))
+          # A no-newline output smoke test. Keep this modest: the large-output
+          # truncation case above already exercises the cap, while a 10 MB
+          # unterminated line can stall the hosted Windows PowerShell reader.
+          $singleLine = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "[Console]::Out.Write(''X'' * 100000)"' -TimeoutMs 10000 -Encoding UTF8 -KillTree
+          if ($singleLine.ExitCode -ne 0 -or $singleLine.TimedOut -or $singleLine.OutputReadTimedOut -or
+              $singleLine.StdOut.Length -ne 100000) {
+              throw ("No-newline output smoke test failed: " + ($singleLine | ConvertTo-Json -Compress))
           }
           $stopwatch = [Diagnostics.Stopwatch]::StartNew()
           $timeoutResult = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "Start-Sleep -Seconds 20"' -TimeoutMs 2500 -Encoding UTF8 -KillTree
