@@ -35624,6 +35624,12 @@ try {
             OnLabel  = [string]$OnLabel
             OffLabel = [string]$OffLabel
         }
+        # Keep the caption cache current after a known state returns, so a later
+        # missing value retains the latest meaningful action label.
+        if ($script:WmtTweakUnknownOriginalCaptions -and $script:WmtTweakUnknownOriginalCaptions.ContainsKey([string]$Button.Name)) {
+            if ($IsOn) { $script:WmtTweakUnknownOriginalCaptions[$Button.Name] = [string]$OnLabel }
+            else { $script:WmtTweakUnknownOriginalCaptions[$Button.Name] = [string]$OffLabel }
+        }
         if ($script:TweakCurrentUnknownStates) {
             [void]$script:TweakCurrentUnknownStates.Remove([string]$Button.Name)
         }
