@@ -35741,6 +35741,16 @@ function Set-WmtTweakUnknownState {
             'btnTogglePaintAI' { 'Toggle Paint AI' }
             'btnToggleNotepadAI' { 'Toggle Notepad AI' }
             'btnTogglePhoneLink' { 'Toggle Phone Link Start Menu Entry' }
+            'btnToggleExtensions' { 'Toggle File Extensions' }
+            'btnToggleHiddenFiles' { 'Toggle Hidden Files' }
+            'btnToggleFullPath' { 'Toggle Explorer Full Path' }
+            'btnToggleExplorerLaunch' { 'Set Explorer Start Location' }
+            'btnToggleRecents' { 'Toggle Explorer Recent Items' }
+            'btnToggleWidgets' { 'Toggle Widgets Taskbar Button' }
+            'btnToggleTaskView' { 'Toggle Task View Taskbar Button' }
+            'btnToggleChat' { 'Toggle Chat Taskbar Button' }
+            'btnToggleMouseAccel' { 'Toggle Mouse Acceleration' }
+            'btnToggleClickMode' { 'Toggle Folder Click Mode' }
             default {
                 $existingLabel = ([string]$button.Content -replace '\s+\(Not set\)$', '').Trim()
                 if ([string]::IsNullOrWhiteSpace($existingLabel) -or $existingLabel -eq $Label) {
@@ -36240,6 +36250,18 @@ if ($property) { return $property.Value }
 return $Default
 }
 
+# Physical presence is distinct from a fallback default returned for a missing value.
+function Test-WmtRegistrySnapshotHasValue {
+    param($Item, [string]$Name)
+    if ($null -eq $Item -or [string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Item -is [System.Collections.IDictionary]) {
+        if ($Item.Contains($Name)) { return $true }
+        if ($Name -eq "(Default)" -and $Item.Contains("")) { return $true }
+        return $false
+    }
+    return ($null -ne $Item.PSObject.Properties[$Name])
+}
+
 function Get-WmtRegValueCached {
 param(
     [string]$Path,
@@ -36372,6 +36394,13 @@ try {
         return (Get-WmtRegistrySnapshotValue -Item $item -Name $Name -Default $Default)
     }.GetNewClosure()
 
+    $hasRegValue = {
+        param([string]$Path, [string]$Name)
+        if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Name)) { return $false }
+        if (-not $regCache.ContainsKey($Path)) { return $false }
+        return (Test-WmtRegistrySnapshotHasValue -Item $regCache[$Path] -Name $Name)
+    }.GetNewClosure()
+
     $pathChecks = $script:TweakButtonStatesPathChecks
     $getPathExists = {
         param([string]$Path)
@@ -36447,45 +36476,118 @@ try {
             else { $btnToggleSearchDisplay.Content = "Search as Icon"; $btnToggleSearchDisplay.Style = ($window.FindResource("ActionBtn") -as [System.Windows.Style]) }
         }
     }
-    $widgetsHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarDa" 1) 0) -eq 0))
+    $widgetsValue = & $getRegValue $ap "TaskbarDa" $null
+    $widgetsInt = ConvertTo-Int $widgetsValue -1
+    $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"
+    if ((& $hasRegValue $ap "TaskbarDa") -and ($widgetsInt -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleWidgets ($widgetsInt -eq 0) "Hide Widgets" "Show Widgets"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleWidgets" "Not set" "TaskbarDa is not explicitly stored, so WMT cannot confirm the current Widgets taskbar setting."
+    }
 
-    $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"; Update-WmtTweakToggle $btnToggleWidgets $widgetsHidden "Hide Widgets" "Show Widgets"
-    $taskViewHidden = (((ConvertTo-Int (& $getRegValue $ap "ShowTaskViewButton" 1) 0) -eq 0)); $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"; Update-WmtTweakToggle $btnToggleTaskView $taskViewHidden "Hide Task View" "Show Task View"
-    $chatHidden = (((ConvertTo-Int (& $getRegValue $ap "TaskbarMn" 1) 0) -eq 0)); $btnToggleChat = Get-Ctrl "btnToggleChat"; Update-WmtTweakToggle $btnToggleChat $chatHidden "Hide Chat" "Show Chat"
+    $taskViewValue = & $getRegValue $ap "ShowTaskViewButton" $null
+    $taskViewInt = ConvertTo-Int $taskViewValue -1
+    $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"
+    if ((& $hasRegValue $ap "ShowTaskViewButton") -and ($taskViewInt -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleTaskView ($taskViewInt -eq 0) "Hide Task View" "Show Task View"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleTaskView" "Not set" "ShowTaskViewButton is not explicitly stored, so WMT cannot confirm the current taskbar setting."
+    }
+
+    $chatValue = & $getRegValue $ap "TaskbarMn" $null
+    $chatInt = ConvertTo-Int $chatValue -1
+    $btnToggleChat = Get-Ctrl "btnToggleChat"
+    if ((& $hasRegValue $ap "TaskbarMn") -and ($chatInt -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleChat ($chatInt -eq 0) "Hide Chat" "Show Chat"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleChat" "Not set" "TaskbarMn is not explicitly stored, so WMT cannot confirm the current chat taskbar setting."
+    }
 
     $cabinetPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState"
     $explorerPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
-    $hideExt = (ConvertTo-Int (& $getRegValue $ap "HideFileExt" 1) 0)
+
+    $hideExt = ConvertTo-Int (& $getRegValue $ap "HideFileExt" $null) -1
     $btnToggleExtensions = Get-Ctrl "btnToggleExtensions"
-    Update-WmtTweakToggle $btnToggleExtensions ($hideExt -ne 0) "Hide Extensions" "Show Extensions"
-    $hidden = (ConvertTo-Int (& $getRegValue $ap "Hidden" 2) 0)
+    if ((& $hasRegValue $ap "HideFileExt") -and ($hideExt -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleExtensions ($hideExt -eq 1) "Hide Extensions" "Show Extensions"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleExtensions" "Not set" "HideFileExt is not explicitly stored, so WMT cannot confirm the current file-extension display setting."
+    }
+
+    $hidden = ConvertTo-Int (& $getRegValue $ap "Hidden" $null) -1
     $btnToggleHiddenFiles = Get-Ctrl "btnToggleHiddenFiles"
-    Update-WmtTweakToggle $btnToggleHiddenFiles ($hidden -eq 2) "Hide Hidden Files" "Show Hidden Files"
-    $fullPath = (ConvertTo-Int (& $getRegValue $cabinetPath "FullPath" 0) 0)
+    if ((& $hasRegValue $ap "Hidden") -and ($hidden -in @(1,2))) {
+        Update-WmtTweakToggle $btnToggleHiddenFiles ($hidden -eq 2) "Hide Hidden Files" "Show Hidden Files"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleHiddenFiles" "Not set" "The Hidden value is not explicitly stored, so WMT cannot confirm the current hidden-file setting."
+    }
+
+    $fullPath = ConvertTo-Int (& $getRegValue $cabinetPath "FullPath" $null) -1
     $btnToggleFullPath = Get-Ctrl "btnToggleFullPath"
-    Update-WmtTweakToggle $btnToggleFullPath ($fullPath -eq 1) "Full Path On" "Full Path Off"
-    $launchTo = (ConvertTo-Int (& $getRegValue $ap "LaunchTo" 2) 0)
+    if ((& $hasRegValue $cabinetPath "FullPath") -and ($fullPath -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleFullPath ($fullPath -eq 1) "Full Path On" "Full Path Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleFullPath" "Not set" "FullPath is not explicitly stored, so WMT cannot confirm the current Explorer title-bar setting."
+    }
+
+    $launchTo = ConvertTo-Int (& $getRegValue $ap "LaunchTo" $null) -1
     $btnToggleExplorerLaunch = Get-Ctrl "btnToggleExplorerLaunch"
-    Update-WmtTweakToggle $btnToggleExplorerLaunch ($launchTo -eq 1) "Open to This PC" "Open to Quick Access"
-    $recentsHidden = ((ConvertTo-Int (& $getRegValue $explorerPath "ShowRecent" 1) 0) -eq 0 -and (ConvertTo-Int (& $getRegValue $explorerPath "ShowFrequent" 1) 0) -eq 0)
+    if ((& $hasRegValue $ap "LaunchTo") -and ($launchTo -in @(1,2))) {
+        Update-WmtTweakToggle $btnToggleExplorerLaunch ($launchTo -eq 1) "Open to This PC" "Open to Quick Access"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleExplorerLaunch" "Not set" "LaunchTo is not explicitly stored, so WMT cannot confirm the configured Explorer start location."
+    }
+
+    $showRecentValue = & $getRegValue $explorerPath "ShowRecent" $null
+    $showFrequentValue = & $getRegValue $explorerPath "ShowFrequent" $null
+    $showRecent = ConvertTo-Int $showRecentValue -1
+    $showFrequent = ConvertTo-Int $showFrequentValue -1
     $btnToggleRecents = Get-Ctrl "btnToggleRecents"
-    Update-WmtTweakToggle $btnToggleRecents $recentsHidden "Hide Recents" "Show Recents"
+    if ((& $hasRegValue $explorerPath "ShowRecent") -and (& $hasRegValue $explorerPath "ShowFrequent") -and
+        ($showRecent -in @(0,1)) -and ($showFrequent -in @(0,1))) {
+        $recentsHidden = ($showRecent -eq 0 -and $showFrequent -eq 0)
+        Update-WmtTweakToggle $btnToggleRecents $recentsHidden "Hide Recents" "Show Recents"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleRecents" "Not set" "ShowRecent and ShowFrequent must both be present to confirm recent and frequent item visibility."
+    }
 
     $mousePath = "HKCU:\Control Panel\Mouse"
-    $mouseSpeedValue = & $getRegValue $mousePath "MouseSensitivity" 10
-    $mouseSpeed = ConvertTo-Int $mouseSpeedValue 10
-    $script:WmtMouseSpeedValue = [int]$mouseSpeed
-    & $setButtonEnabled "btnMouseSpeedSlow" ($mouseSpeed -ne 6); & $setButtonEnabled "btnMouseSpeedDefault" ($mouseSpeed -ne 10); & $setButtonEnabled "btnMouseSpeedFast" ($mouseSpeed -ne 15)
-    $mouseAccelSpeed = ConvertTo-Str (& $getRegValue $mousePath "MouseSpeed" "1") ""
-    $mouseAccelT1 = ConvertTo-Str (& $getRegValue $mousePath "MouseThreshold1" "6") ""
-    $mouseAccelT2 = ConvertTo-Str (& $getRegValue $mousePath "MouseThreshold2" "10") ""
-    $mouseAccelOn = ($mouseAccelSpeed -eq "1" -and $mouseAccelT1 -ne "0" -and $mouseAccelT2 -ne "0")
+    $mouseSpeedValue = & $getRegValue $mousePath "MouseSensitivity" $null
+    $mouseSpeed = ConvertTo-Int $mouseSpeedValue -1
+    if ((& $hasRegValue $mousePath "MouseSensitivity") -and $mouseSpeed -ge 1 -and $mouseSpeed -le 20) {
+        $script:WmtMouseSpeedValue = [int]$mouseSpeed
+        & $setButtonEnabled "btnMouseSpeedSlow" ($mouseSpeed -ne 6); & $setButtonEnabled "btnMouseSpeedDefault" ($mouseSpeed -ne 10); & $setButtonEnabled "btnMouseSpeedFast" ($mouseSpeed -ne 15)
+    } else {
+        $script:WmtMouseSpeedValue = $null
+        & $setButtonEnabled "btnMouseSpeedSlow" $true; & $setButtonEnabled "btnMouseSpeedDefault" $true; & $setButtonEnabled "btnMouseSpeedFast" $true
+    }
+
+    $mouseAccelSpeedValue = & $getRegValue $mousePath "MouseSpeed" $null
+    $mouseAccelT1Value = & $getRegValue $mousePath "MouseThreshold1" $null
+    $mouseAccelT2Value = & $getRegValue $mousePath "MouseThreshold2" $null
     $btnToggleMouseAccel = Get-Ctrl "btnToggleMouseAccel"
-    Update-WmtTweakToggle $btnToggleMouseAccel $mouseAccelOn "Acceleration On" "Acceleration Off"
-    $shellState = & $getRegValue $explorerPath "ShellState"
-    $singleClick = ($shellState -and $shellState.Length -gt 4 -and [int]$shellState[4] -eq 0x1E)
+    if ((& $hasRegValue $mousePath "MouseSpeed") -and (& $hasRegValue $mousePath "MouseThreshold1") -and (& $hasRegValue $mousePath "MouseThreshold2")) {
+        $mouseAccelSpeed = ConvertTo-Str $mouseAccelSpeedValue ""
+        $mouseAccelT1 = ConvertTo-Str $mouseAccelT1Value ""
+        $mouseAccelT2 = ConvertTo-Str $mouseAccelT2Value ""
+        if ($mouseAccelSpeed -in @("0","1") -and $mouseAccelT1 -match '^\d+$' -and $mouseAccelT2 -match '^\d+$') {
+            $mouseAccelOn = ($mouseAccelSpeed -eq "1" -and [int]$mouseAccelT1 -gt 0 -and [int]$mouseAccelT2 -gt 0)
+            Update-WmtTweakToggle $btnToggleMouseAccel $mouseAccelOn "Acceleration On" "Acceleration Off"
+        } else {
+            Set-WmtTweakUnknownState "btnToggleMouseAccel" "Not set" "The mouse acceleration values exist but are invalid."
+        }
+    } else {
+        Set-WmtTweakUnknownState "btnToggleMouseAccel" "Not set" "MouseSpeed, MouseThreshold1, and MouseThreshold2 must all exist to confirm acceleration."
+    }
+
+    $shellState = & $getRegValue $explorerPath "ShellState" $null
     $btnToggleClickMode = Get-Ctrl "btnToggleClickMode"
-    Update-WmtTweakToggle $btnToggleClickMode $singleClick "Single-Click Folders" "Double-Click Folders"
+    if ((& $hasRegValue $explorerPath "ShellState") -and $null -ne $shellState -and $shellState.Length -gt 4) {
+        $singleClick = ([int]$shellState[4] -eq 0x1E)
+        Update-WmtTweakToggle $btnToggleClickMode $singleClick "Single-Click Folders" "Double-Click Folders"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleClickMode" "Not set" "ShellState is absent or incomplete, so WMT cannot confirm folder click mode."
+    }
 
     $classicContext = & $getPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
     $btnToggleCtxMenu = Get-Ctrl "btnToggleCtxMenu"
@@ -39051,8 +39153,11 @@ function Update-WmtQuickFindStateLabels {
         $label = $script:WmtQuickFindStateLabels[$name]
         if (-not $label) { continue }
         if ($name -eq "__MouseSpeed") {
-            if (-not $script:TweakStatesReady -or $null -eq $script:WmtMouseSpeedValue) {
+            if (-not $script:TweakStatesReady) {
                 $label.Text = "State: Checking..."
+            }
+            elseif ($null -eq $script:WmtMouseSpeedValue) {
+                $label.Text = "Current cursor speed: Not set / not detected"
             }
             else {
                 $speed = [int]$script:WmtMouseSpeedValue
@@ -39131,7 +39236,7 @@ function Sync-WmtQuickFindStateAvailability {
             continue
         }
         if ($name -eq "__MouseSpeed") {
-            $ready = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue)
+            $ready = [bool]$script:TweakStatesReady
             if ($ready -ne $script:WmtQuickFindRenderedReadiness[$name]) {
                 $requiresRebuild = $true
                 break
@@ -39486,7 +39591,8 @@ function Update-WmtQuickFindResults {
             $tweakReady = $true
             if ($entry.Item.Tab -eq "btnTabTweaks") {
                 if ($isMouseSpeedGroup) {
-                    $tweakReady = [bool]($script:TweakStatesReady -and $null -ne $script:WmtMouseSpeedValue)
+                    # Missing speed data affects state text, not action availability.
+                    $tweakReady = [bool]$script:TweakStatesReady
                 }
                 elseif ($isMouseSettingsAction) {
                     # Opening the Windows Mouse control panel is an action, not a toggle.
