@@ -802,8 +802,11 @@ jobs:
               $success.TerminationFailed -or $success.StdOut -notmatch 'WMT_PROCESS_OK') {
               throw ("Normal process output capture failed: " + ($success | ConvertTo-Json -Compress))
           }
-          $noisy = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "1..1000 | ForEach-Object { ''X'' * 10000 }"' -TimeoutMs 30000 -Encoding UTF8 -KillTree
-          if ($noisy.ExitCode -ne 0 -or -not $noisy.OutputTruncated -or
+          # Write chunks directly instead of using the PowerShell formatting pipeline;
+          # pipeline formatting can be so slow on hosted runners that the timeout fires
+          # before the output cap is reached, making this test nondeterministic.
+          $noisy = Invoke-WmtProcess -FilePath $exe -Arguments '-NoProfile -Command "for($i=0; $i -lt 1000; $i++){ [Console]::Out.WriteLine((''X'' * 10000)) }"' -TimeoutMs 60000 -Encoding UTF8 -KillTree
+          if ($noisy.ExitCode -ne 0 -or $noisy.TimedOut -or -not $noisy.OutputTruncated -or
               $noisy.StdOut.Length -gt (8 * 1024 * 1024) -or
               $noisy.StdOut.Length -lt 1000000) {
               throw ("High-volume process output was not bounded: " + ($noisy | ConvertTo-Json -Compress))
