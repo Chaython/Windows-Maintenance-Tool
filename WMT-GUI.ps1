@@ -39091,7 +39091,7 @@ $btnTogglePSExec.Add_Click({
         else {
             Invoke-UiCommand { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Restricted -Force; Write-GuiLog "PowerShell execution set to Restricted (no scripts)." } "Disabling script execution..."
         }
-        Update-WmtTweakToggle $btnTogglePSExec (-not ($current -eq "Restricted" -or $current -eq "AllSigned")) "Disable PS Execution" "Enable PS Execution"
+        Update-WmtTweakToggle $btnTogglePSExec (-not ($current -eq "Restricted")) "Disable PS Execution" "Enable PS Execution"
     })
 }
 
