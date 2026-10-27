@@ -31753,74 +31753,50 @@ function Sync-WmtRegCacheAfterWrite {
 # '*' or '?', CreateSubKey builds the whole key chain in one call, and (Default)
 # values are written via SetValue("") without the "(Default)" provider pseudo-name.
 function Set-WmtRegDword {
-param(
-    [string]$Path,
-    [string]$Name,
-    [int]$Value
-)
-
+param([string]$Path,[string]$Name,[int]$Value)
 $parts = Convert-WmtRegistryPath -Path $Path
-if (-not $parts) { return }
-$baseKey = $null
-$key = $null
+if (-not $parts) { throw "Cannot write registry DWORD: invalid path '$Path'." }
+$baseKey = $null; $key = $null
 try {
     $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
     $key = $baseKey.CreateSubKey($parts.SubPath)
-    if ($key) { $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::DWord) }
+    if (-not $key) { throw "Could not open or create registry key '$Path'." }
+    $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::DWord)
 }
-catch {}
-finally {
-    if ($key) { $key.Close() }
-    if ($baseKey) { $baseKey.Close() }
-}
+catch { throw "Failed to write registry DWORD '$Path\$Name': $($_.Exception.Message)" }
+finally { if ($key) { $key.Close() }; if ($baseKey) { $baseKey.Close() } }
 Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $Value
 }
 
 function Set-WmtRegString {
-param(
-    [string]$Path,
-    [string]$Name,
-    [string]$Value
-)
-
+param([string]$Path,[string]$Name,[string]$Value)
 $parts = Convert-WmtRegistryPath -Path $Path
-if (-not $parts) { return }
-$baseKey = $null
-$key = $null
+if (-not $parts) { throw "Cannot write registry string: invalid path '$Path'." }
+$baseKey = $null; $key = $null
 try {
     $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
     $key = $baseKey.CreateSubKey($parts.SubPath)
-    if ($key) { $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::String) }
+    if (-not $key) { throw "Could not open or create registry key '$Path'." }
+    $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::String)
 }
-catch {}
-finally {
-    if ($key) { $key.Close() }
-    if ($baseKey) { $baseKey.Close() }
-}
+catch { throw "Failed to write registry string '$Path\$Name': $($_.Exception.Message)" }
+finally { if ($key) { $key.Close() }; if ($baseKey) { $baseKey.Close() } }
 Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $Value
 }
 
 function Set-WmtRegBinary {
-param(
-    [string]$Path,
-    [string]$Name,
-    [byte[]]$Value
-)
-
+param([string]$Path,[string]$Name,[byte[]]$Value)
 $parts = Convert-WmtRegistryPath -Path $Path
-if (-not $parts) { return }
-$baseKey = $null
-$key = $null
+if (-not $parts) { throw "Cannot write registry binary value: invalid path '$Path'." }
+$baseKey = $null; $key = $null
 try {
     $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
     $key = $baseKey.CreateSubKey($parts.SubPath)
-    if ($key) { $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::Binary) }
+    if (-not $key) { throw "Could not open or create registry key '$Path'." }
+    $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::Binary)
 }
-catch {}
-finally {
-    if ($key) { $key.Close() }
-    if ($baseKey) { $baseKey.Close() }
-}
+catch { throw "Failed to write registry binary value '$Path\$Name': $($_.Exception.Message)" }
+finally { if ($key) { $key.Close() }; if ($baseKey) { $baseKey.Close() } }
 Sync-WmtRegCacheAfterWrite -Path $Path -Name $Name -Default $Value
 }
 
@@ -31867,28 +31843,19 @@ finally {
 }
 
 function Set-WmtRegDefaultValue {
-param(
-    [string]$Path,
-    [AllowNull()][AllowEmptyString()][string]$Value
-)
-
-# Sets the key's (Default) value, creating the key chain first if needed.
+param([string]$Path,[AllowNull()][AllowEmptyString()][string]$Value)
 $parts = Convert-WmtRegistryPath -Path $Path
-if (-not $parts) { return }
-$text = $Value
-if ($null -eq $text) { $text = "" }
-$baseKey = $null
-$key = $null
+if (-not $parts) { throw "Cannot write registry default value: invalid path '$Path'." }
+$text = if ($null -eq $Value) { "" } else { $Value }
+$baseKey = $null; $key = $null
 try {
     $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
     $key = $baseKey.CreateSubKey($parts.SubPath)
-    if ($key) { $key.SetValue("", $text, [Microsoft.Win32.RegistryValueKind]::String) }
+    if (-not $key) { throw "Could not open or create registry key '$Path'." }
+    $key.SetValue("", $text, [Microsoft.Win32.RegistryValueKind]::String)
 }
-catch {}
-finally {
-    if ($key) { $key.Close() }
-    if ($baseKey) { $baseKey.Close() }
-}
+catch { throw "Failed to write registry default value '$Path': $($_.Exception.Message)" }
+finally { if ($key) { $key.Close() }; if ($baseKey) { $baseKey.Close() } }
 Sync-WmtRegCacheAfterWrite -Path $Path -Name "(Default)" -Default $text
 }
 
@@ -31970,14 +31937,16 @@ public class Params {
     /// <summary>Set pointer speed (1-20, default 10). Updates live state + registry.</summary>
     public static void SetSpeed(uint speed) {
         speed = Math.Max(1u, Math.Min(20u, speed));
-        SystemParametersInfo(SPI_SETMOUSESPEED, 0, speed, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        if (!SystemParametersInfo(SPI_SETMOUSESPEED, 0, speed, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Windows could not apply mouse pointer speed.");
     }
 
     /// <summary>Enable or disable enhanced pointer precision. Updates live state + registry.</summary>
     /// <param name="enable">true = acceleration ON, false = acceleration OFF</param>
     public static void SetAcceleration(bool enable) {
         int[] mouseParams = enable ? new int[] { 6, 10, 1 } : new int[] { 0, 0, 0 };
-        SystemParametersInfo(SPI_SETMOUSE, 0, mouseParams, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        if (!SystemParametersInfo(SPI_SETMOUSE, 0, mouseParams, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Windows could not apply mouse acceleration settings.");
     }
 }
 }
