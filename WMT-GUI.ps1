@@ -2270,6 +2270,12 @@ try {
 }
 catch { return $Default }
 }
+function Test-WmtDwordAllBitsSet {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    try { return ((([long]$Value -band [long]4294967295) -eq [long]4294967295)) }
+    catch { return (([string]$Value).Trim() -match '^(?i:-1|4294967295|0xFFFFFFFF)$') }
+}
 
 function ConvertTo-Str {
 param($Value, [string]$Default = "")
@@ -35579,8 +35585,10 @@ $script:WmtQuickFindStateTextOverrides = @{
     "btnToggleHibernate"        = @{ On = "Hibernation enabled"; Off = "Hibernation disabled" }
     "btnMyDeviceHibernateToggle" = @{ On = "Hibernation enabled"; Off = "Hibernation disabled" }
     "btnToggleSuperfetch"       = @{ On = "SysMain (Superfetch) not disabled"; Off = "SysMain (Superfetch) disabled" }
-    "btnToggleIPv6"             = @{ On = "IPv6 enabled"; Off = "IPv6 disabled" }
-    "btnToggleNetThrottling"    = @{ On = "Network throttling enabled"; Off = "Network throttling disabled" }
+    "btnToggleIPv6"             = @{ On = "IPv6 disabled"; Off = "IPv6 enabled" }
+    "btnToggleNetThrottling"    = @{ On = "Network throttling disabled"; Off = "Network throttling enabled" }
+    "btnToggleLocationSvc"      = @{ On = "Location access allowed"; Off = "Location access denied" }
+    "btnTogglePSExec"           = @{ On = "PowerShell script execution restricted"; Off = "PowerShell script execution allowed" }
     "btnToggleSudo"             = @{ On = "Windows Sudo enabled"; Off = "Windows Sudo disabled" }
     "btnToggleWSH"              = @{ On = "Windows Script Host enabled"; Off = "Windows Script Host disabled" }
     "btnToggleDrvMeta"          = @{ On = "Device metadata downloads enabled"; Off = "Device metadata downloads disabled" }
@@ -35727,60 +35735,22 @@ function Set-WmtTweakUnknownState {
     try {
         if (-not $script:TweakCurrentUnknownStates) { $script:TweakCurrentUnknownStates = @{} }
         $script:TweakCurrentUnknownStates[$ButtonName] = @{ Label = $Label; Reason = $Reason }
+        if (-not $script:WmtTweakUnknownOriginalCaptions) { $script:WmtTweakUnknownOriginalCaptions = @{} }
+        if (-not $script:WmtTweakUnknownOriginalCaptions.ContainsKey($ButtonName)) {
+            $initialCaption = ([string]$button.Content -replace '\s+\(Not set\)$', '').Trim()
+            if ([string]::IsNullOrWhiteSpace($initialCaption) -or $initialCaption -eq $Label -or $initialCaption -match '^Toggle\s+') {
+                $initialCaption = 'Open / toggle ' + ($ButtonName -replace '^btnToggle', '')
+            }
+            $script:WmtTweakUnknownOriginalCaptions[$ButtonName] = $initialCaption
+        }
         if ($script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($ButtonName)) {
             [void]$script:TweakCurrentStates.Remove($ButtonName)
         }
-        # Keep "Not set" in the tooltip and separate Quick Find state line,
-        # not in the button caption. The setting remains actionable.
-        $functionLabel = switch ($ButtonName) {
-            'btnToggleCopilot' { 'Toggle Copilot' }
-            'btnToggleRecall' { 'Toggle Recall' }
-            'btnToggleClickToDo' { 'Toggle Click To Do' }
-            'btnToggleAISvcAutoStart' { 'Toggle AI Service AutoStart' }
-            'btnToggleEdgeAI' { 'Toggle Edge AI' }
-            'btnTogglePaintAI' { 'Toggle Paint AI' }
-            'btnToggleNotepadAI' { 'Toggle Notepad AI' }
-            'btnTogglePhoneLink' { 'Toggle Phone Link Start Menu Entry' }
-            'btnToggleIPv6' { 'Toggle IPv6' }
-            'btnToggleNetThrottling' { 'Toggle Network Throttling' }
-            'btnToggleNetLocationWizard' { 'Toggle Network Location Wizard' }
-            'btnToggleWifiSense' { 'Toggle Wi-Fi Sense' }
-            'btnToggleAutoWifi' { 'Toggle Suggested Wi-Fi' }
-            'btnToggleDiagData' { 'Set Diagnostic Data Level' }
-            'btnToggleInkingPersonal' { 'Toggle Inking Personalization' }
-            'btnToggleSpeechOnline' { 'Toggle Online Speech Recognition' }
-            'btnToggleAppDiagnostics' { 'Toggle App Diagnostics Access' }
-            'btnToggleBackgroundApps' { 'Toggle Background Apps' }
-            'btnToggleFeedbackNotify' { 'Toggle Feedback Notifications' }
-            'btnToggleCompatTelemetry' { 'Toggle Compatibility Telemetry' }
-            'btnToggleCEIP' { 'Toggle CEIP' }
-            'btnToggleThumbCache' { 'Toggle Thumbnail Cache' }
-            'btnToggleDriveLettersFirst' { 'Set Drive Letter Order' }
-            'btnToggleTaskbarAlign' { 'Set Taskbar Alignment' }
-            'btnToggleCombine' { 'Toggle Taskbar Grouping' }
-            'btnToggleClockSecs' { 'Toggle Clock Seconds' }
-            'btnToggleExtensions' { 'Toggle File Extensions' }
-            'btnToggleHiddenFiles' { 'Toggle Hidden Files' }
-            'btnToggleFullPath' { 'Toggle Explorer Full Path' }
-            'btnToggleExplorerLaunch' { 'Set Explorer Start Location' }
-            'btnToggleRecents' { 'Toggle Explorer Recent Items' }
-            'btnToggleWidgets' { 'Toggle Widgets Taskbar Button' }
-            'btnToggleTaskView' { 'Toggle Task View Taskbar Button' }
-            'btnToggleChat' { 'Toggle Chat Taskbar Button' }
-            'btnToggleMouseAccel' { 'Toggle Mouse Acceleration' }
-            'btnToggleClickMode' { 'Toggle Folder Click Mode' }
-            default {
-                $existingLabel = ([string]$button.Content -replace '\s+\(Not set\)$', '').Trim()
-                if ([string]::IsNullOrWhiteSpace($existingLabel) -or $existingLabel -eq $Label) {
-                    'Toggle ' + ($ButtonName -replace '^btnToggle', '')
-                } else {
-                    $existingLabel
-                }
-            }
-        }
-        $button.Content = $functionLabel
+        # Preserve the original function caption and append the unknown/custom status.
+        $buttonContent = [string]$script:WmtTweakUnknownOriginalCaptions[$ButtonName]
+        $button.Content = "$buttonContent ($Label)"
         $button.Style = ($window.FindResource('ActionBtn') -as [System.Windows.Style])
-        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'The setting is not detected, but the control remains available. Click to explicitly change it.')
+        $button.ToolTip = ($Label + [Environment]::NewLine + $Reason + [Environment]::NewLine + 'The control remains available; click to change this setting.')
     }
     catch {}
 }
@@ -36584,8 +36554,12 @@ try {
     $btnToggleRecents = Get-Ctrl "btnToggleRecents"
     if ((& $hasRegValue $explorerPath "ShowRecent") -and (& $hasRegValue $explorerPath "ShowFrequent") -and
         ($showRecent -in @(0,1)) -and ($showFrequent -in @(0,1))) {
-        $recentsHidden = ($showRecent -eq 0 -and $showFrequent -eq 0)
-        Update-WmtTweakToggle $btnToggleRecents $recentsHidden "Hide Recents" "Show Recents"
+        if ($showRecent -ne $showFrequent) {
+            Set-WmtTweakUnknownState "btnToggleRecents" "Partially configured" "Recent-file and frequent-folder visibility differ, so a single shown/hidden status would be misleading."
+        } else {
+            $recentsHidden = ($showRecent -eq 0)
+            Update-WmtTweakToggle $btnToggleRecents $recentsHidden "Hide Recents" "Show Recents"
+        }
     } else {
         Set-WmtTweakUnknownState "btnToggleRecents" "Not set" "ShowRecent and ShowFrequent must both be present to confirm recent and frequent item visibility."
     }
@@ -36702,10 +36676,13 @@ try {
         $fmdOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\FindMyDevice\LocationSync" "Enabled" 0) 0) -eq 0))
         Update-WmtTweakToggle $fmdBtn (-not $fmdOff) "Find My Device On" "Find My Device Off"
     }
+    $locationConsentPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+    $locationConsent = ConvertTo-Str (& $getRegValue $locationConsentPath "Value" $null) ""
     $locBtn = Get-Ctrl "btnToggleLocationSvc"
-    if ($locBtn) {
-        $locOff = (((ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location" "Value" 1) 0) -eq 0))
-        Update-WmtTweakToggle $locBtn (-not $locOff) "Location On" "Location Off"
+    if ((& $hasRegValue $locationConsentPath "Value") -and $locationConsent -match '^(?i:Allow|Deny)$') {
+        Update-WmtTweakToggle $locBtn ($locationConsent -ieq "Allow") "Location On" "Location Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleLocationSvc" "Not set" "The location ConsentStore value is missing or is not a recognized Allow/Deny string."
     }
     $msBtn = Get-Ctrl "btnToggleModernStandby"
     if ($msBtn) {
@@ -36868,8 +36845,10 @@ try {
     $ipv6Raw = & $getRegValue $ipv6Path "DisabledComponents" $null
     $ipv6Btn = Get-Ctrl "btnToggleIPv6"
     if (& $hasRegValue $ipv6Path "DisabledComponents") {
-        $v = ConvertTo-Int $ipv6Raw 0
-        Update-WmtTweakToggle $ipv6Btn (-not (($v -band 0xFF) -ne 0)) "Disable IPv6" "Enable IPv6"
+        $ipv6Mask = ConvertTo-Int $ipv6Raw -1
+        if ($ipv6Mask -eq 0) { Update-WmtTweakToggle $ipv6Btn $false "Disable IPv6" "Enable IPv6" }
+        elseif ($ipv6Mask -eq 255) { Update-WmtTweakToggle $ipv6Btn $true "Disable IPv6" "Enable IPv6" }
+        else { Set-WmtTweakUnknownState "btnToggleIPv6" "Custom IPv6 configuration" "DisabledComponents is set to '$ipv6Raw'. This can affect individual IPv6 components or prefer IPv4 without fully disabling IPv6." }
     } else {
         Set-WmtTweakUnknownState "btnToggleIPv6" "Not set" "DisabledComponents is absent, so WMT is not assuming a forced IPv6 state."
     }
@@ -36878,8 +36857,8 @@ try {
     $throttleRaw = & $getRegValue $throttlePath "NetworkThrottlingIndex" $null
     $ntBtn = Get-Ctrl "btnToggleNetThrottling"
     if (& $hasRegValue $throttlePath "NetworkThrottlingIndex") {
-        $v = ConvertTo-Int $throttleRaw 10
-        Update-WmtTweakToggle $ntBtn (-not ($v -eq 0xFFFFFFFF)) "Disable Net Throttling" "Enable Net Throttling"
+        $throttlingDisabled = Test-WmtDwordAllBitsSet $throttleRaw
+        Update-WmtTweakToggle $ntBtn $throttlingDisabled "Disable Net Throttling" "Enable Net Throttling"
     } else {
         Set-WmtTweakUnknownState "btnToggleNetThrottling" "Not set" "NetworkThrottlingIndex is absent, so WMT cannot confirm the explicit throttle configuration."
     }
@@ -37062,7 +37041,7 @@ try {
 
     # Developer (round 2)
     $psBtn = Get-Ctrl "btnTogglePSExec"
-    if ($psBtn) { $v = $nrd["ExecutionPolicy"]; if ($null -eq $v) { try { $v = (Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue) } catch {} }; if ($null -ne $v) { Update-WmtTweakToggle $psBtn ($v -ne "Restricted" -and $v -ne "AllSigned") "Disable PS Execution" "Enable PS Execution" } }
+    if ($psBtn) { $v = $nrd["ExecutionPolicy"]; if ($null -eq $v) { try { $v = (Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue) } catch {} }; if ($null -ne $v) { Update-WmtTweakToggle $psBtn ($v -eq "Restricted" -or $v -eq "AllSigned") "Disable PS Execution" "Enable PS Execution" } }
     $sdBtn = Get-Ctrl "btnToggleSudo"
     if ($sdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" "Enabled" 0) 0); Update-WmtTweakToggle $sdBtn ($v -ne 0) "Disable Sudo" "Enable Sudo" }
     $wshBtn = Get-Ctrl "btnToggleWSH"
@@ -38063,12 +38042,13 @@ if ($btnToggleLocationSvc) {
 $btnToggleLocationSvc.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
         Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location")
-        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "Value" 1) 0) -eq 0))
+        $locationConsent = ConvertTo-Str (Get-WmtRegValue $p "Value" "") ""
+        $currentlyOff = ($locationConsent -ine "Allow")
         if ($currentlyOff) {
-            Invoke-UiCommand { Set-WmtRegDword $p "Value" 1; Write-GuiLog "Location services enabled." } "Enabling location services..."
+            Invoke-UiCommand { Set-WmtRegString $p "Value" "Allow"; Write-GuiLog "Location services enabled." } "Enabling location services..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword $p "Value" 0; Write-GuiLog "Location services disabled." } "Disabling location services..."
+            Invoke-UiCommand { Set-WmtRegString $p "Value" "Deny"; Write-GuiLog "Location services disabled." } "Disabling location services..."
         }
         Update-WmtTweakToggle $btnToggleLocationSvc $currentlyOff "Location On" "Location Off"
     })
@@ -38542,7 +38522,7 @@ $btnToggleIPv6.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "DisabledComponents" 255; Write-GuiLog "IPv6 disabled (reboot required)." } "Disabling IPv6..."
         }
-        Update-WmtTweakToggle $btnToggleIPv6 $currentlyOff "Disable IPv6" "Enable IPv6"
+        Update-WmtTweakToggle $btnToggleIPv6 (-not $currentlyOff) "Disable IPv6" "Enable IPv6"
     })
 }
 
@@ -38551,14 +38531,14 @@ if ($btnToggleNetThrottling) {
 $btnToggleNetThrottling.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
         Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile")
-        $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "NetworkThrottlingIndex" 10) 0) -eq 0xFFFFFFFF))
+        $currentlyOff = Test-WmtDwordAllBitsSet (Get-WmtRegValue $p "NetworkThrottlingIndex" 10)
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "NetworkThrottlingIndex" 10; Write-GuiLog "Network throttling enabled." } "Enabling network throttling..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword $p "NetworkThrottlingIndex" 0xFFFFFFFF; Write-GuiLog "Network throttling disabled (unlimited)." } "Disabling network throttling..."
+            Invoke-UiCommand { Set-WmtRegDword $p "NetworkThrottlingIndex" -1; Write-GuiLog "Network throttling disabled (unlimited)." } "Disabling network throttling..."
         }
-        Update-WmtTweakToggle $btnToggleNetThrottling $currentlyOff "Disable Net Throttling" "Enable Net Throttling"
+        Update-WmtTweakToggle $btnToggleNetThrottling (-not $currentlyOff) "Disable Net Throttling" "Enable Net Throttling"
     })
 }
 
@@ -39105,7 +39085,7 @@ $btnTogglePSExec.Add_Click({
         else {
             Invoke-UiCommand { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Restricted -Force; Write-GuiLog "PowerShell execution set to Restricted (no scripts)." } "Disabling script execution..."
         }
-        Update-WmtTweakToggle $btnTogglePSExec ($current -eq "Restricted" -or $current -eq "AllSigned") "Disable PS Execution" "Enable PS Execution"
+        Update-WmtTweakToggle $btnTogglePSExec (-not ($current -eq "Restricted" -or $current -eq "AllSigned")) "Disable PS Execution" "Enable PS Execution"
     })
 }
 
@@ -39658,8 +39638,12 @@ function Update-WmtQuickFindResults {
         if (-not $current -or $current -isnot [System.Windows.Controls.Button] -or -not $current.Parent) { continue }
         $liveTooltip = ""
         try { if ($current.ToolTip -is [string]) { $liveTooltip = [string]$current.ToolTip } } catch {}
-        $entry.Description = $liveTooltip
-        $entry.SearchText = "$($entry.Text) $liveTooltip"
+        if ($entry.Item.Group -eq "MouseSpeed") {
+            $entry.Description = "Choose slow, default, or fast cursor speed."
+        } else {
+            $entry.Description = $liveTooltip
+        }
+        $entry.SearchText = "$($entry.Text) $liveTooltip $($entry.Item.SearchAliases) $($entry.Description)"
         if ($entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         $script:WmtControlCache[$name] = $current
         if (-not [object]::ReferenceEquals($current, $entry.Item.Button)) {
@@ -40055,7 +40039,7 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnToggleChat" "Chat Teams Button" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleCombine" "Taskbar Combine" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleFullPath" "Full Path Title" "btnTabTweaks"
-    Add-SearchIndexEntry "btnToggleRecents" "Recent Files" "btnTabTweaks"
+    Add-SearchIndexEntry "btnToggleRecents" "Recent Files and Folders" "btnTabTweaks" "" "hide show recent files frequent folders history"
     Add-SearchIndexEntry "btnMouseSpeedSlow" "Mouse Cursor Speed" "btnTabTweaks" "MouseSpeed" "cursor pointer speed mouse speed slow fast default dpi"
     Add-SearchIndexEntry "btnToggleMouseAccel" "Mouse Acceleration" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleClickMode" "Folder Click Mode" "btnTabTweaks" "" "folder click single double"
@@ -40188,8 +40172,8 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnPowerUserUEFI" "Restart to UEFI" "btnTabTweaks"
     Add-SearchIndexEntry "btnPowerUserSigDriver" "Test Mode Driver Signing" "btnTabTweaks"
 
-    Add-SearchIndexEntry "btnToggleExtensions" "File Extensions" "btnTabTweaks"
-    Add-SearchIndexEntry "btnToggleHiddenFiles" "Hidden Files" "btnTabTweaks"
+    Add-SearchIndexEntry "btnToggleExtensions" "File Extensions" "btnTabTweaks" "" "hide show file extension extensions filename suffix known file types"
+    Add-SearchIndexEntry "btnToggleHiddenFiles" "Hidden Files" "btnTabTweaks" "" "hide show hidden files folders"
     Add-SearchIndexEntry "btnToggleExplorerLaunch" "File Explorer Launch Folder" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleCtxMenu" "Context Menu Style" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleTakeOwnership" "Take Ownership Context Menu" "btnTabTweaks"
