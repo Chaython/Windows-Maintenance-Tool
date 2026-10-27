@@ -35741,6 +35741,24 @@ function Set-WmtTweakUnknownState {
             'btnTogglePaintAI' { 'Toggle Paint AI' }
             'btnToggleNotepadAI' { 'Toggle Notepad AI' }
             'btnTogglePhoneLink' { 'Toggle Phone Link Start Menu Entry' }
+            'btnToggleIPv6' { 'Toggle IPv6' }
+            'btnToggleNetThrottling' { 'Toggle Network Throttling' }
+            'btnToggleNetLocationWizard' { 'Toggle Network Location Wizard' }
+            'btnToggleWifiSense' { 'Toggle Wi-Fi Sense' }
+            'btnToggleAutoWifi' { 'Toggle Suggested Wi-Fi' }
+            'btnToggleDiagData' { 'Set Diagnostic Data Level' }
+            'btnToggleInkingPersonal' { 'Toggle Inking Personalization' }
+            'btnToggleSpeechOnline' { 'Toggle Online Speech Recognition' }
+            'btnToggleAppDiagnostics' { 'Toggle App Diagnostics Access' }
+            'btnToggleBackgroundApps' { 'Toggle Background Apps' }
+            'btnToggleFeedbackNotify' { 'Toggle Feedback Notifications' }
+            'btnToggleCompatTelemetry' { 'Toggle Compatibility Telemetry' }
+            'btnToggleCEIP' { 'Toggle CEIP' }
+            'btnToggleThumbCache' { 'Toggle Thumbnail Cache' }
+            'btnToggleDriveLettersFirst' { 'Set Drive Letter Order' }
+            'btnToggleTaskbarAlign' { 'Set Taskbar Alignment' }
+            'btnToggleCombine' { 'Toggle Taskbar Grouping' }
+            'btnToggleClockSecs' { 'Toggle Clock Seconds' }
             'btnToggleExtensions' { 'Toggle File Extensions' }
             'btnToggleHiddenFiles' { 'Toggle Hidden Files' }
             'btnToggleFullPath' { 'Toggle Explorer Full Path' }
@@ -36447,13 +36465,34 @@ try {
     }
 
     $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    $ta = & $getRegValue $ap "TaskbarAl";
+    $ta = & $getRegValue $ap "TaskbarAl" $null
+    $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"
+    if ((& $hasRegValue $ap "TaskbarAl") -and ((ConvertTo-Int $ta -1) -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleTaskbarAlign ((ConvertTo-Int $ta 0) -eq 0) "Align Taskbar Left" "Align Taskbar Center"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleTaskbarAlign" "Not set" "TaskbarAl is absent or invalid, so WMT cannot confirm the alignment."
+    }
 
-    $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"; $taskbarLeft = ($ta -eq 0); Update-WmtTweakToggle $btnToggleTaskbarAlign $taskbarLeft "Align Taskbar Left" "Align Taskbar Center"
-    $tc = & $getRegValue $ap "TaskbarGlomLevel"; $neverCombine = ($tc -eq 2); Update-WmtTweakToggle $btnToggleCombine $neverCombine "Never Combine" "Always Combine"
+    $tcRaw = & $getRegValue $ap "TaskbarGlomLevel" $null
+    $tc = ConvertTo-Int $tcRaw -1
+    $btnToggleCombine = Get-Ctrl "btnToggleCombine"
+    if ((& $hasRegValue $ap "TaskbarGlomLevel") -and ($tc -in @(0,2))) {
+        Update-WmtTweakToggle $btnToggleCombine ($tc -eq 2) "Never Combine" "Always Combine"
+    } elseif ((& $hasRegValue $ap "TaskbarGlomLevel") -and $tc -eq 1) {
+        Set-WmtTweakUnknownState "btnToggleCombine" "Combine when full" "Windows is configured for the third taskbar grouping mode. The two-mode control cannot represent it exactly."
+    } else {
+        Set-WmtTweakUnknownState "btnToggleCombine" "Not set" "TaskbarGlomLevel is absent or invalid."
+    }
+
     $is24 = ((ConvertTo-Str (& $getRegValue "HKCU:\Control Panel\International" "sShortTime") "") -cmatch "H")
     $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"; Update-WmtTweakToggle $btnToggleClockFormat (-not $is24) "12-Hour Clock" "24-Hour Clock"
-    $cs = & $getRegValue $ap "ShowSecondsInSystemClock"; $clockSecsHidden = ($cs -ne 1); Update-WmtTweakToggle $btnToggleClockSecs $clockSecsHidden "Hide Clock Seconds" "Show Clock Seconds"
+
+    $cs = ConvertTo-Int (& $getRegValue $ap "ShowSecondsInSystemClock" $null) -1
+    if ((& $hasRegValue $ap "ShowSecondsInSystemClock") -and ($cs -in @(0,1))) {
+        Update-WmtTweakToggle $btnToggleClockSecs ($cs -eq 0) "Hide Clock Seconds" "Show Clock Seconds"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleClockSecs" "Not set" "ShowSecondsInSystemClock is absent or invalid."
+    }
     $smode = & $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode"
     $script:WmtSearchDisplayMode = $null
     if ($null -ne $smode) {
@@ -36825,44 +36864,161 @@ try {
     # --- EXPANDED TWEAK STATE DETECTION (round 2) ---
 
     # Network Tweaks
+    $ipv6Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
+    $ipv6Raw = & $getRegValue $ipv6Path "DisabledComponents" $null
     $ipv6Btn = Get-Ctrl "btnToggleIPv6"
-    if ($ipv6Btn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0) 0); Update-WmtTweakToggle $ipv6Btn (-not (($v -band 0xFF) -ne 0)) "Disable IPv6" "Enable IPv6" }
+    if (& $hasRegValue $ipv6Path "DisabledComponents") {
+        $v = ConvertTo-Int $ipv6Raw 0
+        Update-WmtTweakToggle $ipv6Btn (-not (($v -band 0xFF) -ne 0)) "Disable IPv6" "Enable IPv6"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleIPv6" "Not set" "DisabledComponents is absent, so WMT is not assuming a forced IPv6 state."
+    }
+
+    $throttlePath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+    $throttleRaw = & $getRegValue $throttlePath "NetworkThrottlingIndex" $null
     $ntBtn = Get-Ctrl "btnToggleNetThrottling"
-    if ($ntBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 10) 0); Update-WmtTweakToggle $ntBtn (-not ($v -eq 0xFFFFFFFF)) "Disable Net Throttling" "Enable Net Throttling" }
+    if (& $hasRegValue $throttlePath "NetworkThrottlingIndex") {
+        $v = ConvertTo-Int $throttleRaw 10
+        Update-WmtTweakToggle $ntBtn (-not ($v -eq 0xFFFFFFFF)) "Disable Net Throttling" "Enable Net Throttling"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleNetThrottling" "Not set" "NetworkThrottlingIndex is absent, so WMT cannot confirm the explicit throttle configuration."
+    }
+
+    $locationWizardPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters"
+    $locationWizardRaw = & $getRegValue $locationWizardPath "ShowNetworkLocationWizard" $null
     $nlwBtn = Get-Ctrl "btnToggleNetLocationWizard"
-    if ($nlwBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters" "ShowNetworkLocationWizard" 1) 0); Update-WmtTweakToggle $nlwBtn (-not ($v -eq 0)) "Net Location Wizard On" "Net Location Wizard Off" }
+    if ((& $hasRegValue $locationWizardPath "ShowNetworkLocationWizard") -and ((ConvertTo-Int $locationWizardRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $nlwBtn ((ConvertTo-Int $locationWizardRaw 0) -ne 0) "Net Location Wizard On" "Net Location Wizard Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleNetLocationWizard" "Not set" "ShowNetworkLocationWizard is absent or invalid."
+    }
+
+    $wifiSensePath = "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config"
+    $wifiSenseRaw = & $getRegValue $wifiSensePath "AutoConnectAllowedOEM" $null
     $wfsBtn = Get-Ctrl "btnToggleWifiSense"
-    if ($wfsBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $wfsBtn (-not ($v -eq 0)) "Wi-Fi Sense On" "Wi-Fi Sense Off" }
+    if ((& $hasRegValue $wifiSensePath "AutoConnectAllowedOEM") -and ((ConvertTo-Int $wifiSenseRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $wfsBtn ((ConvertTo-Int $wifiSenseRaw 0) -ne 0) "Wi-Fi Sense On" "Wi-Fi Sense Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleWifiSense" "Not set" "AutoConnectAllowedOEM is absent or invalid."
+    }
+
+    $autoWifiPath = "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config"
+    $autoWifiRaw = & $getRegValue $autoWifiPath "AutoConnectAllowedOEM" $null
     $awBtn = Get-Ctrl "btnToggleAutoWifi"
-    if ($awBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 1) 0); Update-WmtTweakToggle $awBtn (-not ($v -eq 0)) "Suggested WiFi On" "Suggested WiFi Off" }
+    if ((& $hasRegValue $autoWifiPath "AutoConnectAllowedOEM") -and ((ConvertTo-Int $autoWifiRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $awBtn ((ConvertTo-Int $autoWifiRaw 0) -ne 0) "Suggested WiFi On" "Suggested WiFi Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleAutoWifi" "Not set" "AutoConnectAllowedOEM is absent or invalid for the current user."
+    }
 
     # Privacy (round 2)
+    $ddPath1 = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
+    $ddPath2 = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
+    $ddValue1 = & $getRegValue $ddPath1 "AllowTelemetry" $null
+    $ddValue2 = & $getRegValue $ddPath2 "AllowTelemetry" $null
+    $ddPresent1 = & $hasRegValue $ddPath1 "AllowTelemetry"
+    $ddPresent2 = & $hasRegValue $ddPath2 "AllowTelemetry"
     $ddBtn = Get-Ctrl "btnToggleDiagData"
-    if ($ddBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 3) 0); Update-WmtTweakToggle $ddBtn ($v -le 1) "Diag Data Optional" "Diag Data Required" }
+    if (($ddPresent1 -or $ddPresent2) -and
+        ((-not $ddPresent1 -or ((ConvertTo-Int $ddValue1 -1) -in @(0,1,2,3))) -and
+         (-not $ddPresent2 -or ((ConvertTo-Int $ddValue2 -1) -in @(0,1,2,3))))) {
+        $currentlyRequired = (($ddPresent1 -and ((ConvertTo-Int $ddValue1 3) -le 1)) -or
+            ($ddPresent2 -and ((ConvertTo-Int $ddValue2 3) -le 1)))
+        Update-WmtTweakToggle $ddBtn (-not $currentlyRequired) "Diag Data Optional" "Diag Data Required"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleDiagData" "Not set" "AllowTelemetry is not explicitly stored as a recognized value in either policy location."
+    }
+
+    $inkPath = "HKCU:\Software\Microsoft\InputPersonalization"
+    $inkValue = & $getRegValue $inkPath "RestrictImplicitInkCollection" $null
+    $textValue = & $getRegValue $inkPath "RestrictImplicitTextCollection" $null
     $ipBtn = Get-Ctrl "btnToggleInkingPersonal"
-    if ($ipBtn) { $v1 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0) 0); $v2 = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0) 0); Update-WmtTweakToggle $ipBtn (-not ($v1 -eq 1 -and $v2 -eq 1)) "Inking Personal On" "Inking Personal Off" }
+    if ((& $hasRegValue $inkPath "RestrictImplicitInkCollection") -and (& $hasRegValue $inkPath "RestrictImplicitTextCollection") -and
+        ((ConvertTo-Int $inkValue -1) -in @(0,1)) -and ((ConvertTo-Int $textValue -1) -in @(0,1))) {
+        $v1 = ConvertTo-Int $inkValue 0
+        $v2 = ConvertTo-Int $textValue 0
+        Update-WmtTweakToggle $ipBtn (-not ($v1 -eq 1 -and $v2 -eq 1)) "Inking Personal On" "Inking Personal Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleInkingPersonal" "Not set" "Both implicit-inking and implicit-text restriction values must exist to confirm this setting."
+    }
+
+    $speechPath = "HKCU:\Software\Microsoft\Speech_OneSet"
+    $speechRaw = & $getRegValue $speechPath "AcceptPrivacyNotice" $null
     $soBtn = Get-Ctrl "btnToggleSpeechOnline"
-    if ($soBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Speech_OneSet" "AcceptPrivacyNotice" 1) 0); Update-WmtTweakToggle $soBtn (-not ($v -eq 0)) "Speech Online On" "Speech Online Off" }
+    if ((& $hasRegValue $speechPath "AcceptPrivacyNotice") -and ((ConvertTo-Int $speechRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $soBtn ((ConvertTo-Int $speechRaw 0) -ne 0) "Speech Online On" "Speech Online Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleSpeechOnline" "Not set" "AcceptPrivacyNotice is absent or invalid."
+    }
+
+    $appDiagPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics"
+    $appDiagRaw = & $getRegValue $appDiagPath "Value" $null
     $adBtn = Get-Ctrl "btnToggleAppDiagnostics"
-    if ($adBtn) { $v = (ConvertTo-Str (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics" "Value" "Allow") ""); Update-WmtTweakToggle $adBtn (-not ($v -ne "Allow")) "App Diagnostics On" "App Diagnostics Off" }
+    if ((& $hasRegValue $appDiagPath "Value") -and ([string]$appDiagRaw -in @("Allow","Deny"))) {
+        Update-WmtTweakToggle $adBtn ([string]$appDiagRaw -eq "Allow") "App Diagnostics On" "App Diagnostics Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleAppDiagnostics" "Not set" "The appDiagnostics consent value is absent or is not Allow/Deny."
+    }
+
+    $backgroundAppsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"
+    $backgroundAppsRaw = & $getRegValue $backgroundAppsPath "GlobalUserDisabled" $null
     $baBtn = Get-Ctrl "btnToggleBackgroundApps"
-    if ($baBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 0) 0); Update-WmtTweakToggle $baBtn (-not ($v -eq 1)) "Background Apps On" "Background Apps Off" }
+    if ((& $hasRegValue $backgroundAppsPath "GlobalUserDisabled") -and ((ConvertTo-Int $backgroundAppsRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $baBtn ((ConvertTo-Int $backgroundAppsRaw 0) -ne 1) "Background Apps On" "Background Apps Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleBackgroundApps" "Not set" "GlobalUserDisabled is absent or invalid."
+    }
+
+    $feedbackPath = "HKCU:\Software\Microsoft\Siuf\Rules"
+    $feedbackRaw = & $getRegValue $feedbackPath "NumberOfSIUFInPeriod" $null
     $fnBtn = Get-Ctrl "btnToggleFeedbackNotify"
-    if ($fnBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" -1) 0); Update-WmtTweakToggle $fnBtn (-not ($v -eq 0)) "Feedback Notify On" "Feedback Notify Off" }
+    if (& $hasRegValue $feedbackPath "NumberOfSIUFInPeriod") {
+        $v = ConvertTo-Int $feedbackRaw -1
+        Update-WmtTweakToggle $fnBtn ($v -ne 0) "Feedback Notify On" "Feedback Notify Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleFeedbackNotify" "Not set" "NumberOfSIUFInPeriod is absent, which is not enough to confirm feedback-notification status."
+    }
+
+    $compatPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat"
+    $compatRaw = & $getRegValue $compatPath "AITEnable" $null
     $ctBtn = Get-Ctrl "btnToggleCompatTelemetry"
-    if ($ctBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable" 1) 0); Update-WmtTweakToggle $ctBtn (-not ($v -eq 0)) "Compat Telemetry On" "Compat Telemetry Off" }
+    if ((& $hasRegValue $compatPath "AITEnable") -and ((ConvertTo-Int $compatRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $ctBtn ((ConvertTo-Int $compatRaw 0) -ne 0) "Compat Telemetry On" "Compat Telemetry Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleCompatTelemetry" "Not set" "AITEnable is absent or invalid."
+    }
+
+    $ceipPath = "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows"
+    $ceipRaw = & $getRegValue $ceipPath "CEIPEnable" $null
     $ceBtn = Get-Ctrl "btnToggleCEIP"
-    if ($ceBtn) { $v = (ConvertTo-Str (& $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" "1") ""); Update-WmtTweakToggle $ceBtn (-not ($v -ne "1")) "CEIP On" "CEIP Off" }
+    if ((& $hasRegValue $ceipPath "CEIPEnable") -and ([string]$ceipRaw -in @("0","1"))) {
+        Update-WmtTweakToggle $ceBtn ([string]$ceipRaw -eq "1") "CEIP On" "CEIP Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleCEIP" "Not set" "CEIPEnable is absent or invalid."
+    }
 
     # Explorer (round 2)
     $ntlaBtn = Get-Ctrl "btnToggleNTFSLastAccess"
     if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn (-not $off) "Disable NTFS Last Access" "Enable NTFS Last Access" } }
     $n83Btn = Get-Ctrl "btnToggleNTFS83"
     if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn (-not $off) "Disable NTFS 8.3" "Enable NTFS 8.3" } }
+    $thumbCachePath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    $thumbRaw = & $getRegValue $thumbCachePath "DisableThumbnails" $null
     $tcBtn = Get-Ctrl "btnToggleThumbCache"
-    if ($tcBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisableThumbnails" 0) 0); Update-WmtTweakToggle $tcBtn (-not ($v -eq 1)) "Thumbnail Cache On" "Thumbnail Cache Off" }
+    if ((& $hasRegValue $thumbCachePath "DisableThumbnails") -and ((ConvertTo-Int $thumbRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $tcBtn ((ConvertTo-Int $thumbRaw 0) -ne 1) "Thumbnail Cache On" "Thumbnail Cache Off"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleThumbCache" "Not set" "DisableThumbnails is absent or invalid."
+    }
+
+    $driveLetterPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
+    $driveLetterRaw = & $getRegValue $driveLetterPath "ShowDriveLettersFirst" $null
     $dlfBtn = Get-Ctrl "btnToggleDriveLettersFirst"
-    if ($dlfBtn) { $v = (ConvertTo-Int (& $getRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer" "ShowDriveLettersFirst" 0) 0); Update-WmtTweakToggle $dlfBtn ($v -eq 1) "Drive Letters Last" "Drive Letters First" }
+    if ((& $hasRegValue $driveLetterPath "ShowDriveLettersFirst") -and ((ConvertTo-Int $driveLetterRaw -1) -in @(0,1))) {
+        Update-WmtTweakToggle $dlfBtn ((ConvertTo-Int $driveLetterRaw 1) -eq 0) "Drive Letters Last" "Drive Letters First"
+    } else {
+        Set-WmtTweakUnknownState "btnToggleDriveLettersFirst" "Not set" "ShowDriveLettersFirst is absent or invalid."
+    }
 
     # Context Menu (round 2)
     $cmdBtn = Get-Ctrl "btnToggleCmdHere"
@@ -38468,7 +38624,8 @@ $btnToggleDiagData.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p1 "AllowTelemetry" 1; Set-WmtRegDword $p2 "AllowTelemetry" 1; Write-GuiLog "Diagnostic data set to Required only." } "Setting diagnostic data to required..."
         }
-        Update-WmtTweakToggle $btnToggleDiagData (-not $currentlyRequired) "Diag Data Optional" "Diag Data Required"
+        # IsOn is the resulting mode: Required -> Optional is On.
+        Update-WmtTweakToggle $btnToggleDiagData $currentlyRequired "Diag Data Optional" "Diag Data Required"
     })
 }
 
@@ -38643,7 +38800,8 @@ $btnToggleDriveLettersFirst.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowDriveLettersFirst" 1; Write-GuiLog "Drive letters shown first." } "Setting drive letters first..."
         }
-        Update-WmtTweakToggle $btnToggleDriveLettersFirst (-not $currentlyFirst) "Drive Letters Last" "Drive Letters First"
+        # IsOn is the resulting mode: toggling from First yields Last.
+        Update-WmtTweakToggle $btnToggleDriveLettersFirst $currentlyFirst "Drive Letters Last" "Drive Letters First"
     })
 }
 
