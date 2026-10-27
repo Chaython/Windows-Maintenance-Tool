@@ -37047,7 +37047,7 @@ try {
 
     # Developer (round 2)
     $psBtn = Get-Ctrl "btnTogglePSExec"
-    if ($psBtn) { $v = $nrd["ExecutionPolicy"]; if ($null -eq $v) { try { $v = (Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue) } catch {} }; if ($null -ne $v) { Update-WmtTweakToggle $psBtn ($v -eq "Restricted" -or $v -eq "AllSigned") "Disable PS Execution" "Enable PS Execution" } }
+    if ($psBtn) { $v = $nrd["ExecutionPolicy"]; if ($null -eq $v) { try { $v = (Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue) } catch {} }; if ($null -ne $v) { Update-WmtTweakToggle $psBtn ($v -eq "Restricted") "Disable PS Execution" "Enable PS Execution" } }
     $sdBtn = Get-Ctrl "btnToggleSudo"
     if ($sdBtn) { $v = (ConvertTo-Int (& $getRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" "Enabled" 0) 0); Update-WmtTweakToggle $sdBtn ($v -ne 0) "Disable Sudo" "Enable Sudo" }
     $wshBtn = Get-Ctrl "btnToggleWSH"
@@ -39085,7 +39085,7 @@ $btnTogglePSExec = Get-Ctrl "btnTogglePSExec"
 if ($btnTogglePSExec) {
 $btnTogglePSExec.Add_Click({
         $current = (Get-ExecutionPolicy -Scope CurrentUser)
-        if ($current -eq "Restricted" -or $current -eq "AllSigned") {
+        if ($current -eq "Restricted") {
             Invoke-UiCommand { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force; Write-GuiLog "PowerShell execution set to RemoteSigned (scripts allowed)." } "Enabling script execution..."
         }
         else {
