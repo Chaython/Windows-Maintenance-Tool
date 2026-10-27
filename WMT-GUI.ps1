@@ -63977,6 +63977,7 @@ catch {
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection",
             "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat",
             "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows",
             "HKLM:\SOFTWARE\Policies\Microsoft\Edge",
