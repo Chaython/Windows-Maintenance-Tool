@@ -39053,14 +39053,39 @@ Register-WmtTweakButton "btnA11ySettings" { Start-Process "ms-settings:easeofacc
 $btnTogglePSExec = Get-Ctrl "btnTogglePSExec"
 if ($btnTogglePSExec) {
 $btnTogglePSExec.Add_Click({
-        $current = (Get-ExecutionPolicy -Scope CurrentUser)
+        $machinePolicy = Get-ExecutionPolicy -Scope MachinePolicy -ErrorAction SilentlyContinue
+        $userPolicy = Get-ExecutionPolicy -Scope UserPolicy -ErrorAction SilentlyContinue
+        if ($machinePolicy -ne "Undefined" -or $userPolicy -ne "Undefined") {
+            $effective = Get-ExecutionPolicy -ErrorAction SilentlyContinue
+            Write-GuiLog "PowerShell execution policy is enforced by Group Policy; WMT cannot override MachinePolicy/UserPolicy from CurrentUser scope."
+            if ($effective -eq "Restricted") {
+                Update-WmtTweakToggle $btnTogglePSExec $true "Disable PS Execution" "Enable PS Execution"
+            } elseif ($effective) {
+                Update-WmtTweakToggle $btnTogglePSExec $false "Disable PS Execution" "Enable PS Execution"
+            } else {
+                Set-WmtTweakUnknownState "btnTogglePSExec" "Not set" "WMT could not read the effective PowerShell execution policy."
+            }
+            return
+        }
+
+        $current = Get-ExecutionPolicy -Scope CurrentUser -ErrorAction SilentlyContinue
         if ($current -eq "Restricted") {
             Invoke-UiCommand { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force; Write-GuiLog "PowerShell execution set to RemoteSigned (scripts allowed)." } "Enabling script execution..."
         }
         else {
             Invoke-UiCommand { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Restricted -Force; Write-GuiLog "PowerShell execution set to Restricted (no scripts)." } "Disabling script execution..."
         }
-        Update-WmtTweakToggle $btnTogglePSExec (-not ($current -eq "Restricted")) "Disable PS Execution" "Enable PS Execution"
+
+        # Read back the effective policy instead of inferring success from the
+        # pre-change CurrentUser value. Set-ExecutionPolicy can be blocked or fail.
+        $effective = Get-ExecutionPolicy -ErrorAction SilentlyContinue
+        if ($effective -eq "Restricted") {
+            Update-WmtTweakToggle $btnTogglePSExec $true "Disable PS Execution" "Enable PS Execution"
+        } elseif ($effective) {
+            Update-WmtTweakToggle $btnTogglePSExec $false "Disable PS Execution" "Enable PS Execution"
+        } else {
+            Set-WmtTweakUnknownState "btnTogglePSExec" "Not set" "WMT could not read the effective PowerShell execution policy after the change."
+        }
     })
 }
 
