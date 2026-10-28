@@ -2,9 +2,9 @@ name: Build WinUI 3 Artifact
 
 on:
   push:
-    branches: [main, master, Main]
+    branches: [main, master, Main, WinUi]
   pull_request:
-    branches: [main, master, Main]
+    branches: [main, master, Main, WinUi]
   workflow_dispatch:
 
 permissions:
