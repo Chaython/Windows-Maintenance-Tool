@@ -1,0 +1,19 @@
+<Page x:Class="WMT_WinUI.Pages.SettingsPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Transparent">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Padding="0,16,0,24" Spacing="16">
+            <TextBlock Text="Settings" FontSize="24" FontWeight="Bold" Foreground="#F1F1F3" />
+            <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                <StackPanel Spacing="8">
+                    <CheckBox x:Name="ChkDisableJobs" Content="Disable Background Jobs" Foreground="#F1F1F3" FontSize="13" />
+                    <TextBlock Text="When enabled, background scanning and async operations are paused." Foreground="#A0A0A8" FontSize="11" />
+                </StackPanel>
+            </Border>
+            <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Log Path" FontWeight="SemiBold" Foreground="#F1F1F3" FontSize="14" />
+                    <TextBlock x:Name="TxtLogPath" Text="data\WmtWinUI.log" Foreground="#A0A0A8" FontSize="12" FontFamily="Consolas" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

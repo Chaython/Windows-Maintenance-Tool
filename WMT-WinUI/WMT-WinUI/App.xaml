@@ -1,0 +1,26 @@
+<Application
+    x:Class="WMT_WinUI.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:WMT_WinUI"
+    xmlns:converters="using:CommunityToolkit.WinUI.UI.Converters">
+
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- Theme brushes -->
+            <SolidColorBrush x:Key="AppBackgroundBrush" Color="#1A1A1E" />
+            <SolidColorBrush x:Key="AppPanelBrush" Color="#222227" />
+            <SolidColorBrush x:Key="AppBorderBrush" Color="#33333A" />
+            <SolidColorBrush x:Key="AppAccentBrush" Color="#0078D4" />
+            <SolidColorBrush x:Key="AppTextPrimaryBrush" Color="#F1F1F3" />
+            <SolidColorBrush x:Key="AppTextSecondaryBrush" Color="#A0A0A8" />
+            <SolidColorBrush x:Key="AppSuccessBrush" Color="#3FB950" />
+            <SolidColorBrush x:Key="AppWarningBrush" Color="#D29922" />
+            <SolidColorBrush x:Key="AppErrorBrush" Color="#F85149" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

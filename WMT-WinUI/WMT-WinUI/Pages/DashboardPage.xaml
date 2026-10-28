@@ -1,0 +1,112 @@
+<Page
+    x:Class="WMT_WinUI.Pages.DashboardPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto">
+        <Grid Padding="0,16,0,24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" Margin="0,0,0,24">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*" />
+                    <ColumnDefinition Width="1*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="24" Margin="0,0,12,0">
+                    <StackPanel>
+                        <TextBlock Text="System Health" FontWeight="Bold" FontSize="18" Foreground="#F1F1F3" Margin="0,0,0,12" />
+                        <Grid ColumnSpacing="12" RowSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Background="#1A1A1E" CornerRadius="8" Padding="16">
+                                <StackPanel>
+                                    <TextBlock Text="CPU Usage" FontSize="11" Foreground="#A0A0A8" />
+                                    <TextBlock Text="3.2%" FontWeight="Bold" FontSize="22" Foreground="#3FB950" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="1" Background="#1A1A1E" CornerRadius="8" Padding="16">
+                                <StackPanel>
+                                    <TextBlock Text="Memory" FontSize="11" Foreground="#A0A0A8" />
+                                    <TextBlock Text="42% Used" FontWeight="Bold" FontSize="22" Foreground="#D29922" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="1" Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="24">
+                    <StackPanel>
+                        <TextBlock Text="Quick Actions" FontWeight="Bold" FontSize="18" Foreground="#F1F1F3" Margin="0,0,0,12" />
+                        <Button x:Name="BtnQuickScan" Content="Run Quick Scan" Click="OnQuickScanClick" HorizontalAlignment="Stretch" Margin="0,0,0,8" />
+                        <Button x:Name="BtnCleanTemp" Content="Clean Temp Files" Click="OnCleanTempClick" HorizontalAlignment="Stretch" Margin="0,0,0,8" />
+                        <Button x:Name="BtnRefreshInfo" Content="Refresh System Info" Click="OnRefreshInfoClick" HorizontalAlignment="Stretch" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Grid Grid.Row="1" Margin="0,0,0,24">
+                <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="24">
+                    <StackPanel>
+                        <TextBlock Text="Device Summary" FontWeight="Bold" FontSize="18" Foreground="#F1F1F3" Margin="0,0,0,12" />
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Background="#1A1A1E" CornerRadius="8" Padding="16">
+                                <StackPanel>
+                                    <TextBlock Text="Processor" FontSize="11" Foreground="#A0A0A8" />
+                                    <TextBlock Text="Intel Core i9-13900K" FontWeight="SemiBold" Foreground="#F1F1F3" FontSize="12" />
+                                    <TextBlock Text="16 Cores / 32 Threads" FontSize="11" Foreground="#A0A0A8" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="1" Background="#1A1A1E" CornerRadius="8" Padding="16">
+                                <StackPanel>
+                                    <TextBlock Text="Memory" FontSize="11" Foreground="#A0A0A8" />
+                                    <TextBlock Text="32 GB DDR5" FontWeight="SemiBold" Foreground="#F1F1F3" FontSize="12" />
+                                    <TextBlock Text="6400 MT/s" FontSize="11" Foreground="#A0A0A8" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="2" Background="#1A1A1E" CornerRadius="8" Padding="16">
+                                <StackPanel>
+                                    <TextBlock Text="Storage" FontSize="11" Foreground="#A0A0A8" />
+                                    <TextBlock Text="2 TB NVMe SSD" FontWeight="SemiBold" Foreground="#F1F1F3" FontSize="12" />
+                                    <TextBlock Text="850 GB Free" FontSize="11" Foreground="#A0A0A8" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="3" Background="#1A1A1E" CornerRadius="8" Padding="16">
+                                <StackPanel>
+                                    <TextBlock Text="OS Status" FontSize="11" Foreground="#A0A0A8" />
+                                    <TextBlock Text="Windows 11 Pro" FontWeight="SemiBold" Foreground="#F1F1F3" FontSize="12" />
+                                    <TextBlock Text="Build 22631" FontSize="11" Foreground="#A0A0A8" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Grid Grid.Row="2">
+                <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="24">
+                    <StackPanel>
+                        <TextBlock Text="Recent Operations" FontWeight="Bold" FontSize="18" Foreground="#F1F1F3" Margin="0,0,0,8" />
+                        <TextBlock Text="No operations executed yet. Run a scan or refresh to see results." Foreground="#A0A0A8" FontSize="12" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Grid>
+    </ScrollViewer>
+</Page>

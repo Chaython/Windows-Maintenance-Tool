@@ -1,0 +1,85 @@
+name: Build WinUI 3 Artifact
+
+on:
+  push:
+    branches: [main, master, Main]
+  pull_request:
+    branches: [main, master, Main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-winui:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      MSBuildSDKsPath: C:\Program Files\dotnet\sdk\9.0.320\Sdks
+      BuildConfiguration: Release
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore NuGet packages
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet restore "WMT-WinUI\WMT-WinUI.sln"
+
+      - name: Build WinUI 3 App
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Windows SDK / Visual Studio is present on windows-latest runners,
+          # so .g.cs generation and MSIX packaging work out of the box.
+          dotnet build "WMT-WinUI\WMT-WinUI.sln" --configuration $env:BuildConfiguration --verbosity normal
+
+      - name: Copy build artifacts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outDir = "WMT-WinUI\WMT-WinUI\bin\Release\net9.0-windows10.0.19041.0\win-x64"
+          if (-not (Test-Path $outDir)) {
+            $outDir = "WMT-WinUI\WMT-WinUI\bin\Release\net9.0-windows10.0.19041.0"
+          }
+          New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
+          Copy-Item -Path "$outDir\*" -Destination "artifacts\" -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Artifacts copied from $outDir"
+
+      - name: Upload WinUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: winui-3-artifact
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Verify PowerShell engine
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $enginePath = "WMT-WinUI\WMT-Engine.psm1"
+          if (Test-Path $enginePath) {
+            $content = Get-Content $enginePath -Raw
+            $lineCount = $content.Split([Environment]::NewLine).Count
+            Write-Host "Engine module loaded: $lineCount lines"
+            # Quick syntax check: remove #Requires temporarily and invoke
+            $temp = $content -replace '#Requires -RunAsAdministrator', ''
+            $temp | Out-File -FilePath ".\temp_engine.ps1" -Encoding UTF8 -NoNewline
+            Import-Module ".\temp_engine.ps1" -Force -ErrorAction SilentlyContinue
+            if (Get-Command Get-WmtVersion -ErrorAction SilentlyContinue) {
+              Write-Host "Engine version: $(Get-WmtVersion)"
+            }
+          } else {
+            Write-Warning "WMT-Engine.psm1 not found at expected path"
+          }

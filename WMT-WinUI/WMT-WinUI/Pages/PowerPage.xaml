@@ -1,0 +1,13 @@
+<Page x:Class="WMT_WinUI.Pages.PowerPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Transparent">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Padding="0,16,0,24" Spacing="16">
+            <TextBlock Text="Power & Battery" FontSize="24" FontWeight="Bold" Foreground="#F1F1F3" />
+            <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Battery Health" FontSize="16" FontWeight="SemiBold" Foreground="#F1F1F3" />
+                    <TextBlock Text="Battery telemetry and cycle count will be displayed here." Foreground="#A0A0A8" FontSize="12" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

@@ -1,0 +1,25 @@
+<Page x:Class="WMT_WinUI.Pages.NetworkPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Transparent">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Padding="0,16,0,24" Spacing="16">
+            <TextBlock Text="Network Tools" FontSize="24" FontWeight="Bold" Foreground="#F1F1F3" />
+            <Grid ColumnSpacing="16">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="Status & Adapters" FontWeight="SemiBold" FontSize="16" Foreground="#F1F1F3" />
+                        <TextBlock Text="Active adapters and connection profiles will be shown here." Foreground="#A0A0A8" FontSize="12" />
+                        <Button Content="Refresh Status" Click="OnRefreshStatusClick" HorizontalAlignment="Left" Padding="16,8" />
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="1" Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="Reset Tools" FontWeight="SemiBold" FontSize="16" Foreground="#F1F1F3" />
+                        <TextBlock Text="Basic or full network reset options." Foreground="#A0A0A8" FontSize="12" />
+                        <Button Content="Basic Reset" Click="OnBasicResetClick" HorizontalAlignment="Left" Padding="16,8" Margin="0,4,0,0" />
+                        <Button Content="Full Reset" Click="OnFullResetClick" HorizontalAlignment="Left" Padding="16,8" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

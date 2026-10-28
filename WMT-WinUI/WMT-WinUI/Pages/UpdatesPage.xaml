@@ -1,0 +1,20 @@
+<Page x:Class="WMT_WinUI.Pages.UpdatesPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Transparent">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Padding="0,16,0,24" Spacing="16">
+            <TextBlock Text="System Updates" FontSize="24" FontWeight="Bold" Foreground="#F1F1F3" />
+            <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Store & Package Updates" FontSize="16" FontWeight="SemiBold" Foreground="#F1F1F3" />
+                    <TextBlock Text="Check for available updates via Microsoft Store and winget sources. Updates will be listed below." Foreground="#A0A0A8" FontSize="12" TextWrapping="Wrap" />
+                    <Button Content="Check for Updates" Click="OnCheckUpdatesClick" HorizontalAlignment="Left" Padding="16,8" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
+            <Border Background="#16161A" BorderBrush="#33333A" BorderThickness="1" CornerRadius="12" Padding="20">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Update Logs" FontSize="16" FontWeight="SemiBold" Foreground="#F1F1F3" />
+                    <TextBlock Text="No recent updates found. Run 'Check for Updates' to scan for available packages." Foreground="#A0A0A8" FontSize="12" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>
