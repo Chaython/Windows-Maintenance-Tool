@@ -955,8 +955,16 @@ jobs:
           $script:WmtThemedElements = [Collections.ArrayList]::new()
           $script:WmtUiBackgroundCommands = @{}
           $script:WmtUiPollOperations = @{}
-          # Use isolated real workers rather than WMT's pool, which loads system helpers.
-          function New-WmtPooledPowerShell { param($PoolKind) [PowerShell]::Create() }
+          # These functions are extracted without WMT's top-level startup code,
+          # so initialize the manager and an isolated pool explicitly.
+          $script:WmtBackgroundOperationState = [hashtable]::Synchronized(@{
+              Operations = @{}; NextId = [long]0; ShuttingDown = $false; Log = $null
+          })
+          Initialize-WmtBackgroundOperationManager
+          $script:WmtTestRunspacePool = [runspacefactory]::CreateRunspacePool(1, 2)
+          $script:WmtTestRunspacePool.ApartmentState = 'STA'
+          $script:WmtTestRunspacePool.Open()
+          function Get-WmtReadyRunspacePool { param([string]$PoolKind = 'Background') return $script:WmtTestRunspacePool }
           function Write-GuiLog { param($Message) }
           $failures = [Collections.Generic.List[string]]::new()
           function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
@@ -2135,10 +2143,13 @@ jobs:
               try {
                   $p=New-WmtAsyncProgress -Owner $d
                   $d.Content.Content=$p.View
-                  Set-WmtAsyncProgressState -Progress $p -State Failed -Message ('Long worker error. ' * 150)
+                  $longError = 'Long worker error. ' * 150
+                  Set-WmtAsyncProgressState -Progress $p -State Failed -Message $longError
                   Measure-Window $d 420 160
                   $position=$p.CancelButton.TranslatePoint([Windows.Point]::new(0,0),$d.Content)
                   Assert ($position.Y -ge 0 -and $position.Y+$p.CancelButton.ActualHeight -le 160) 'Long worker error pushed the close button outside the window.'
+                  Assert ($p.Output.Text.Contains($longError)) 'The full worker error was not preserved in the scrollable output.'
+                  Assert ($p.Status.Text -match 'details are shown below') 'Long worker error did not leave a concise visible status.'
               } finally { $d.Close() }
           }
           Test-Case 'Installer option labels wrap inside the narrow scroll viewport' {
@@ -2246,12 +2257,16 @@ jobs:
           # Cancellation finalizes workers asynchronously. Let the real stop collectors
           # release their PowerShell instances before stopping the shared dispatcher timer.
           $cleanupWatch=[Diagnostics.Stopwatch]::StartNew()
-          while ($script:WmtUiPollOperations.Count -and $cleanupWatch.ElapsedMilliseconds -lt 5000) {
+          while (($script:WmtUiPollOperations.Count -or $script:WmtBackgroundOperationState.Operations.Count) -and $cleanupWatch.ElapsedMilliseconds -lt 5000) {
               Invoke-WmtDispatcherPump
               Start-Sleep -Milliseconds 20
           }
           Assert ($script:WmtUiPollOperations.Count -eq 0) 'Background cleanup monitors did not drain.'
+          Assert ($script:WmtBackgroundOperationState.Operations.Count -eq 0) 'Background manager operations did not drain.'
           Stop-WmtUiPoller
+          [void](Stop-WmtBackgroundOperationManager)
+          try { $script:WmtTestRunspacePool.Close() } catch {}
+          try { $script:WmtTestRunspacePool.Dispose() } catch {}
           if ($failures.Count) { throw ($failures -join "`n") }
           Write-Host 'All WPF component tests passed.'
 

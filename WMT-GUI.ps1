@@ -2314,26 +2314,80 @@ $result = [PSCustomObject]@{
     Error              = ""
 }
 $proc = $null
-$stdoutBuilder = [System.Text.StringBuilder]::new()
-$stderrBuilder = [System.Text.StringBuilder]::new()
+$outCapture = $null
+$errCapture = $null
 # Read fixed-size character chunks, never lines: ReadLineAsync can allocate an
 # arbitrarily large string when a child emits a huge line without a newline.
 # Retained output is capped per stream, but reads continue after the cap so
-# the child cannot deadlock on a full redirected pipe.
+# the child cannot deadlock on a full redirected pipe. Dedicated .NET reader
+# threads keep output draining out of the PowerShell polling loop.
 $maxOutputChars = 8 * 1024 * 1024
-$appendOutputChunk = {
-    param([char[]]$Buffer, [int]$Count, [System.Text.StringBuilder]$Builder)
-    if ($Count -le 0) { return }
-    $remaining = $maxOutputChars - $Builder.Length
-    if ($remaining -le 0) {
-        $result.OutputTruncated = $true
-        return
-    }
-    $take = [Math]::Min($Count, $remaining)
-    [void]$Builder.Append($Buffer, 0, $take)
-    if ($take -lt $Count) { $result.OutputTruncated = $true }
-}
 try {
+    $typeLock = [System.AppDomain]::CurrentDomain
+    [System.Threading.Monitor]::Enter($typeLock)
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'WmtProcessCapture.BoundedStreamReader').Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace WmtProcessCapture {
+    public sealed class BoundedStreamReader {
+        private readonly StreamReader reader;
+        private readonly int maxChars;
+        private readonly object sync = new object();
+        private readonly StringBuilder text = new StringBuilder();
+        private readonly Task readTask;
+        private volatile bool truncated;
+        private string error = "";
+
+        public BoundedStreamReader(StreamReader stream, int limit) {
+            if (stream == null) throw new ArgumentNullException("stream");
+            reader = stream;
+            maxChars = Math.Max(0, limit);
+            readTask = Task.Factory.StartNew(
+                new Action(ReadToEnd),
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default
+            );
+        }
+
+        private void ReadToEnd() {
+            char[] buffer = new char[65536];
+            try {
+                int count;
+                while ((count = reader.Read(buffer, 0, buffer.Length)) > 0) {
+                    lock (sync) {
+                        int remaining = maxChars - text.Length;
+                        if (remaining <= 0) {
+                            truncated = true;
+                        } else {
+                            int take = Math.Min(count, remaining);
+                            text.Append(buffer, 0, take);
+                            if (take < count) truncated = true;
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                lock (sync) { error = ex.Message; }
+            }
+        }
+
+        public Task ReadTask { get { return readTask; } }
+        public bool Truncated { get { return truncated; } }
+        public string Text { get { lock (sync) { return text.ToString(); } } }
+        public string Error { get { lock (sync) { return error; } } }
+    }
+}
+'@
+        }
+    }
+    finally { [System.Threading.Monitor]::Exit($typeLock) }
+
     $textEncoding = switch ($Encoding) {
         "UTF8"    { [System.Text.UTF8Encoding]::new($false) }
         "Unicode" { [System.Text.Encoding]::Unicode }
@@ -2355,10 +2409,8 @@ try {
     $result.ProcessId = $proc.Id
     $startedAtUtc = [DateTime]::UtcNow
     $timedOut = $false
-    $outBuffer = New-Object char[] 4096
-    $errBuffer = New-Object char[] 4096
-    $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
-    $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
+    $outCapture = [WmtProcessCapture.BoundedStreamReader]::new($proc.StandardOutput, $maxOutputChars)
+    $errCapture = [WmtProcessCapture.BoundedStreamReader]::new($proc.StandardError, $maxOutputChars)
     $drainDeadlineUtc = $null
 
     while ($true) {
@@ -2401,55 +2453,26 @@ try {
             $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(3)
         }
 
-        $outDrainCount = 0
-        while ($outTask -and $outTask.IsCompleted -and $outDrainCount -lt 256) {
-            $outDrainCount++
-            $count = 0
-            try { $count = [int]$outTask.GetAwaiter().GetResult() } catch {}
-            if ($count -le 0) {
-                $outTask = $null
-            }
-            else {
-                & $appendOutputChunk $outBuffer $count $stdoutBuilder
-                $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
-            }
-        }
-        $errDrainCount = 0
-        while ($errTask -and $errTask.IsCompleted -and $errDrainCount -lt 256) {
-            $errDrainCount++
-            $count = 0
-            try { $count = [int]$errTask.GetAwaiter().GetResult() } catch {}
-            if ($count -le 0) {
-                $errTask = $null
-            }
-            else {
-                & $appendOutputChunk $errBuffer $count $stderrBuilder
-                $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
-            }
-        }
-
         $hasExited = $false
         try { $hasExited = [bool]$proc.HasExited } catch { $hasExited = $true }
         if ($hasExited -and $null -eq $drainDeadlineUtc) {
             # Descendants can inherit redirected handles; never wait indefinitely.
             $drainDeadlineUtc = [DateTime]::UtcNow.AddSeconds(3)
         }
-        if ($hasExited -and -not $outTask -and -not $errTask) { break }
+        $outReadDone = $outCapture.ReadTask.IsCompleted
+        $errReadDone = $errCapture.ReadTask.IsCompleted
+        if ($hasExited -and $outReadDone -and $errReadDone) { break }
         if ($drainDeadlineUtc -and [DateTime]::UtcNow -ge $drainDeadlineUtc) {
-            if ($outTask -or $errTask) {
+            if (-not $outReadDone -or -not $errReadDone) {
                 $result.OutputReadTimedOut = $true
                 if ($result.TimedOut) { $result.TerminationFailed = $true }
                 if ([string]::IsNullOrWhiteSpace($result.Error)) {
                     $result.Error = "Process output did not finish within 3 seconds of exit; a child may still hold the pipe."
                 }
             }
-            $outTask = $null
-            $errTask = $null
             break
         }
-        if (-not (($outTask -and $outTask.IsCompleted) -or ($errTask -and $errTask.IsCompleted))) {
-            Start-Sleep -Milliseconds 10
-        }
+        Start-Sleep -Milliseconds 10
     }
 
     try {
@@ -2465,12 +2488,24 @@ finally {
     try { if ($proc) { $proc.Dispose() } } catch {}
 }
 try {
-    $result.StdOut = $stdoutBuilder.ToString()
-    $result.StdErr = $stderrBuilder.ToString()
+    if ($outCapture) {
+        $result.StdOut = $outCapture.Text
+        $result.OutputTruncated = [bool]($result.OutputTruncated -or $outCapture.Truncated)
+        if ([string]::IsNullOrWhiteSpace($result.Error) -and -not [string]::IsNullOrWhiteSpace($outCapture.Error)) {
+            $result.Error = "Standard output capture failed: $($outCapture.Error)"
+        }
+    }
+    if ($errCapture) {
+        $result.StdErr = $errCapture.Text
+        $result.OutputTruncated = [bool]($result.OutputTruncated -or $errCapture.Truncated)
+        if ([string]::IsNullOrWhiteSpace($result.Error) -and -not [string]::IsNullOrWhiteSpace($errCapture.Error)) {
+            $result.Error = "Standard error capture failed: $($errCapture.Error)"
+        }
+    }
 }
 catch {}
-$stdoutBuilder = $null
-$stderrBuilder = $null
+$outCapture = $null
+$errCapture = $null
 if ($result.OutputTruncated -and [string]::IsNullOrWhiteSpace($result.Error)) {
     $result.Error = "Process output exceeded $maxOutputChars characters per stream; capture was truncated to protect memory."
 }
@@ -5413,6 +5448,8 @@ $view.RowDefinitions[0].Height = [System.Windows.GridLength]::Auto
 $view.RowDefinitions[1].Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
 $status = [System.Windows.Controls.TextBlock]::new()
 $status.TextWrapping = 'Wrap'
+$status.MaxHeight = 56
+$status.TextTrimming = 'CharacterEllipsis'
 $status.Margin = '0,0,0,8'
 $output = [System.Windows.Controls.TextBox]::new()
 $output.IsReadOnly = $true
@@ -5488,7 +5525,24 @@ if ($State -eq 'Running' -and $Progress.State -ne 'Running') {
     }
 }
 $Progress.State = $State
-$Progress.Status.Text = $Message
+if ($State -eq 'Failed' -and $Message.Length -gt 300) {
+    if ($Progress.Output) {
+        $existingOutput = [string]$Progress.Output.Text
+        if ([string]::IsNullOrWhiteSpace($existingOutput)) {
+            $Progress.Output.Text = $Message
+        }
+        elseif ($existingOutput.IndexOf($Message, [System.StringComparison]::Ordinal) -lt 0) {
+            $Progress.Output.AppendText([Environment]::NewLine + $Message)
+        }
+        $Progress.Output.ScrollToEnd()
+    }
+    $Progress.Status.Text = 'Operation failed. Full error details are shown below.'
+    $Progress.Status.ToolTip = $Message
+}
+else {
+    $Progress.Status.Text = $Message
+    $Progress.Status.ToolTip = $null
+}
 $Progress.Status.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, $(if ($State -eq 'Failed') { 'Danger' } else { 'TextSecondary' }))
 $Progress.Bar.IsIndeterminate = ($State -eq 'Running' -and [double]::IsNaN($Percent))
 if (-not [double]::IsNaN($Percent)) { $Progress.Bar.Value = [Math]::Max(0, [Math]::Min(100, $Percent)) }
@@ -64324,8 +64378,12 @@ catch {
 
         $pathChecks = @{
             "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+            "HKCR:\*\shell\WMT_TakeOwnership" = Get-WmtRegistryPathExists "HKCR:\*\shell\WMT_TakeOwnership"
             "HKCR:\Directory\shell\WMT_TakeOwnership" = Get-WmtRegistryPathExists "HKCR:\Directory\shell\WMT_TakeOwnership"
+            "HKCR:\Drive\shell\WMT_TakeOwnership" = Get-WmtRegistryPathExists "HKCR:\Drive\shell\WMT_TakeOwnership"
             "HKCR:\Directory\Background\shell\WMT_OpenPowerShell" = Get-WmtRegistryPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
+            "HKCR:\Directory\shell\WMT_OpenPowerShell" = Get-WmtRegistryPathExists "HKCR:\Directory\shell\WMT_OpenPowerShell"
+            "HKCR:\Drive\shell\WMT_OpenPowerShell" = Get-WmtRegistryPathExists "HKCR:\Drive\shell\WMT_OpenPowerShell"
             "HKCU:\Software\Classes\Directory\shell\WmtCmdHere" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\Directory\shell\WmtCmdHere"
             "HKCU:\Software\Classes\*\shell\WmtNotepad" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"
             "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print" = Get-WmtRegistryPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print"
