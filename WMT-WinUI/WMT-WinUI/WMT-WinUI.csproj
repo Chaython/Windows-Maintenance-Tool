@@ -18,7 +18,6 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
-    <UseWinUI>true</UseWinUI>
 
   </PropertyGroup>
 
@@ -28,6 +27,19 @@
     <PackageReference Include="Microsoft.Windows.CsWin32" Version="0.3.183" GeneratePathProperty="true" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1" />
     <PackageReference Include="System.Management.Automation" Version="7.4.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Page Include="App.xaml" />
+    <Page Include="MainWindow.xaml" />
+    <Page Include="Pages\DashboardPage.xaml" />
+    <Page Include="Pages\CleanerPage.xaml" />
+    <Page Include="Pages\UpdatesPage.xaml" />
+    <Page Include="Pages\DeviceInfoPage.xaml" />
+    <Page Include="Pages\NetworkPage.xaml" />
+    <Page Include="Pages\StoragePage.xaml" />
+    <Page Include="Pages\PowerPage.xaml" />
+    <Page Include="Pages\SettingsPage.xaml" />
   </ItemGroup>
 
   <ItemGroup>
