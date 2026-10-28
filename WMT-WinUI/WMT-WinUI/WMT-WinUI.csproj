@@ -30,6 +30,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
     <Page Include="App.xaml" />
     <Page Include="MainWindow.xaml" />
     <Page Include="Pages\DashboardPage.xaml" />
