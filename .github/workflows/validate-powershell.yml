@@ -203,6 +203,51 @@ jobs:
           }
           Write-Host "Quick Find natural-language checks passed ($($cases.Count) cases)."
 
+      - name: Smoke test tweak-state snapshot validation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null; $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path '.\\WMT-GUI.ps1').Path, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) { throw 'WMT must parse before snapshot validation tests.' }
+          $functionAst = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq 'Start-TweakButtonStatesBackgroundUpdate'
+          }, $true)
+          if (-not $functionAst) { throw 'Tweak-state preload function is missing.' }
+          $validationIfs = $functionAst.FindAll({
+              param($node)
+              $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                  $node.Clauses.Count -gt 0 -and
+                  $node.Clauses[0].Item1.Extent.Text -match '\$result\.ExpectedPathChecks'
+          }, $true)
+          if ($validationIfs.Count -ne 1) { throw 'Could not find the tweak-state snapshot validation condition.' }
+          $validationCondition = $validationIfs[0].Clauses[0].Item1.Extent.Text
+          $pathChecks = @{}
+          1..11 | ForEach-Object { $pathChecks["path$_"] = $true }
+          $supportChecks = @{}
+          1..6 | ForEach-Object { $supportChecks["support$_"] = $true }
+          $result = @{
+              RegCache = @{ 'test-path' = $true }
+              PathChecks = $pathChecks
+              NonRegData = @{ MMAgentMemoryCompression = $null }
+              SupportChecks = $supportChecks
+              ExpectedRegPaths = 1
+              ExpectedPathChecks = 11
+              ExpectedSupportChecks = 6
+              RegistryReadErrors = @()
+          }
+          if (-not [bool](Invoke-Expression $validationCondition)) {
+              throw 'A valid 11-path-check snapshot was rejected.'
+          }
+          $result.PathChecks.Remove('path11')
+          if ([bool](Invoke-Expression $validationCondition)) {
+              throw 'A snapshot missing a path check was accepted.'
+          }
+          Write-Host 'Tweak-state snapshot count validation passed.'
+
       - name: Smoke test optional feature startup and fail-closed safety
         shell: powershell
         run: |
@@ -268,9 +313,14 @@ jobs:
               throw 'Tweak state application still reads OS state synchronously.'
           }
           if ($tweak -notmatch 'ExpectedRegPaths' -or
+              $tweak -notmatch 'ExpectedPathChecks = \$pathChecks\.Count' -or
+              $tweak -notmatch 'ExpectedSupportChecks = \$supportChecks\.Count' -or
+              $tweak -notmatch '\$result\.PathChecks\.Count -eq \$result\.ExpectedPathChecks' -or
+              $tweak -notmatch '\$result\.SupportChecks\.Count -eq \$result\.ExpectedSupportChecks' -or
+              $tweak -match '\$result\.(?:PathChecks|SupportChecks)\.Count -eq \d+' -or
               $tweak -notmatch 'if \(\$key\) \{ \$key\.Dispose\(\) \}' -or
               $tweak -notmatch 'if \(\$baseKey\) \{ \$baseKey\.Dispose\(\) \}') {
-              throw 'Tweak preload no longer verifies snapshot size or disposes registry handles.'
+              throw 'Tweak preload no longer validates snapshot counts dynamically or disposes registry handles.'
           }
           $cloudRegistryPreloads = @(($tweak -split '\r?\n') |
               Where-Object { $_ -match '^\s*"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore' -and

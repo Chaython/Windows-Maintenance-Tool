@@ -64615,6 +64615,7 @@ catch {
         # Missing paths are normal; exceptions invalidate the cached snapshot.
         return @{ RegCache = $regCache; PathChecks = $pathChecks; NonRegData = $nonRegData;
                   SupportChecks = $supportChecks; ExpectedRegPaths = $paths.Count;
+                  ExpectedPathChecks = $pathChecks.Count; ExpectedSupportChecks = $supportChecks.Count;
                   RegistryReadErrors = @($registryReadErrors.ToArray()) }
     })
 
@@ -64661,11 +64662,13 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                     $result.NonRegData -is [System.Collections.IDictionary] -and
                     $result.SupportChecks -is [System.Collections.IDictionary] -and
                     $result.ExpectedRegPaths -gt 0 -and
+                    $result.ExpectedPathChecks -gt 0 -and
+                    $result.ExpectedSupportChecks -gt 0 -and
                     $null -ne $result.RegistryReadErrors -and
                     @($result.RegistryReadErrors).Count -eq 0 -and
                     $result.RegCache.Count -eq $result.ExpectedRegPaths -and
-                    $result.PathChecks.Count -eq 7 -and
-                    $result.SupportChecks.Count -eq 6 -and
+                    $result.PathChecks.Count -eq $result.ExpectedPathChecks -and
+                    $result.SupportChecks.Count -eq $result.ExpectedSupportChecks -and
                     $result.NonRegData.Contains("MMAgentMemoryCompression")) {
                     # Store the pre-loaded regCache, path checks, non-registry data, and support checks
                     $script:TweakButtonStatesCache = $result.RegCache
@@ -64689,6 +64692,8 @@ Register-WmtUiPollOperation -Name "TweakStatesLoad" -IntervalMs 200 -TestComplet
                     $script:TweakStatesReady = $false
                     $failureDetails = if ($result -is [hashtable] -and @($result.RegistryReadErrors).Count -gt 0) {
                         "Registry snapshot had $(@($result.RegistryReadErrors).Count) unreadable paths; see activity log."
+                    } elseif ($result -is [hashtable]) {
+                        "Snapshot validation failed (registry paths $($result.RegCache.Count)/$($result.ExpectedRegPaths), path checks $($result.PathChecks.Count)/$($result.ExpectedPathChecks), support checks $($result.SupportChecks.Count)/$($result.ExpectedSupportChecks))."
                     } else { "Snapshot validation failed (type: $typeInfo)." }
                     if ($result -is [hashtable]) {
                         foreach ($readError in @($result.RegistryReadErrors) | Select-Object -First 10) {
