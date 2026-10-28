@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>WMT_WinUI</RootNamespace>
     <ApplicationIcon>Assets\WMT.ico</ApplicationIcon>
@@ -9,12 +9,15 @@
     <Platforms>x86;x64;arm64</Platforms>
     <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
     <PublishProfile>Default</PublishProfile>
-    <EnableMsixTooling>true</EnableMsixTooling>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <UseWPF>false</UseWPF>
+    <UseWinUI>true</UseWinUI>
+    <EnableDefaultPageItems>true</EnableDefaultPageItems>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <UseWinUI>true</UseWinUI>
-    <EnableDefaultPageItems>true</EnableDefaultPageItems>
 
   </PropertyGroup>
 

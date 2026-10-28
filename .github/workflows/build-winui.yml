@@ -16,7 +16,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      MSBuildSDKsPath: C:\Program Files\dotnet\sdk\9.0.320\Sdks
+      MSBuildSDKsPath: C:\Program Files\dotnet\sdk\8.0.320\Sdks
       BuildConfiguration: Release
 
     steps:
@@ -28,7 +28,7 @@ jobs:
       - name: Setup .NET 9
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '8.0.x'
 
       - name: Restore NuGet packages
         shell: powershell
@@ -48,9 +48,9 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $outDir = "WMT-WinUI\WMT-WinUI\bin\Release\net9.0-windows10.0.19041.0\win-x64"
+          $outDir = "WMT-WinUI\WMT-WinUI\bin\Release\net8.0-windows10.0.19041.0\win-x64"
           if (-not (Test-Path $outDir)) {
-            $outDir = "WMT-WinUI\WMT-WinUI\bin\Release\net9.0-windows10.0.19041.0"
+            $outDir = "WMT-WinUI\WMT-WinUI\bin\Release\net8.0-windows10.0.19041.0"
           }
           New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
           Copy-Item -Path "$outDir\*" -Destination "artifacts\" -Recurse -Force -ErrorAction SilentlyContinue
