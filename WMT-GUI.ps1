@@ -31993,13 +31993,106 @@ else {
 Restart-WmtExplorer
 }
 
+function Get-WmtShellActionHelperPath {
+$helperDirectory = Join-Path $env:ProgramFiles "WindowsMaintenanceTool"
+if (-not (Test-Path -LiteralPath $helperDirectory -PathType Container)) {
+    New-Item -Path $helperDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+}
+$helperPath = Join-Path $helperDirectory "WmtShellAction.ps1"
+
+# The Take Ownership verb relaunches this helper elevated. Keep both the
+# directory and script protected from standard-user writes before installing
+# a registry command that points to it.
+$systemSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")
+$adminSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+$usersSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-545")
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+$directoryAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+$directoryAcl.SetAccessRuleProtection($true, $false)
+$directoryAcl.SetOwner($adminSid)
+$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($systemSid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, $allow))
+$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, $allow))
+$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($usersSid, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, $allow))
+Set-Acl -LiteralPath $helperDirectory -AclObject $directoryAcl -ErrorAction Stop
+
+$helperContent = @'
+param(
+    [ValidateSet("Open", "TakeOwnershipFile", "TakeOwnershipTree")][string]$Mode,
+    [Parameter(Mandatory = $true)][string]$TargetPath
+)
+
+function ConvertTo-WmtProcessArgument([string]$Value) {
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]92) { $slashes++; continue }
+        if ($character -eq [char]34) {
+            [void]$builder.Append(('\' * (2 * $slashes + 1)))
+            [void]$builder.Append('"')
+        }
+        else {
+            if ($slashes) { [void]$builder.Append(('\' * $slashes)) }
+            [void]$builder.Append($character)
+        }
+        $slashes = 0
+    }
+    if ($slashes) { [void]$builder.Append(('\' * (2 * $slashes))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+if ($Mode -eq "Open") {
+    if (-not (Test-Path -LiteralPath $TargetPath -PathType Container)) { throw "Folder not found: $TargetPath" }
+    Set-Location -LiteralPath $TargetPath
+    return
+}
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $powershellExe = Join-Path $PSHOME "powershell.exe"
+    $arguments = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        (ConvertTo-WmtProcessArgument $PSCommandPath),
+        "-Mode", (ConvertTo-WmtProcessArgument $Mode),
+        "-TargetPath", (ConvertTo-WmtProcessArgument $TargetPath)
+    ) -join " "
+    Start-Process -FilePath $powershellExe -Verb RunAs -ArgumentList $arguments -ErrorAction Stop | Out-Null
+    return
+}
+
+$tree = ($Mode -eq "TakeOwnershipTree")
+Write-Host "Taking ownership of: $TargetPath"
+if ($tree) { & "$env:SystemRoot\System32\takeown.exe" /f $TargetPath /r /d y /a }
+else { & "$env:SystemRoot\System32\takeown.exe" /f $TargetPath /a }
+$takeownExit = $LASTEXITCODE
+if ($tree) { & "$env:SystemRoot\System32\icacls.exe" $TargetPath /grant '*S-1-5-32-544:F' /t /c }
+else { & "$env:SystemRoot\System32\icacls.exe" $TargetPath /grant '*S-1-5-32-544:F' /c }
+$icaclsExit = $LASTEXITCODE
+if ($takeownExit -ne 0 -or $icaclsExit -ne 0) { Write-Warning "One or more ownership commands returned a nonzero exit code." }
+Read-Host "Press Enter to close"
+'@
+[System.IO.File]::WriteAllText($helperPath, $helperContent, [System.Text.UTF8Encoding]::new($false))
+$fileAcl = [System.Security.AccessControl.FileSecurity]::new()
+$fileAcl.SetAccessRuleProtection($true, $false)
+$fileAcl.SetOwner($adminSid)
+$fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($systemSid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow))
+$fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow))
+$fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($usersSid, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, [System.Security.AccessControl.AccessControlType]::Allow))
+Set-Acl -LiteralPath $helperPath -AclObject $fileAcl -ErrorAction Stop
+return $helperPath
+}
+
 function Set-WmtTakeOwnershipMenu {
 param([bool]$Enable)
 
+$helperPath = if ($Enable) { Get-WmtShellActionHelperPath } else { $null }
 $targets = @(
-    @{Path = "Registry::HKEY_CLASSES_ROOT\*\shell\WMT_TakeOwnership"; Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /a && icacls ""%1"" /grant *S-1-5-32-544:F /c && pause''"' },
-    @{Path = "Registry::HKEY_CLASSES_ROOT\Directory\shell\WMT_TakeOwnership"; Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /r /d y /a && icacls ""%1"" /grant *S-1-5-32-544:F /t /c && pause''"' },
-    @{Path = "Registry::HKEY_CLASSES_ROOT\Drive\shell\WMT_TakeOwnership"; Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /r /d y /a && icacls ""%1"" /grant *S-1-5-32-544:F /t /c && pause''"' }
+    @{Path = "Registry::HKEY_CLASSES_ROOT\*\shell\WMT_TakeOwnership"; Mode = "TakeOwnershipFile" },
+    @{Path = "Registry::HKEY_CLASSES_ROOT\Directory\shell\WMT_TakeOwnership"; Mode = "TakeOwnershipTree" },
+    @{Path = "Registry::HKEY_CLASSES_ROOT\Drive\shell\WMT_TakeOwnership"; Mode = "TakeOwnershipTree" }
 )
 
 foreach ($target in $targets) {
@@ -32010,7 +32103,9 @@ foreach ($target in $targets) {
         Set-WmtRegString $path "HasLUAShield" ""
         $cmdPath = "$path\command"
         New-WmtRegKey $cmdPath
-        Set-WmtRegDefaultValue $cmdPath $target.Command
+        $targetArgument = if ($target.Mode -eq "TakeOwnershipTree") { "%1\." } else { "%1" }
+        $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Mode {1} -TargetPath "{2}"' -f $helperPath, $target.Mode, $targetArgument
+        Set-WmtRegDefaultValue $cmdPath $command
     }
     else {
         Remove-WmtRegKeyTree $path
@@ -32021,10 +32116,11 @@ foreach ($target in $targets) {
 function Set-WmtPowerShellHereMenu {
 param([bool]$Enable)
 
+$helperPath = if ($Enable) { Get-WmtShellActionHelperPath } else { $null }
 $targets = @(
-    @{Path = "Registry::HKEY_CLASSES_ROOT\Directory\Background\shell\WMT_OpenPowerShell"; Location = "%V" },
-    @{Path = "Registry::HKEY_CLASSES_ROOT\Directory\shell\WMT_OpenPowerShell"; Location = "%1" },
-    @{Path = "Registry::HKEY_CLASSES_ROOT\Drive\shell\WMT_OpenPowerShell"; Location = "%1" }
+    @{Path = "Registry::HKEY_CLASSES_ROOT\Directory\Background\shell\WMT_OpenPowerShell"; Location = "%V\." },
+    @{Path = "Registry::HKEY_CLASSES_ROOT\Directory\shell\WMT_OpenPowerShell"; Location = "%1\." },
+    @{Path = "Registry::HKEY_CLASSES_ROOT\Drive\shell\WMT_OpenPowerShell"; Location = "%1\." }
 )
 
 foreach ($target in $targets) {
@@ -32035,7 +32131,8 @@ foreach ($target in $targets) {
         Set-WmtRegString $path "Icon" "powershell.exe"
         $cmdPath = "$path\command"
         New-WmtRegKey $cmdPath
-        Set-WmtRegDefaultValue $cmdPath "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -Command `"Set-Location -LiteralPath '$($target.Location)'`""
+        $command = 'powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File "{0}" -Mode Open -TargetPath "{1}"' -f $helperPath, $target.Location
+        Set-WmtRegDefaultValue $cmdPath $command
     }
     else {
         Remove-WmtRegKeyTree $path
@@ -32083,13 +32180,15 @@ param(
 )
 
 try {
-    $output = powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>$null
+    $output = @(powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>$null)
+    if ($LASTEXITCODE -ne 0) { $output = @() }
     $label = if ($Mode -eq "DC") { "Current DC Power Setting Index" } else { "Current AC Power Setting Index" }
     $pattern = [regex]::Escape($label) + "\s*:\s*0x([0-9a-fA-F]+)"
     foreach ($line in $output) {
         if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
     }
-    $output = powercfg /qh SCHEME_CURRENT $SubGroup $Setting 2>$null
+    $output = @(powercfg /qh SCHEME_CURRENT $SubGroup $Setting 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
     foreach ($line in $output) {
         if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
     }
@@ -32106,9 +32205,46 @@ param(
     [switch]$DCOnly
 )
 
-if (-not $DCOnly) { powercfg /setacvalueindex SCHEME_CURRENT $SubGroup $Setting $Value | Out-Null }
-powercfg /setdcvalueindex SCHEME_CURRENT $SubGroup $Setting $Value | Out-Null
-powercfg /S SCHEME_CURRENT | Out-Null
+if (-not $DCOnly) {
+    $output = @(powercfg /setacvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the AC value: $($output -join ' ')" }
+}
+$output = @(powercfg /setdcvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the DC value: $($output -join ' ')" }
+$output = @(powercfg /S SCHEME_CURRENT 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "powercfg could not activate the current power plan: $($output -join ' ')" }
+
+$actualDc = Get-WmtPowerSettingIndex $SubGroup $Setting "DC"
+if ($null -eq $actualDc -or $actualDc -ne $Value) { throw "Powercfg did not confirm the requested DC value ($Value)." }
+if (-not $DCOnly) {
+    $actualAc = Get-WmtPowerSettingIndex $SubGroup $Setting "AC"
+    if ($null -eq $actualAc -or $actualAc -ne $Value) { throw "Powercfg did not confirm the requested AC value ($Value)." }
+}
+}
+
+function Get-WmtFsutilDisableLastAccessState {
+$output = @( & fsutil behavior query DisableLastAccess 2>$null )
+if ($LASTEXITCODE -ne 0) { return $null }
+$text = $output -join "`n"
+if ($text -notmatch '(?im)\bDisableLastAccess\s*=\s*(0x[0-9a-f]+|\d+)') { return $null }
+try {
+    $raw = $Matches[1]
+    $value = if ($raw.StartsWith("0x", [StringComparison]::OrdinalIgnoreCase)) { [Convert]::ToUInt32($raw.Substring(2), 16) } else { [Convert]::ToUInt32($raw, 10) }
+    return (($value -band 1) -ne 0)
+} catch { return $null }
+}
+
+function Get-WmtFsutilDisable8dot3State {
+$output = @( & fsutil behavior query Disable8dot3 2>$null )
+if ($LASTEXITCODE -ne 0) { return $null }
+$text = $output -join "`n"
+if ($text -notmatch '(?im)(?:registry\s+state\s+is\s*:?|Disable8dot3\s*=)\s*(\d+)') { return $null }
+$mode = 0
+if (-not [int]::TryParse($Matches[1], [ref]$mode)) { return $null }
+if ($mode -eq 0) { return $false }
+if ($mode -eq 1) { return $true }
+# Modes 2 and 3 have per-volume or system-volume-dependent behavior.
+return $null
 }
 
 function ConvertTo-WmtPagefileConfiguration {
@@ -32315,7 +32451,8 @@ $quiet = [bool]$RefreshOnly
 $known = (-not $RefreshOnly) -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains('btnTogglePagefile')
 $enable = $false
 if ($known) {
-    $enable = [bool]$script:TweakCurrentStates['btnTogglePagefile'].On
+    # .On is the current pagefile state; request its opposite to toggle.
+    $enable = -not [bool]$script:TweakCurrentStates['btnTogglePagefile'].On
     if (-not $enable) {
         $answer = Show-WmtMessageBox -Owner $window -Message 'Disable the pagefile? This reduces available committed memory and can prevent Windows crash dumps. Keeping it enabled is recommended. Restart Windows for the change to take effect.' -Title 'Disable Pagefile' -Button YesNo -Image Warning
         if ($answer -ne [Windows.MessageBoxResult]::Yes) { $state.LastRequestState = 'Cancelled'; return }
@@ -33086,8 +33223,8 @@ catch { & $failed $_ }
                                 <Button Name="btnToggleCopilot" Content="Copilot Off" Style="{StaticResource ActionBtn}" ToolTip="Toggle Windows Copilot button and service. Blue = Copilot disabled."/>
                                 <Button Name="btnToggleRecall" Content="Recall Off" Style="{StaticResource ActionBtn}" ToolTip="Toggle Windows Recall snapshot saving. Blue = Recall disabled."/>
                                 <Button Name="btnToggleClickToDo" Content="Click To Do Off" Style="{StaticResource ActionBtn}" ToolTip="Toggle Click To Do (25H2 AI snapshot action). Blue = disabled."/>
-                                <Button Name="btnToggleAISvcAutoStart" Content="AI Svc AutoStart Off" Style="{StaticResource ActionBtn}" ToolTip="Stop the Windows AI service from auto-starting at boot. Blue = autostart disabled."/>
-                                <Button Name="btnToggleEdgeAI" Content="Edge AI Off" Style="{StaticResource ActionBtn}" ToolTip="Disable Microsoft Edge AI features (Copilot, Bing Discover, etc.). Blue = disabled."/>
+                                <Button Name="btnToggleAISvcAutoStart" Content="AI Analysis Policy" Style="{StaticResource ActionBtn}" ToolTip="Control the device WindowsAI DisableAIDataAnalysis policy. This is not an AI service autostart setting; disabling analysis can stop Recall snapshot saving and delete saved snapshots. The user may still need to enable Recall in Settings."/>
+                                <Button Name="btnToggleEdgeAI" Content="Edge Sidebar" Style="{StaticResource ActionBtn}" ToolTip="Force the Microsoft Edge sidebar on or off for all sidebar apps. This does not control the newer Copilot toolbar button."/>
                                 <Button Name="btnTogglePaintAI" Content="Paint AI Off" Style="{StaticResource ActionBtn}" ToolTip="Disable AI features in Microsoft Paint (Cocreator, Generative Fill). Blue = disabled."/>
                                 <Button Name="btnToggleNotepadAI" Content="Notepad AI Off" Style="{StaticResource ActionBtn}" ToolTip="Disable AI features in Notepad (Rewrite, Summarize). Blue = disabled."/>
                             </WrapPanel>
@@ -33125,7 +33262,7 @@ catch { & $failed $_ }
                                 <Button Name="btnToggleMemCompress" Content="Disable Mem Compression" Style="{StaticResource ActionBtn}" ToolTip="Toggle Windows memory compression. Compresses inactive RAM pages to free physical memory."/>
                                 <Button Name="btnTogglePagefile" Content="Pagefile status unknown" Style="{StaticResource ActionBtn}" ToolTip="Pagefile configuration is loading. Keeping it enabled is recommended for committed memory and Windows crash dumps. Restart Windows after changing it."/>
                                 <Button Name="btnPerfUltimatePower" Content="Ultimate Performance" Style="{StaticResource PositiveBtn}" ToolTip="Enable the Ultimate Performance power plan. Removes all power throttling for maximum performance. Best for desktops and high-performance laptops."/>
-                                <Button Name="btnToggleHags" Content="Enable HAGS" Style="{StaticResource ActionBtn}" ToolTip="Current state: Enable HAGS (Gray = inactive/default)&#10;Click to switch to: Disable HAGS (Blue)&#10;Restart the app or game for changes to take effect.&#10;&#10;Hardware-Accelerated GPU Scheduling (HAGS) lets the GPU manage its own memory and render queues independently of the CPU, reducing latency and improving frame pacing in games. Requires a modern GPU (NVIDIA Pascal+ / AMD RDNA+) and recent drivers. Some older games or capture software may be incompatible."/>
+                                <Button Name="btnToggleHags" Content="Enable HAGS" Style="{StaticResource ActionBtn}" ToolTip="Current state: Enable HAGS (Gray = inactive/default)&#10;Click to switch to: Disable HAGS (Blue)&#10;Restart Windows to apply changes.&#10;&#10;Hardware-Accelerated GPU Scheduling (HAGS) lets the GPU manage its own memory and render queues independently of the CPU, reducing latency and improving frame pacing in games. Requires a modern GPU (NVIDIA Pascal+ / AMD RDNA+) and recent drivers. Some older games or capture software may be incompatible."/>
                                 <Button Name="btnPowerBatterySaverOff" Content="Saver Off" Style="{StaticResource ActionBtn}" ToolTip="Set battery saver threshold to 0 percent."/>
                                 <Button Name="btnPowerBatterySaver20" Content="Saver 20%" Style="{StaticResource ActionBtn}" ToolTip="Set battery saver threshold to 20 percent."/>
                                 <Button Name="btnPowerBatterySaver50" Content="Saver 50%" Style="{StaticResource ActionBtn}" ToolTip="Set battery saver threshold to 50 percent."/>
@@ -33461,8 +33598,8 @@ catch { & $failed $_ }
                                 <Button Name="btnTogglePsHere" Content="Add PowerShell Here" Style="{StaticResource ActionBtn}" ToolTip="Add or remove the Open PowerShell Here context menu action."/>
                             <Button Name="btnToggleCmdHere" Content="Add CMD Here" Style="{StaticResource ActionBtn}" ToolTip="Add 'Open Command Prompt Here' to folder/drive context menu (Shift+Right-Click shows it by default; this makes it always visible)."/>
                             <Button Name="btnToggleNotepadCtx" Content="Add Notepad" Style="{StaticResource ActionBtn}" ToolTip="Add 'Open with Notepad' to all file context menus. Quick way to inspect any file as text."/>
-                            <Button Name="btnToggleRemovePrint" Content="Remove Print" Style="{StaticResource ActionBtn}" ToolTip="Remove the 'Print' context menu entry from image files. Blue = removed."/>
-                            <Button Name="btnToggleRemoveCast" Content="Remove Cast to Device" Style="{StaticResource ActionBtn}" ToolTip="Remove the 'Cast to Device' context menu entry from media files. Blue = removed."/>
+                            <Button Name="btnToggleRemovePrint" Content="Remove Print" Style="{StaticResource ActionBtn}" ToolTip="Hide the image 'Print' verb using a per-user LegacyDisable marker. Blue = hidden."/>
+                            <Button Name="btnToggleRemoveCast" Content="Remove Cast to Device" Style="{StaticResource ActionBtn}" ToolTip="Hide the image 'Cast to Device' verb using a per-user LegacyDisable marker. Blue = hidden."/>
                             </WrapPanel>
                         </StackPanel>
                     </Grid>
@@ -35329,7 +35466,7 @@ $script:TweakMetaData = @{
 "btnToggleHibernate"          = @{ Description = "Hibernation saves your session to disk (hiberfil.sys) and powers off. Disabling it frees disk space equal to ~75% of your RAM but removes the hibernate power option."; RestartHint = "No restart needed." }
 "btnToggleSuperfetch"         = @{ Description = "Superfetch (SysMain) preloads frequently-used apps into RAM. Disabling it reduces background disk activity, which can help SSDs and older HDDs alike."; RestartHint = "Restart recommended." }
 "btnToggleMemCompress"        = @{ Description = "Windows memory compression squeezes inactive RAM pages to delay swapping. Disabling it uses more physical RAM but avoids compression CPU overhead."; RestartHint = "No restart needed." }
-"btnToggleHags"               = @{ Description = "Hardware-Accelerated GPU Scheduling (HAGS) lets the GPU manage its own memory and render queues independently of the CPU, reducing latency and improving frame pacing in games. Requires a modern GPU (NVIDIA Pascal+ / AMD RDNA+) and recent drivers. Some older games or capture software may be incompatible."; RestartHint = "Restart the app or game for changes to take effect." }
+"btnToggleHags"               = @{ Description = "Hardware-Accelerated GPU Scheduling (HAGS) lets the GPU manage its own memory and render queues independently of the CPU, reducing latency and improving frame pacing in games. Requires a modern GPU (NVIDIA Pascal+ / AMD RDNA+) and recent drivers. Some older games or capture software may be incompatible."; RestartHint = "Restart Windows to apply changes." }
 "btnToggleUsbSuspend"         = @{ Description = "USB selective suspend powers down idle USB ports to save battery. Disabling it prevents USB devices from disconnecting randomly but uses more power."; RestartHint = "No restart needed." }
 "btnTogglePcie"               = @{ Description = "PCI Express Active State Power Management (ASPM) saves power by lowering PCIe link power when idle. Disabling it can prevent audio crackling or USB dropouts on some systems."; RestartHint = "Restart recommended." }
 "btnToggleBitlocker"          = @{ Description = "Windows automatically encrypts new OS installs with BitLocker on supported hardware. Disabling this prevents automatic encryption; existing encrypted drives are not affected."; RestartHint = "Restart recommended for new OS installs." }
@@ -35377,8 +35514,8 @@ $script:TweakMetaData = @{
 "btnTogglePsHere"             = @{ Description = "Adds 'Open PowerShell Here' to the folder right-click menu. Hold Shift+Right-Click to see it by default; this makes it always visible."; RestartHint = "No restart needed - applies instantly." }
 "btnToggleCmdHere"            = @{ Description = "Adds 'Open Command Prompt Here' to the folder right-click menu for quick CMD access."; RestartHint = "No restart needed - applies instantly." }
 "btnToggleNotepadCtx"         = @{ Description = "Adds 'Open with Notepad' to ALL file types, so you can quickly inspect any file as plain text."; RestartHint = "No restart needed - applies instantly." }
-"btnToggleRemovePrint"        = @{ Description = "Removes the 'Print' option from image file context menus. Useful if you never print from the right-click menu."; RestartHint = "Restart Explorer to apply." }
-"btnToggleRemoveCast"         = @{ Description = "Removes the 'Cast to Device' option from media file context menus. Useful if you do not stream to Miracast/DLNA devices."; RestartHint = "Restart Explorer to apply." }
+"btnToggleRemovePrint"        = @{ Description = "Hides the Print verb from image context menus with a per-user LegacyDisable marker. Removing the marker restores any existing Print command."; RestartHint = "Restart Explorer to apply." }
+"btnToggleRemoveCast"         = @{ Description = "Hides the Cast to Device verb from image context menus with a per-user LegacyDisable marker. Removing the marker restores the registered verb."; RestartHint = "Restart Explorer to apply." }
 
 # Privacy
 "btnToggleAds"                = @{ Description = "The Windows Advertising ID tracks your app usage to serve personalized ads. Disabling it does not remove ads but makes them generic."; RestartHint = "No restart needed." }
@@ -35450,8 +35587,8 @@ $script:TweakMetaData = @{
 "btnToggleCopilot"            = @{ Description = "Windows Copilot is Microsoft's AI assistant integrated into the taskbar. Disabling it removes the button and the background Copilot service."; RestartHint = "Restart to fully apply." }
 "btnToggleRecall"             = @{ Description = "Windows Recall (Preview) takes periodic screenshots of your screen for AI-searchable history. Disabling it stops screenshot capture and AI analysis. Requires a Copilot+ PC."; RestartHint = "Restart to fully apply." }
 "btnToggleClickToDo"          = @{ Description = "Click To Do (Windows 11 25H2) analyzes Recall snapshots to suggest actions on text/images. Disabling it stops this AI analysis."; RestartHint = "Restart to fully apply." }
-"btnToggleAISvcAutoStart"     = @{ Description = "The Windows AI service (AIDataAnalysis) starts at boot to support Recall and Copilot features. Disabling autostart delays AI features until manually launched."; RestartHint = "Restart to apply." }
-"btnToggleEdgeAI"             = @{ Description = "Microsoft Edge AI features include Copilot in the sidebar, Bing Discover, and AI-powered writing assistance. Disabling it removes these from Edge."; RestartHint = "Restart Edge to apply." }
+"btnToggleAISvcAutoStart"     = @{ Description = "Controls the device WindowsAI DisableAIDataAnalysis policy. This does not control service startup; disabling analysis can stop Recall snapshot saving and delete saved snapshots. The user may still need to enable Recall in Settings."; RestartHint = "Restart Windows to apply the device policy." }
+"btnToggleEdgeAI"             = @{ Description = "Controls Edge's HubsSidebarEnabled policy, which forces the whole sidebar on or off for all sidebar apps. It does not control the newer Copilot toolbar button."; RestartHint = "Restart Edge to apply." }
 "btnTogglePaintAI"            = @{ Description = "Paint AI (Cocreator) generates images from text prompts using DALL-E. Disabling it removes the Cocreator button from Paint."; RestartHint = "Restart Paint to apply." }
 "btnToggleNotepadAI"          = @{ Description = "Notepad AI features include Rewrite (rephrase text) and Summarize. Disabling it removes these AI buttons from Notepad."; RestartHint = "Restart Notepad to apply." }
 
@@ -35567,8 +35704,8 @@ $script:WmtQuickFindStateTextOverrides = @{
     "btnTogglePsHere"           = @{ On = "PowerShell Here context-menu entry installed"; Off = "PowerShell Here context-menu entry absent" }
     "btnToggleCmdHere"          = @{ On = "CMD Here context-menu entry installed"; Off = "CMD Here context-menu entry absent" }
     "btnToggleNotepadCtx"       = @{ On = "Open with Notepad context-menu entry installed"; Off = "Open with Notepad context-menu entry absent" }
-    "btnToggleRemovePrint"      = @{ On = "Print context-menu entry installed"; Off = "Print context-menu entry absent" }
-    "btnToggleRemoveCast"       = @{ On = "Cast to Device context-menu entry installed"; Off = "Cast to Device context-menu entry absent" }
+    "btnToggleRemovePrint"      = @{ On = "Print context-menu removal marker applied"; Off = "Print context-menu removal marker absent" }
+    "btnToggleRemoveCast"       = @{ On = "Cast to Device removal marker applied"; Off = "Cast to Device removal marker absent" }
 }
 
 function Update-WmtTweakToggle {
@@ -36580,10 +36717,10 @@ try {
     $classicContext = & $getPathExists "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
     $btnToggleCtxMenu = Get-Ctrl "btnToggleCtxMenu"
     Update-WmtTweakToggle $btnToggleCtxMenu $classicContext "Classic Right-Click" "Modern Right-Click"
-    $takeOwnInstalled = & $getPathExists "HKCR:\Directory\shell\WMT_TakeOwnership"
+    $takeOwnInstalled = ((& $getPathExists "HKCR:\*\shell\WMT_TakeOwnership") -or (& $getPathExists "HKCR:\Directory\shell\WMT_TakeOwnership") -or (& $getPathExists "HKCR:\Drive\shell\WMT_TakeOwnership"))
     $btnToggleTakeOwnership = Get-Ctrl "btnToggleTakeOwnership"
     Update-WmtTweakToggle $btnToggleTakeOwnership $takeOwnInstalled "Remove Take Ownership" "Add Take Ownership"
-    $psHereInstalled = & $getPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
+    $psHereInstalled = ((& $getPathExists "HKCR:\Directory\Background\shell\WMT_OpenPowerShell") -or (& $getPathExists "HKCR:\Directory\shell\WMT_OpenPowerShell") -or (& $getPathExists "HKCR:\Drive\shell\WMT_OpenPowerShell"))
     $btnTogglePsHere = Get-Ctrl "btnTogglePsHere"
     Update-WmtTweakToggle $btnTogglePsHere $psHereInstalled "Remove PowerShell Here" "Add PowerShell Here"
 
@@ -36625,13 +36762,13 @@ try {
     if ($aisvcBtn) {
         $disableAiService = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" $null
         if ($null -eq $disableAiService) { Set-WmtTweakUnknownState "btnToggleAISvcAutoStart" }
-        else { Update-WmtTweakToggle $aisvcBtn ((ConvertTo-Int $disableAiService 0) -ne 1) "AI Svc AutoStart On" "AI Svc AutoStart Off" }
+        else { Update-WmtTweakToggle $aisvcBtn ((ConvertTo-Int $disableAiService 0) -ne 1) "AI Analysis Allowed" "AI Analysis Blocked" }
     }
     $edgeAiBtn = Get-Ctrl "btnToggleEdgeAI"
     if ($edgeAiBtn) {
         $edgeAiValue = & $getRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "HubsSidebarEnabled" $null
         if ($null -eq $edgeAiValue) { Set-WmtTweakUnknownState "btnToggleEdgeAI" }
-        else { Update-WmtTweakToggle $edgeAiBtn ((ConvertTo-Int $edgeAiValue 0) -ne 0) "Edge AI On" "Edge AI Off" }
+        else { Update-WmtTweakToggle $edgeAiBtn ((ConvertTo-Int $edgeAiValue 0) -ne 0) "Edge Sidebar On" "Edge Sidebar Off" }
     }
     $paintAiBtn = Get-Ctrl "btnTogglePaintAI"
     if ($paintAiBtn) {
@@ -36953,9 +37090,9 @@ try {
 
     # Explorer (round 2)
     $ntlaBtn = Get-Ctrl "btnToggleNTFSLastAccess"
-    if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn (-not $off) "Disable NTFS Last Access" "Enable NTFS Last Access" } }
+    if ($ntlaBtn) { $off = $nrd["FsutilDisableLastAccess"]; if ($null -ne $off) { Update-WmtTweakToggle $ntlaBtn $off "Disable NTFS Last Access" "Enable NTFS Last Access" } else { Set-WmtTweakUnknownState "btnToggleNTFSLastAccess" "Mode varies" "The fsutil value is missing or invalid." } }
     $n83Btn = Get-Ctrl "btnToggleNTFS83"
-    if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn (-not $off) "Disable NTFS 8.3" "Enable NTFS 8.3" } }
+    if ($n83Btn) { $off = $nrd["FsutilDisable8dot3"]; if ($null -ne $off) { Update-WmtTweakToggle $n83Btn $off "Disable NTFS 8.3" "Enable NTFS 8.3" } else { Set-WmtTweakUnknownState "btnToggleNTFS83" "Per-volume / mixed" "The global 8.3-name mode varies by volume, so WMT cannot show one enabled/disabled state." } }
     $thumbCachePath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
     $thumbRaw = & $getRegValue $thumbCachePath "DisableThumbnails" $null
     $tcBtn = Get-Ctrl "btnToggleThumbCache"
@@ -36980,9 +37117,9 @@ try {
     $npBtn = Get-Ctrl "btnToggleNotepadCtx"
     if ($npBtn) { $exists = & $getPathExists "HKCU:\Software\Classes\*\shell\WmtNotepad"; Update-WmtTweakToggle $npBtn $exists "Remove Notepad" "Add Notepad" }
     $prBtn = Get-Ctrl "btnToggleRemovePrint"
-    if ($prBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print")); Update-WmtTweakToggle $prBtn (-not $exists) "Remove Print" "Restore Print" }
+    if ($prBtn) { $hidden = Test-WmtRegistryValueExists -Path "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print" -ValueName "LegacyDisable"; Update-WmtTweakToggle $prBtn $hidden "Remove Print" "Restore Print" }
     $castBtn = Get-Ctrl "btnToggleRemoveCast"
-    if ($castBtn) { $exists = (-not (& $getPathExists "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice")); Update-WmtTweakToggle $castBtn (-not $exists) "Remove Cast to Device" "Restore Cast to Device" }
+    if ($castBtn) { $hidden = Test-WmtRegistryValueExists -Path "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice" -ValueName "LegacyDisable"; Update-WmtTweakToggle $castBtn $hidden "Remove Cast to Device" "Restore Cast to Device" }
 
     # Sound
     $ssBtn = Get-Ctrl "btnToggleStartupSound"
@@ -37906,12 +38043,18 @@ $btnToggleRecall.Add_Click({
         Clear-WmtRegCache @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polMachine "AllowRecallEnablement" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "TurnOffSavingSnapshots" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "DisableAIDataAnalysis" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0) -eq 1))
         if ($currentlyOff) {
-            Invoke-UiCommand { Remove-WmtRegValue $polMachine "AllowRecallEnablement"; Remove-WmtRegValue $polMachine "TurnOffSavingSnapshots"; Remove-WmtRegValue $polUser "DisableAIDataAnalysis"; Write-GuiLog "Recall enabled (user must turn it on in Settings)." } "Enabling Recall..."
+            Invoke-UiCommand { Remove-WmtRegValue $polMachine "AllowRecallEnablement"; Remove-WmtRegValue $polMachine "TurnOffSavingSnapshots"; Remove-WmtRegValue $polUser "DisableAIDataAnalysis"; Remove-WmtRegValue $polMachine "DisableAIDataAnalysis"; Write-GuiLog "Recall snapshot-saving policies cleared. The user may still need to enable Recall in Settings." } "Enabling Recall..."
         }
         else {
             Invoke-UiCommand { Set-WmtRegDword $polUser "DisableAIDataAnalysis" 1; Set-WmtRegDword $polMachine "AllowRecallEnablement" 0; Set-WmtRegDword $polMachine "TurnOffSavingSnapshots" 1; Write-GuiLog "Recall disabled." } "Disabling Recall..."
         }
-        Update-WmtTweakToggle $btnToggleRecall $currentlyOff "Recall On" "Recall Off"
+        Clear-WmtRegCache @($polUser, $polMachine)
+        $allowRecallNow = Get-WmtRegValue $polMachine "AllowRecallEnablement" 1
+        $turnOffSnapshotsNow = Get-WmtRegValue $polMachine "TurnOffSavingSnapshots" 0
+        $disableAiUserNow = Get-WmtRegValue $polUser "DisableAIDataAnalysis" 0
+        $disableAiMachineNow = Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0
+        $recallOffNow = (((ConvertTo-Int $allowRecallNow 1) -eq 0) -or ((ConvertTo-Int $turnOffSnapshotsNow 0) -eq 1) -or ((ConvertTo-Int $disableAiUserNow 0) -eq 1) -or ((ConvertTo-Int $disableAiMachineNow 0) -eq 1))
+        Update-WmtTweakToggle $btnToggleRecall (-not $recallOffNow) "Recall On" "Recall Off"
     })
 }
 
@@ -37939,12 +38082,14 @@ $btnToggleAISvcAutoStart.Add_Click({
         Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0) -eq 1))
         if ($currentlyOff) {
-            Invoke-UiCommand { Remove-WmtRegValue $polMachine "DisableAIDataAnalysis"; Write-GuiLog "Windows AI service autostart enabled." } "Enabling AI service autostart..."
+            Invoke-UiCommand { Remove-WmtRegValue $polMachine "DisableAIDataAnalysis"; Write-GuiLog "Device AI data-analysis policy cleared." } "Allowing AI data analysis..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword $polMachine "DisableAIDataAnalysis" 1; Write-GuiLog "Windows AI service autostart disabled." } "Disabling AI service autostart..."
+            Invoke-UiCommand { Set-WmtRegDword $polMachine "DisableAIDataAnalysis" 1; Write-GuiLog "Device AI data-analysis policy applied." } "Blocking AI data analysis..."
         }
-        Update-WmtTweakToggle $btnToggleAISvcAutoStart $currentlyOff "AI Svc AutoStart On" "AI Svc AutoStart Off"
+        Clear-WmtRegCache @($polMachine)
+        $disableAiServiceNow = ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0
+        Update-WmtTweakToggle $btnToggleAISvcAutoStart ($disableAiServiceNow -ne 1) "AI Analysis Allowed" "AI Analysis Blocked"
     })
 }
 
@@ -37955,12 +38100,14 @@ $btnToggleEdgeAI.Add_Click({
         Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Edge")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "HubsSidebarEnabled" 1) 0) -eq 0))
         if ($currentlyOff) {
-            Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 1; Write-GuiLog "Edge AI features enabled." } "Enabling Edge AI..."
+            Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 1; Write-GuiLog "Edge sidebar forced on." } "Enabling Edge sidebar..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 0; Write-GuiLog "Edge AI features disabled." } "Disabling Edge AI..."
+            Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 0; Write-GuiLog "Edge sidebar forced off." } "Disabling Edge sidebar..."
         }
-        Update-WmtTweakToggle $btnToggleEdgeAI $currentlyOff "Edge AI On" "Edge AI Off"
+        Clear-WmtRegCache @($p)
+        $sidebarEnabledNow = ConvertTo-Int (Get-WmtRegValue $p "HubsSidebarEnabled" 1) 1
+        Update-WmtTweakToggle $btnToggleEdgeAI ($sidebarEnabledNow -ne 0) "Edge Sidebar On" "Edge Sidebar Off"
     })
 }
 
@@ -38702,28 +38849,34 @@ $btnToggleCEIP.Add_Click({
 $btnToggleNTFSLastAccess = Get-Ctrl "btnToggleNTFSLastAccess"
 if ($btnToggleNTFSLastAccess) {
 $btnToggleNTFSLastAccess.Add_Click({
-        $currentlyOff = ((& fsutil behavior query DisableLastAccess 2>$null) -match "1")
-        if ($currentlyOff) {
-            Invoke-UiCommand { & fsutil behavior set DisableLastAccess 0 | Out-Null; Write-GuiLog "NTFS Last Access time updates enabled." } "Enabling NTFS Last Access..."
+        $currentlyDisabled = Get-WmtFsutilDisableLastAccessState
+        $targetDisabled = if ($null -eq $currentlyDisabled) { $true } else { -not [bool]$currentlyDisabled }
+        if ($targetDisabled) {
+            Invoke-UiCommand { $fsutilOutput = @(& fsutil behavior set DisableLastAccess 1 2>&1); if ($LASTEXITCODE -ne 0) { throw "fsutil failed: $($fsutilOutput -join ' ')" }; Write-GuiLog "NTFS Last Access time updates disabled." } "Disabling NTFS Last Access..."
         }
         else {
-            Invoke-UiCommand { & fsutil behavior set DisableLastAccess 1 | Out-Null; Write-GuiLog "NTFS Last Access time updates disabled." } "Disabling NTFS Last Access..."
+            Invoke-UiCommand { $fsutilOutput = @(& fsutil behavior set DisableLastAccess 0 2>&1); if ($LASTEXITCODE -ne 0) { throw "fsutil failed: $($fsutilOutput -join ' ')" }; Write-GuiLog "NTFS Last Access time updates enabled." } "Enabling NTFS Last Access..."
         }
-        Update-WmtTweakToggle $btnToggleNTFSLastAccess $currentlyOff "Disable NTFS Last Access" "Enable NTFS Last Access"
+        $actualDisabled = Get-WmtFsutilDisableLastAccessState
+        if ($null -eq $actualDisabled) { Set-WmtTweakUnknownState "btnToggleNTFSLastAccess" "Mode varies" "fsutil did not return a recognized DisableLastAccess value." }
+        else { Update-WmtTweakToggle $btnToggleNTFSLastAccess $actualDisabled "Disable NTFS Last Access" "Enable NTFS Last Access" }
     })
 }
 
 $btnToggleNTFS83 = Get-Ctrl "btnToggleNTFS83"
 if ($btnToggleNTFS83) {
 $btnToggleNTFS83.Add_Click({
-        $currentlyOff = ((& fsutil behavior query Disable8dot3 2>$null) -match "1")
-        if ($currentlyOff) {
-            Invoke-UiCommand { & fsutil behavior set Disable8dot3 0 | Out-Null; Write-GuiLog "NTFS 8.3 short names enabled." } "Enabling NTFS 8.3..."
+        $currentlyDisabled = Get-WmtFsutilDisable8dot3State
+        $targetDisabled = if ($null -eq $currentlyDisabled) { $true } else { -not [bool]$currentlyDisabled }
+        if ($targetDisabled) {
+            Invoke-UiCommand { $fsutilOutput = @(& fsutil behavior set Disable8dot3 1 2>&1); if ($LASTEXITCODE -ne 0) { throw "fsutil failed: $($fsutilOutput -join ' ')" }; Write-GuiLog "NTFS 8.3 short names disabled globally." } "Disabling NTFS 8.3..."
         }
         else {
-            Invoke-UiCommand { & fsutil behavior set Disable8dot3 1 | Out-Null; Write-GuiLog "NTFS 8.3 short names disabled." } "Disabling NTFS 8.3..."
+            Invoke-UiCommand { $fsutilOutput = @(& fsutil behavior set Disable8dot3 0 2>&1); if ($LASTEXITCODE -ne 0) { throw "fsutil failed: $($fsutilOutput -join ' ')" }; Write-GuiLog "NTFS 8.3 short names enabled globally." } "Enabling NTFS 8.3..."
         }
-        Update-WmtTweakToggle $btnToggleNTFS83 $currentlyOff "Disable NTFS 8.3" "Enable NTFS 8.3"
+        $actualDisabled = Get-WmtFsutilDisable8dot3State
+        if ($null -eq $actualDisabled) { Set-WmtTweakUnknownState "btnToggleNTFS83" "Per-volume / mixed" "The global 8.3-name mode varies by volume or could not be queried." }
+        else { Update-WmtTweakToggle $btnToggleNTFS83 $actualDisabled "Disable NTFS 8.3" "Enable NTFS 8.3" }
     })
 }
 
@@ -38810,20 +38963,19 @@ $btnToggleRemovePrint = Get-Ctrl "btnToggleRemovePrint"
 if ($btnToggleRemovePrint) {
 $btnToggleRemovePrint.Add_Click({
         $p = "HKCU:\Software\Classes\SystemFileAssociations\image\shell\print"
-        $exists = (Get-WmtRegistryPathExists -Path $p)
-        if ($exists) {
-            Invoke-UiCommand { Remove-WmtRegKeyTree $p; Write-GuiLog "Print removed from image context menu." } "Removing Print..."
+        $hidden = Test-WmtRegistryValueExists -Path $p -ValueName "LegacyDisable"
+        if ($hidden) {
+            Invoke-UiCommand { Remove-WmtRegValue $p "LegacyDisable"; Write-GuiLog "Print restored in image context menus." } "Restoring Print..."
         }
         else {
             Invoke-UiCommand {
                 New-WmtRegKey $p
-                Set-WmtRegDefaultValue $p "Print"
-                New-WmtRegKey "$p\command"
-                Set-WmtRegDefaultValue "$p\command" 'mspaint.exe /pt "%1"' 
-                Write-GuiLog "Print restored to image context menu."
-            } "Restoring Print..."
+                Set-WmtRegString $p "LegacyDisable" ""
+                Write-GuiLog "Print hidden from image context menus."
+            } "Removing Print..."
         }
-        Update-WmtTweakToggle $btnToggleRemovePrint (-not $exists) "Remove Print" "Restore Print"
+        $hiddenNow = Test-WmtRegistryValueExists -Path $p -ValueName "LegacyDisable"
+        Update-WmtTweakToggle $btnToggleRemovePrint $hiddenNow "Remove Print" "Restore Print"
     })
 }
 
@@ -38831,14 +38983,15 @@ $btnToggleRemoveCast = Get-Ctrl "btnToggleRemoveCast"
 if ($btnToggleRemoveCast) {
 $btnToggleRemoveCast.Add_Click({
         $p = "HKCU:\Software\Classes\SystemFileAssociations\image\shell\CastToDevice"
-        $exists = (Get-WmtRegistryPathExists -Path $p)
-        if ($exists) {
-            Invoke-UiCommand { Remove-WmtRegKeyTree $p; Write-GuiLog "Cast to Device removed." } "Removing Cast to Device..."
+        $hidden = Test-WmtRegistryValueExists -Path $p -ValueName "LegacyDisable"
+        if ($hidden) {
+            Invoke-UiCommand { Remove-WmtRegValue $p "LegacyDisable"; Write-GuiLog "Cast to Device restored in image context menus." } "Restoring Cast to Device..."
         }
         else {
-            Invoke-UiCommand { New-WmtRegKey $p; Write-GuiLog "Cast to Device restored." } "Restoring Cast to Device..."
+            Invoke-UiCommand { New-WmtRegKey $p; Set-WmtRegString $p "LegacyDisable" ""; Write-GuiLog "Cast to Device hidden from image context menus." } "Removing Cast to Device..."
         }
-        Update-WmtTweakToggle $btnToggleRemoveCast (-not $exists) "Remove Cast to Device" "Restore Cast to Device"
+        $hiddenNow = Test-WmtRegistryValueExists -Path $p -ValueName "LegacyDisable"
+        Update-WmtTweakToggle $btnToggleRemoveCast $hiddenNow "Remove Cast to Device" "Restore Cast to Device"
     })
 }
 
@@ -40077,8 +40230,8 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnToggleRecall" "Disable Recall" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleRecall" "Recall" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleClickToDo" "Click To Do" "btnTabTweaks"
-    Add-SearchIndexEntry "btnToggleAISvcAutoStart" "AI Service Autostart" "btnTabTweaks"
-    Add-SearchIndexEntry "btnToggleEdgeAI" "Edge AI" "btnTabTweaks"
+    Add-SearchIndexEntry "btnToggleAISvcAutoStart" "Windows AI Data Analysis Policy Recall Snapshots" "btnTabTweaks"
+    Add-SearchIndexEntry "btnToggleEdgeAI" "Edge Sidebar HubsSidebarEnabled" "btnTabTweaks"
     Add-SearchIndexEntry "btnTogglePaintAI" "Paint AI" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleNotepadAI" "Notepad AI" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleFindMyDevice" "Find My Device" "btnTabTweaks"
@@ -58706,10 +58859,18 @@ $btnToggleHibernate.Add_Click({
             Update-WmtTweakToggle $btnToggleHibernate ($actual -ne 0) "Disable Hibernation" "Enable Hibernation"
         }.GetNewClosure()
         if ($enabling) {
-            Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb { powercfg /hibernate on | Out-Null; Write-Output "Hibernation enabled." } -OnComplete $done | Out-Null
+            Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb {
+                $output = @(powercfg /hibernate on 2>&1)
+                if ($LASTEXITCODE -ne 0) { throw "powercfg could not enable hibernation: $($output -join ' ')" }
+                Write-Output "Hibernation enabled."
+            } -OnComplete $done | Out-Null
         }
         else {
-            Invoke-WmtUiBackgroundCommand -Name "DisableHibernate" -Msg "Disabling hibernation..." -Sb { powercfg /hibernate off | Out-Null; Write-Output "Hibernation disabled. Disk space freed." } -OnComplete $done | Out-Null
+            Invoke-WmtUiBackgroundCommand -Name "DisableHibernate" -Msg "Disabling hibernation..." -Sb {
+                $output = @(powercfg /hibernate off 2>&1)
+                if ($LASTEXITCODE -ne 0) { throw "powercfg could not disable hibernation: $($output -join ' ')" }
+                Write-Output "Hibernation disabled. Disk space freed."
+            } -OnComplete $done | Out-Null
         }
     })
 }
@@ -58736,8 +58897,31 @@ if ($btnToggleSuperfetch) { $btnToggleSuperfetch.Add_Click({
 
 if ($btnPerfUltimatePower) { $btnPerfUltimatePower.Add_Click({
     Invoke-WmtUiBackgroundCommand -Name "UltimatePerformancePowerPlan" -Msg "Enabling Ultimate Performance..." -Sb {
-        powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
-        powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
+        $sourceGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+        # A stable destination lets repeated clicks reuse the WMT-created plan.
+        $wmtPlanGuid = "b76b7d19-1b2a-4e91-9f54-08f7032cb568"
+        $listedPlans = @(powercfg /list 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Could not list power plans: $($listedPlans -join ' ')" }
+        $planText = $listedPlans -join "`n"
+        $targetGuid = $null
+        if ($planText.IndexOf($sourceGuid, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $targetGuid = $sourceGuid
+        }
+        elseif ($planText.IndexOf($wmtPlanGuid, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $targetGuid = $wmtPlanGuid
+        }
+        else {
+            $duplicateOutput = @(powercfg /duplicatescheme $sourceGuid $wmtPlanGuid 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the Ultimate Performance plan: $($duplicateOutput -join ' ')" }
+            $targetGuid = $wmtPlanGuid
+        }
+
+        $activationOutput = @(powercfg /setactive $targetGuid 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Could not activate the Ultimate Performance plan: $($activationOutput -join ' ')" }
+        $activeOutput = @(powercfg /getactivescheme 2>&1)
+        if ($LASTEXITCODE -ne 0 -or ($activeOutput -join "`n").IndexOf($targetGuid, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw "Powercfg did not confirm that plan $targetGuid is active: $($activeOutput -join ' ')"
+        }
         Write-Output "Ultimate Performance power plan enabled."
     } | Out-Null
     Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power"); $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0); if ($btnToggleHibernate) { Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Disable Hibernation" "Enable Hibernation" }
@@ -59321,32 +59505,21 @@ $btnToggleCtxMenu.Add_Click({
 $btnToggleTakeOwnership = Get-Ctrl "btnToggleTakeOwnership"
 if ($btnToggleTakeOwnership) {
 $btnToggleTakeOwnership.Add_Click({
-        $installed = Get-WmtRegistryPathExists -Path "HKCR:\Directory\shell\WMT_TakeOwnership"
+        $installed = ((Get-WmtRegistryPathExists -Path "HKCR:\*\shell\WMT_TakeOwnership") -or (Get-WmtRegistryPathExists -Path "HKCR:\Directory\shell\WMT_TakeOwnership") -or (Get-WmtRegistryPathExists -Path "HKCR:\Drive\shell\WMT_TakeOwnership"))
         if ($installed) {
             Invoke-UiCommand {
-                Remove-WmtRegKeyTree "HKCR:\*\shell\WMT_TakeOwnership"
-                Remove-WmtRegKeyTree "HKCR:\Directory\shell\WMT_TakeOwnership"
-                Remove-WmtRegKeyTree "HKCR:\Drive\shell\WMT_TakeOwnership"
+                Set-WmtTakeOwnershipMenu -Enable $false
                 Write-GuiLog "Take Ownership context menu removed."
             } "Removing Take Ownership..."
         }
         else {
             Invoke-UiCommand {
-                $cmds = [ordered]@{
-                    "HKCR:\*\shell\WMT_TakeOwnership"         = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /a && icacls ""%1"" /grant *S-1-5-32-544:F /c && pause''"'
-                    "HKCR:\Directory\shell\WMT_TakeOwnership" = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /r /d y /a && icacls ""%1"" /grant *S-1-5-32-544:F /t /c && pause''"'
-                    "HKCR:\Drive\shell\WMT_TakeOwnership"     = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList ''/c takeown /f ""%1"" /r /d y /a && icacls ""%1"" /grant *S-1-5-32-544:F /t /c && pause''"'
-                }
-                foreach ($hivePath in $cmds.Keys) {
-                    New-WmtRegKey $hivePath
-                    Set-WmtRegDefaultValue $hivePath "Take Ownership"
-                    New-WmtRegKey "$hivePath\command"
-                    Set-WmtRegDefaultValue "$hivePath\command" $cmds[$hivePath]
-                }
+                Set-WmtTakeOwnershipMenu -Enable $true
                 Write-GuiLog "Take Ownership context menu added (files, folders, drives)."
             } "Adding Take Ownership..."
         }
-        Update-WmtTweakToggle $btnToggleTakeOwnership (-not $installed) "Remove Take Ownership" "Add Take Ownership"
+        $installedNow = ((Get-WmtRegistryPathExists -Path "HKCR:\*\shell\WMT_TakeOwnership") -or (Get-WmtRegistryPathExists -Path "HKCR:\Directory\shell\WMT_TakeOwnership") -or (Get-WmtRegistryPathExists -Path "HKCR:\Drive\shell\WMT_TakeOwnership"))
+        Update-WmtTweakToggle $btnToggleTakeOwnership $installedNow "Remove Take Ownership" "Add Take Ownership"
     })
 }
 
@@ -59354,23 +59527,21 @@ $btnTogglePsHere = Get-Ctrl "btnTogglePsHere"
 if ($btnTogglePsHere) {
 $btnTogglePsHere.Add_Click({
         $regPath = "HKCR:\Directory\Background\shell\WMT_OpenPowerShell"
-        $installed = Get-WmtRegistryPathExists -Path $regPath
+        $installed = ((Get-WmtRegistryPathExists -Path $regPath) -or (Get-WmtRegistryPathExists -Path "HKCR:\Directory\shell\WMT_OpenPowerShell") -or (Get-WmtRegistryPathExists -Path "HKCR:\Drive\shell\WMT_OpenPowerShell"))
         if ($installed) {
             Invoke-UiCommand {
-                Remove-WmtRegKeyTree $regPath
+                Set-WmtPowerShellHereMenu -Enable $false
                 Write-GuiLog "PowerShell Here context menu removed."
             } "Removing PowerShell Here..."
         }
         else {
             Invoke-UiCommand {
-                New-WmtRegKey "$regPath\command"
-                Set-WmtRegDefaultValue $regPath "Open PowerShell Here"
-                Set-WmtRegString $regPath "Icon" "powershell.exe"
-                Set-WmtRegDefaultValue "$regPath\command" 'powershell.exe -NoExit -Command "Set-Location -LiteralPath ''%V''"'
-                Write-GuiLog "PowerShell Here context menu added."
+                Set-WmtPowerShellHereMenu -Enable $true
+                Write-GuiLog "PowerShell Here context menu added for folders, drives, and folder backgrounds."
             } "Adding PowerShell Here..."
         }
-        Update-WmtTweakToggle $btnTogglePsHere (-not $installed) "Remove PowerShell Here" "Add PowerShell Here"
+        $installedNow = ((Get-WmtRegistryPathExists -Path $regPath) -or (Get-WmtRegistryPathExists -Path "HKCR:\Directory\shell\WMT_OpenPowerShell") -or (Get-WmtRegistryPathExists -Path "HKCR:\Drive\shell\WMT_OpenPowerShell"))
+        Update-WmtTweakToggle $btnTogglePsHere $installedNow "Remove PowerShell Here" "Add PowerShell Here"
     })
 }
 
@@ -59697,6 +59868,7 @@ $btnToggleLockScreen.Add_Click({
         if ($btnToggleLockFacts) { Update-WmtTweakToggle $btnToggleLockFacts (-not $lfOff) "Lock Facts On" "Lock Facts Off" }
         $spOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
         if ($btnToggleLockSpotlight) { Update-WmtTweakToggle $btnToggleLockSpotlight (-not $spOff) "Spotlight On" "Spotlight Off" }
+        Update-WmtTweakToggle $btnToggleLockScreen ($lfOff -and $spOff) "Plain Lock Screen" "Default Lock Screen"
     })
 }
 
@@ -59706,16 +59878,31 @@ $btnToggleFastStartup.Add_Click({
         Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1) 0)) -eq 0)
         if ($currentlyOn) {
-            Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
+            $done = {
+                param($results)
+                Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
+                Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+                $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
+                Update-WmtTweakToggle $btnToggleFastStartup ($actual -ne 0) "Fast Startup On" "Fast Startup Off"
+            }.GetNewClosure()
+            $failed = {
+                param($errorRecord)
+                Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+                $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
+                Update-WmtTweakToggle $btnToggleFastStartup ($actual -ne 0) "Fast Startup On" "Fast Startup Off"
+            }.GetNewClosure()
             Invoke-WmtUiBackgroundCommand -Name "EnableFastStartupHibernate" -Msg "Enabling Fast Startup..." -Sb {
-                powercfg /hibernate on | Out-Null
-                Write-Output "Fast Startup enabled. Hibernation was enabled because Fast Startup depends on it."
-            } | Out-Null
+                $output = @(powercfg /hibernate on 2>&1)
+                if ($LASTEXITCODE -ne 0) { throw "powercfg could not enable hibernation: $($output -join ' ')" }
+                Write-Output "Hibernation enabled."
+            } -OnComplete $done -OnError $failed | Out-Null
         }
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0; Write-GuiLog "Fast Startup disabled." } "Disabling Fast Startup..."
+            Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+            $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
+            Update-WmtTweakToggle $btnToggleFastStartup ($actual -ne 0) "Fast Startup On" "Fast Startup Off"
         }
-        Update-WmtTweakToggle $btnToggleFastStartup $currentlyOn "Fast Startup On" "Fast Startup Off"
     })
 }
 $btnToggleRestoreFolders = Get-Ctrl "btnToggleRestoreFolders"
@@ -59772,13 +59959,12 @@ $btnToggleUsbSuspend.Add_Click({
         $usbSub = "2a737441-1930-4402-8d77-b2bebba308a3"; $usbSetting = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
         $usbAc = Get-WmtPowerSettingIndex $usbSub $usbSetting "AC"; $usbDc = Get-WmtPowerSettingIndex $usbSub $usbSetting "DC"
         $currentlyOn = ($usbAc -eq 1 -and $usbDc -eq 1)
-        if ($currentlyOn) {
-            Invoke-UiCommand { Set-WmtPowerSettingIndex "2a737441-1930-4402-8d77-b2bebba308a3" "48e6b7a6-50f5-4782-a5d4-53bb8f07e226" 0; Write-GuiLog "USB selective suspend disabled." } "Disabling USB selective suspend..."
-        }
-        else {
-            Invoke-UiCommand { Set-WmtPowerSettingIndex "2a737441-1930-4402-8d77-b2bebba308a3" "48e6b7a6-50f5-4782-a5d4-53bb8f07e226" 1; Write-GuiLog "USB selective suspend enabled." } "Enabling USB selective suspend..."
-        }
-        Update-WmtTweakToggle $btnToggleUsbSuspend (-not $currentlyOn) "USB Suspend On" "USB Suspend Off"
+        $targetValue = if ($currentlyOn) { 0 } else { 1 }
+        $operationMessage = if ($targetValue -eq 0) { "Disabling USB selective suspend..." } else { "Enabling USB selective suspend..." }
+        Invoke-UiCommand { Set-WmtPowerSettingIndex $usbSub $usbSetting $targetValue; Write-GuiLog "USB selective suspend set to $targetValue for AC and DC." } $operationMessage
+        $actualAc = Get-WmtPowerSettingIndex $usbSub $usbSetting "AC"; $actualDc = Get-WmtPowerSettingIndex $usbSub $usbSetting "DC"
+        if ($null -eq $actualAc -or $null -eq $actualDc) { Set-WmtTweakUnknownState "btnToggleUsbSuspend" "Not confirmed" "Powercfg did not return both AC and DC values." }
+        else { Update-WmtTweakToggle $btnToggleUsbSuspend ($actualAc -eq 1 -and $actualDc -eq 1) "USB Suspend On" "USB Suspend Off" }
     })
 }
 $btnTogglePcie = Get-Ctrl "btnTogglePcie"
@@ -59787,13 +59973,12 @@ $btnTogglePcie.Add_Click({
         $pcieSub = "501a4d13-42af-4429-9fd1-a8218c268e20"; $pcieSetting = "ee12f906-d277-404b-b6da-e5fa1a576df5"
         $pcieAc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "AC"; $pcieDc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "DC"
         $currentlyOn = ($pcieAc -eq 1 -and $pcieDc -eq 1)
-        if ($currentlyOn) {
-            Invoke-UiCommand { Set-WmtPowerSettingIndex "501a4d13-42af-4429-9fd1-a8218c268e20" "ee12f906-d277-404b-b6da-e5fa1a576df5" 0; Write-GuiLog "PCI Express link state savings disabled." } "Disabling PCIe link state savings..."
-        }
-        else {
-            Invoke-UiCommand { Set-WmtPowerSettingIndex "501a4d13-42af-4429-9fd1-a8218c268e20" "ee12f906-d277-404b-b6da-e5fa1a576df5" 1; Write-GuiLog "PCI Express link state set to moderate savings." } "Setting PCIe link state savings..."
-        }
-        Update-WmtTweakToggle $btnTogglePcie (-not $currentlyOn) "PCIe Savings" "PCIe Savings Off"
+        $targetValue = if ($currentlyOn) { 0 } else { 1 }
+        $operationMessage = if ($targetValue -eq 0) { "Disabling PCIe link state savings..." } else { "Enabling PCIe link state savings..." }
+        Invoke-UiCommand { Set-WmtPowerSettingIndex $pcieSub $pcieSetting $targetValue; Write-GuiLog "PCIe link state value set to $targetValue for AC and DC." } $operationMessage
+        $actualAc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "AC"; $actualDc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "DC"
+        if ($null -eq $actualAc -or $null -eq $actualDc) { Set-WmtTweakUnknownState "btnTogglePcie" "Not confirmed" "Powercfg did not return both AC and DC values." }
+        else { Update-WmtTweakToggle $btnTogglePcie ($actualAc -eq 1 -and $actualDc -eq 1) "PCIe Savings" "PCIe Savings Off" }
     })
 }
 
@@ -64171,14 +64356,28 @@ catch {
             }
         } catch { $nonRegData["MMAgentMemoryCompression"] = $null }
 
-        # fsutil behavior query ×2 (process spawns)
+        # fsutil behavior query ×2 (process spawns). Preserve unknown and
+        # per-volume modes instead of treating any occurrence of "1" as state.
         try {
-            $out1 = (& fsutil behavior query DisableLastAccess 2>$null)
-            $nonRegData["FsutilDisableLastAccess"] = if ($out1 -match "1") { $true } else { $false }
+            $out1 = @(& fsutil behavior query DisableLastAccess 2>$null)
+            if ($LASTEXITCODE -ne 0) { $nonRegData["FsutilDisableLastAccess"] = $null }
+            elseif (($out1 -join "`n") -match '(?im)\bDisableLastAccess\s*=\s*(0x[0-9a-f]+|\d+)') {
+                $rawLastAccess = $Matches[1]
+                $lastAccessValue = if ($rawLastAccess.StartsWith("0x", [StringComparison]::OrdinalIgnoreCase)) { [Convert]::ToUInt32($rawLastAccess.Substring(2), 16) } else { [Convert]::ToUInt32($rawLastAccess, 10) }
+                $nonRegData["FsutilDisableLastAccess"] = (($lastAccessValue -band 1) -ne 0)
+            }
+            else { $nonRegData["FsutilDisableLastAccess"] = $null }
         } catch { $nonRegData["FsutilDisableLastAccess"] = $null }
         try {
-            $out2 = (& fsutil behavior query Disable8dot3 2>$null)
-            $nonRegData["FsutilDisable8dot3"] = if ($out2 -match "1") { $true } else { $false }
+            $out2 = @(& fsutil behavior query Disable8dot3 2>$null)
+            if ($LASTEXITCODE -ne 0) { $nonRegData["FsutilDisable8dot3"] = $null }
+            elseif (($out2 -join "`n") -match '(?im)(?:registry\s+state\s+is\s*:?|Disable8dot3\s*=)\s*(\d+)') {
+                $eightDotThreeMode = [int]$Matches[1]
+                if ($eightDotThreeMode -eq 0) { $nonRegData["FsutilDisable8dot3"] = $false }
+                elseif ($eightDotThreeMode -eq 1) { $nonRegData["FsutilDisable8dot3"] = $true }
+                else { $nonRegData["FsutilDisable8dot3"] = $null }
+            }
+            else { $nonRegData["FsutilDisable8dot3"] = $null }
         } catch { $nonRegData["FsutilDisable8dot3"] = $null }
 
         # Get-ExecutionPolicy
