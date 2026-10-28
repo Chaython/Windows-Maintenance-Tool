@@ -159,6 +159,50 @@ jobs:
           $script:WmtQuickFindMovedButtons.Clear()
           Write-Host 'Quick Find host/restore safety checks passed.'
 
+      - name: Smoke test Quick Find natural-language matching
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null; $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path '.\\WMT-GUI.ps1').Path, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) { throw 'WMT must parse before search matching tests.' }
+          foreach ($name in @('ConvertTo-WmtQuickFindTokens', 'Get-WmtQuickFindMatchRank')) {
+              $functionAst = $ast.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $node.Name -eq $name
+              }, $true)
+              if (-not $functionAst) { throw "Missing Quick Find matching function: $name" }
+              Invoke-Expression $functionAst.Extent.Text
+          }
+          $aliasesAst = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                  $node.Left.Extent.Text -eq '$searchAliasesByButton'
+          }, $true)
+          if (-not $aliasesAst) { throw 'Quick Find search aliases were not declared.' }
+          Invoke-Expression $aliasesAst.Extent.Text
+          $cases = @(
+              @{ Query = 'wifi fix'; Label = 'Restart Wi-Fi Adapter'; Search = $searchAliasesByButton.btnResetWifi; Expected = $true },
+              @{ Query = 'wifi fix'; Label = 'Suggested WiFi'; Search = 'wireless networking suggested networks'; Expected = $false },
+              @{ Query = 'printer'; Label = 'Remove Print'; Search = $searchAliasesByButton.btnToggleRemovePrint; Expected = $true },
+              @{ Query = 'app updates'; Label = 'Update All Apps'; Search = $searchAliasesByButton.btnWingetUpdateAll; Expected = $true },
+              @{ Query = 'search packages'; Label = 'Search Winget Packages'; Search = $searchAliasesByButton.txtWingetSearch; Expected = $true },
+              @{ Query = 'speed up pc'; Label = 'Optimize System Services'; Search = $searchAliasesByButton.btnSvcOptimize; Expected = $true },
+              @{ Query = 'enable dark mode'; Label = 'Dark Mode'; Search = $searchAliasesByButton.btnToggleDarkMode; Expected = $true },
+              @{ Query = 'hide file extensions'; Label = 'File Extensions'; Search = 'hide show file extension extensions filename suffix known file types'; Expected = $true },
+              @{ Query = 'wifi printer'; Label = 'Restart Wi-Fi Adapter'; Search = $searchAliasesByButton.btnResetWifi; Expected = $false }
+          )
+          foreach ($case in $cases) {
+              $rank = Get-WmtQuickFindMatchRank $case.Query $case.Label ("$($case.Label) $($case.Search)")
+              $matched = $rank -ge 0
+              if ($matched -ne [bool]$case.Expected) {
+                  throw "Quick Find mismatch for '$($case.Query)' against '$($case.Label)' (rank $rank)."
+              }
+          }
+          Write-Host "Quick Find natural-language checks passed ($($cases.Count) cases)."
+
       - name: Smoke test optional feature startup and fail-closed safety
         shell: powershell
         run: |

@@ -39430,13 +39430,61 @@ function Add-SearchIndexNavigationEntry {
     param([string]$Desc, [string]$BtnName, [string]$ParentTab)
     Add-SearchIndexEntry $BtnName $Desc $ParentTab
 }
+function ConvertTo-WmtQuickFindTokens {
+    param([string]$Text)
+    $stopWords = @(
+        "a", "an", "and", "are", "can", "could", "do", "does", "for", "from",
+        "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "please",
+        "the", "to", "turn", "up", "what", "where", "with", "you", "your",
+        "this", "that", "best", "way", "why", "won", "not", "working", "enable", "disable"
+    )
+    $terms = [System.Collections.ArrayList]::new()
+    foreach ($match in [regex]::Matches([string]$Text, '[\p{L}\p{N}]+')) {
+        $term = $match.Value.ToLowerInvariant()
+        if ($term.Length -eq 1) { continue }
+        if ($term -in $stopWords) { continue }
+        # Match common plural forms without turning short abbreviations into noise.
+        if ($term.Length -gt 4 -and $term.EndsWith("ies", [System.StringComparison]::Ordinal)) {
+            $term = $term.Substring(0, $term.Length - 3) + "y"
+        } elseif ($term.Length -gt 3 -and $term.EndsWith("s", [System.StringComparison]::Ordinal) -and -not $term.EndsWith("ss", [System.StringComparison]::Ordinal)) {
+            $term = $term.Substring(0, $term.Length - 1)
+        }
+        if (-not $terms.Contains($term)) { [void]$terms.Add($term) }
+    }
+    return $terms.ToArray()
+}
+function Get-WmtQuickFindMatchRank {
+    param([string]$Query, [string]$Label, [string]$SearchText)
+    $query = ([string]$Query).Trim()
+    if (-not $query) { return -1 }
+    if ($Label.Equals($query, [System.StringComparison]::OrdinalIgnoreCase)) { return 0 }
+    if ($Label.StartsWith($query, [System.StringComparison]::OrdinalIgnoreCase)) { return 1 }
+    if ($Label.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return 2 }
+    if ($SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return 3 }
+
+    $queryTerms = @(ConvertTo-WmtQuickFindTokens $query)
+    if ($queryTerms.Count -eq 0) { return -1 }
+    $labelTerms = @(ConvertTo-WmtQuickFindTokens $Label)
+    $searchTerms = @(ConvertTo-WmtQuickFindTokens $SearchText)
+    foreach ($term in $queryTerms) {
+        if ($searchTerms -notcontains $term) { return -1 }
+    }
+    foreach ($term in $queryTerms) {
+        if ($labelTerms -notcontains $term) { return 4 }
+    }
+    return 3
+}
 function Update-WmtSearchIndexEntries {
     $entries = [System.Collections.ArrayList]::new()
     foreach ($entry in ($SearchIndex.GetEnumerator() | Sort-Object Key)) {
         $item = $entry.Value
         $tooltip = ""
+        $content = ""
         try {
             if ($item.Button -and $item.Button.ToolTip -is [string]) { $tooltip = [string]$item.Button.ToolTip }
+            if ($item.Button -is [System.Windows.Controls.TextBox]) { $content = [string]$item.Button.Text }
+            elseif ($item.Button -is [System.Windows.Controls.Button] -and $item.Button.Content -is [string]) { $content = [string]$item.Button.Content }
+            elseif ($item.Button -and $item.Button.Content -is [System.Windows.Controls.AccessText]) { $content = [string]$item.Button.Content.Text }
         } catch {}
         $description = $tooltip
         if ($item.Group -eq "MouseSpeed") {
@@ -39446,7 +39494,8 @@ function Update-WmtSearchIndexEntries {
             Text = [string]$entry.Key
             Item = $item
             Description = $description
-            SearchText = "$($entry.Key) $tooltip $description $($item.SearchAliases)"
+            SearchText = "$($entry.Key) $content $tooltip $description $($item.SearchAliases)"
+            MatchRank = -1
         })
     }
     $script:WmtSearchIndexEntries = $entries
@@ -39790,7 +39839,10 @@ function Open-WmtQuickFindTarget {
         }
     }
     if ($target -and $target.IsVisible) {
-        try { $target.BringIntoView() } catch {}
+        try {
+            $target.BringIntoView()
+            if ($target -is [System.Windows.Controls.TextBox]) { [void]$target.Focus() }
+        } catch {}
     }
 }
 function Update-WmtQuickFindResults {
@@ -39842,16 +39894,25 @@ function Update-WmtQuickFindResults {
         if (-not $current -and $entry.Item.Button -and $entry.Item.Button.Parent) {
             $current = $entry.Item.Button
         }
-        if (-not $current -or $current -isnot [System.Windows.Controls.Button] -or -not $current.Parent) { continue }
+        if (-not $current -or
+            ($current -isnot [System.Windows.Controls.Button] -and $current -isnot [System.Windows.Controls.TextBox]) -or
+            -not $current.Parent) { continue }
         $liveTooltip = ""
+        $liveContent = ""
         try { if ($current.ToolTip -is [string]) { $liveTooltip = [string]$current.ToolTip } } catch {}
+        try {
+            if ($current -is [System.Windows.Controls.TextBox]) { $liveContent = [string]$current.Text }
+            elseif ($current -is [System.Windows.Controls.Button] -and $current.Content -is [string]) { $liveContent = [string]$current.Content }
+            elseif ($current.Content -is [System.Windows.Controls.AccessText]) { $liveContent = [string]$current.Content.Text }
+        } catch {}
         if ($entry.Item.Group -eq "MouseSpeed") {
             $entry.Description = "Choose slow, default, or fast cursor speed."
         } else {
             $entry.Description = $liveTooltip
         }
-        $entry.SearchText = "$($entry.Text) $liveTooltip $($entry.Item.SearchAliases) $($entry.Description)"
-        if ($entry.SearchText.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $entry.SearchText = "$($entry.Text) $liveContent $liveTooltip $($entry.Item.SearchAliases) $($entry.Description)"
+        $entry.MatchRank = Get-WmtQuickFindMatchRank $query ([string]$entry.Text) ([string]$entry.SearchText)
+        if ($entry.MatchRank -lt 0) { continue }
         $script:WmtControlCache[$name] = $current
         if (-not [object]::ReferenceEquals($current, $entry.Item.Button)) {
             $entry.Item.Button = $current
@@ -39862,13 +39923,7 @@ function Update-WmtQuickFindResults {
         $seen[$key] = $true
         [void]$quickFindMatches.Add($entry)
     }
-    $quickFindMatches = @($quickFindMatches | Sort-Object @{ Expression = {
-        $label = [string]$_.Text
-        if ($label.Equals($query, [System.StringComparison]::OrdinalIgnoreCase)) { 0 }
-        elseif ($label.StartsWith($query, [System.StringComparison]::OrdinalIgnoreCase)) { 1 }
-        elseif ($label.IndexOf($query, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { 2 }
-        else { 3 }
-    } }, @{ Expression = { [string]$_.Text } })
+    $quickFindMatches = @($quickFindMatches | Sort-Object @{ Expression = { [int]$_.MatchRank } }, @{ Expression = { [string]$_.Text } })
     # Limit expensive WPF reparenting for very broad search terms.
     $limit = 16
     $lblQuickFindSummary.Text = if ($quickFindMatches.Count -eq 0) {
@@ -40010,13 +40065,16 @@ function Update-WmtQuickFindResults {
                 # Controls that depend on their page context (including the
                 # catalogue/library navigators and search fields) stay in place.
                 $open = [System.Windows.Controls.Button]::new()
-                $open.Content = if ($entry.Item.Tab -eq "btnTabTweaks" -and
-                    (-not $tweakReady)) { "Open Tweaks (loading)" } else { "Open section" }
+                $open.Content = if ($original -is [System.Windows.Controls.TextBox]) { "Focus search field" }
+                    elseif ($entry.Item.Tab -eq "btnTabTweaks" -and (-not $tweakReady)) { "Open Tweaks (loading)" }
+                    else { "Open section" }
                 $open.Style = $window.FindResource("ActionBtn")
                 $open.HorizontalAlignment = "Left"
                 $open.Margin = [System.Windows.Thickness]::new(0,9,0,0)
                 $open.Tag = $entry
-                $open.ToolTip = "This control needs its original page; open the section without running a tool."
+                $open.ToolTip = if ($original -is [System.Windows.Controls.TextBox]) {
+                    "Open the page and focus this search field."
+                } else { "This control needs its original page; open the section without running a tool." }
                 $open.Add_Click({
                     param($searchSender, $searchEventArgs)
                     Open-WmtQuickFindTarget -Entry $searchSender.Tag
@@ -40192,7 +40250,7 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexNavigationEntry "Enable Launch Minimized" "btnLaunchMinimized" "btnTabSupport"
     Add-SearchIndexNavigationEntry "Disable Launch Minimized" "btnLaunchMinimized" "btnTabSupport"
     Add-SearchIndexNavigationEntry "Light Mode" "btnToggleTheme" "btnTabSupport"
-    Add-SearchIndexNavigationEntry "Dark Mode" "btnToggleTheme" "btnTabSupport"
+    Add-SearchIndexNavigationEntry "Application Dark Mode" "btnToggleTheme" "btnTabSupport"
 
     # 9. My Device
     Add-SearchIndexEntry "btnMyDeviceCleanRAM" "Clean RAM" "btnTabMyDevice"
@@ -40397,6 +40455,73 @@ $searchIndexDeferTimer.Add_Tick({
     Add-SearchIndexEntry "btnToggleUsbSuspend" "USB Selective Suspend" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleLongPaths" "Win32 Long Paths" "btnTabTweaks"
     Add-SearchIndexEntry "btnToggleDevMode" "Developer Mode" "btnTabTweaks"
+
+    # Common words people use when looking for these tools. Keep these as
+    # searchable metadata; Quick Find only navigates to the matching control.
+    $searchAliasesByButton = @{
+        btnWingetScan = "scan outdated upgrades apps programs software package manager"
+        txtWingetSearch = "search find lookup software apps application package name winget install"
+        btnWingetUpdateSel = "update upgrade apps applications programs software selected"
+        btnWingetUpdateAll = "update upgrade all apps applications programs installed software"
+        btnWingetInstall = "install add apps applications programs software packages"
+        btnWingetUninstall = "uninstall remove apps applications programs software packages"
+        btnQuickFix = "blue screen bluescreen bsod crash repair corrupted corrupt system files health startup"
+        btnSFC = "corrupt corrupted damaged missing system files checker repair scan"
+        btnDISMRestore = "corrupt corrupted damaged windows image component store repair health"
+        btnNetInfo = "ipconfig ip address adapter ethernet wifi wireless connection details"
+        btnFlushDNS = "clear dns resolver cache lookup host ipconfig flushdns"
+        btnResetWifi = "wifi wireless internet connect connection reconnect disconnect adapter broken connectivity fix"
+        btnNetRepair = "internet wifi wireless broken offline connect connection reconnect disconnect repair reset winsock tcpip troubleshoot fix"
+        btnDnsGoogle = "dns resolver nameserver internet"
+        btnDnsCloudflare = "dns resolver nameserver internet privacy"
+        btnDnsQuad9 = "dns resolver nameserver internet security malware"
+        btnDnsAdGuard = "dns resolver nameserver internet adblock"
+        btnDnsAuto = "automatic dns resolver dhcp default"
+        btnDnsCustom = "manual dns resolver nameserver address"
+        btnCleanDisk = "storage disk space low free up cleanmgr temporary junk pc"
+        btnCleanTemp = "storage disk space low free up temporary temp cache junk files pc"
+        btnCleanupOneDrive = "onedrive cloud sync storage disk space free up files"
+        btnUtilResetGPU = "graphics video display driver reset black screen lag stutter gaming"
+        btnUtilSysInfo = "system hardware cpu processor memory ram motherboard graphics specifications"
+        btnUtilRestoreMgr = "restore point system protection rollback recovery checkpoint"
+        btnUtilStartupMgr = "startup apps programs launch boot slow login run automatically autostart"
+        btnStartWithWindows = "startup launch boot login automatically sign in"
+        btnPerfServicesManual = "performance speed faster responsive background services debloat pc computer cpu processor high"
+        btnPerfServicesRevert = "restore revert default services startup types"
+        btnSvcOptimize = "performance speed faster responsive background services debloat pc computer cpu processor high"
+        btnPerfUltimatePower = "performance speed power plan cpu gaming pc computer"
+        btnToggleHibernate = "sleep hibernate power disk space fast startup"
+        btnTogglePagefile = "virtual memory paging file ram low memory swap"
+        btnToggleHags = "hardware accelerated gpu scheduling graphics gaming fps lag stutter"
+        btnPowerBatterySaverOff = "battery low power energy saver threshold disable"
+        btnPowerBatterySaver20 = "battery low power energy saver threshold"
+        btnPowerBatterySaver50 = "battery low power energy saver threshold"
+        btnToggleMouseAccel = "mouse pointer precision enhance pointer gaming"
+        btnToggleRemovePrint = "printer printers printing print context menu shell"
+        btnToggleDarkMode = "windows appearance theme night dark light"
+        btnUtilMas = "windows activation product key license kms digital"
+        btnUpdateRepair = "windows update stuck broken repair reset components download install"
+        btnUpdateServices = "windows update stuck restart service repair download install"
+        btnSoundSettings = "audio sound no sound speaker headphones volume device playback recording"
+        btnDisplaySettings = "display screen monitor resolution change size scale settings"
+        btnSearchIndexRebuild = "windows file search indexing slow rebuild files find"
+        btnToggleRecall = "windows ai snapshots privacy activity recall"
+        btnToggleAISvcAutoStart = "windows ai snapshots privacy recall startup"
+        btnToggleLocationSvc = "gps location tracking privacy"
+        btnToggleFindMyDevice = "locate lost laptop device tracking location"
+        btnToggleBackgroundApps = "background applications battery performance privacy"
+        btnToggleGameMode = "gaming performance games fps speed pc computer"
+        btnToggleGameBar = "gaming xbox game recording overlay"
+        btnToggleFastStartup = "boot slow startup shutdown hibernation hiberboot"
+        btnTasksDisableTelemetry = "diagnostic data tracking privacy collection scheduled tasks"
+        btnPowerUserUEFI = "bios firmware boot setup restart"
+    }
+    foreach ($item in $SearchIndex.Values) {
+        $buttonName = [string]$item.Button.Name
+        if ($searchAliasesByButton.ContainsKey($buttonName)) {
+            $item.SearchAliases = ("$($item.SearchAliases) $($searchAliasesByButton[$buttonName])").Trim()
+        }
+    }
     Update-WmtSearchIndexEntries
     $searchIndexDeferTimer = $null
 })
