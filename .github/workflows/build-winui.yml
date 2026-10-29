@@ -16,7 +16,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      MSBuildSDKsPath: C:\Program Files\dotnet\sdk\9.0.320\Sdks
       BuildConfiguration: Release
 
     steps:
@@ -25,24 +24,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup .NET 9
+      - name: Setup .NET 9 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
 
-      - name: Restore NuGet packages
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          dotnet restore "WMT-WinUI\WMT-WinUI.sln"
+      - name: Setup MSBuild (Visual Studio Build Tools)
+        uses: microsoft/setup-msbuild@v2
 
-      - name: Build WinUI 3 App
+      - name: Restore NuGet packages (MSBuild)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          # Windows SDK / Visual Studio is present on windows-latest runners,
-          # so .g.cs generation and MSIX packaging work out of the box.
-          dotnet build "WMT-WinUI\WMT-WinUI.sln" --configuration $env:BuildConfiguration --verbosity normal
+          msbuild "WMT-WinUI\WMT-WinUI.sln" -t:Restore -p:Configuration=$env:BuildConfiguration -verbosity:quiet
+
+      - name: Build WinUI 3 App (MSBuild)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          # MSBuild hooks the Windows App SDK targets correctly on windows-latest,
+          # generating .g.cs (App.g.i.cs, MainWindow.g.cs, etc.) without MSIX conflicts.
+          msbuild "WMT-WinUI\WMT-WinUI.sln" -p:Configuration=$env:BuildConfiguration -verbosity:normal -t:Rebuild
 
       - name: Copy build artifacts
         shell: powershell
@@ -73,7 +75,6 @@ jobs:
             $content = Get-Content $enginePath -Raw
             $lineCount = $content.Split([Environment]::NewLine).Count
             Write-Host "Engine module loaded: $lineCount lines"
-            # Quick syntax check: remove #Requires temporarily and invoke
             $temp = $content -replace '#Requires -RunAsAdministrator', ''
             $temp | Out-File -FilePath ".\temp_engine.ps1" -Encoding UTF8 -NoNewline
             Import-Module ".\temp_engine.ps1" -Force -ErrorAction SilentlyContinue
