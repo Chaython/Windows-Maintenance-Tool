@@ -83,6 +83,59 @@ jobs:
               throw "PowerShell syntax validation failed."
           }
 
+      - name: Verify maintenance actions fail safely
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+              $source, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw 'WMT must parse before maintenance safety checks.' }
+          function Find-FunctionText([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node.Extent.Text
+          }
+
+          $registryClean = Find-FunctionText 'Start-RegClean'
+          $backupExport = $registryClean.IndexOf('reg.exe" export', [StringComparison]::OrdinalIgnoreCase)
+          $backupCheck = $registryClean.IndexOf('$LASTEXITCODE -ne 0', [StringComparison]::Ordinal)
+          $firstDelete = $registryClean.IndexOf('Remove-Item -LiteralPath $key.PSPath', [StringComparison]::Ordinal)
+          if ($backupExport -lt 0 -or $backupCheck -le $backupExport -or $firstDelete -le $backupCheck -or
+              $registryClean -notmatch 'Length -le 0' -or
+              $registryClean -notmatch 'Remove-Item -LiteralPath \$key\.PSPath -Recurse -Force -ErrorAction Stop') {
+              throw 'Registry cleanup must verify a nonempty export before deleting and must surface delete failures.'
+          }
+
+          $updateRepair = Find-FunctionText 'Start-UpdateRepair'
+          if ($updateRepair -notmatch 'Stop-Service -Name \$serviceName -Force -ErrorAction Stop' -or
+              $updateRepair -notmatch 'netsh\.exe.*winsock reset' -or
+              $updateRepair -notmatch '\$LASTEXITCODE -ne 0' -or
+              $updateRepair -notmatch 'Could not restore service' -or
+              $updateRepair -match 'SilentlyContinue') {
+              throw 'Windows Update repair must check operation failures and restore prior service state.'
+          }
+
+          $indexStart = $source.IndexOf('if ($btnSearchIndexRebuild)')
+          $indexEnd = $source.IndexOf('$btnToggleExtensions', $indexStart)
+          if ($indexStart -lt 0 -or $indexEnd -le $indexStart) {
+              throw 'Could not locate the Search Index rebuild handler.'
+          }
+          $indexRebuild = $source.Substring($indexStart, $indexEnd - $indexStart)
+          if ($indexRebuild -notmatch 'Microsoft\\Search\\Data\\Applications\\Windows\\Windows\.edb' -or
+              $indexRebuild -notmatch 'Remove-Item -LiteralPath \$databasePath -Force -ErrorAction Stop' -or
+              $indexRebuild -notmatch 'Start-Service -Name "WSearch" -ErrorAction Stop' -or
+              $indexRebuild -notmatch 'WaitForStatus' -or
+              $indexRebuild -match 'SilentlyContinue') {
+              throw 'Search Index rebuild must remove the database, restart the service, and report failures.'
+          }
+
+          Write-Host 'Registry cleanup backup gate, Windows Update repair recovery, and Search Index rebuild checks passed.'
+
       - name: Smoke test Quick Find button hosting and safety
         shell: powershell
         run: |

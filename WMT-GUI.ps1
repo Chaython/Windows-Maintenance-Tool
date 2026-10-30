@@ -11867,13 +11867,78 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
 
 function Start-UpdateRepair {
 Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateRepairQuick" -Msg "Repairing Windows Update..." -Sb {
-    Stop-Service -Name wuauserv, bits, cryptsvc, msiserver -Force -ErrorAction SilentlyContinue
-    $rnd = Get-Random
-    if (Test-Path "$env:windir\SoftwareDistribution") { Rename-Item "$env:windir\SoftwareDistribution" "$env:windir\SoftwareDistribution.bak_$rnd" -ErrorAction SilentlyContinue }
-    if (Test-Path "$env:windir\System32\catroot2") { Rename-Item "$env:windir\System32\catroot2" "$env:windir\System32\catroot2.bak_$rnd" -ErrorAction SilentlyContinue }
-    netsh winsock reset | Out-Null
-    Start-Service -Name wuauserv, bits, cryptsvc, msiserver -ErrorAction SilentlyContinue
-    Write-Output "Windows Update repair completed."
+    $serviceNames = @("wuauserv", "bits", "cryptsvc", "msiserver")
+    $servicesToRestart = [System.Collections.Generic.List[string]]::new()
+    $renamedDirectories = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $operationError = $null
+    $backupSuffix = "{0}_{1}" -f (Get-Date -Format "yyyyMMdd_HHmmss_fff"), ([guid]::NewGuid().ToString("N"))
+
+    try {
+        foreach ($serviceName in $serviceNames) {
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+            if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+                Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                [void]$servicesToRestart.Add($serviceName)
+                $service.WaitForStatus(
+                    [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                    [TimeSpan]::FromSeconds(30)
+                )
+            }
+        }
+
+        $softwareDistribution = Join-Path $env:windir "SoftwareDistribution"
+        if (Test-Path -LiteralPath $softwareDistribution) {
+            $backupPath = Join-Path $env:windir "SoftwareDistribution.bak_$backupSuffix"
+            Rename-Item -LiteralPath $softwareDistribution -NewName (Split-Path -Leaf $backupPath) -ErrorAction Stop
+            [void]$renamedDirectories.Add([pscustomobject]@{ Original = $softwareDistribution; Backup = $backupPath })
+        }
+
+        $catroot = Join-Path $env:windir "System32\catroot2"
+        if (Test-Path -LiteralPath $catroot) {
+            $backupPath = Join-Path (Split-Path -Parent $catroot) "catroot2.bak_$backupSuffix"
+            Rename-Item -LiteralPath $catroot -NewName (Split-Path -Leaf $backupPath) -ErrorAction Stop
+            [void]$renamedDirectories.Add([pscustomobject]@{ Original = $catroot; Backup = $backupPath })
+        }
+
+        $netshOutput = @(& "$env:SystemRoot\System32\netsh.exe" winsock reset 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "netsh winsock reset failed (exit code $LASTEXITCODE): $($netshOutput -join ' ')"
+        }
+    }
+    catch {
+        $operationError = $_.Exception.Message
+        for ($index = $renamedDirectories.Count - 1; $index -ge 0; $index--) {
+            $renamed = $renamedDirectories[$index]
+            try {
+                if (Test-Path -LiteralPath $renamed.Original) {
+                    throw "Cannot restore '$($renamed.Backup)' because '$($renamed.Original)' already exists."
+                }
+                Rename-Item -LiteralPath $renamed.Backup -NewName (Split-Path -Leaf $renamed.Original) -ErrorAction Stop
+            }
+            catch {
+                [void]$failures.Add("Could not restore '$($renamed.Original)': $($_.Exception.Message)")
+            }
+        }
+    }
+
+    foreach ($serviceName in $servicesToRestart) {
+        try {
+            Start-Service -Name $serviceName -ErrorAction Stop
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+            $service.WaitForStatus(
+                [System.ServiceProcess.ServiceControllerStatus]::Running,
+                [TimeSpan]::FromSeconds(30)
+            )
+        }
+        catch {
+            [void]$failures.Add("Could not restore service '$serviceName': $($_.Exception.Message)")
+        }
+    }
+
+    if ($operationError) { [void]$failures.Insert(0, "Repair operation failed: $operationError") }
+    if ($failures.Count -gt 0) { throw ($failures -join " ") }
+    Write-Output "Windows Update repair completed. Winsock reset may require a restart to take effect."
 } | Out-Null
 }
 
@@ -12291,12 +12356,43 @@ function Start-RegClean {
 $bkDir = Join-Path (Get-DataPath) "RegistryBackups"
 Invoke-WmtUiBackgroundCommand -Name "RegistryObsoleteClean" -Msg "Cleaning Registry..." -Sb {
     param($bkDir)
-    if (!(Test-Path $bkDir)) { New-Item -Path $bkDir -ItemType Directory | Out-Null }
-    $bkFile = "$bkDir\Backup_$(Get-Date -F 'yyyyMMdd_HHmm').reg"
-    reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" $bkFile /y | Out-Null
-    $keys = Get-ChildItem HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall | Where-Object { $_.PSChildName -match 'IE40|IE4Data|DirectDrawEx|DXM_Runtime|SchedulingAgent' }
-    if ($keys) { foreach ($k in $keys) { Remove-Item $k.PSPath -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Removed: $($k.PSChildName)" } } else { Write-Output "No obsolete keys found." }
-    Write-Output "Backup saved to: $bkFile"
+    if (-not (Test-Path -LiteralPath $bkDir -PathType Container)) {
+        New-Item -Path $bkDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+    $bkFile = Join-Path $bkDir ("Backup_{0}.reg" -f (Get-Date -Format "yyyyMMdd_HHmmss_fff"))
+    $exportOutput = @(& "$env:SystemRoot\System32\reg.exe" export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" $bkFile /y 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Registry backup failed (exit code $LASTEXITCODE); no keys were deleted. $($exportOutput -join ' ')"
+    }
+    if (-not (Test-Path -LiteralPath $bkFile -PathType Leaf) -or
+        (Get-Item -LiteralPath $bkFile -ErrorAction Stop).Length -le 0) {
+        throw "Registry backup was not created or is empty; no keys were deleted: $bkFile"
+    }
+
+    $keys = @(Get-ChildItem -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction Stop |
+        Where-Object { $_.PSChildName -match 'IE40|IE4Data|DirectDrawEx|DXM_Runtime|SchedulingAgent' })
+    if ($keys.Count -eq 0) {
+        Write-Output "No obsolete keys found. Backup saved to: $bkFile"
+        return
+    }
+
+    $removed = [System.Collections.Generic.List[string]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $keys) {
+        try {
+            Remove-Item -LiteralPath $key.PSPath -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $key.PSPath) { throw "Registry key still exists after deletion." }
+            [void]$removed.Add([string]$key.PSChildName)
+        }
+        catch {
+            [void]$failures.Add("$($key.PSChildName): $($_.Exception.Message)")
+        }
+    }
+    if ($failures.Count -gt 0) {
+        $removedText = if ($removed.Count -gt 0) { " Removed $($removed.Count) key(s): $($removed -join ',')." } else { "" }
+        throw "Registry cleanup partially failed. Backup: $bkFile.$removedText Failures: $($failures -join '; ')"
+    }
+    Write-Output "Removed $($removed.Count) obsolete registry key(s): $($removed -join ', '). Backup saved to: $bkFile"
 } -ArgumentList $bkDir | Out-Null
 }
 
@@ -60364,13 +60460,65 @@ if ($btnMouseSettings) { $btnMouseSettings.Add_Click({ Start-Process "main.cpl" 
 if ($btnSearchIndexRebuild) {
 $btnSearchIndexRebuild.Add_Click({
         Invoke-WmtUiBackgroundCommand -Name "SearchIndexRebuild" -Msg "Rebuilding search index..." -Sb {
-            $svc = Get-Service WSearch -ErrorAction SilentlyContinue
-            if ($svc) {
-                Stop-Service WSearch -Force -ErrorAction SilentlyContinue
-                try { $svc.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(20)) } catch {}
-                Start-Service WSearch -ErrorAction SilentlyContinue
+            $service = Get-Service -Name "WSearch" -ErrorAction Stop
+            $wasRunning = ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running)
+            $databasePath = Join-Path $env:ProgramData "Microsoft\Search\Data\Applications\Windows\Windows.edb"
+            $databaseExisted = Test-Path -LiteralPath $databasePath -PathType Leaf
+            $operationError = $null
+            $restoreError = $null
+
+            try {
+                if ($wasRunning) {
+                    Stop-Service -Name "WSearch" -Force -ErrorAction Stop
+                    $service.WaitForStatus(
+                        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                        [TimeSpan]::FromSeconds(30)
+                    )
+                }
+
+                if ($databaseExisted) {
+                    Remove-Item -LiteralPath $databasePath -Force -ErrorAction Stop
+                }
             }
-            Write-Output "Search index rebuild started."
+            catch {
+                $operationError = $_.Exception.Message
+            }
+
+            $shouldRun = if ($operationError) { $wasRunning } else { $true }
+            try {
+                $service = Get-Service -Name "WSearch" -ErrorAction Stop
+                if ($shouldRun -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running) {
+                    Start-Service -Name "WSearch" -ErrorAction Stop
+                    $service = Get-Service -Name "WSearch" -ErrorAction Stop
+                    $service.WaitForStatus(
+                        [System.ServiceProcess.ServiceControllerStatus]::Running,
+                        [TimeSpan]::FromSeconds(30)
+                    )
+                }
+                elseif (-not $shouldRun -and $service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+                    Stop-Service -Name "WSearch" -Force -ErrorAction Stop
+                    $service.WaitForStatus(
+                        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                        [TimeSpan]::FromSeconds(30)
+                    )
+                }
+            }
+            catch {
+                $restoreError = $_.Exception.Message
+            }
+
+            if ($operationError -or $restoreError) {
+                $message = if ($operationError) { "Search index rebuild failed: $operationError" } else { "Search index rebuild could not be confirmed." }
+                if ($restoreError) { $message += " Previous service state could not be restored: $restoreError" }
+                throw $message
+            }
+
+            if ($databaseExisted) {
+                Write-Output "Search index database removed and Windows Search restarted to rebuild it."
+            }
+            else {
+                Write-Output "Search index database was already absent; Windows Search was started to initialize the index."
+            }
         } | Out-Null
     })
 }
