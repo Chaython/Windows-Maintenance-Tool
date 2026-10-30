@@ -37371,6 +37371,9 @@ try {
         $hagsOn = ($h -eq 2)
         Update-WmtTweakToggle $btnToggleHags $hagsOn "Disable HAGS" "Enable HAGS"
         Update-WmtTweakToggle $btnMyDeviceHagsToggle $hagsOn "Disable HAGS" "Enable HAGS"
+    } else {
+        Set-WmtTweakUnknownState -ButtonName "btnToggleHags" -Label "Not set" `
+            -Reason "HwSchMode is not configured; Windows is using its default HAGS behavior."
     }
 
     $smStartType = $nrd["SysMainStartType"]
@@ -40771,7 +40774,8 @@ function Update-WmtQuickFindResults {
             }
             $isMouseSpeedGroup = ($entry.Item.Group -eq "MouseSpeed")
             $isMouseSettingsAction = ([string]$entry.Item.Button.Name -eq "btnMouseSettings")
-            if ($entry.Item.Tab -eq "btnTabTweaks" -and -not $isMouseSettingsAction) {
+            $isRestartExplorerAction = ([string]$entry.Item.Button.Name -eq "btnPowerUserRestartExplorer")
+            if ($entry.Item.Tab -eq "btnTabTweaks" -and -not $isMouseSettingsAction -and -not $isRestartExplorerAction) {
                 $stateLabel = [System.Windows.Controls.TextBlock]::new()
                 $stateLabel.FontSize = 12
                 $stateLabel.Margin = [System.Windows.Thickness]::new(0,7,0,5)
@@ -40785,14 +40789,15 @@ function Update-WmtQuickFindResults {
             $original = $entry.Item.Button
             $isMouseSpeedGroup = ($entry.Item.Group -eq "MouseSpeed")
             $isMouseSettingsAction = ([string]$original.Name -eq "btnMouseSettings")
+            $isRestartExplorerAction = ([string]$original.Name -eq "btnPowerUserRestartExplorer")
             $tweakReady = $true
             if ($entry.Item.Tab -eq "btnTabTweaks") {
                 if ($isMouseSpeedGroup) {
                     # Missing speed data affects state text, not action availability.
                     $tweakReady = [bool]$script:TweakStatesReady
                 }
-                elseif ($isMouseSettingsAction) {
-                    # Opening the Windows Mouse control panel is an action, not a toggle.
+                elseif ($isMouseSettingsAction -or $isRestartExplorerAction) {
+                    # These controls perform actions and do not have toggle-state readiness.
                     $tweakReady = [bool]$original.IsEnabled
                 }
                 elseif ([string]$original.Name -eq "btnToggleSearchDisplay") {
@@ -40812,7 +40817,7 @@ function Update-WmtQuickFindResults {
                     }
                 }
             }
-            if ($entry.Item.Tab -eq "btnTabTweaks" -and -not $isMouseSettingsAction) {
+            if ($entry.Item.Tab -eq "btnTabTweaks" -and -not $isMouseSettingsAction -and -not $isRestartExplorerAction) {
                 $readinessName = if ($isMouseSpeedGroup) { "__MouseSpeed" } else { [string]$original.Name }
                 $script:WmtQuickFindRenderedReadiness[$readinessName] = [bool]$tweakReady
             }
