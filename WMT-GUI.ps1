@@ -16386,7 +16386,7 @@ $formatPreviewBytes = {
 
     <Border Grid.Row="1" Background="{DynamicResource BgPanel}" BorderThickness="0" CornerRadius="4" Padding="12" Margin="0,12,0,0">
         <Grid>
-            <CheckBox Name="chkHideProtected" Content="Hide protected" Foreground="{DynamicResource Warning}" VerticalAlignment="Center"/>
+            <CheckBox Name="chkHideProtected" Content="Hide protected" IsChecked="True" Foreground="{DynamicResource Warning}" VerticalAlignment="Center"/>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                 <Button Name="btnCleanSelected" Content="Clean Selected" MinWidth="124" Background="{DynamicResource Accent}" Foreground="{DynamicResource AccentText}" Margin="0,0,8,0"/>
                 <Button Name="btnCleanAll" Content="Clean All" MinWidth="104" Background="{DynamicResource Danger}" Foreground="{DynamicResource DangerText}" Margin="0,0,8,0"/>
@@ -16532,7 +16532,7 @@ $invokePreviewDeletion = {
 
     $targetArray = $deleteTargets.ToArray()
     $completedIds = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    $failedPaths = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    $failedDetails = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     $deleteState = [hashtable]::Synchronized(@{
             Total        = $targetArray.Count
             Processed    = 0
@@ -16545,7 +16545,7 @@ $invokePreviewDeletion = {
             IsCompleted  = $false
             Error        = ""
             CompletedIds = $completedIds
-            FailedPaths  = $failedPaths
+            FailedDetails = $failedDetails
         })
 
     [xml]$deleteProgressXaml = @'
@@ -16659,7 +16659,10 @@ $invokePreviewDeletion = {
                         catch {
                             $State["Failed"] = ([int]$State["Failed"]) + 1
                             if (-not [string]::IsNullOrWhiteSpace($path)) {
-                                [void]$State["FailedPaths"].Add($path)
+                                [void]$State["FailedDetails"].Add([PSCustomObject]@{
+                                        Path  = $path
+                                        Error = $_.Exception.Message
+                                    })
                             }
                         }
                         finally {
@@ -16782,16 +16785,18 @@ $invokePreviewDeletion = {
 
     $completedRowIds = @($deleteState["CompletedIds"] | ForEach-Object { [int]$_ })
     $failedLookup = @{}
-    foreach ($failedPath in @($deleteState["FailedPaths"])) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$failedPath)) { $failedLookup[[string]$failedPath] = $true }
+    foreach ($failure in @($deleteState["FailedDetails"])) {
+        if ($failure -and -not [string]::IsNullOrWhiteSpace([string]$failure.Path)) {
+            $failedLookup[[string]$failure.Path] = [string]$failure.Error
+        }
     }
 
     if ($failedLookup.Count -gt 0) {
         foreach ($row in @($allPreviewRows.ToArray())) {
             if ($row -and $failedLookup.ContainsKey([string]$row.FilePath)) {
                 $row.IsProtected = $true
-                $row.ProtectionReason = "Delete failed"
-                $row.Protection = "Delete failed"
+                $row.ProtectionReason = "Delete failed: $($failedLookup[[string]$row.FilePath])"
+                $row.Protection = $row.ProtectionReason
             }
         }
     }
@@ -16808,8 +16813,8 @@ $invokePreviewDeletion = {
 
     if ($finalFailed -gt 0) {
         Write-GuiLog "Preview cleanup completed with $finalFailed failure(s). Recovered: $finalFreed"
-        foreach ($failedPath in @($deleteState["FailedPaths"] | Select-Object -First 5)) {
-            Write-GuiLog "Failed to delete from Analyze: $failedPath"
+        foreach ($failure in @($deleteState["FailedDetails"] | Select-Object -First 5)) {
+            Write-GuiLog "Failed to delete from Analyze: $($failure.Path) - $($failure.Error)"
         }
     }
     elseif ($wasCanceled) {
@@ -16825,6 +16830,10 @@ $invokePreviewDeletion = {
     else {
         "Cleanup complete.`n`nDeleted: $finalDeleted`nAlready missing: $finalMissing`nFailed: $finalFailed`nRecovered: $finalFreed"
     }
+    $failureMessages = @($deleteState["FailedDetails"] | Select-Object -First 3 | ForEach-Object {
+            "$($_.Path): $($_.Error)"
+        })
+    if ($failureMessages.Count -gt 0) { $resultText += "`n`nFailure details:`n" + ($failureMessages -join "`n") }
     if (-not [string]::IsNullOrWhiteSpace($workerError)) { $resultText += "`n`nWorker note: $workerError" }
 
     $icon = if ($finalFailed -gt 0 -or -not [string]::IsNullOrWhiteSpace($workerError)) {
@@ -17030,6 +17039,7 @@ function Get-WmtCleanupProtectionInfo {
 
             $protectedRoots = @(
                 "$env:SystemRoot\Temp",
+                "$env:SystemRoot\Logs",
                 "$env:SystemRoot\System32",
                 "$env:SystemRoot\SysWOW64",
                 "$env:SystemRoot\WinSxS",
