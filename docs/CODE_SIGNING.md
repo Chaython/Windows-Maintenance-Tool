@@ -60,7 +60,9 @@ application privacy review or an assertion that no network connections occur.
    Never commit SignPath tokens or certificates to the repository.
 
 5. **Bump `$AppVersion` in `WMT-GUI.ps1` and publish a new version**.
-   Do not rebuild or overwrite a previously published winget-linked release.
+   Stable releases must be dispatched from `Main`. The workflow refuses any
+   version whose tag or release already exists; do not rebuild or overwrite a
+   previously published version.
 6. Trigger the **Build PS2EXE Release** workflow on `Main`. Review and
    approve its SignPath request promptly: the workflow currently waits up to
    60 minutes for SignPath and the job has a 90-minute limit. A missed
@@ -70,6 +72,11 @@ application privacy review or an assertion that no network connections occur.
    final SHA-256, generates and verifies a Sigstore/GitHub attestation for
    that exact final executable, then publishes release assets and optionally
    submits winget/Chocolatey updates.
+8. WinGet and Chocolatey submissions run as separate jobs after publication.
+   Enable only the submissions you intend to make and configure their
+   corresponding `WINGET_TOKEN` and `CHOCOLATEY_API_KEY` repository secrets.
+   A failed submission job can be rerun independently without rebuilding or
+   replacing the stable release assets.
 
 ## Rolling prereleases
 
