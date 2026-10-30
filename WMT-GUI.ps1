@@ -5113,14 +5113,127 @@ param(
     [System.Windows.Window]$Owner = $null
 )
 
-try {
-    if (-not $Owner -and $window -and $window.IsVisible) { $Owner = $window }
-    if ($Owner) {
-        return [System.Windows.MessageBox]::Show($Owner, $Message, $Title, $Button, $Image)
+$choices = switch ($Button) {
+    ([System.Windows.MessageBoxButton]::OK) { [pscustomobject]@{ Label = 'OK'; Result = [System.Windows.MessageBoxResult]::OK }; break }
+    ([System.Windows.MessageBoxButton]::OKCancel) {
+        [pscustomobject]@{ Label = 'OK'; Result = [System.Windows.MessageBoxResult]::OK }
+        [pscustomobject]@{ Label = 'Cancel'; Result = [System.Windows.MessageBoxResult]::Cancel }
+        break
+    }
+    ([System.Windows.MessageBoxButton]::YesNo) {
+        [pscustomobject]@{ Label = 'Yes'; Result = [System.Windows.MessageBoxResult]::Yes }
+        [pscustomobject]@{ Label = 'No'; Result = [System.Windows.MessageBoxResult]::No }
+        break
+    }
+    ([System.Windows.MessageBoxButton]::YesNoCancel) {
+        [pscustomobject]@{ Label = 'Yes'; Result = [System.Windows.MessageBoxResult]::Yes }
+        [pscustomobject]@{ Label = 'No'; Result = [System.Windows.MessageBoxResult]::No }
+        [pscustomobject]@{ Label = 'Cancel'; Result = [System.Windows.MessageBoxResult]::Cancel }
+        break
+    }
+    default { [pscustomobject]@{ Label = 'OK'; Result = [System.Windows.MessageBoxResult]::OK }; break }
+}
+$choices = @($choices)
+
+$icon = switch -Regex ($Image.ToString()) {
+    '^(Hand|Stop|Error)$' { @{ Glyph = [string][char]0x2716; Resource = 'Danger' }; break }
+    '^Question$' { @{ Glyph = '?'; Resource = 'Accent' }; break }
+    '^(Exclamation|Warning)$' { @{ Glyph = [string][char]0x26A0; Resource = 'Warning' }; break }
+    '^(Asterisk|Information)$' { @{ Glyph = [string][char]0x2139; Resource = 'Accent' }; break }
+    default { @{ Glyph = ''; Resource = 'TextSecondary' }; break }
+}
+$escapedTitle = [System.Security.SecurityElement]::Escape($Title)
+$closeResult = [System.Windows.MessageBoxResult]::None
+foreach ($choice in $choices) {
+    if ($choice.Result -in @([System.Windows.MessageBoxResult]::Cancel, [System.Windows.MessageBoxResult]::No)) {
+        $closeResult = $choice.Result
+        break
     }
 }
-catch {}
-return [System.Windows.MessageBox]::Show($Message, $Title, $Button, $Image)
+if ($closeResult -eq [System.Windows.MessageBoxResult]::None -and $choices.Count -gt 0) { $closeResult = $choices[0].Result }
+
+$dialogXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="$escapedTitle" Width="480" MinWidth="360" MaxWidth="720"
+    SizeToContent="Height" MaxHeight="600" ResizeMode="NoResize"
+    WindowStyle="None" WindowStartupLocation="CenterScreen"
+    Background="{DynamicResource BgDark}" Foreground="{DynamicResource TextPrimary}"
+    FontFamily="Segoe UI Variable Display, Segoe UI, Arial" FontSize="13"
+    ShowInTaskbar="False" Topmost="False">
+    <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" Background="{DynamicResource BgDark}">
+        <Grid>
+            <Grid.RowDefinitions><RowDefinition Height="38"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+            <Border Name="titleBar" Grid.Row="0" Background="{DynamicResource BgPanel}" Padding="12,0,8,0">
+                <DockPanel LastChildFill="True">
+                    <Button Name="btnClose" DockPanel.Dock="Right" Width="34" Height="30" Margin="8,0,0,0"
+                        Content="×" FontSize="18" Background="Transparent" Foreground="{DynamicResource TextSecondary}"
+                        BorderThickness="0" Focusable="False" Cursor="Hand"/>
+                    <TextBlock Name="lblTitle" VerticalAlignment="Center" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                </DockPanel>
+            </Border>
+            <Grid Grid.Row="1" Margin="22,20,22,16">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="46"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <TextBlock Name="lblIcon" Grid.Column="0" FontSize="27" FontWeight="SemiBold" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="0,0,12,0"/>
+                <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" MaxHeight="330" HorizontalScrollBarVisibility="Disabled">
+                    <TextBlock Name="lblMessage" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                </ScrollViewer>
+            </Grid>
+            <StackPanel Name="spButtons" Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right"
+                Margin="12,0,16,16"/>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+$dialog = New-WmtWindowFromFullXaml -Xaml ([xml]$dialogXaml) -NoOwner
+if ($Owner -and $Owner.IsVisible) { $dialog.Owner = $Owner }
+elseif (-not $Owner -and $window -and $window.IsVisible) { $dialog.Owner = $window }
+if ($dialog.Owner) { $dialog.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterOwner }
+$dialog.FindName('lblTitle').Text = $Title
+$dialog.FindName('lblMessage').Text = $Message
+$iconLabel = $dialog.FindName('lblIcon')
+$iconLabel.Text = $icon.Glyph
+Set-WmtThemedBrush -Object $iconLabel -Property ([System.Windows.Controls.TextBlock]::ForegroundProperty) -ColorOrKey $icon.Resource
+$buttonsPanel = $dialog.FindName('spButtons')
+$firstButton = $true
+foreach ($choice in $choices) {
+    $buttonControl = [System.Windows.Controls.Button]::new()
+    $buttonControl.Content = $choice.Label
+    $buttonControl.MinWidth = 82
+    $buttonControl.Height = 32
+    $buttonControl.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+    $buttonControl.Padding = [System.Windows.Thickness]::new(12, 4, 12, 4)
+    $buttonControl.Cursor = [System.Windows.Input.Cursors]::Hand
+    $buttonControl.BorderThickness = [System.Windows.Thickness]::new(1)
+    $buttonControl.Focusable = $true
+    if ($firstButton) {
+        Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::BackgroundProperty) -ColorOrKey 'Accent'
+        Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::ForegroundProperty) -ColorOrKey 'AccentText'
+        $buttonControl.IsDefault = $true
+        $firstButton = $false
+    }
+    else {
+        Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::BackgroundProperty) -ColorOrKey 'BgElevated'
+        Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::ForegroundProperty) -ColorOrKey 'TextPrimary'
+    }
+    Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::BorderBrushProperty) -ColorOrKey 'BorderBrush'
+    $dialogResult = [System.Windows.MessageBoxResult]$choice.Result
+    $clickHandler = { param($s, $e) $null = $e; $dialog.Tag = $dialogResult; $dialog.Close() }.GetNewClosure()
+    $buttonControl.Add_Click($clickHandler)
+    [void]$buttonsPanel.Children.Add($buttonControl)
+}
+
+$closeButton = $dialog.FindName('btnClose')
+$closeHandler = { param($s, $e) $null = $s; $null = $e; $dialog.Tag = $closeResult; $dialog.Close() }.GetNewClosure()
+$closeButton.Add_Click($closeHandler)
+$titleBar = $dialog.FindName('titleBar')
+$dragHandler = { param($s, $e) $null = $s; if ($e.LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) { $dialog.DragMove() } }.GetNewClosure()
+$titleBar.Add_MouseLeftButtonDown($dragHandler)
+$dialog.Add_KeyDown({ param($s, $e) if ($e.Key -eq [System.Windows.Input.Key]::Escape) { $s.Tag = $closeResult; $s.Close(); $e.Handled = $true } }.GetNewClosure())
+$dialog.Add_Closed({ param($s, $e) $null = $e; if ($null -eq $s.Tag) { $s.Tag = $closeResult } }.GetNewClosure())
+[void]$dialog.ShowDialog()
+return [System.Windows.MessageBoxResult]$dialog.Tag
 }
 
 function Set-WmtBusyCursor {
@@ -7916,12 +8029,7 @@ function Show-WingetPackageManifest {
 param([object]$Item)
 
 if (-not (Test-WingetManifestSupportedItem $Item)) {
-    [System.Windows.MessageBox]::Show(
-        "App manifests are only available for winget and Microsoft Store packages.",
-        "Manifest Unavailable",
-        [System.Windows.MessageBoxButton]::OK,
-        [System.Windows.MessageBoxImage]::Information
-    ) | Out-Null
+    Show-WmtMessageBox -Message ("App manifests are only available for winget and Microsoft Store packages.") -Title ("Manifest Unavailable") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
     return
 }
 
@@ -8310,12 +8418,7 @@ param([object]$Item)
 
 $url = Get-ChocoCommunityPageUrl -Item $Item
 if ([string]::IsNullOrWhiteSpace($url)) {
-    [System.Windows.MessageBox]::Show(
-        "The Chocolatey community page is only available for Chocolatey packages.",
-        "Community Page Unavailable",
-        [System.Windows.MessageBoxButton]::OK,
-        [System.Windows.MessageBoxImage]::Information
-    ) | Out-Null
+    Show-WmtMessageBox -Message ("The Chocolatey community page is only available for Chocolatey packages.") -Title ("Community Page Unavailable") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
     return
 }
 
@@ -8566,12 +8669,7 @@ function Show-ChocoPackageManifest {
 param([object]$Item)
 
 if (-not (Test-ChocoManifestSupportedItem $Item)) {
-    [System.Windows.MessageBox]::Show(
-        "Chocolatey manifests are only available for Chocolatey packages.",
-        "Manifest Unavailable",
-        [System.Windows.MessageBoxButton]::OK,
-        [System.Windows.MessageBoxImage]::Information
-    ) | Out-Null
+    Show-WmtMessageBox -Message ("Chocolatey manifests are only available for Chocolatey packages.") -Title ("Manifest Unavailable") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
     return
 }
 
@@ -11636,7 +11734,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                             }
 
                             $msg = "A new version is available!`n`nLocal Version:  v$localVerText`nRemote Version: v$remoteVerText`n`nDo you want to download and install the update now?"
-                            $mbRes = [System.Windows.MessageBox]::Show($msg, "Update Available", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                            $mbRes = Show-WmtMessageBox -Message ($msg) -Title ("Update Available") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Information)
                             if ($mbRes -eq [System.Windows.MessageBoxResult]::Yes) {
                                 $downloadUrl = [string]$jobResult.ExeDownloadUrl
                                 $expectedHash = [string]$jobResult.ExeSha256
@@ -11661,7 +11759,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                         $updateLogBox.ScrollToEnd()
                                     }
 
-                                    [System.Windows.MessageBox]::Show("Update installed successfully! The application will restart with the new version.", "Update Complete", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                                    Show-WmtMessageBox -Message ("Update installed successfully! The application will restart with the new version.") -Title ("Update Complete") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
                                     Start-Process -FilePath ([string]$result.CurrentExe) -WorkingDirectory (Split-Path -Parent ([string]$result.CurrentExe))
                                     $allowFinalCloseState.Value = $true
                                     $updateWindow.Close()
@@ -11675,7 +11773,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                         $updateLogBox.AppendText("[UPDATE] ERROR: $errMsg`n")
                                         $updateLogBox.ScrollToEnd()
                                     }
-                                    [System.Windows.MessageBox]::Show("$errMsg`n`nPlease download the update manually from the Releases page.", "Update Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+                                    Show-WmtMessageBox -Message ("$errMsg`n`nPlease download the update manually from the Releases page.") -Title ("Update Failed") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Error) | Out-Null
                                 }.GetNewClosure()
 
                                 Invoke-WmtUiBackgroundCommand -Name "SelfUpdateInstallExe" -Msg "Downloading and installing update..." -SuppressResultLog -Sb {
@@ -11760,7 +11858,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                         # Use Dispatcher to show dialog on UI thread
                         $window.Dispatcher.Invoke([Action] {
                                 $msg = "A new version is available!`n`nLocal Version:  v$localVerText`nRemote Version: v$remoteVerText`n`nDo you want to update now?"
-                                $mbRes = [System.Windows.MessageBox]::Show($msg, "Update Available", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                                $mbRes = Show-WmtMessageBox -Message ($msg) -Title ("Update Available") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Information)
 
                                 if ($mbRes -eq [System.Windows.MessageBoxResult]::Yes) {
                                     $scriptPath = $null
@@ -11827,7 +11925,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
 
                                         if ($lb) { $lb.AppendText("[UPDATE] Integrity verified. Update applied.`n"); $lb.ScrollToEnd() }
 
-                                        [System.Windows.MessageBox]::Show("Update complete! Restarting...", "Updated", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                                        Show-WmtMessageBox -Message ("Update complete! Restarting...") -Title ("Updated") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
                                         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -WorkingDirectory (Split-Path -Parent $scriptPath)
                                         $script:WmtAllowFinalClose = $true
                                         $window.Close()
@@ -11840,12 +11938,7 @@ Register-WmtUiPollOperation -Name "SelfUpdateCheck" -IntervalMs 500 -TestComplet
                                         $errMsg = "Auto-update failed: $($_.Exception.Message)"
                                         try { Write-GuiLog "[UPDATE] $errMsg" } catch {}
 
-                                        $fallback = [System.Windows.MessageBox]::Show(
-                                            "$errMsg`n`nOpen Releases page and update manually?",
-                                            "Update Failed",
-                                            [System.Windows.MessageBoxButton]::YesNo,
-                                            [System.Windows.MessageBoxImage]::Warning
-                                        )
+                                        $fallback = Show-WmtMessageBox -Message ("$errMsg`n`nOpen Releases page and update manually?") -Title ("Update Failed") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
                                         if ($fallback -eq [System.Windows.MessageBoxResult]::Yes) {
                                             Start-Process "https://github.com/ios12checker/Windows-Maintenance-Tool/releases"
                                         }
@@ -12333,23 +12426,13 @@ Invoke-WmtUiBackgroundCommand -Name "NetworkRepair" -Msg "Running Full Network R
     $summary = @($args[0]) | Where-Object { $null -ne $_ -and $_.PSObject.Properties['WmtNetworkRepairSummary'] } | Select-Object -Last 1
     if (-not $summary -or -not $summary.RestartRecommended) { return }
     $problemText = if ([int]$summary.FailedSteps -gt 0) { "`r`n`r`n$($summary.FailedSteps) step(s) reported problems; review the output window first." } else { '' }
-    $restartChoice = [System.Windows.MessageBox]::Show(
-        "Network repair has finished. Restarting completes the Winsock and TCP/IP resets; until you restart, some changes may not take full effect. Restarting may temporarily interrupt your network or VPN connection.$problemText`r`n`r`nSave your work first. Windows restarts after a 20-second countdown (run 'shutdown /a' to cancel it). Restart Windows now?",
-        "Restart Recommended",
-        [System.Windows.MessageBoxButton]::YesNo,
-        [System.Windows.MessageBoxImage]::Question
-    )
+    $restartChoice = Show-WmtMessageBox -Message ("Network repair has finished. Restarting completes the Winsock and TCP/IP resets; until you restart, some changes may not take full effect. Restarting may temporarily interrupt your network or VPN connection.$problemText`r`n`r`nSave your work first. Windows restarts after a 20-second countdown (run 'shutdown /a' to cancel it). Restart Windows now?") -Title ("Restart Recommended") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Question)
     if ($restartChoice -eq [System.Windows.MessageBoxResult]::Yes) {
         try {
             Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList '/r /t 20 /c "Windows Maintenance Tool: restarting to finish the network reset. Run shutdown /a to cancel."' -WindowStyle Hidden
         }
         catch {
-            [System.Windows.MessageBox]::Show(
-                "Windows could not be restarted automatically. Please restart manually.`r`n`r`n$($_.Exception.Message)",
-                "Restart Failed",
-                [System.Windows.MessageBoxButton]::OK,
-                [System.Windows.MessageBoxImage]::Warning
-            ) | Out-Null
+            Show-WmtMessageBox -Message ("Windows could not be restarted automatically. Please restart manually.`r`n`r`n$($_.Exception.Message)") -Title ("Restart Failed") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Warning) | Out-Null
         }
     }
 }.GetNewClosure()) | Out-Null
@@ -12827,20 +12910,20 @@ if (-not $script:WmtDnsProviders.Contains($ProviderKey)) {
 $provider = $script:WmtDnsProviders[$ProviderKey]
 $addressText = $provider.Addresses -join " / "
 $msg = "Set DNS to $($provider.Name) ($addressText) on all active adapters?`n`nDNS cache will be flushed after changes."
-$res = [System.Windows.MessageBox]::Show($msg, "DNS Preset", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+$res = Show-WmtMessageBox -Message ($msg) -Title ("DNS Preset") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Question)
 if ($res -ne "Yes") { return }
 
 Set-DnsAddresses -Addresses $provider.Addresses -Label $provider.Label
 }
 
 function Reset-DnsAddressesToAutomatic {
-$res = [System.Windows.MessageBox]::Show("Reset DNS server assignment to automatic (DHCP) on all active adapters?`n`nDNS cache will be flushed after changes.", "DNS Reset", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+$res = Show-WmtMessageBox -Message ("Reset DNS server assignment to automatic (DHCP) on all active adapters?`n`nDNS cache will be flushed after changes.") -Title ("DNS Reset") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Question)
 if ($res -ne "Yes") { return }
 
 Start-DnsAssignmentRunspace -Reset -Label "Auto DNS" -OnComplete {
     param($Result)
     if ($Result -and $Result.Success) {
-        [System.Windows.MessageBox]::Show("DNS reset to automatic (DHCP).", "DNS Reset", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        Show-WmtMessageBox -Message ("DNS reset to automatic (DHCP).") -Title ("DNS Reset") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
     }
 } | Out-Null
 }
@@ -13181,7 +13264,7 @@ $dohOnComplete = {
             $finMsg = if ($isEnableForTimer) { "Registered $c DoH templates." } else { "Removed or verified $c DoH templates." }
             Write-GuiLog "Done. $finMsg"
             if ($c -gt 0) {
-                [System.Windows.MessageBox]::Show($finMsg, "DoH Manager", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                Show-WmtMessageBox -Message ($finMsg) -Title ("DoH Manager") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
             }
         }
         else {
@@ -13461,7 +13544,7 @@ $dialog.ShowDialog() | Out-Null
 }
 # --- STORAGE / SYSTEM ---
 function Invoke-ChkdskAll {
-$confirm = [System.Windows.MessageBox]::Show("Run CHKDSK /f /r on all file-system drives in a live console window?`n`nThis can take a long time. System drive repairs may be scheduled for next reboot.", "Confirm CHKDSK", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+$confirm = Show-WmtMessageBox -Message ("Run CHKDSK /f /r on all file-system drives in a live console window?`n`nThis can take a long time. System drive repairs may be scheduled for next reboot.") -Title ("Confirm CHKDSK") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
 Start-ChkdskConsole
 }
@@ -18855,7 +18938,7 @@ function script:Open-WmtRegistryPathInRegedit {
 
     $regeditPath = ConvertTo-WmtRegeditPath -RegistryPath $RegistryPath
     if ([string]::IsNullOrWhiteSpace($regeditPath)) {
-        [System.Windows.MessageBox]::Show("No registry path is available for the selected result.", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        Show-WmtMessageBox -Message ("No registry path is available for the selected result.") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
         return $false
     }
 
@@ -18869,7 +18952,7 @@ function script:Open-WmtRegistryPathInRegedit {
         return $true
     }
     catch {
-        [System.Windows.MessageBox]::Show("Could not open Regedit to:`n$regeditPath`n`n$($_.Exception.Message)", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        Show-WmtMessageBox -Message ("Could not open Regedit to:`n$regeditPath`n`n$($_.Exception.Message)") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Error) | Out-Null
         return $false
     }
 }
@@ -19251,7 +19334,7 @@ $mniOpenRegedit.Add_Click({
         }
         catch {
             try { Write-GuiLog "Open in Regedit failed: $($_.Exception.Message)" } catch {}
-            [System.Windows.MessageBox]::Show("Could not open the selected registry path:`n$($_.Exception.Message)", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+            Show-WmtMessageBox -Message ("Could not open the selected registry path:`n$($_.Exception.Message)") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Error) | Out-Null
         }
     }.GetNewClosure())
 
@@ -19408,20 +19491,20 @@ $btnCopySelected.Add_Click({
 
         try {
             [System.Windows.Clipboard]::SetText((ConvertTo-WmtRegistryResultClipboardText -Rows $rowsToCopy))
-            [System.Windows.MessageBox]::Show("Copied $($rowsToCopy.Count) registry result(s).", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            Show-WmtMessageBox -Message ("Copied $($rowsToCopy.Count) registry result(s).") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
         }
         catch {
-            [System.Windows.MessageBox]::Show("Could not copy details:`n$($_.Exception.Message)", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+            Show-WmtMessageBox -Message ("Could not copy details:`n$($_.Exception.Message)") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Error) | Out-Null
         }
     })
 
 $btnCopyAll.Add_Click({
         try {
             [System.Windows.Clipboard]::SetText((ConvertTo-WmtRegistryResultClipboardText -Rows @($registryRows)))
-            [System.Windows.MessageBox]::Show("Copied $($registryRows.Count) registry result(s).", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            Show-WmtMessageBox -Message ("Copied $($registryRows.Count) registry result(s).") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
         }
         catch {
-            [System.Windows.MessageBox]::Show("Could not copy details:`n$($_.Exception.Message)", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+            Show-WmtMessageBox -Message ("Could not copy details:`n$($_.Exception.Message)") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Error) | Out-Null
         }
     })
 
@@ -19470,7 +19553,7 @@ $btnFix.Add_Click({
         }
 
         if ($toFix.Count -eq 0) {
-            [System.Windows.MessageBox]::Show("No issues selected.", "Registry Cleaner", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            Show-WmtMessageBox -Message ("No issues selected.") -Title ("Registry Cleaner") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
             return
         }
 
@@ -28140,10 +28223,24 @@ $knownFixes = @{
     "Documents"     = "::{450D8FBA-AD25-11D0-98A8-0800361B1103}"
 }
 
-$getRoots = {
-    $roots = [System.Collections.Generic.List[string]]::new()
-    $seen = @{}
-    $paths = @(
+$scan = {
+    $rows.Clear()
+    $lblStatus.Text = "Scanning shortcuts..."
+    $btnRescan.IsEnabled = $false
+    $btnDelete.IsEnabled = $false
+    $btnBrowse.IsEnabled = $false
+    $btnApply.IsEnabled = $false
+    # The completion/error blocks are closures nested inside this closure.
+    # Copy UI references into this scope so GetNewClosure captures the actual
+    # controls instead of looking them up from the function's expired scope.
+    $scanDialog = $dialog
+    $scanStatus = $lblStatus
+    $scanRows = $rows
+    $scanRescanButton = $btnRescan
+    $scanDeleteButton = $btnDelete
+    $scanBrowseButton = $btnBrowse
+    $scanApplyButton = $btnApply
+    $scanRoots = @(
         [Environment]::GetFolderPath('CommonStartMenu'),
         [Environment]::GetFolderPath('StartMenu'),
         [Environment]::GetFolderPath('CommonDesktopDirectory'),
@@ -28153,93 +28250,140 @@ $getRoots = {
         "$env:USERPROFILE\Desktop",
         "$env:PUBLIC\Desktop"
     )
-    foreach ($pathItem in $paths) {
-        if ([string]::IsNullOrWhiteSpace($pathItem) -or -not (Test-Path -LiteralPath $pathItem)) { continue }
-        $full = ([System.IO.DirectoryInfo]::new($pathItem)).FullName.TrimEnd("\")
-        $key = $full.ToUpperInvariant()
-        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; [void]$roots.Add($full) }
-    }
-    return @($roots)
-}.GetNewClosure()
-
-$findAppTarget = {
-    param([string]$FileName)
-    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -notmatch '\.exe$') { return $null }
-    foreach ($hive in @([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryHive]::LocalMachine)) {
-        $base = $null
-        $key = $null
+    $scanArguments = [object[]]::new(3)
+    $scanArguments[0] = $scanRoots
+    $scanArguments[1] = $knownFixes
+    $scanArguments[2] = [string]$env:Path
+    $scanComplete = {
+        param($results)
+        if (-not $scanDialog.IsLoaded) { return }
+        $scanStatus.Text = "Scan finished; displaying results..."
         try {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Default)
-            $key = $base.OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$FileName")
-            if ($key) {
-                $candidate = Expand-ShortcutTarget ([string]$key.GetValue(""))
-                if ([System.IO.File]::Exists($candidate)) { return $candidate }
+            $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['Rows'] } | Select-Object -Last 1)[0]
+            if (-not $result) {
+                $scanStatus.Text = "Scan failed: the background scan returned no results."
+                Write-GuiLog "[Broken Shortcuts] Background scan returned no results."
+                return
             }
+            foreach ($item in @($result.Rows)) { [void]$scanRows.Add($item) }
+            $scanStatus.Text = "Scan complete. Scanned $($result.Scanned) shortcut(s); found $($scanRows.Count)."
+            foreach ($failure in @($result.Failures)) { Write-GuiLog "[Broken Shortcuts] $failure" }
+            if ($scanRows.Count -eq 0) { Show-WmtMessageBox -Owner $scanDialog -Message "Scan complete. No broken shortcuts found." -Title "All Clean" -Image Information | Out-Null }
         }
-        catch {}
+        catch {
+            $scanStatus.Text = "Scan finished, but results could not be displayed."
+            Write-GuiLog "[Broken Shortcuts] Completion handler failed: $($_.Exception.Message)"
+        }
         finally {
-            try { if ($key) { $key.Close() } } catch {}
-            try { if ($base) { $base.Close() } } catch {}
+            $scanRescanButton.IsEnabled = $true
+            $scanDeleteButton.IsEnabled = $true
+            $scanBrowseButton.IsEnabled = $true
+            $scanApplyButton.IsEnabled = $true
         }
-    }
-    foreach ($dir in @(([string]$env:Path).Split(";"))) {
+    }.GetNewClosure()
+    $scanError = {
+        param($errorRecord)
+        if (-not $scanDialog.IsLoaded) { return }
+        $scanRescanButton.IsEnabled = $true
+        $scanDeleteButton.IsEnabled = $true
+        $scanBrowseButton.IsEnabled = $true
+        $scanApplyButton.IsEnabled = $true
+        $scanStatus.Text = "Scan failed."
+        Show-WmtMessageBox -Owner $scanDialog -Message "Shortcut scan failed:`n$($errorRecord.Exception.Message)" -Title "Scan Failed" -Image Error | Out-Null
+    }.GetNewClosure()
+    $job = Invoke-WmtUiBackgroundCommand -Name ("BrokenShortcutScan_" + [guid]::NewGuid().ToString("N")) `
+        -Msg "Scanning shortcuts..." -ArgumentList $scanArguments -SuppressResultLog `
+        -OnComplete $scanComplete -OnError $scanError -Sb {
+        param([string[]]$Roots, [hashtable]$Fixes, [string]$SearchPath)
+        $foundRows = [System.Collections.Generic.List[object]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $shell = $null
+        $scanned = 0
         try {
-            $candidate = Join-Path ([Environment]::ExpandEnvironmentVariables($dir.Trim())) $FileName
-            if ([System.IO.File]::Exists($candidate)) { return $candidate }
-        }
-        catch {}
-    }
-    return $null
-}.GetNewClosure()
-
-$scan = {
-    $rows.Clear()
-    $lblStatus.Text = "Scanning shortcuts..."
-    Set-WmtBusyCursor -Busy
-    $shell = $null
-    $scanned = 0
-    try {
-        $shell = New-Object -ComObject WScript.Shell
-        foreach ($root in & $getRoots) {
-            $lblStatus.Text = "Scanning $root"
-            Invoke-WmtDispatcherPump -Dispatcher $dialog.Dispatcher
-            foreach ($lnk in @(Get-ChildItem -LiteralPath $root -Filter *.lnk -Recurse -Force -ErrorAction SilentlyContinue)) {
-                $scanned++
-                try {
-                    $sc = $shell.CreateShortcut($lnk.FullName)
-                    $target = [string]$sc.TargetPath
-                    if (Test-ShortcutTargetIsSpecial $target) { continue }
-                    $expanded = Expand-ShortcutTarget $target
-                    if ([System.IO.File]::Exists($expanded) -or [System.IO.Directory]::Exists($expanded)) { continue }
-                    $action = "None"
-                    $details = "Review Needed"
-                    $newTarget = ""
-                    if ($knownFixes.ContainsKey($lnk.BaseName)) {
-                        $action = "Fix"; $details = "Restore System Path"; $newTarget = $knownFixes[$lnk.BaseName]
-                    }
-                    else {
-                        $guess = [System.IO.Path]::GetFileName($expanded)
-                        if ([string]::IsNullOrWhiteSpace($guess)) { $guess = "$($lnk.BaseName).exe" }
-                        $candidate = & $findAppTarget $guess
-                        if ($candidate) { $action = "Fix"; $details = "Located installed app"; $newTarget = $candidate }
-                    }
-                    [void]$rows.Add([PSCustomObject]@{
-                            Shortcut = $lnk.Name; Location = $lnk.DirectoryName; Action = $action; Details = $details
-                            BrokenTarget = $target; NewTarget = $newTarget; FullPath = $lnk.FullName
-                        })
+            $shell = New-Object -ComObject WScript.Shell
+            foreach ($root in $Roots) {
+                if ([string]::IsNullOrWhiteSpace($root) -or -not [System.IO.Directory]::Exists($root)) { continue }
+                $fullRoot = [System.IO.Path]::GetFullPath($root).TrimEnd('\')
+                if (-not $visited.Add($fullRoot)) { continue }
+                $enumerationErrors = @()
+                $links = @(Get-ChildItem -LiteralPath $fullRoot -Filter '*.lnk' -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable enumerationErrors)
+                foreach ($enumerationError in $enumerationErrors) {
+                    [void]$failures.Add("$fullRoot`: $($enumerationError.Exception.Message)")
                 }
-                catch {}
+                foreach ($link in $links) {
+                    $scanned++
+                    try {
+                        $shortcut = $shell.CreateShortcut($link.FullName)
+                        $target = ([string]$shortcut.TargetPath).Trim().Trim('"')
+                        if ([string]::IsNullOrWhiteSpace($target) -or $target -match '^shell:' -or $target -match '^\s*::{') { continue }
+                        if ($target -match '^[a-zA-Z][a-zA-Z0-9+.-]+:' -and $target -notmatch '^[a-zA-Z]:[\\/]') { continue }
+                        $expanded = [Environment]::ExpandEnvironmentVariables($target)
+                        if ([System.IO.File]::Exists($expanded) -or [System.IO.Directory]::Exists($expanded)) { continue }
+                        $action = "None"
+                        $details = "Review Needed"
+                        $newTarget = ""
+                        if ($Fixes.ContainsKey($link.BaseName)) {
+                            $action = "Fix"
+                            $details = "Restore System Path"
+                            $newTarget = [string]$Fixes[$link.BaseName]
+                        }
+                        else {
+                            $guess = [System.IO.Path]::GetFileName($expanded)
+                            if ([string]::IsNullOrWhiteSpace($guess)) { $guess = "$($link.BaseName).exe" }
+                            if ($guess -match '\.exe$') {
+                                foreach ($hive in @([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryHive]::LocalMachine)) {
+                                    $base = $null
+                                    $key = $null
+                                    try {
+                                        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Default)
+                                        $key = $base.OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$guess")
+                                        if ($key) {
+                                            $candidate = [Environment]::ExpandEnvironmentVariables([string]$key.GetValue(""))
+                                            if ([System.IO.File]::Exists($candidate)) { $newTarget = $candidate; break }
+                                        }
+                                    }
+                                    finally {
+                                        if ($key) { $key.Dispose() }
+                                        if ($base) { $base.Dispose() }
+                                    }
+                                }
+                                if ([string]::IsNullOrWhiteSpace($newTarget)) {
+                                    foreach ($directory in $SearchPath.Split(';')) {
+                                        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+                                        $candidate = Join-Path ([Environment]::ExpandEnvironmentVariables($directory.Trim().Trim('"'))) $guess
+                                        if ([System.IO.File]::Exists($candidate)) { $newTarget = $candidate; break }
+                                    }
+                                }
+                                if (-not [string]::IsNullOrWhiteSpace($newTarget)) { $action = "Fix"; $details = "Located installed app" }
+                            }
+                        }
+                        [void]$foundRows.Add([PSCustomObject]@{
+                            Shortcut = [string]$link.Name
+                            Location = [string]$link.DirectoryName
+                            Action = $action
+                            Details = $details
+                            BrokenTarget = [string]$shortcut.TargetPath
+                            NewTarget = $newTarget
+                            FullPath = [string]$link.FullName
+                        })
+                    }
+                    catch {
+                        [void]$failures.Add("$($link.FullName): $($_.Exception.Message)")
+                    }
+                }
             }
         }
-        $lblStatus.Text = "Scan complete. Scanned $scanned shortcut(s); found $($rows.Count)."
-        if ($rows.Count -eq 0) { Show-WmtMessageBox -Owner $dialog -Message "Scan complete. No broken shortcuts found." -Title "All Clean" -Image Information | Out-Null }
+        finally {
+            if ($shell) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+        }
+        [PSCustomObject]@{ Rows = $foundRows.ToArray(); Scanned = $scanned; Failures = $failures.ToArray() }
     }
-    catch {
-        Show-WmtMessageBox -Owner $dialog -Message "Shortcut scan failed:`n$($_.Exception.Message)" -Title "Scan Failed" -Image Error | Out-Null
-    }
-    finally {
-        try { if ($shell) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } } catch {}
-        Set-WmtBusyCursor
+    if (-not $job) {
+        $btnRescan.IsEnabled = $true
+        $btnDelete.IsEnabled = $true
+        $btnBrowse.IsEnabled = $true
+        $btnApply.IsEnabled = $true
     }
 }.GetNewClosure()
 
@@ -28260,11 +28404,45 @@ $btnDelete.Add_Click({
         $items = & $selected
         if ($items.Count -eq 0) { return }
         if ((Show-WmtMessageBox -Owner $dialog -Message "Permanently delete $($items.Count) selected shortcut(s)?`n`nThis action is immediate." -Title "Confirm Delete" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        foreach ($item in $items) {
-            try { Remove-Item -LiteralPath ([string]$item.FullPath) -Force -ErrorAction Stop }
-            catch { Show-WmtMessageBox -Owner $dialog -Message "Could not delete: $($item.FullPath)`n$($_.Exception.Message)" -Title "Delete Failed" -Image Error | Out-Null }
-            [void]$rows.Remove($item)
+        $deleteRecords = @($items | ForEach-Object { [PSCustomObject]@{ FullPath = [string]$_.FullPath; Shortcut = [string]$_.Shortcut } })
+        $btnDelete.IsEnabled = $false
+        $deleteComplete = {
+            param($results)
+            if (-not $dialog.IsLoaded) { return }
+            $btnDelete.IsEnabled = $true
+            $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['DeletedPaths'] } | Select-Object -Last 1)[0]
+            if (-not $result) { $lblStatus.Text = "Delete failed: no result returned."; return }
+            $deleted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($path in @($result.DeletedPaths)) { [void]$deleted.Add([string]$path) }
+            foreach ($item in $items) { if ($deleted.Contains([string]$item.FullPath)) { [void]$rows.Remove($item) } }
+            $lblStatus.Text = "Deleted $($deleted.Count) of $($deleteRecords.Count) shortcut(s)."
+            foreach ($failure in @($result.Failures)) { Write-GuiLog "[Broken Shortcuts] $failure" }
+            if (@($result.Failures).Count -gt 0) {
+                Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Delete Failed" -Image Warning | Out-Null
+            }
+        }.GetNewClosure()
+        $deleteError = {
+            param($errorRecord)
+            if (-not $dialog.IsLoaded) { return }
+            $btnDelete.IsEnabled = $true
+            Show-WmtMessageBox -Owner $dialog -Message "Could not delete selected shortcuts:`n$($errorRecord.Exception.Message)" -Title "Delete Failed" -Image Error | Out-Null
+        }.GetNewClosure()
+        $job = Invoke-WmtUiBackgroundCommand -Name ("BrokenShortcutDelete_" + [guid]::NewGuid().ToString("N")) `
+            -Msg "Deleting selected shortcuts..." -ArgumentList @($deleteRecords) -SuppressResultLog `
+            -OnComplete $deleteComplete -OnError $deleteError -Sb {
+            param($Entries)
+            $deletedPaths = [System.Collections.Generic.List[string]]::new()
+            $failures = [System.Collections.Generic.List[string]]::new()
+            foreach ($entry in $Entries) {
+                try {
+                    Remove-Item -LiteralPath ([string]$entry.FullPath) -Force -ErrorAction Stop
+                    [void]$deletedPaths.Add([string]$entry.FullPath)
+                }
+                catch { [void]$failures.Add("$($entry.FullPath): $($_.Exception.Message)") }
+            }
+            [PSCustomObject]@{ DeletedPaths = $deletedPaths.ToArray(); Failures = $failures.ToArray() }
         }
+        if (-not $job) { $btnDelete.IsEnabled = $true }
     }.GetNewClosure())
 
 $state = @{ Result = $null }
@@ -28303,40 +28481,42 @@ if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
 Invoke-UiCommand {
     param($toFix)
     $shell = $null
-
+    $fixed = [System.Collections.Generic.List[string]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
     try {
         $shell = New-Object -ComObject WScript.Shell
-
         foreach ($item in $toFix) {
             try {
-                if (-not [System.IO.File]::Exists([string]$item.FullPath)) { throw "Shortcut file no longer exists." }
-                $newTarget = [string]$item.NewTarget
-                $sc = $shell.CreateShortcut([string]$item.FullPath)
-                $sc.TargetPath = $newTarget
-
-                if (-not (Test-ShortcutTargetIsSpecial $newTarget)) {
-                    $expandedTarget = Expand-ShortcutTarget $newTarget
-                    if ([System.IO.File]::Exists($expandedTarget)) {
-                        $targetDir = [System.IO.Path]::GetDirectoryName($expandedTarget)
-                        if (-not [string]::IsNullOrWhiteSpace($targetDir) -and [System.IO.Directory]::Exists($targetDir)) {
-                            $sc.WorkingDirectory = $targetDir
-                        }
-                    }
+                $path = [string]$item.FullPath
+                if (-not [System.IO.File]::Exists($path)) { throw "Shortcut file no longer exists." }
+                $target = [string]$item.NewTarget
+                $shortcut = $shell.CreateShortcut($path)
+                $shortcut.TargetPath = $target
+                $expandedTarget = [Environment]::ExpandEnvironmentVariables($target.Trim().Trim('"'))
+                if ([System.IO.File]::Exists($expandedTarget)) {
+                    $directory = [System.IO.Path]::GetDirectoryName($expandedTarget)
+                    if (-not [string]::IsNullOrWhiteSpace($directory) -and [System.IO.Directory]::Exists($directory)) { $shortcut.WorkingDirectory = $directory }
                 }
-
-                $sc.Save()
-                Write-Output "Fixed: $($item.Shortcut) -> $newTarget"
+                $shortcut.Save()
+                [void]$fixed.Add("$($item.Shortcut) -> $target")
             }
-            catch { Write-Output "Failed to fix $($item.Shortcut): $($_.Exception.Message)" }
+            catch { [void]$failures.Add("$($item.Shortcut): $($_.Exception.Message)") }
         }
-
-        Write-Output "Shortcut operation complete."
     }
     finally {
-        try { if ($shell) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } } catch {}
+        if ($shell) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
     }
-
-} "Applying shortcut fixes..." -ArgumentList $toFix
+    [PSCustomObject]@{ Fixed = $fixed.ToArray(); Failures = $failures.ToArray() }
+} "Applying shortcut fixes..." -ArgumentList $toFix -OnComplete {
+    param($results)
+    $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['Fixed'] } | Select-Object -Last 1)[0]
+    if (-not $result) { Write-GuiLog "[Broken Shortcuts] Fix operation returned no results."; return }
+    foreach ($item in @($result.Fixed)) { Write-GuiLog "[Broken Shortcuts] Fixed: $item" }
+    foreach ($failure in @($result.Failures)) { Write-GuiLog "[Broken Shortcuts] Failed: $failure" }
+    if (@($result.Failures).Count -gt 0) {
+        Show-WmtMessageBox -Message (@($result.Failures) -join "`r`n") -Title "Shortcut Fix" -Image Warning | Out-Null
+    }
+} | Out-Null
 }
 
 # --- FIREWALL TOOLS ---
@@ -28354,13 +28534,13 @@ Invoke-WmtUiBackgroundCommand -Name "FirewallImport" -Msg "Importing firewall ru
 }
 
 function Invoke-FirewallDefaults {
-$confirm = [System.Windows.MessageBox]::Show("Restore default Windows Firewall rules? Custom rules will be removed.", "Restore Defaults", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+$confirm = Show-WmtMessageBox -Message ("Restore default Windows Firewall rules? Custom rules will be removed.") -Title ("Restore Defaults") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
 Invoke-WmtUiBackgroundCommand -Name "FirewallReset" -Msg "Restoring default firewall rules..." -Sb { netsh advfirewall reset } | Out-Null
 }
 
 function Invoke-FirewallPurge {
-$confirm = [System.Windows.MessageBox]::Show("Delete ALL firewall rules? This is destructive.", "Delete All Rules", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+$confirm = Show-WmtMessageBox -Message ("Delete ALL firewall rules? This is destructive.") -Title ("Delete All Rules") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
 if ($confirm -ne "Yes") { return }
 Invoke-WmtUiBackgroundCommand -Name "FirewallPurge" -Msg "Deleting all firewall rules..." -Sb { Remove-NetFirewallRule -All } | Out-Null
 }
@@ -30103,12 +30283,7 @@ This will run:
 
 It can take a while.
 "@
-$res = [System.Windows.MessageBox]::Show(
-    $confirmMsg,
-    "Quick Fix",
-    [System.Windows.MessageBoxButton]::YesNo,
-    [System.Windows.MessageBoxImage]::Question
-)
+$res = Show-WmtMessageBox -Message ($confirmMsg) -Title ("Quick Fix") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Question)
 if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
 $runner = @'
@@ -30936,6 +31111,7 @@ $tabHeader = $dialog.FindName("tabHeader")
 $mainHost = $dialog.FindName("mainHost")
 $tabs = @{}
 $tabButtons = @{}
+$loadingTabs = @{}
 $tabLoaded = @{
     "Windows"         = $false
     "Scheduled Tasks" = $false
@@ -31842,12 +32018,51 @@ function global:Remove-WmtDataRows {
     param($TabObj, [object[]]$Rows)
     foreach ($row in @($Rows)) { try { $row.Delete() } catch {} }
     $TabObj.Meta.Table.AcceptChanges()
-    if ([string]::IsNullOrWhiteSpace($TabObj.SearchBox.Text.Trim())) {
+    Update-WmtStartupTabFilter -TabObj $TabObj
+}
+
+function global:Update-WmtStartupTabFilter {
+    param($TabObj)
+    if (-not $TabObj -or -not $TabObj.Meta) { return }
+    $query = ([string]$TabObj.SearchBox.Text).Trim()
+    if ([string]::IsNullOrWhiteSpace($query)) {
+        $TabObj.Meta.View.RowFilter = ""
         $TabObj.CountLabel.Text = "$($TabObj.Meta.Table.Rows.Count) items"
+        return
     }
-    else {
-        $TabObj.CountLabel.Text = "$($TabObj.Meta.View.Count) shown / $($TabObj.Meta.Table.Rows.Count) total"
+    $safe = $query.Replace("'", "''").Replace("[", "[[]").Replace("%", "[%]").Replace("*", "[*]")
+    $clauses = @()
+    foreach ($column in $TabObj.Meta.SearchColumns) {
+        if ($TabObj.Meta.Table.Columns.Contains($column)) { $clauses += "CONVERT([$column], 'System.String') LIKE '%$safe%'" }
     }
+    try { $TabObj.Meta.View.RowFilter = ($clauses -join " OR ") }
+    catch { $TabObj.Meta.View.RowFilter = "" }
+    $TabObj.CountLabel.Text = "$($TabObj.Meta.View.Count) shown / $($TabObj.Meta.Table.Rows.Count) total"
+}
+
+function global:Set-WmtStartupTabRows {
+    param(
+        $TabObj,
+        [object[]]$Rows,
+        [string[]]$Columns,
+        [string[]]$SearchColumns,
+        [string[]]$HiddenColumns = @(),
+        [hashtable]$Widths = @{}
+    )
+    $table = [System.Data.DataTable]::new()
+    foreach ($column in $Columns) { [void]$table.Columns.Add($column) }
+    foreach ($item in $Rows) {
+        $row = $table.NewRow()
+        foreach ($column in $Columns) {
+            $property = $item.PSObject.Properties[$column]
+            if ($property -and $null -ne $property.Value) { $row[$column] = [string]$property.Value }
+        }
+        [void]$table.Rows.Add($row)
+    }
+    $TabObj.Grid.ItemsSource = $table.DefaultView
+    Set-WmtDataGridColumns -DataGrid $TabObj.Grid -Columns $Columns -Widths $Widths -Hidden $HiddenColumns
+    $TabObj.Meta = [PSCustomObject]@{ Table = $table; View = $table.DefaultView; SearchColumns = $SearchColumns }
+    Update-WmtStartupTabFilter -TabObj $TabObj
 }
 
 function Get-StartupApprovedState {
@@ -31949,121 +32164,319 @@ function Add-GridContextMenu {
     }
 }
 
-function Invoke-StartupWindowsLoad {
-    $items = @()
-    $items += & $fnGetRegRunEntries "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" "Current User"
-    $items += & $fnGetRegRunEntries "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" "All Users"
-    $items += & $fnGetRegRunEntries "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run" "All Users (32-bit)"
-    $items += & $fnGetStartupFolderEntries "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "Current User"
-    $items += & $fnGetStartupFolderEntries "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup" "All Users"
-
-    $table = [System.Data.DataTable]::new()
-    foreach ($name in @("Name", "Enabled", "Scope", "Type", "Command", "Location", "ItemPath", "ValueName", "RootRunPath")) { [void]$table.Columns.Add($name) }
-    foreach ($item in @($items)) {
-        $row = $table.NewRow()
-        $row["Name"] = [string]$item.Name
-        $row["Enabled"] = if ([bool]$item.Enabled) { "Yes" } else { "No" }
-        $row["Scope"] = [string]$item.Scope
-        $row["Type"] = [string]$item.EntryType
-        $row["Command"] = [string]$item.Command
-        $row["Location"] = [string]$item.Location
-        $row["ItemPath"] = [string]$item.ItemPath
-        $row["ValueName"] = [string]$item.ValueName
-        $row["RootRunPath"] = [string]$item.RootRunPath
-        [void]$table.Rows.Add($row)
-    }
-    & $fnSetStartupTabData $winTab $table @("Name", "Enabled", "Scope", "Type", "Command", "Location") @("Command", "Location", "ItemPath", "ValueName", "RootRunPath") @{ Name = "44*"; Enabled = "12*"; Scope = "24*"; Type = "20*" }
-    & $fnUpdateStartupTabFilter $winTab
-}
-
-function Invoke-StartupTasksLoad {
-    # COM engine instead of the module cmdlets: it survives broken CIM task
-    # stores and answers in milliseconds even on slow machines.
-    $tasks = @(Get-WmtScheduledTaskRows | Select-Object TaskName, TaskPath, State)
-    $table = [System.Data.DataTable]::new()
-    foreach ($name in @("TaskName", "Path", "State")) { [void]$table.Columns.Add($name) }
-    foreach ($task in @($tasks)) {
-        $row = $table.NewRow()
-        $row["TaskName"] = [string]$task.TaskName
-        $row["Path"] = [string]$task.TaskPath
-        $row["State"] = [string]$task.State
-        [void]$table.Rows.Add($row)
-    }
-    & $fnSetStartupTabData $taskTab $table @("TaskName", "Path", "State") @() @{ TaskName = "*"; Path = 260; State = 120 }
-    & $fnUpdateStartupTabFilter $taskTab
-}
-
-function Invoke-StartupContextMenuLoad {
-    if (-not (Get-PSDrive HKCR -ErrorAction SilentlyContinue)) { New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -ErrorAction SilentlyContinue | Out-Null }
-    $table = [System.Data.DataTable]::new()
-    foreach ($name in @("Name", "Enabled", "Root", "Path", "KeyName")) { [void]$table.Columns.Add($name) }
-    foreach ($rootInfo in @(
-            @{ Path = "HKCR:\*\shell"; RootName = "All Files (*)" },
-            @{ Path = "HKCR:\Directory\shell"; RootName = "Directory" },
-            @{ Path = "HKCR:\Directory\Background\shell"; RootName = "Directory Background" },
-            @{ Path = "HKCR:\Drive\shell"; RootName = "Drive" }
-        )) {
-        if (-not (Test-Path -LiteralPath $rootInfo.Path -ErrorAction SilentlyContinue)) { continue }
-        foreach ($subKey in @(Get-ChildItem -LiteralPath $rootInfo.Path -ErrorAction SilentlyContinue)) {
-            $row = $table.NewRow()
-            $row["Name"] = [string]$subKey.PSChildName
-            $row["Enabled"] = if ($null -ne (Get-ItemProperty -LiteralPath $subKey.PSPath -Name "LegacyDisable" -ErrorAction SilentlyContinue)) { "No" } else { "Yes" }
-            $row["Root"] = [string]$rootInfo.RootName
-            $row["Path"] = [string]$subKey.PSPath
-            $row["KeyName"] = [string]$subKey.Name
-            [void]$table.Rows.Add($row)
-        }
-    }
-    & $fnSetStartupTabData $ctxTab $table @("Name", "Enabled", "Root", "KeyName") @("Path", "KeyName") @{ Name = "68*"; Enabled = "12*"; Root = "20*" }
-    & $fnUpdateStartupTabFilter $ctxTab
-}
-
-function Invoke-StartupServicesLoad {
-    $table = [System.Data.DataTable]::new()
-    foreach ($name in @("Name", "DisplayName", "StartType", "State")) { [void]$table.Columns.Add($name) }
-    foreach ($service in @(Get-Service -ErrorAction SilentlyContinue | Sort-Object DisplayName)) {
-        $startType = "Unknown"
-        try {
-            $rawStart = (Get-ItemProperty -Path ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $service.Name) -Name Start -ErrorAction SilentlyContinue).Start
-            switch ($rawStart) {
-                0 { $startType = "Boot" }
-                1 { $startType = "System" }
-                2 { $startType = "Automatic" }
-                3 { $startType = "Manual" }
-                4 { $startType = "Disabled" }
-                default { if ($null -ne $rawStart) { $startType = [string]$rawStart } }
-            }
-        }
-        catch {}
-        $row = $table.NewRow()
-        $row["Name"] = [string]$service.Name
-        $row["DisplayName"] = [string]$service.DisplayName
-        $row["StartType"] = [string]$startType
-        $row["State"] = [string]$service.Status
-        [void]$table.Rows.Add($row)
-    }
-    & $fnSetStartupTabData $svcTab $table @("Name", "DisplayName", "StartType", "State") @() @{ DisplayName = "56*"; Name = "24*"; StartType = "10*"; State = "10*" }
-    & $fnUpdateStartupTabFilter $svcTab
-}
-
 function Invoke-StartupTabLoad {
     param([string]$TabName, [bool]$Force = $false)
     if (-not $Force -and $tabLoaded.ContainsKey($TabName) -and $tabLoaded[$TabName]) { return }
-    Set-WmtBusyCursor -Busy
-    try {
-        switch ($TabName) {
-            "Windows" { & $LoadWindowsStartup }
-            "Scheduled Tasks" { & $LoadScheduledTasks }
-            "Context Menu" { & $LoadContextMenu }
-            "Services" { & $LoadServices }
+    if ($loadingTabs.ContainsKey($TabName) -and $loadingTabs[$TabName]) { return }
+    $tabObj = $tabs[$TabName]
+    if (-not $tabObj) { throw "Unknown Startup Manager tab '$TabName'." }
+    if ($TabName -eq "Context Menu" -and -not (Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+        try { New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -ErrorAction Stop | Out-Null }
+        catch {
+            $tabObj.CountLabel.Text = "Load failed."
+            Show-WmtMessageBox -Owner $dialog -Message "Could not initialize the Classes registry drive:`n$($_.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
+            return
         }
-        if ($tabLoaded.ContainsKey($TabName)) { $tabLoaded[$TabName] = $true }
     }
-    catch {
-        Show-WmtMessageBox -Owner $dialog -Message "Failed to load tab '$TabName'.`n$($_.Exception.Message)" -Title "Startup Manager" -Image Error | Out-Null
+    $loadingTabs[$TabName] = $true
+    $tabObj.CountLabel.Text = "Loading..."
+    if ($tabObj.Buttons.Children.Count -gt 0) { $tabObj.Buttons.Children[0].IsEnabled = $false }
+    $startupFolders = [string[]]@(
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+        "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+    $loadArguments = [object[]]::new(2)
+    $loadArguments[0] = $TabName
+    $loadArguments[1] = $startupFolders
+    # These callbacks are closures inside a closure. Snapshot the current UI
+    # references into this invocation scope so the callbacks retain them.
+    $loadDialog = $dialog
+    $loadTab = $tabObj
+    $loadTabName = $TabName
+    $loadStates = $loadingTabs
+    $loadedStates = $tabLoaded
+    $completed = {
+        param($results)
+        try {
+            $loadStates[$loadTabName] = $false
+            if (-not $loadDialog.IsLoaded) { return }
+            $result = $null
+            foreach ($candidate in @($results)) {
+                if ($candidate -and $candidate.PSObject.Properties['Rows']) { $result = $candidate; break }
+            }
+            if (-not $result) {
+                $resultTypes = (@($results) | ForEach-Object { if ($null -eq $_) { '<null>' } else { $_.GetType().FullName } }) -join ', '
+                $loadTab.CountLabel.Text = "Load failed: no data returned."
+                Write-GuiLog "[Startup Manager] '$loadTabName' completion had no Rows result (types: $resultTypes)."
+                Show-WmtMessageBox -Owner $loadDialog -Message "Startup Manager returned no data for '$loadTabName'." -Title "Startup Manager" -Image Error | Out-Null
+                return
+            }
+            switch ($loadTabName) {
+                "Windows" {
+                    Set-WmtStartupTabRows -TabObj $loadTab -Rows @($result.Rows) `
+                        -Columns @("Name", "Enabled", "Scope", "Type", "Command", "Location", "ItemPath", "ValueName", "RootRunPath") `
+                        -SearchColumns @("Name", "Enabled", "Scope", "Type", "Command", "Location") `
+                        -HiddenColumns @("Command", "Location", "ItemPath", "ValueName", "RootRunPath") `
+                        -Widths @{ Name = "44*"; Enabled = "12*"; Scope = "24*"; Type = "20*" }
+                }
+                "Scheduled Tasks" {
+                    Set-WmtStartupTabRows -TabObj $loadTab -Rows @($result.Rows) `
+                        -Columns @("TaskName", "Path", "State") -SearchColumns @("TaskName", "Path", "State") `
+                        -Widths @{ TaskName = "*"; Path = 260; State = 120 }
+                }
+                "Context Menu" {
+                    Set-WmtStartupTabRows -TabObj $loadTab -Rows @($result.Rows) `
+                        -Columns @("Name", "Enabled", "Root", "Path", "KeyName") `
+                        -SearchColumns @("Name", "Enabled", "Root", "KeyName") `
+                        -HiddenColumns @("Path", "KeyName") `
+                        -Widths @{ Name = "68*"; Enabled = "12*"; Root = "20*" }
+                }
+                "Services" {
+                    Set-WmtStartupTabRows -TabObj $loadTab -Rows @($result.Rows) `
+                        -Columns @("Name", "DisplayName", "StartType", "State") `
+                        -SearchColumns @("Name", "DisplayName", "StartType", "State") `
+                        -Widths @{ DisplayName = "56*"; Name = "24*"; StartType = "10*"; State = "10*" }
+                }
+            }
+            if ($loadedStates.ContainsKey($loadTabName)) { $loadedStates[$loadTabName] = $true }
+        }
+        catch {
+            $loadTab.CountLabel.Text = "Load failed."
+            Write-GuiLog "[Startup Manager] '$loadTabName' completion failed: $($_.Exception.ToString())"
+            Show-WmtMessageBox -Owner $loadDialog -Message "Could not display '$loadTabName'.`n$($_.Exception.Message)" -Title "Startup Manager" -Image Error | Out-Null
+        }
+        finally {
+            $loadStates[$loadTabName] = $false
+            if ($loadDialog.IsLoaded -and $loadTab.Buttons.Children.Count -gt 0) { $loadTab.Buttons.Children[0].IsEnabled = $true }
+        }
+    }.GetNewClosure()
+    $onError = {
+        param($errorRecord)
+        $loadStates[$loadTabName] = $false
+        if (-not $loadDialog.IsLoaded) { return }
+        if ($loadTab.Buttons.Children.Count -gt 0) { $loadTab.Buttons.Children[0].IsEnabled = $true }
+        $loadTab.CountLabel.Text = "Load failed."
+        Show-WmtMessageBox -Owner $loadDialog -Message "Failed to load tab '$loadTabName'.`n$($errorRecord.Exception.Message)" -Title "Startup Manager" -Image Error | Out-Null
+    }.GetNewClosure()
+    $job = Invoke-WmtUiBackgroundCommand -Name ("StartupManager_" + [string]$dialog.GetHashCode() + "_" + ($TabName -replace '\W', '')) `
+        -Msg "Loading $TabName..." -ArgumentList $loadArguments -SuppressResultLog `
+        -OnComplete $completed -OnError $onError -Sb {
+        param([string]$Name, [string[]]$StartupFolders)
+        $rows = [System.Collections.Generic.List[object]]::new()
+        $openRegistryPath = {
+            param([string]$Path)
+            if ($Path -notmatch '^(HKCU|HKLM|HKCR):\\?(.*)$') { throw "Unsupported registry path '$Path'." }
+            $hiveName = $Matches[1]
+            $subPath = $Matches[2]
+            $hive = switch ($hiveName) {
+                "HKCU" { [Microsoft.Win32.RegistryHive]::CurrentUser }
+                "HKLM" { [Microsoft.Win32.RegistryHive]::LocalMachine }
+                "HKCR" { [Microsoft.Win32.RegistryHive]::ClassesRoot }
+            }
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Default)
+            try {
+                $key = $base.OpenSubKey($subPath)
+                if (-not $key) { return $null }
+                return $key
+            }
+            finally { $base.Dispose() }
+        }
+        $readStartupApproved = {
+            param([string]$Type, [string]$RootPath, [string]$ValueName)
+            if ($Type -eq "Registry") {
+                if ($RootPath -match '(?i)WOW6432Node') {
+                    $approvedPath = $RootPath -replace '(?i)WOW6432Node\\', '' -replace '(?i)CurrentVersion\\Run', 'CurrentVersion\Explorer\StartupApproved\Run32'
+                } else {
+                    $approvedPath = $RootPath -replace '(?i)CurrentVersion\\Run', 'CurrentVersion\Explorer\StartupApproved\Run'
+                }
+            }
+            elseif ($RootPath -match '(?i)Roaming') {
+                $approvedPath = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+            }
+            else {
+                $approvedPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+            }
+            $key = & $openRegistryPath $approvedPath
+            if (-not $key) { return $true }
+            try {
+                $value = $key.GetValue($ValueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($value -is [byte[]] -and $value.Length -gt 0) { return ([int]$value[0] % 2 -eq 0) }
+                return $true
+            }
+            finally { $key.Dispose() }
+        }
+        switch ($Name) {
+            "Windows" {
+                foreach ($entry in @(
+                    @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'; Scope = 'Current User' },
+                    @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'; Scope = 'All Users' },
+                    @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Scope = 'All Users (32-bit)' }
+                )) {
+                    $key = & $openRegistryPath $entry.Path
+                    if (-not $key) { continue }
+                    try {
+                        foreach ($valueName in $key.GetValueNames()) {
+                            $value = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                            $enabled = & $readStartupApproved "Registry" $entry.Path $valueName
+                            [void]$rows.Add([PSCustomObject]@{
+                                Name = [string]$valueName; Enabled = $(if ($enabled) { 'Yes' } else { 'No' })
+                                Scope = [string]$entry.Scope; Type = 'Registry'; Command = [string]$value
+                                Location = [string]$entry.Path; ItemPath = [string]$entry.Path
+                                ValueName = [string]$valueName; RootRunPath = [string]$entry.Path
+                            })
+                        }
+                    }
+                    finally { $key.Dispose() }
+                }
+                for ($index = 0; $index -lt $StartupFolders.Count; $index++) {
+                    $folder = $StartupFolders[$index]
+                    if (-not [System.IO.Directory]::Exists($folder)) { continue }
+                    $scope = if ($index -eq 0) { 'Current User' } else { 'All Users' }
+                    foreach ($path in [System.IO.Directory]::EnumerateFiles($folder)) {
+                        $file = [System.IO.FileInfo]::new($path)
+                        $enabled = & $readStartupApproved "StartupFolder" $folder $file.Name
+                        [void]$rows.Add([PSCustomObject]@{
+                            Name = $file.BaseName; Enabled = $(if ($enabled) { 'Yes' } else { 'No' })
+                            Scope = $scope; Type = 'StartupFolder'; Command = $file.FullName
+                            Location = $folder; ItemPath = $file.FullName
+                            ValueName = $file.Name; RootRunPath = $folder
+                        })
+                    }
+                }
+            }
+            "Scheduled Tasks" {
+                $service = New-Object -ComObject Schedule.Service
+                $pending = [System.Collections.Generic.Stack[object]]::new()
+                try {
+                    $service.Connect()
+                    $pending.Push($service.GetFolder('\'))
+                    while ($pending.Count -gt 0) {
+                        $folder = $pending.Pop()
+                        try {
+                            $tasks = $null
+                            try {
+                                $tasks = $folder.GetTasks(1)
+                                foreach ($task in $tasks) {
+                                    try {
+                                        $taskName = ""
+                                        $taskPath = ""
+                                        $taskFolderPath = "\"
+                                        $state = "Unknown"
+                                        try { $taskName = [string]$task.Name } catch {}
+                                        try { $taskPath = [string]$task.Path } catch {}
+                                        $separatorIndex = $taskPath.LastIndexOf('\')
+                                        if ($separatorIndex -ge 0) { $taskFolderPath = $taskPath.Substring(0, $separatorIndex + 1) }
+                                        try {
+                                            $state = switch ([int]$task.State) {
+                                                1 { 'Disabled' }
+                                                2 { 'Queued' }
+                                                3 { 'Ready' }
+                                                4 { 'Running' }
+                                                default { 'Unknown' }
+                                            }
+                                        } catch {}
+                                        [void]$rows.Add([PSCustomObject]@{
+                                            TaskName = $taskName
+                                            Path = $taskFolderPath
+                                            State = $state
+                                        })
+                                    }
+                                    finally {
+                                        try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($task) } catch {}
+                                    }
+                                }
+                            }
+                            catch {}
+                            finally {
+                                if ($tasks) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($tasks) } catch {} }
+                            }
+                            $children = $null
+                            try {
+                                $children = $folder.GetFolders(0)
+                                foreach ($child in $children) { $pending.Push($child) }
+                            }
+                            catch {}
+                            finally {
+                                if ($children) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($children) } catch {} }
+                            }
+                        }
+                        finally {
+                            try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($folder) } catch {}
+                        }
+                    }
+                }
+                finally {
+                    while ($pending.Count -gt 0) {
+                        $folder = $pending.Pop()
+                        try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($folder) } catch {}
+                    }
+                    try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) } catch {}
+                }
+            }
+            "Context Menu" {
+                $contextRoots = @(
+                    @{ Path = '*\shell'; Root = 'All Files (*)' },
+                    @{ Path = 'Directory\shell'; Root = 'Directory' },
+                    @{ Path = 'Directory\Background\shell'; Root = 'Directory Background' },
+                    @{ Path = 'Drive\shell'; Root = 'Drive' }
+                )
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::ClassesRoot, [Microsoft.Win32.RegistryView]::Default)
+                try {
+                    foreach ($root in $contextRoots) {
+                        $key = $base.OpenSubKey($root.Path)
+                        if (-not $key) { continue }
+                        try {
+                            foreach ($subName in $key.GetSubKeyNames()) {
+                                $child = $key.OpenSubKey($subName)
+                                if (-not $child) { continue }
+                                try {
+                                    $disabled = $null -ne $child.GetValue('LegacyDisable', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                                    $path = "HKCR:\$($root.Path)\$subName"
+                                    [void]$rows.Add([PSCustomObject]@{
+                                        Name = $subName; Enabled = $(if ($disabled) { 'No' } else { 'Yes' })
+                                        Root = [string]$root.Root; Path = $path; KeyName = "HKEY_CLASSES_ROOT\$($root.Path)\$subName"
+                                    })
+                                }
+                                finally { $child.Dispose() }
+                            }
+                        }
+                        finally { $key.Dispose() }
+                    }
+                }
+                finally { $base.Dispose() }
+            }
+            "Services" {
+                foreach ($service in @(Get-Service -ErrorAction Stop | Sort-Object DisplayName)) {
+                    $startType = "Unknown"
+                    $key = & $openRegistryPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $service.Name)
+                    if ($key) {
+                        try {
+                            $rawStart = $key.GetValue('Start', $null)
+                            switch ($rawStart) {
+                                0 { $startType = "Boot" }
+                                1 { $startType = "System" }
+                                2 { $startType = "Automatic" }
+                                3 { $startType = "Manual" }
+                                4 { $startType = "Disabled" }
+                                default { if ($null -ne $rawStart) { $startType = [string]$rawStart } }
+                            }
+                        }
+                        finally { $key.Dispose() }
+                    }
+                    [void]$rows.Add([PSCustomObject]@{
+                        Name = [string]$service.Name; DisplayName = [string]$service.DisplayName
+                        StartType = $startType; State = [string]$service.Status
+                    })
+                }
+            }
+            default { throw "Unknown Startup Manager tab '$Name'." }
+        }
+        [PSCustomObject]@{ Rows = $rows.ToArray() }
     }
-    finally {
-        Set-WmtBusyCursor
+    if (-not $job) {
+        $loadingTabs[$TabName] = $false
+        if ($tabObj.Buttons.Children.Count -gt 0) { $tabObj.Buttons.Children[0].IsEnabled = $true }
+        $tabObj.CountLabel.Text = "Load could not be started."
     }
 }
 
@@ -32076,9 +32489,12 @@ function Set-StartupView {
     & $fnInvokeStartupTabLoad $Title $false
 }
 
+$taskActionState = @{ IsRunning = $false }
+
 function Invoke-WmtStartupTaskSelection {
     param([ValidateSet("Enable", "Disable", "Delete")][string]$Action)
 
+    if ($taskActionState.IsRunning) { return }
     $selected = @(Get-WmtDataGridSelectedRows -DataGrid $taskTab.Grid)
     if ($selected.Count -eq 0) { return }
     if ($Action -eq "Delete") {
@@ -32086,31 +32502,100 @@ function Invoke-WmtStartupTaskSelection {
         if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
     }
 
-    Set-WmtBusyCursor -Busy
-    $failures = @()
-    try {
-        foreach ($row in $selected) {
-            $name = [string]$row["TaskName"]
-            $path = [string]$row["Path"]
-            $result = Invoke-WmtScheduledTaskAction -Action $Action -TaskName $name -TaskPath $path
-            if ($result.Success) {
-                if ($Action -eq "Enable") { $row["State"] = "Ready" }
-                elseif ($Action -eq "Disable") { $row["State"] = "Disabled" }
-                elseif ($Action -eq "Delete") { $row.Delete() }
-            }
-            else {
-                $failures += "$($result.Task): $($result.Message)"
+    $records = @($selected | ForEach-Object {
+        [PSCustomObject]@{ TaskName = [string]$_['TaskName']; Path = [string]$_['Path'] }
+    })
+    $arguments = [object[]]::new(2)
+    $arguments[0] = $records
+    $arguments[1] = $Action
+    # The completion/error blocks below are nested closures. Keep explicit
+    # references from this invocation scope for their UI updates.
+    $actionState = $taskActionState
+    $actionDialog = $dialog
+    $actionTab = $taskTab
+    $actionFilter = $fnUpdateStartupTabFilter
+    $actionName = $Action
+    $actionRows = $selected
+    $actionRecords = $records
+    $actionState.IsRunning = $true
+    $actionTab.CountLabel.Text = "$actionName in progress..."
+    $completed = {
+        param($results)
+        $actionState.IsRunning = $false
+        if (-not $actionDialog.IsLoaded) { return }
+        $result = $null
+        foreach ($candidate in @($results)) {
+            if ($candidate -and $candidate.PSObject.Properties['SucceededKeys']) { $result = $candidate; break }
+        }
+        if (-not $result) {
+            $actionTab.CountLabel.Text = "Operation returned no result."
+            Write-GuiLog "[Scheduled Tasks] $actionName operation returned no result."
+            return
+        }
+        $succeeded = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($result.SucceededKeys)) { [void]$succeeded.Add([string]$key) }
+        foreach ($index in 0..($actionRows.Count - 1)) {
+            $key = "$($actionRecords[$index].Path)|$($actionRecords[$index].TaskName)"
+            if (-not $succeeded.Contains($key)) { continue }
+            if ($actionName -eq "Enable") { $actionRows[$index]["State"] = "Ready" }
+            elseif ($actionName -eq "Disable") { $actionRows[$index]["State"] = "Disabled" }
+            elseif ($actionName -eq "Delete") { $actionRows[$index].Delete() }
+        }
+        if ($actionName -eq "Delete") { $actionTab.Meta.Table.AcceptChanges() }
+        & $actionFilter $actionTab
+        if (@($result.Failures).Count -gt 0) {
+            Show-WmtMessageBox -Owner $actionDialog -Message (@($result.Failures) -join "`r`n") -Title "Scheduled Tasks" -Image Warning | Out-Null
+        }
+    }.GetNewClosure()
+    $onError = {
+        param($errorRecord)
+        $actionState.IsRunning = $false
+        if (-not $actionDialog.IsLoaded) { return }
+        $actionTab.CountLabel.Text = "$actionName failed."
+        Show-WmtMessageBox -Owner $actionDialog -Message "Could not $actionName scheduled tasks:`n$($errorRecord.Exception.Message)" -Title "Scheduled Tasks" -Image Error | Out-Null
+    }.GetNewClosure()
+    $job = Invoke-WmtUiBackgroundCommand -Name ("StartupTaskAction_" + [guid]::NewGuid().ToString("N")) `
+        -Msg "$Action scheduled tasks..." -ArgumentList $arguments -SuppressResultLog `
+        -OnComplete $completed -OnError $onError -Sb {
+        param($Entries, [string]$TaskAction)
+        $service = $null
+        $succeeded = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        try {
+            $service = New-Object -ComObject Schedule.Service
+            $service.Connect()
+            foreach ($entry in $Entries) {
+                $folder = $null
+                $task = $null
+                try {
+                    $folderPath = ([string]$entry.Path).TrimEnd("\")
+                    if ([string]::IsNullOrWhiteSpace($folderPath)) { $folderPath = "\" }
+                    $folder = $service.GetFolder($folderPath)
+                    if ($TaskAction -eq "Delete") {
+                        $folder.DeleteTask([string]$entry.TaskName, 0)
+                    }
+                    else {
+                        $task = $folder.GetTask([string]$entry.TaskName)
+                        if (-not $task) { throw "Task was not found." }
+                        $task.Enabled = ($TaskAction -eq "Enable")
+                    }
+                    [void]$succeeded.Add("$($entry.Path)|$($entry.TaskName)")
+                }
+                catch { [void]$failures.Add("$($entry.Path)$($entry.TaskName): $($_.Exception.Message)") }
+                finally {
+                    if ($task) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($task) }
+                    if ($folder) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($folder) }
+                }
             }
         }
-        if ($Action -eq "Delete") { $taskTab.Meta.Table.AcceptChanges() }
-        & $fnUpdateStartupTabFilter $taskTab
+        finally {
+            if ($service) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) }
+        }
+        [PSCustomObject]@{ SucceededKeys = $succeeded.ToArray(); Failures = $failures.ToArray() }
     }
-    finally {
-        Set-WmtBusyCursor
-    }
-
-    if ($failures.Count -gt 0) {
-        Show-WmtMessageBox -Owner $dialog -Message ($failures -join "`r`n") -Title "Scheduled Tasks" -Image Warning | Out-Null
+    if (-not $job) {
+        $actionState.IsRunning = $false
+        $actionTab.CountLabel.Text = "Could not start operation."
     }
 }
 
@@ -32125,17 +32610,10 @@ $ctxTab = New-StartupPage "Context Menu"
 $svcTab = New-StartupPage "Services"
 
 $fnSetTabButtonActive = ${function:Set-TabButtonActive}.GetNewClosure()
-$fnSetStartupTabData = ${function:Set-StartupTabData}.GetNewClosure()
 $fnUpdateStartupTabFilter = ${function:Update-StartupTabFilter}.GetNewClosure()
 $fnShowStartupRowDetails = ${function:Show-StartupRowDetails}.GetNewClosure()
 $fnGetStartupApprovedState = ${function:Get-StartupApprovedState}.GetNewClosure()
 $fnSetStartupApprovedState = ${function:Set-StartupApprovedState}.GetNewClosure()
-$fnGetRegRunEntries = ${function:Get-RegRunEntries}.GetNewClosure()
-$fnGetStartupFolderEntries = ${function:Get-StartupFolderEntries}.GetNewClosure()
-$LoadWindowsStartup = ${function:Invoke-StartupWindowsLoad}.GetNewClosure()
-$LoadScheduledTasks = ${function:Invoke-StartupTasksLoad}.GetNewClosure()
-$LoadContextMenu = ${function:Invoke-StartupContextMenuLoad}.GetNewClosure()
-$LoadServices = ${function:Invoke-StartupServicesLoad}.GetNewClosure()
 $fnInvokeStartupTabLoad = ${function:Invoke-StartupTabLoad}.GetNewClosure()
 $fnSetStartupView = ${function:Set-StartupView}.GetNewClosure()
 $fnInvokeStartupTaskSelection = ${function:Invoke-WmtStartupTaskSelection}.GetNewClosure()
@@ -32280,6 +32758,9 @@ $invokeStartupRowDelete = {
         param($Entries, [string]$DeleteKind)
         $succeeded = [System.Collections.Generic.List[string]]::new()
         $failures = [System.Collections.Generic.List[string]]::new()
+        if ($DeleteKind -eq 'ContextMenu' -and -not (Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+            New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -ErrorAction Stop | Out-Null
+        }
         foreach ($entry in $Entries) {
             try {
                 switch ($entry.Kind) {
@@ -32390,19 +32871,27 @@ $btnCtxEnable.Add_Click({
     $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
     if ($selected.Count -eq 0) { return }
     $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $contextDialog = $dialog
+    $contextRows = $selected
     $complete = {
         param($results)
-        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededPaths'] } | Select-Object -Last 1)[0]
+        $result = $null
+        foreach ($candidate in @($results)) {
+            if ($candidate -and $candidate.PSObject.Properties['SucceededPaths']) { $result = $candidate; break }
+        }
         if (-not $result) { return }
-        foreach ($row in $selected) { if (@($result.SucceededPaths) -contains [string]$row['Path']) { $row['Enabled'] = 'Yes' } }
+        foreach ($row in $contextRows) { if (@($result.SucceededPaths) -contains [string]$row['Path']) { $row['Enabled'] = 'Yes' } }
         if (@($result.Failures).Count -gt 0) {
-            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Context Menu" -Image Warning | Out-Null
+            Show-WmtMessageBox -Owner $contextDialog -Message (@($result.Failures) -join "`r`n") -Title "Context Menu" -Image Warning | Out-Null
         }
     }.GetNewClosure()
     Invoke-UiCommand {
         param([string[]]$Paths)
         $succeeded = [System.Collections.Generic.List[string]]::new()
         $failures = [System.Collections.Generic.List[string]]::new()
+        if (-not (Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+            New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -ErrorAction Stop | Out-Null
+        }
         foreach ($path in $Paths) {
             try {
                 $item = Get-Item -LiteralPath $path -ErrorAction Stop
@@ -32416,26 +32905,34 @@ $btnCtxEnable.Add_Click({
         [pscustomobject]@{ Message = "Enabled $($succeeded.Count) context menu item(s)."; SucceededPaths=$succeeded.ToArray(); Failures=$failures.ToArray() }
     } 'Enabling context menu entries...' -ArgumentList @($records) -OnComplete $complete -OnError {
         param($errorRecord)
-        Show-WmtMessageBox -Owner $dialog -Message "Could not enable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
+        Show-WmtMessageBox -Owner $contextDialog -Message "Could not enable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
     }.GetNewClosure()
 }.GetNewClosure())
 $btnCtxDisable.Add_Click({
     $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
     if ($selected.Count -eq 0) { return }
     $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $contextDialog = $dialog
+    $contextRows = $selected
     $complete = {
         param($results)
-        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededPaths'] } | Select-Object -Last 1)[0]
+        $result = $null
+        foreach ($candidate in @($results)) {
+            if ($candidate -and $candidate.PSObject.Properties['SucceededPaths']) { $result = $candidate; break }
+        }
         if (-not $result) { return }
-        foreach ($row in $selected) { if (@($result.SucceededPaths) -contains [string]$row['Path']) { $row['Enabled'] = 'No' } }
+        foreach ($row in $contextRows) { if (@($result.SucceededPaths) -contains [string]$row['Path']) { $row['Enabled'] = 'No' } }
         if (@($result.Failures).Count -gt 0) {
-            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Context Menu" -Image Warning | Out-Null
+            Show-WmtMessageBox -Owner $contextDialog -Message (@($result.Failures) -join "`r`n") -Title "Context Menu" -Image Warning | Out-Null
         }
     }.GetNewClosure()
     Invoke-UiCommand {
         param([string[]]$Paths)
         $succeeded = [System.Collections.Generic.List[string]]::new()
         $failures = [System.Collections.Generic.List[string]]::new()
+        if (-not (Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+            New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -ErrorAction Stop | Out-Null
+        }
         foreach ($path in $Paths) {
             try {
                 New-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -Value '' -PropertyType String -Force -ErrorAction Stop | Out-Null
@@ -32446,7 +32943,7 @@ $btnCtxDisable.Add_Click({
         [pscustomobject]@{ Message = "Disabled $($succeeded.Count) context menu item(s)."; SucceededPaths=$succeeded.ToArray(); Failures=$failures.ToArray() }
     } 'Disabling context menu entries...' -ArgumentList @($records) -OnComplete $complete -OnError {
         param($errorRecord)
-        Show-WmtMessageBox -Owner $dialog -Message "Could not disable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
+        Show-WmtMessageBox -Owner $contextDialog -Message "Could not disable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
     }.GetNewClosure()
 }.GetNewClosure())
 $btnCtxDelete.Add_Click({
@@ -35526,7 +36023,7 @@ $window = New-WmtWindowFromFullXaml -Xaml $xaml -NoOwner
 } catch {
 Write-Host "FATAL: XAML load failed: $($_.Exception.Message)" -ForegroundColor Red
 Write-Host "Inner: $(($_.Exception.InnerException).Message)" -ForegroundColor Yellow
-[System.Windows.MessageBox]::Show("XAML load failed:\n$($_.Exception.Message)", 'WMT Startup Error', 'OK', 'Error') | Out-Null
+Show-WmtMessageBox -Message ("XAML load failed:\n$($_.Exception.Message)") -Title ('WMT Startup Error') -Button ('OK') -Image ('Error') | Out-Null
 exit 1
 }
 $ErrorActionPreference = 'SilentlyContinue'
@@ -40172,7 +40669,7 @@ Invoke-WmtUiBackgroundCommand -Name "RestartExplorer" -Msg "Restarting Explorer.
 
 Register-WmtTweakButton "btnPowerUserUEFI" {
 Invoke-UiCommand {
-    $confirm = [System.Windows.MessageBox]::Show("Restart into UEFI/BIOS now? Save your work first.", "Confirm UEFI Restart", [System.Windows.MessageBoxButton]::OKCancel, [System.Windows.MessageBoxImage]::Warning)
+    $confirm = Show-WmtMessageBox -Message ("Restart into UEFI/BIOS now? Save your work first.") -Title ("Confirm UEFI Restart") -Button ([System.Windows.MessageBoxButton]::OKCancel) -Image ([System.Windows.MessageBoxImage]::Warning)
     if ($confirm -eq [System.Windows.MessageBoxResult]::OK) {
         shutdown /r /fw /t 0
         Write-GuiLog "UEFI restart requested."
@@ -41520,12 +42017,7 @@ $miManifest.ToolTip = "Show the winget manifest details for the selected package
 $miManifest.Add_Click({
     $selected = @($lstWinget.SelectedItems)
     if ($selected.Count -ne 1) {
-        [System.Windows.MessageBox]::Show(
-            "Select one winget or Microsoft Store package to view its manifest.",
-            "Select One Package",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Information
-        ) | Out-Null
+        Show-WmtMessageBox -Message ("Select one winget or Microsoft Store package to view its manifest.") -Title ("Select One Package") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
         return
     }
     Show-WingetPackageManifest -Item $selected[0]
@@ -41539,12 +42031,7 @@ $miChocoManifest.ToolTip = "Show the local chocolatey manifest (nuspec) for the 
 $miChocoManifest.Add_Click({
     $selected = @($lstWinget.SelectedItems)
     if ($selected.Count -ne 1) {
-        [System.Windows.MessageBox]::Show(
-            "Select one Chocolatey package to view its manifest.",
-            "Select One Package",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Information
-        ) | Out-Null
+        Show-WmtMessageBox -Message ("Select one Chocolatey package to view its manifest.") -Title ("Select One Package") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
         return
     }
     Show-ChocoPackageManifest -Item $selected[0]
@@ -41558,12 +42045,7 @@ $miChocoPage.ToolTip = "Open community.chocolatey.org for the selected package"
 $miChocoPage.Add_Click({
     $selected = @($lstWinget.SelectedItems)
     if ($selected.Count -ne 1) {
-        [System.Windows.MessageBox]::Show(
-            "Select one Chocolatey package to open its community page.",
-            "Select One Package",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Information
-        ) | Out-Null
+        Show-WmtMessageBox -Message ("Select one Chocolatey package to open its community page.") -Title ("Select One Package") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
         return
     }
     Open-ChocoCommunityPage -Item $selected[0]
@@ -46251,7 +46733,7 @@ $script:ProcessWingetLines = {
                 }
             }
             $msg = "Store CLI isn't working for $packageName. $reasonText.`r`n`r`nA Microsoft Store page was opened so you can download or update it directly."
-            [System.Windows.MessageBox]::Show($msg, "Microsoft Store CLI Stalled", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            Show-WmtMessageBox -Message ($msg) -Title ("Microsoft Store CLI Stalled") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Warning) | Out-Null
             continue
         }
         if ($line -match "^WINDOWS_UPDATE_COMPLETED:(.+)$") {
@@ -50986,10 +51468,7 @@ $btnWingetScan.Add_Click({
                 $txtWingetSearch.ToolTip = ""
                 if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
                 $btnWingetUpdateSel.IsEnabled = $true
-                [System.Windows.MessageBox]::Show(
-                    "Scan timed out after 120 seconds.`n`nOne of the enabled package providers did not respond.`nTry disabling slow providers and scan again.",
-                    "Scan Timeout", "OK", "Warning"
-                ) | Out-Null
+                Show-WmtMessageBox -Message ("Scan timed out after 120 seconds.`n`nOne of the enabled package providers did not respond.`nTry disabling slow providers and scan again.") -Title ("Scan Timeout") -Button ("OK") -Image ("Warning") | Out-Null
             }
             $script:GlobalScanTimer.Stop()
         })
@@ -54614,7 +55093,7 @@ $joined = ($pkgNames -join ", ")
 if ([string]::IsNullOrWhiteSpace($joined)) { $joined = "the selected EA package" }
 
 $msg = "Warning: Updating $joined may trigger a Windows restart (installer behavior outside WMT control).`n`nDo you want to continue?"
-$res = [System.Windows.MessageBox]::Show($msg, "Restart Warning", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+$res = Show-WmtMessageBox -Message ($msg) -Title ("Restart Warning") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
 return ($res -eq [System.Windows.MessageBoxResult]::Yes)
 }
 
@@ -54782,7 +55261,7 @@ $btnWingetUpdateAll.Add_Click({
         if ($items.Count -eq 0) { return }
 
         $msg = "Update all $($items.Count) listed package(s)?"
-        $res = [System.Windows.MessageBox]::Show($msg, "Update All", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        $res = Show-WmtMessageBox -Message ($msg) -Title ("Update All") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Question)
         if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
         if (-not (Show-WingetRestartRiskWarning -Items $items -Action "Update")) {
@@ -54927,7 +55406,7 @@ $btnNetInfo.Add_Click({
     } -OnComplete $done | Out-Null
 })
 $btnFlushDNS.Add_Click({
-    $done = { param($results) [System.Windows.MessageBox]::Show("DNS cache flushed.", "Flush DNS", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
+    $done = { param($results) Show-WmtMessageBox -Message ("DNS cache flushed.") -Title ("Flush DNS") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null }
     Invoke-WmtUiBackgroundCommand -Name "FlushDns" -Msg "Flushing DNS cache..." -Sb {
         Invoke-WmtCliText -FilePath "ipconfig" -Arguments "/flushdns"
     } -OnComplete $done | Out-Null
@@ -54936,7 +55415,7 @@ $btnResetWifi.Add_Click({
     $done = {
         param($results)
         $r = @($results | Where-Object { $_ -and $_.PSObject.Properties["Message"] } | Select-Object -Last 1)
-        if ($r) { [System.Windows.MessageBox]::Show([string]$r.Message, "Restart Wi-Fi", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
+        if ($r) { Show-WmtMessageBox -Message ([string]$r.Message) -Title ("Restart Wi-Fi") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null }
     }
     Invoke-WmtUiBackgroundCommand -Name "RestartWifiAdapters" -Msg "Restarting Wi-Fi adapters..." -SuppressResultLog -Sb {
         $wifi = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -match "Wi-Fi|Wireless" }
@@ -54961,7 +55440,7 @@ $btnNetRepair.Add_Click({
     "`n- Reset the TCP/IP stack (clears manually configured static IP, DNS, gateway and route settings)" +
     "`n`nYour current settings are recorded in the diagnostic log first. Adapters may briefly disconnect and a restart is needed to finish. Continue?"
 
-    $res = [System.Windows.MessageBox]::Show($msg, "Full Network Repair", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+    $res = Show-WmtMessageBox -Message ($msg) -Title ("Full Network Repair") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
 
     if ($res -eq "Yes") {
         Start-NetRepair
@@ -55006,10 +55485,10 @@ $btnHostsRestore.Add_Click({
     $o.Filter = "*.bak;*.txt|*.bak;*.txt"
     if ($o.ShowDialog() -eq $true) {
         $restoreFile = $o.FileName
-        $res = [System.Windows.MessageBox]::Show("Restore hosts file from:`n$restoreFile`n`nThis will overwrite the current hosts file. Continue?", "Restore Hosts", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        $res = Show-WmtMessageBox -Message ("Restore hosts file from:`n$restoreFile`n`nThis will overwrite the current hosts file. Continue?") -Title ("Restore Hosts") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
         if ($res -ne "Yes") { return }
         Invoke-UiCommand { Copy-Item $restoreFile "$env:windir\System32\drivers\etc\hosts" -Force } "Restored hosts file from $restoreFile"
-        [System.Windows.MessageBox]::Show("Hosts file restored from:`n$restoreFile", "Restore Hosts", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        Show-WmtMessageBox -Message ("Hosts file restored from:`n$restoreFile") -Title ("Restore Hosts") -Button ([System.Windows.MessageBoxButton]::OK) -Image ([System.Windows.MessageBoxImage]::Information) | Out-Null
     }
 })
 
@@ -59397,7 +59876,7 @@ if ($btnUpdateServices) { $btnUpdateServices.Add_Click({
     }
 }) }
 if ($btnDotNetEnable) { $btnDotNetEnable.Add_Click({
-    $res = [System.Windows.MessageBox]::Show("Set .NET roll-forward? This forces apps to use the latest installed .NET version (depending on selection).", "Set .NET RollForward", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+    $res = Show-WmtMessageBox -Message ("Set .NET roll-forward? This forces apps to use the latest installed .NET version (depending on selection).") -Title ("Set .NET RollForward") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
     if ($res -ne "Yes") { return }
 
     [xml]$rollForwardXaml = @'
@@ -59446,7 +59925,7 @@ if ($btnInstallGpedit) { $btnInstallGpedit.Add_Click({ Start-GpeditInstall }) }
 $btnUtilResetGPU = Get-Ctrl "btnUtilResetGPU"
 if ($btnUtilResetGPU) {
 $btnUtilResetGPU.Add_Click({
-        $res = [System.Windows.MessageBox]::Show("Reset GPU driver now? This sends Win+Ctrl+Shift+B - the screen will flash black briefly and the GPU driver will restart.", "Reset GPU", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        $res = Show-WmtMessageBox -Message ("Reset GPU driver now? This sends Win+Ctrl+Shift+B - the screen will flash black briefly and the GPU driver will restart.") -Title ("Reset GPU") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
         if ($res -ne "Yes") { return }
         Reset-WmtGPU
     })
@@ -59455,7 +59934,7 @@ $btnUtilResetGPU.Add_Click({
 $btnMyDeviceResetGPU = Get-Ctrl "btnMyDeviceResetGPU"
 if ($btnMyDeviceResetGPU) {
 $btnMyDeviceResetGPU.Add_Click({
-        $res = [System.Windows.MessageBox]::Show("Reset GPU driver now? This sends Win+Ctrl+Shift+B - the screen will flash black briefly and the GPU driver will restart.", "Reset GPU", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        $res = Show-WmtMessageBox -Message ("Reset GPU driver now? This sends Win+Ctrl+Shift+B - the screen will flash black briefly and the GPU driver will restart.") -Title ("Reset GPU") -Button ([System.Windows.MessageBoxButton]::YesNo) -Image ([System.Windows.MessageBoxImage]::Warning)
         if ($res -ne "Yes") { return }
         Reset-WmtGPU
     })
@@ -59666,31 +60145,120 @@ function Test-WmtStartupEntryValid {
     }
 }
 
-function Update-WmtStartWithWindowsButton {
-    $btn = Get-Ctrl "btnStartWithWindows"
-    if (-not $btn) { return }
+function Start-WmtStartWithWindowsTaskOperation {
+    param([ValidateSet("Refresh", "Toggle")][string]$Action)
+    $button = Get-Ctrl "btnStartWithWindows"
+    if (-not $button) { return }
+    $command = Get-WmtStartupCommand
+    $arguments = [object[]]::new(4)
+    $arguments[0] = [string]$Action
+    $arguments[1] = [string]$script:WmtStartupTaskName
+    $arguments[2] = if ($command) { [string]$command.FilePath } else { "" }
+    $arguments[3] = if ($command) { [string]$command.Arguments } else { "" }
+    $completed = {
+        param($results)
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties["Enabled"] } | Select-Object -Last 1)[0]
+        if (-not $result) {
+            Write-GuiLog "[Start with Windows] Task Scheduler returned no state."
+            return
+        }
+        Update-WmtTweakToggle `
+            -Button $button `
+            -IsOn ([bool]$result.Enabled) `
+            -OnLabel "Start with Windows: On" `
+            -OffLabel "Start with Windows: Off" `
+            -Description "Launches WMT automatically when Windows logs in using Task Scheduler with highest privileges."
+        if (-not [string]::IsNullOrWhiteSpace([string]$result.Message)) { Write-GuiLog "[Start with Windows] $($result.Message)" }
+    }.GetNewClosure()
+    $onError = {
+        param($errorRecord)
+        $message = [string]$errorRecord.Exception.Message
+        Write-GuiLog "[Start with Windows] Task Scheduler operation failed: $message"
+        Show-WmtMessageBox -Message "Could not check or update the startup task:`n$message" -Title "Start with Windows" -Image Error | Out-Null
+    }.GetNewClosure()
+    $job = Invoke-WmtUiBackgroundCommand -Name "StartWithWindowsTask" -Msg "Checking Start with Windows task..." `
+        -ArgumentList $arguments -SuppressResultLog -OnComplete $completed -OnError $onError -Sb {
+        param([string]$Operation, [string]$TaskName, [string]$FilePath, [string]$CommandArguments)
+        $service = $null
+        $root = $null
+        $task = $null
+        $definition = $null
+        $trigger = $null
+        $taskAction = $null
+        try {
+            $service = New-Object -ComObject Schedule.Service
+            $service.Connect()
+            $root = $service.GetFolder("\")
+            try { $task = $root.GetTask($TaskName) } catch { $task = $null }
+            $isEnabled = [bool]($task -and [int]$task.State -ne 1 -and [bool]$task.Enabled)
+            if ($Operation -eq "Toggle" -and $isEnabled) {
+                $task.Enabled = $false
+                [PSCustomObject]@{ Enabled = $false; Message = "Startup task disabled." }
+                return
+            }
+            if ($Operation -eq "Refresh" -and -not $isEnabled) {
+                [PSCustomObject]@{ Enabled = $false; Message = "" }
+                return
+            }
+            if ([string]::IsNullOrWhiteSpace($FilePath)) {
+                if ($Operation -eq "Toggle") { throw "WMT's launch file could not be located." }
+                [PSCustomObject]@{ Enabled = $isEnabled; Message = "WMT's launch file could not be located; task validation was skipped." }
+                return
+            }
+            if ($Operation -eq "Refresh" -and $isEnabled) {
+                $actions = @($task.Definition.Actions)
+                if ($actions.Count -gt 0 -and
+                    ([string]$actions[0].Path).Trim() -ieq $FilePath.Trim() -and
+                    ([string]$actions[0].Arguments).Trim() -ceq $CommandArguments.Trim()) {
+                    [PSCustomObject]@{ Enabled = $true; Message = "" }
+                    return
+                }
+            }
+            $definition = $service.NewTask(0)
+            $definition.RegistrationInfo.Description = "Starts Windows Maintenance Tool when the user logs on."
+            try { $definition.RegistrationInfo.Author = [Environment]::UserName } catch {}
+            $definition.Principal.UserId = "$env:USERDOMAIN\$env:USERNAME"
+            $definition.Principal.LogonType = 3
+            $definition.Principal.RunLevel = 1
+            $trigger = $definition.Triggers.Create(9)
+            try { $trigger.UserId = "$env:USERDOMAIN\$env:USERNAME" } catch {}
+            try { $trigger.Enabled = $true } catch {}
+            $taskAction = $definition.Actions.Create(0)
+            $taskAction.Path = $FilePath
+            $taskAction.Arguments = $CommandArguments
+            try { $taskAction.WorkingDirectory = Split-Path -Parent $FilePath } catch {}
+            try { $definition.Settings.Enabled = $true } catch {}
+            try { $definition.Settings.StartWhenAvailable = $true } catch {}
+            try { $definition.Settings.DisallowStartIfOnBatteries = $false } catch {}
+            try { $definition.Settings.StopIfGoingOnBatteries = $false } catch {}
+            try { $definition.Settings.ExecutionTimeLimit = "PT0S" } catch {}
+            [void]$root.RegisterTaskDefinition($TaskName, $definition, 6, $null, $null, 3, $null)
+            $message = if ($Operation -eq "Refresh" -and $isEnabled) { "Startup task repaired to use the current WMT launch file." } else { "Startup task enabled." }
+            [PSCustomObject]@{ Enabled = $true; Message = $message }
+        }
+        finally {
+            if ($taskAction) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($taskAction) } catch {} }
+            if ($trigger) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($trigger) } catch {} }
+            if ($definition) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($definition) } catch {} }
+            if ($task) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($task) } catch {} }
+            if ($root) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($root) } catch {} }
+            if ($service) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) } catch {} }
+        }
+    }
+    if (-not $job) {
+        Write-GuiLog "[Start with Windows] Could not start background Task Scheduler operation."
+    }
+}
 
-    $isEnabled = Test-WmtStartWithWindows
-    Update-WmtTweakToggle `
-        -Button $btn `
-        -IsOn $isEnabled `
-        -OnLabel "Start with Windows: On" `
-        -OffLabel "Start with Windows: Off" `
-        -Description "Launches WMT automatically when Windows logs in using Task Scheduler with highest privileges."
+function Update-WmtStartWithWindowsButton {
+    Start-WmtStartWithWindowsTaskOperation -Action "Refresh"
 }
 
 if ($btnStartWithWindows) {
-    # Repair the startup entry if the WMT file was moved or the command changed.
-    Test-WmtStartupEntryValid | Out-Null
-
     Update-WmtStartWithWindowsButton
 
     $btnStartWithWindows.Add_Click({
-        $script:WmtTaskService = $null
-        $isEnabled = Test-WmtStartWithWindows
-        if (Set-WmtStartWithWindows -Enabled (-not $isEnabled)) {
-            Update-WmtStartWithWindowsButton
-        }
+        Start-WmtStartWithWindowsTaskOperation -Action "Toggle"
     })
 }
 
