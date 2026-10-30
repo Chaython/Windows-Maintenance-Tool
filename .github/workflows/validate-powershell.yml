@@ -392,7 +392,9 @@ jobs:
           # registry value on cache miss and refresh every value in that key.
           Invoke-Expression (Find-FunctionText 'Convert-WmtRegistryPath')
           Invoke-Expression (Find-FunctionText 'Get-WmtRegistryKeyValuesCached')
+          Invoke-Expression (Find-FunctionText 'Read-WmtRegistryKeyValuesLive')
           Invoke-Expression (Find-FunctionText 'Get-WmtRegValue')
+          function Write-GuiLog([string]$Message) { Write-Host $Message }
           $cacheTestSubPath = 'Software\WMT-RegValue-Cache-Test-' + [Guid]::NewGuid().ToString('N')
           $cacheTestFullPath = "HKCU:\$cacheTestSubPath"
           $cacheTestKey = $null
