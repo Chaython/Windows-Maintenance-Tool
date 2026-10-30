@@ -32097,29 +32097,66 @@ $btnCtxRefresh.Add_Click({ & $fnInvokeStartupTabLoad "Context Menu" $true }.GetN
 $btnCtxDetails.Add_Click({ & $fnShowStartupRowDetails $ctxTab "Context Menu Details" }.GetNewClosure())
 $btnCtxEnable.Add_Click({
     $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
-    $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($selected.Count -eq 0) { return }
+    $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $complete = {
         param($results)
-        foreach ($row in $selected) { if ($records -contains [string]$row['Path']) { $row['Enabled'] = 'Yes' } }
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededPaths'] } | Select-Object -Last 1)[0]
+        if (-not $result) { return }
+        foreach ($row in $selected) { if (@($result.SucceededPaths) -contains [string]$row['Path']) { $row['Enabled'] = 'Yes' } }
+        if (@($result.Failures).Count -gt 0) {
+            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Context Menu" -Image Warning | Out-Null
+        }
     }.GetNewClosure()
     Invoke-UiCommand {
         param([string[]]$Paths)
-        foreach ($path in $Paths) { Remove-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -ErrorAction SilentlyContinue }
-        [pscustomobject]@{ Message = "Enabled $($Paths.Count) context menu item(s)." }
-    } 'Enabling context menu entries...' -ArgumentList @($records) -OnComplete $complete
+        $succeeded = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        foreach ($path in $Paths) {
+            try {
+                $item = Get-Item -LiteralPath $path -ErrorAction Stop
+                if ($item.GetValueNames() -contains 'LegacyDisable') {
+                    Remove-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -ErrorAction Stop
+                }
+                [void]$succeeded.Add($path)
+            }
+            catch { [void]$failures.Add("${path}: $($_.Exception.Message)") }
+        }
+        [pscustomobject]@{ Message = "Enabled $($succeeded.Count) context menu item(s)."; SucceededPaths=$succeeded.ToArray(); Failures=$failures.ToArray() }
+    } 'Enabling context menu entries...' -ArgumentList @($records) -OnComplete $complete -OnError {
+        param($errorRecord)
+        Show-WmtMessageBox -Owner $dialog -Message "Could not enable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
+    }.GetNewClosure()
 }.GetNewClosure())
 $btnCtxDisable.Add_Click({
     $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
-    $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($selected.Count -eq 0) { return }
+    $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $complete = {
         param($results)
-        foreach ($row in $selected) { if ($records -contains [string]$row['Path']) { $row['Enabled'] = 'No' } }
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededPaths'] } | Select-Object -Last 1)[0]
+        if (-not $result) { return }
+        foreach ($row in $selected) { if (@($result.SucceededPaths) -contains [string]$row['Path']) { $row['Enabled'] = 'No' } }
+        if (@($result.Failures).Count -gt 0) {
+            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Context Menu" -Image Warning | Out-Null
+        }
     }.GetNewClosure()
     Invoke-UiCommand {
         param([string[]]$Paths)
-        foreach ($path in $Paths) { Set-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -Value '' -ErrorAction SilentlyContinue }
-        [pscustomobject]@{ Message = "Disabled $($Paths.Count) context menu item(s)." }
-    } 'Disabling context menu entries...' -ArgumentList @($records) -OnComplete $complete
+        $succeeded = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        foreach ($path in $Paths) {
+            try {
+                New-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -Value '' -PropertyType String -Force -ErrorAction Stop | Out-Null
+                [void]$succeeded.Add($path)
+            }
+            catch { [void]$failures.Add("${path}: $($_.Exception.Message)") }
+        }
+        [pscustomobject]@{ Message = "Disabled $($succeeded.Count) context menu item(s)."; SucceededPaths=$succeeded.ToArray(); Failures=$failures.ToArray() }
+    } 'Disabling context menu entries...' -ArgumentList @($records) -OnComplete $complete -OnError {
+        param($errorRecord)
+        Show-WmtMessageBox -Owner $dialog -Message "Could not disable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
+    }.GetNewClosure()
 }.GetNewClosure())
 $btnCtxDelete.Add_Click({
         $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
@@ -60065,78 +60102,182 @@ if ($btnTasksView) { $btnTasksView.Add_Click({
 }) }
 
 # --- WINDOWS UPDATE PRESETS ---
-if ($btnWUDefault) { $btnWUDefault.Add_Click({
-    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDefault" -Msg "Applying default Windows Update settings..." -Sb {
-        $baseKey = $null
-        $key = $null
-        try {
-            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
-            foreach ($entry in @(
-                @{ Path = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name = 'NoAutoUpdate' },
-                @{ Path = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DeferFeatureUpdates' },
-                @{ Path = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DeferQualityUpdates' }
-            )) {
-                $key = $baseKey.OpenSubKey($entry.Path, $true)
-                if ($key) {
-                    $key.DeleteValue($entry.Name, $false)
-                    $key.Dispose()
-                    $key = $null
-                }
-            }
-        }
-        finally {
-            if ($key) { $key.Dispose() }
-            if ($baseKey) { $baseKey.Dispose() }
-        }
-        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction Stop
-        Start-Service -Name wuauserv -ErrorAction Stop
-        Write-Output "Windows Update set to Default."
-    } | Out-Null
-}) }
+function Invoke-WmtWindowsUpdatePreset {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][object[]]$RegistryChanges,
+        [Parameter(Mandatory = $true)][ValidateSet('Automatic', 'Manual', 'Disabled')][string]$StartupType,
+        [Parameter(Mandatory = $true)][bool]$Running
+    )
 
-if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
-    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateSecurity" -Msg "Applying security-only update settings..." -Sb {
-        $baseKey = $null
-        $key = $null
-        try {
-            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
-            $key = $baseKey.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate')
-            if (-not $key) { throw "Could not open the Windows Update policy registry key." }
-            $key.SetValue('DeferFeatureUpdates', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-            $key.SetValue('DeferFeatureUpdatesPeriodInDays', 365, [Microsoft.Win32.RegistryValueKind]::DWord)
-            $key.Dispose()
-            $key = $baseKey.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU')
-            if (-not $key) { throw "Could not open the Windows Update AU policy registry key." }
-            $key.SetValue('NoAutoUpdate', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
-        }
-        finally {
-            if ($key) { $key.Dispose() }
-            if ($baseKey) { $baseKey.Dispose() }
-        }
-        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction Stop
-        Write-Output "Windows Update set to Security Only (deferring features)."
-    } | Out-Null
-}) }
+    $arguments = [object[]]::new(3)
+    $arguments[0] = ConvertTo-Json -InputObject @($RegistryChanges) -Depth 4 -Compress
+    $arguments[1] = $StartupType
+    $arguments[2] = $Running
+    Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments -Sb {
+        param([string]$ChangesJson, [string]$DesiredStartupType, [bool]$DesiredRunning)
 
-if ($btnWUDisable) { $btnWUDisable.Add_Click({
-    if ((Show-WmtMessageBox -Message "Disable ALL Windows Updates? This is not recommended for security." -Title "Warning" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
-        Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDisable" -Msg "Disabling Windows Update..." -Sb {
+        $changes = @(ConvertFrom-Json -InputObject $ChangesJson -ErrorAction Stop)
+        $snapshots = [System.Collections.Generic.List[object]]::new()
+        $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+        $service = Get-Service -Name 'wuauserv' -ErrorAction Stop
+        $serviceConfig = Get-CimInstance -ClassName Win32_Service -Filter "Name='wuauserv'" -ErrorAction Stop
+        if (-not $serviceConfig) { throw "Could not read Windows Update service configuration." }
+        $oldStartupType = switch ([string]$serviceConfig.StartMode) {
+            'Auto' { 'Automatic'; break }
+            'Manual' { 'Manual'; break }
+            'Disabled' { 'Disabled'; break }
+            default { throw "Unsupported Windows Update service startup mode '$($serviceConfig.StartMode)'." }
+        }
+        $oldRunning = ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running)
+
+        foreach ($change in $changes) {
+            if ([string]$change.Path -notmatch '(?i)^HKLM:\\?(.*)$') { throw "Unsupported Windows Update registry path '$($change.Path)'." }
+            $subPath = $Matches[1]
             $baseKey = $null
             $key = $null
             try {
                 $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
-                $key = $baseKey.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU')
-                if (-not $key) { throw "Could not open the Windows Update AU policy registry key." }
-                $key.SetValue('NoAutoUpdate', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $key = $baseKey.OpenSubKey($subPath, $false)
+                $valueExists = ($key -and $key.GetValueNames() -contains [string]$change.Name)
+                $value = $null
+                $kind = $null
+                if ($valueExists) {
+                    $value = $key.GetValue([string]$change.Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    $kind = $key.GetValueKind([string]$change.Name)
+                }
+                $snapshots.Add([pscustomobject]@{
+                    Path = $subPath
+                    Name = [string]$change.Name
+                    ValueExists = [bool]$valueExists
+                    Value = $value
+                    Kind = $kind
+                })
             }
             finally {
                 if ($key) { $key.Dispose() }
                 if ($baseKey) { $baseKey.Dispose() }
             }
-            Set-Service -Name wuauserv -StartupType Disabled -ErrorAction Stop
-            Stop-Service -Name wuauserv -Force -ErrorAction Stop
-            Write-Output "Windows Update DISABLED."
-        } | Out-Null
+        }
+
+        $serviceChangeStarted = $false
+        try {
+            foreach ($change in $changes) {
+                $baseKey = $null
+                $key = $null
+                try {
+                    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
+                    $subPath = [string]$change.Path.Substring(6)
+                    if ([string]$change.Action -eq 'Remove') {
+                        $key = $baseKey.OpenSubKey($subPath, $true)
+                        if ($key) { $key.DeleteValue([string]$change.Name, $false) }
+                    }
+                    elseif ([string]$change.Action -eq 'Set') {
+                        $key = $baseKey.CreateSubKey($subPath)
+                        if (-not $key) { throw "Could not open or create registry key '$($change.Path)'." }
+                        $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse([Microsoft.Win32.RegistryValueKind], [string]$change.Kind, $true)
+                        $key.SetValue([string]$change.Name, $change.Value, $kind)
+                    }
+                    else { throw "Unsupported Windows Update registry action '$($change.Action)'." }
+                }
+                finally {
+                    if ($key) { $key.Dispose() }
+                    if ($baseKey) { $baseKey.Dispose() }
+                }
+            }
+
+            $serviceChangeStarted = $true
+            Set-Service -Name 'wuauserv' -StartupType $DesiredStartupType -ErrorAction Stop
+            $currentService = Get-Service -Name 'wuauserv' -ErrorAction Stop
+            if ($DesiredRunning -and $currentService.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running) {
+                Start-Service -Name 'wuauserv' -ErrorAction Stop
+            }
+            elseif (-not $DesiredRunning -and $currentService.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+                Stop-Service -Name 'wuauserv' -Force -ErrorAction Stop
+            }
+            $actualService = Get-Service -Name 'wuauserv' -ErrorAction Stop
+            $actualServiceConfig = Get-CimInstance -ClassName Win32_Service -Filter "Name='wuauserv'" -ErrorAction Stop
+            $actualStartupType = switch ([string]$actualServiceConfig.StartMode) {
+                'Auto' { 'Automatic'; break }
+                'Manual' { 'Manual'; break }
+                'Disabled' { 'Disabled'; break }
+                default { throw "Unsupported Windows Update service startup mode '$($actualServiceConfig.StartMode)'." }
+            }
+            if ($actualStartupType -ne $DesiredStartupType) { throw "Windows Update service startup type did not change to $DesiredStartupType." }
+            if (($actualService.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) -ne $DesiredRunning) {
+                throw "Windows Update service did not reach the requested running state."
+            }
+        }
+        catch {
+            $operationError = $_.Exception.Message
+            for ($index = $snapshots.Count - 1; $index -ge 0; $index--) {
+                $snapshot = $snapshots[$index]
+                $baseKey = $null
+                $key = $null
+                try {
+                    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
+                    if ($snapshot.ValueExists) {
+                        $key = $baseKey.CreateSubKey([string]$snapshot.Path)
+                        if (-not $key) { throw "Could not reopen registry key '$($snapshot.Path)'." }
+                        $key.SetValue([string]$snapshot.Name, $snapshot.Value, [Microsoft.Win32.RegistryValueKind]$snapshot.Kind)
+                    }
+                    else {
+                        $key = $baseKey.OpenSubKey([string]$snapshot.Path, $true)
+                        if ($key) { $key.DeleteValue([string]$snapshot.Name, $false) }
+                    }
+                }
+                catch { [void]$rollbackErrors.Add("Registry restore failed for '$($snapshot.Path)\$($snapshot.Name)': $($_.Exception.Message)") }
+                finally {
+                    if ($key) { $key.Dispose() }
+                    if ($baseKey) { $baseKey.Dispose() }
+                }
+            }
+            if ($serviceChangeStarted) {
+                try {
+                    Set-Service -Name 'wuauserv' -StartupType $oldStartupType -ErrorAction Stop
+                    $currentService = Get-Service -Name 'wuauserv' -ErrorAction Stop
+                    $currentlyRunning = ($currentService.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running)
+                    if ($oldRunning -and -not $currentlyRunning) { Start-Service -Name 'wuauserv' -ErrorAction Stop }
+                    elseif (-not $oldRunning -and $currentlyRunning) { Stop-Service -Name 'wuauserv' -Force -ErrorAction Stop }
+                }
+                catch { [void]$rollbackErrors.Add("Windows Update service restore failed: $($_.Exception.Message)") }
+            }
+            if ($rollbackErrors.Count -gt 0) {
+                throw "Windows Update preset failed: $operationError. Rollback was incomplete: $($rollbackErrors -join ' ')"
+            }
+            throw "Windows Update preset failed: $operationError. Previous policy values and service state were restored."
+        }
+
+        [pscustomobject]@{ Message = 'Windows Update preset applied successfully.' }
+    } | Out-Null
+}
+
+if ($btnWUDefault) { $btnWUDefault.Add_Click({
+    $changes = @(
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name='NoAutoUpdate'; Action='Remove' },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name='DeferFeatureUpdates'; Action='Remove' },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name='DeferFeatureUpdatesPeriodInDays'; Action='Remove' },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name='DeferQualityUpdates'; Action='Remove' }
+    )
+    Invoke-WmtWindowsUpdatePreset -Name 'WindowsUpdateDefault' -Message 'Applying default Windows Update settings...' -RegistryChanges $changes -StartupType Automatic -Running $true
+}) }
+
+if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
+    $changes = @(
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name='DeferFeatureUpdates'; Action='Set'; Value=1; Kind='DWord' },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name='DeferFeatureUpdatesPeriodInDays'; Action='Set'; Value=365; Kind='DWord' },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name='NoAutoUpdate'; Action='Set'; Value=0; Kind='DWord' }
+    )
+    Invoke-WmtWindowsUpdatePreset -Name 'WindowsUpdateSecurity' -Message 'Applying security-only update settings...' -RegistryChanges $changes -StartupType Automatic -Running $true
+}) }
+
+if ($btnWUDisable) { $btnWUDisable.Add_Click({
+    if ((Show-WmtMessageBox -Message "Disable ALL Windows Updates? This is not recommended for security." -Title "Warning" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
+        $changes = @(
+            @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name='NoAutoUpdate'; Action='Set'; Value=1; Kind='DWord' }
+        )
+        Invoke-WmtWindowsUpdatePreset -Name 'WindowsUpdateDisable' -Message 'Disabling Windows Update...' -RegistryChanges $changes -StartupType Disabled -Running $false
     }
 }) }
 
