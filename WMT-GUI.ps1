@@ -50349,7 +50349,21 @@ $btnWingetScan.Add_Click({
         if (-not $scanSettings) { $scanSettings = Get-WmtSettings }
         $scanSettingsJson = ConvertTo-Json -InputObject $scanSettings -Depth 8 -Compress
         $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
-        $hasSteamCache = [bool]$script:WmtSteamLibraryCache -or (Test-Path -LiteralPath $steamCacheFile -PathType Leaf)
+        $hasSteamCache = [bool]$script:WmtSteamLibraryCache
+        if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
+            $hasSteamCache = $false
+            try {
+                $cacheInfo = Get-Item -LiteralPath $steamCacheFile -ErrorAction Stop
+                $cacheAgeHours = ((Get-Date) - $cacheInfo.LastWriteTime).TotalHours
+                if ($cacheAgeHours -lt 24) {
+                    $cachedSteamOwnership = @([System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+                    $hasSteamCache = ($cachedSteamOwnership.Count -gt 0)
+                }
+            }
+            catch {
+                Write-GuiLog "[Winget] Steam ownership cache is unreadable; requesting a refresh: $($_.Exception.Message)"
+            }
+        }
         if ($hasSteamCache) { $script:WmtWingetScanSteamCacheAttempted = $false }
         elseif (-not $script:WmtWingetScanSteamCacheAttempted) {
             $previousLibraryBuild = $script:WmtLibraryCacheAsyncResult
@@ -50383,7 +50397,7 @@ $btnWingetScan.Add_Click({
                 return
             }
         }
-        $steamOwnershipJson = if ($script:WmtSteamLibraryCache) {
+        $steamOwnershipJson = if ($script:WmtSteamLibraryCache -and -not (Test-Path -LiteralPath $steamCacheFile -PathType Leaf)) {
             ConvertTo-Json -InputObject @($script:WmtSteamLibraryCache) -Depth 4 -Compress
         } else { "" }
         $preparationArguments = [object[]]::new(3)
@@ -50394,14 +50408,19 @@ $btnWingetScan.Add_Click({
             param([string]$SettingsJson, [string]$SteamCacheFile, [string]$SteamOwnershipJson)
             $settings = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
             $steamOwnership = @()
-            if (-not [string]::IsNullOrWhiteSpace($SteamOwnershipJson)) {
-                try { $steamOwnership = @(ConvertFrom-Json -InputObject $SteamOwnershipJson -ErrorAction Stop) } catch {}
-            }
-            if ($steamOwnership.Count -eq 0 -and (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
+            if (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf) {
                 try {
-                    $steamOwnership = @([System.IO.File]::ReadAllText($SteamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+                    $cacheInfo = Get-Item -LiteralPath $SteamCacheFile -ErrorAction Stop
+                    if (((Get-Date) - $cacheInfo.LastWriteTime).TotalHours -lt 24) {
+                        $steamOwnership = @([System.IO.File]::ReadAllText($SteamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+                    }
                 }
                 catch {}
+            }
+            if ($steamOwnership.Count -eq 0 -and
+                -not (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf) -and
+                -not [string]::IsNullOrWhiteSpace($SteamOwnershipJson)) {
+                try { $steamOwnership = @(ConvertFrom-Json -InputObject $SteamOwnershipJson -ErrorAction Stop) } catch {}
             }
             if ($steamOwnership.Count -eq 0) {
                 $steamOwnership = @()
@@ -60069,8 +60088,8 @@ if ($btnWUDefault) { $btnWUDefault.Add_Click({
             if ($key) { $key.Dispose() }
             if ($baseKey) { $baseKey.Dispose() }
         }
-        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
-        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction Stop
+        Start-Service -Name wuauserv -ErrorAction Stop
         Write-Output "Windows Update set to Default."
     } | Out-Null
 }) }
@@ -60094,7 +60113,7 @@ if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
             if ($key) { $key.Dispose() }
             if ($baseKey) { $baseKey.Dispose() }
         }
-        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
+        Set-Service -Name wuauserv -StartupType Automatic -ErrorAction Stop
         Write-Output "Windows Update set to Security Only (deferring features)."
     } | Out-Null
 }) }
@@ -60114,8 +60133,8 @@ if ($btnWUDisable) { $btnWUDisable.Add_Click({
                 if ($key) { $key.Dispose() }
                 if ($baseKey) { $baseKey.Dispose() }
             }
-            Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
-            Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+            Set-Service -Name wuauserv -StartupType Disabled -ErrorAction Stop
+            Stop-Service -Name wuauserv -Force -ErrorAction Stop
             Write-Output "Windows Update DISABLED."
         } | Out-Null
     }
@@ -60867,12 +60886,14 @@ function Invoke-WmtPowerSettingToggle {
             return $null
         }
 
-        function Set-PowerSettingIndex {
-            param([string]$SubGroup, [string]$Setting, [int]$Value)
-            $output = @(powercfg /setacvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
-            if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the AC value: $($output -join ' ')" }
-            $output = @(powercfg /setdcvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
-            if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the DC value: $($output -join ' ')" }
+        function Set-PowerSettingIndexValue {
+            param([string]$SubGroup, [string]$Setting, [ValidateSet("AC", "DC")][string]$Mode, [int]$Value)
+            $verb = "/set${Mode}valueindex"
+            $output = @(powercfg $verb SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the $Mode value: $($output -join ' ')" }
+        }
+
+        function Invoke-PowerSettingPlan {
             $output = @(powercfg /S SCHEME_CURRENT 2>&1)
             if ($LASTEXITCODE -ne 0) { throw "powercfg could not activate the current power plan: $($output -join ' ')" }
         }
@@ -60882,13 +60903,34 @@ function Invoke-WmtPowerSettingToggle {
         if ($null -eq $currentAc -or $null -eq $currentDc) { throw "Powercfg could not read both AC and DC setting values." }
         $currentlyOn = ($currentAc -eq 1 -and $currentDc -eq 1)
         $targetValue = if ($currentlyOn) { 0 } else { 1 }
-        Set-PowerSettingIndex $Group $SettingName $targetValue
-        $actualAc = Get-PowerSettingIndex $Group $SettingName "AC"
-        $actualDc = Get-PowerSettingIndex $Group $SettingName "DC"
+        try {
+            Set-PowerSettingIndexValue $Group $SettingName "AC" $targetValue
+            Set-PowerSettingIndexValue $Group $SettingName "DC" $targetValue
+            Invoke-PowerSettingPlan
+            $actualAc = Get-PowerSettingIndex $Group $SettingName "AC"
+            $actualDc = Get-PowerSettingIndex $Group $SettingName "DC"
+            if ($actualAc -ne $targetValue -or $actualDc -ne $targetValue) {
+                throw "Powercfg did not confirm the requested AC and DC values."
+            }
+        }
+        catch {
+            $updateError = $_.Exception.Message
+            $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+            try { Set-PowerSettingIndexValue $Group $SettingName "AC" $currentAc }
+            catch { [void]$rollbackErrors.Add("AC restore failed: $($_.Exception.Message)") }
+            try { Set-PowerSettingIndexValue $Group $SettingName "DC" $currentDc }
+            catch { [void]$rollbackErrors.Add("DC restore failed: $($_.Exception.Message)") }
+            try { Invoke-PowerSettingPlan }
+            catch { [void]$rollbackErrors.Add("Power plan activation after restore failed: $($_.Exception.Message)") }
+            if ($rollbackErrors.Count -gt 0) {
+                throw "Power-setting update failed: $updateError. Rollback was incomplete: $($rollbackErrors -join ' ')"
+            }
+            throw "Power-setting update failed: $updateError. The original AC/DC values were restored."
+        }
         [pscustomobject]@{
             Message = "$SettingName set to $targetValue for AC and DC."
-            IsKnown = ($null -ne $actualAc -and $null -ne $actualDc)
-            IsOn = ($null -ne $actualAc -and $null -ne $actualDc -and $actualAc -eq 1 -and $actualDc -eq 1)
+            IsKnown = $true
+            IsOn = ($actualAc -eq 1 -and $actualDc -eq 1)
         }
     } | Out-Null
 }
