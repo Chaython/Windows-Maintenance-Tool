@@ -31877,10 +31877,10 @@ function Set-StartupApprovedState {
         if ($RootPath -match "(?i)Roaming") { "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" }
         else { "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" }
     }
-    if (-not (Test-Path $approvedPath)) { New-Item -Path $approvedPath -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $approvedPath)) { New-Item -LiteralPath $approvedPath -Force -ErrorAction Stop | Out-Null }
     $stateByte = if ($Enable) { [byte]0x02 } else { [byte]0x03 }
     $payload = [byte[]](($stateByte, 0x00, 0x00, 0x00) + [BitConverter]::GetBytes([DateTime]::Now.ToFileTime()))
-    Set-ItemProperty -Path $approvedPath -Name $ValueName -Value $payload -Type Binary -ErrorAction SilentlyContinue
+    Set-ItemProperty -LiteralPath $approvedPath -Name $ValueName -Value $payload -Type Binary -ErrorAction Stop
 }
 
 function Get-RegRunEntries {
