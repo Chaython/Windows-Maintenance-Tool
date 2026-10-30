@@ -261,22 +261,168 @@ while ($parts.Count -lt 4) { $parts += "0" }
 return [System.Version]::new([int]$parts[0], [int]$parts[1], [int]$parts[2], [int]$parts[3])
 }
 
+function Test-WmtUiCommandNeedsUiSession {
+# Invoke-UiCommand's background path starts the block in a brand-new runspace that is handed only
+# the block's text. That runspace cannot see this script's functions (Get-WmtSettings,
+# Save-WmtSettings, Write-GuiLog, ...) or any $script:/$global: state, so a block that uses them
+# fails there with "The term '...' is not recognized". Returns $true when the block is not provably
+# self-contained and therefore has to run in this (UI) session instead.
+# Blocks must not rely on caller-local variables either way; pass them with -ArgumentList.
+param([Parameter(Mandatory = $true)][scriptblock]$ScriptBlock)
+
+$blockAst = $ScriptBlock.Ast
+if (-not $blockAst) { return $true }
+
+foreach ($variable in @($blockAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))) {
+    if ($variable.VariablePath.IsScript -or $variable.VariablePath.IsGlobal) { return $true }
+}
+
+foreach ($command in @($blockAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+    $name = $command.GetCommandName()
+    # & $x / . $x: the target is unknown until run time, so it cannot be proven self-contained.
+    if ([string]::IsNullOrWhiteSpace($name)) { return $true }
+    # -ListImported only inspects what this session already has loaded (no module autoload on the UI thread).
+    $info = Get-Command -Name $name -ListImported -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($info -is [System.Management.Automation.AliasInfo]) { $info = $info.ResolvedCommand }
+    if ($info -is [System.Management.Automation.FunctionInfo] -and [string]::IsNullOrEmpty($info.ModuleName)) { return $true }
+}
+return $false
+}
+
 function Invoke-UiCommand {
 param(
-    [scriptblock]$Sb, 
-    $Msg = "Processing...", 
-    [object[]]$ArgumentList = @()
+    [scriptblock]$Sb,
+    $Msg = "Processing...",
+    [object[]]$ArgumentList = @(),
+    [scriptblock]$OnComplete,
+    [scriptblock]$OnError
 )
 try {
     Set-WmtBusyCursor -Busy
     Write-GuiLog $Msg
+    if ($OnComplete) {
+        $operationName = "UiCmd-" + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $userOnComplete = $OnComplete
+        $userOnError = $OnError
+        $completedCallback = {
+            param($record)
+            try {
+                if ($record.State -eq 'Completed') {
+                    $results = @($record.Result)
+                    $wroteResult = $false
+                    foreach ($item in $results) {
+                        if ($null -eq $item) { continue }
+                        $messageProperty = $null
+                        if ($item -is [System.Collections.IDictionary]) {
+                            if ($item.Contains('Message')) { $messageProperty = $item['Message'] }
+                        }
+                        elseif ($item.PSObject.Properties['Message']) {
+                            $messageProperty = $item.Message
+                        }
+                        if ($null -ne $messageProperty) {
+                            if (-not [string]::IsNullOrWhiteSpace([string]$messageProperty)) {
+                                Write-GuiLog ([string]$messageProperty)
+                                $wroteResult = $true
+                            }
+                            continue
+                        }
+                        $text = if ($item -is [string]) { [string]$item } else { (($item | Out-String).Trim()) }
+                        if (-not [string]::IsNullOrWhiteSpace($text)) {
+                            Write-GuiLog $text
+                            $wroteResult = $true
+                        }
+                    }
+                    if (-not $wroteResult) { Write-GuiLog "Done." }
+                    if ($userOnComplete -is [scriptblock]) {
+                        $paramCount = 0
+                        if ($userOnComplete.Ast -and $userOnComplete.Ast.ParamBlock) {
+                            $paramCount = $userOnComplete.Ast.ParamBlock.Parameters.Count
+                        }
+                        if ($paramCount -gt 0) {
+                            & $userOnComplete @($results)
+                        } else {
+                            & $userOnComplete
+                        }
+                    }
+                } else {
+                    $errors = @($record.Errors)
+                    $message = if ($record.State -eq 'TimedOut') { "Background operation '$operationName' timed out." }
+                        elseif ($record.State -eq 'Cancelled') { "Background operation '$operationName' was cancelled." }
+                        elseif ($errors.Count -gt 0) { Get-WmtErrorSummary $errors }
+                        else { "Background operation '$operationName' failed." }
+                    if ($record.State -ne 'Cancelled') { Write-GuiLog "ERROR: $message" }
+                    if ($userOnError -is [scriptblock] -and $record.State -ne 'Cancelled') {
+                        $paramCount = 0
+                        if ($userOnError.Ast -and $userOnError.Ast.ParamBlock) {
+                            $paramCount = $userOnError.Ast.ParamBlock.Parameters.Count
+                        }
+                        if ($paramCount -gt 0) {
+                            if ($errors.Count -gt 0) {
+                                & $userOnError @($errors)
+                            } else {
+                                & $userOnError @($record)
+                            }
+                        } else {
+                            & $userOnError
+                        }
+                    }
+                }
+            } catch {
+                Write-GuiLog "[Async] Completion callback failed: $($_.Exception.Message)"
+            }
+        }.GetNewClosure()
+        $timeoutSeconds = 300
+        try {
+            if (Test-WmtUiCommandNeedsUiSession -ScriptBlock $Sb) {
+                # The block needs this session's functions/state, which a background worker does not
+                # have. Run it here on the next shared-poller tick (so the caller's UI can repaint and
+                # callbacks never run inside the caller's stack) and deliver the result through the
+                # same callback used for background operations.
+                $uiSessionBlock = $Sb
+                $uiSessionArguments = $ArgumentList
+                $runInUiSession = {
+                    $record = [pscustomobject]@{ State = 'Completed'; Result = @(); Errors = @() }
+                    $previousErrorActionPreference = $ErrorActionPreference
+                    try {
+                        $ErrorActionPreference = 'Stop'
+                        $record.Result = @(& $uiSessionBlock @uiSessionArguments)
+                    }
+                    catch { $record.State = 'Failed'; $record.Errors = @($_) }
+                    finally { $ErrorActionPreference = $previousErrorActionPreference }
+                    & $completedCallback $record
+                }.GetNewClosure()
+                [void](Register-WmtUiPollOperation -Name $operationName -IntervalMs 0 -TestComplete { $true } -OnComplete $runInUiSession)
+            }
+            else {
+                [void](Start-WmtBackgroundOperation -Name $operationName -ScriptBlock $Sb -ArgumentList $ArgumentList -TimeoutSeconds $timeoutSeconds -OnCompleted $completedCallback -Quiet:$false)
+                Initialize-WmtUiPollTimer
+            }
+        } catch {
+            Write-GuiLog "ERROR: $($_.Exception.Message)"
+            if ($userOnError -is [scriptblock]) {
+                $paramCount = 0
+                if ($userOnError.Ast -and $userOnError.Ast.ParamBlock) { $paramCount = $userOnError.Ast.ParamBlock.Parameters.Count }
+                try {
+                    if ($paramCount -gt 0) { & $userOnError @($_) } else { & $userOnError }
+                } catch {}
+            }
+        }
+        return
+    }
     # Pass arguments to the scriptblock using splatting
     $res = & $Sb @ArgumentList | Out-String
     if (-not [string]::IsNullOrWhiteSpace($res)) { Write-GuiLog $res.Trim() }
     else { Write-GuiLog "Done." }
 }
-catch { 
-    Write-GuiLog "ERROR: $($_.Exception.Message)" 
+catch {
+    Write-GuiLog "ERROR: $($_.Exception.Message)"
+    if ($OnError -is [scriptblock]) {
+        $paramCount = 0
+        if ($OnError.Ast -and $OnError.Ast.ParamBlock) { $paramCount = $OnError.Ast.ParamBlock.Parameters.Count }
+        try {
+            if ($paramCount -gt 0) { & $OnError @($_) } else { & $OnError }
+        } catch {}
+    }
 }
 finally {
     Set-WmtBusyCursor
@@ -8468,6 +8614,149 @@ try {
     return "$($fi.Length):$($fi.LastWriteTimeUtc.Ticks)"
 }
 catch { return "<unknown>" }
+}
+
+function Invoke-WmtSettingsPatchSave {
+param(
+    [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Patch,
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$Message,
+    [object[]]$ListOperations = @(),
+    [scriptblock]$OnComplete,
+    [scriptblock]$OnError
+)
+
+$settingsPath = Join-Path (Get-DataPath) "settings.json"
+$baseline = $script:WmtSettingsCache
+if (-not $baseline) { $baseline = Get-WmtSettings }
+$baselineJson = ConvertTo-Json -InputObject $baseline -Depth 8 -Compress
+$patchJson = ConvertTo-Json -InputObject $Patch -Depth 8 -Compress
+$listOperationsJson = ConvertTo-Json -InputObject @($ListOperations) -Depth 8 -Compress
+$mutexName = $script:WmtSettingsWriteMutexName
+$userOnComplete = $OnComplete
+$completed = {
+    param($results)
+    $saved = @($results | Where-Object { $_ -and $_.PSObject.Properties['SettingsStamp'] -and $_.PSObject.Properties['Settings'] } | Select-Object -Last 1)[0]
+    if (-not $saved) { throw "Settings save completed without returning the saved settings state." }
+    $script:WmtSettingsCache = Copy-WmtSettings -Settings $saved.Settings
+    $script:WmtSettingsCacheStamp = [string]$saved.SettingsStamp
+    if (-not [string]::IsNullOrWhiteSpace([string]$saved.Message)) { Write-GuiLog ([string]$saved.Message) }
+    else { Write-GuiLog "Done." }
+    if ($userOnComplete) { & $userOnComplete $results }
+}.GetNewClosure()
+
+$arguments = [object[]]::new(5)
+$arguments[0] = $settingsPath
+$arguments[1] = $baselineJson
+$arguments[2] = $patchJson
+$arguments[3] = $listOperationsJson
+$arguments[4] = $mutexName
+Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments -SuppressResultLog -OnComplete $completed -OnError $OnError -Sb {
+    param([string]$Path, [string]$BaselineJson, [string]$PatchJson, [string]$ListOperationsJson, [string]$WriteMutexName)
+
+    $mutex = $null
+    $lockTaken = $false
+    $tempPath = $null
+    try {
+        $mutex = [System.Threading.Mutex]::new($false, $WriteMutexName)
+        try { $lockTaken = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+        catch [System.Threading.AbandonedMutexException] { $lockTaken = $true }
+        if (-not $lockTaken) { throw "Timed out waiting for the settings file lock." }
+
+        $baselineSettings = ConvertFrom-Json -InputObject $BaselineJson -ErrorAction Stop
+        if ($null -eq $baselineSettings) { throw "Could not load the current settings defaults." }
+        $settings = if ([System.IO.File]::Exists($Path)) {
+            $raw = [System.IO.File]::ReadAllText($Path)
+            if ([string]::IsNullOrWhiteSpace($raw)) { throw "settings.json is empty." }
+            $parsed = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+            if ($null -eq $parsed) { throw "settings.json contains no settings object." }
+            $parsed
+        }
+        else {
+            $baselineSettings
+        }
+        foreach ($property in @($baselineSettings.PSObject.Properties)) {
+            if (-not $settings.PSObject.Properties[$property.Name]) {
+                $settings | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value -Force
+            }
+        }
+        $patch = ConvertFrom-Json -InputObject $PatchJson -ErrorAction Stop
+        foreach ($property in @($patch.PSObject.Properties)) {
+            $settings | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value -Force
+        }
+        $listOperations = @(ConvertFrom-Json -InputObject $ListOperationsJson -ErrorAction Stop)
+        foreach ($operation in $listOperations) {
+            if (-not $operation -or [string]::IsNullOrWhiteSpace([string]$operation.Property)) { continue }
+            $list = [System.Collections.Generic.List[string]]::new()
+            $existing = $settings.PSObject.Properties[[string]$operation.Property]
+            if ($existing) {
+                foreach ($value in @($existing.Value)) {
+                    $text = ([string]$value).Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($text) -and -not $list.Contains($text)) { [void]$list.Add($text) }
+                }
+            }
+            foreach ($value in @($operation.Values)) {
+                $text = ([string]$value).Trim()
+                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                if ([string]$operation.Action -eq 'Add') {
+                    if (-not $list.Contains($text)) { [void]$list.Add($text) }
+                }
+                elseif ([string]$operation.Action -eq 'Remove') {
+                    [void]$list.Remove($text)
+                }
+                else { throw "Unsupported settings list operation '$($operation.Action)'." }
+            }
+            $settings | Add-Member -MemberType NoteProperty -Name ([string]$operation.Property) -Value $list.ToArray() -Force
+        }
+        $json = ConvertTo-Json -InputObject $settings -Depth 8
+        $directory = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not [System.IO.Directory]::Exists($directory)) {
+            [void][System.IO.Directory]::CreateDirectory($directory)
+        }
+        if ([System.IO.File]::Exists($Path) -and
+            (([System.IO.File]::GetAttributes($Path) -band [System.IO.FileAttributes]::ReadOnly) -ne 0)) {
+            throw "settings.json is read-only."
+        }
+        $tempPath = Join-Path $directory ("settings.{0}.{1}.tmp" -f $PID, [Guid]::NewGuid().ToString("N"))
+        [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
+        $validation = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($tempPath)) -ErrorAction Stop
+        if ($null -eq $validation) { throw "Serialized settings unexpectedly parsed as null." }
+
+        if ([System.IO.File]::Exists($Path)) {
+            $backupPath = "$Path.bak"
+            try {
+                if ([System.IO.File]::Exists($backupPath)) { [System.IO.File]::Delete($backupPath) }
+                [System.IO.File]::Replace($tempPath, $Path, $backupPath, $true)
+                $tempPath = $null
+            }
+            catch {
+                try { [System.IO.File]::Copy($Path, $backupPath, $true) } catch {}
+                Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+                $tempPath = $null
+            }
+        }
+        else {
+            [System.IO.File]::Move($tempPath, $Path)
+            $tempPath = $null
+        }
+
+        $fileInfo = [System.IO.FileInfo]::new($Path)
+        [pscustomobject]@{
+            Message = "Settings saved."
+            Settings = $settings
+            SettingsStamp = "$($fileInfo.Length):$($fileInfo.LastWriteTimeUtc.Ticks)"
+        }
+    }
+    finally {
+        if ($tempPath -and [System.IO.File]::Exists($tempPath)) {
+            try { [System.IO.File]::Delete($tempPath) } catch {}
+        }
+        if ($lockTaken -and $mutex) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        if ($mutex) { try { $mutex.Dispose() } catch {} }
+    }
+} | Out-Null
 }
 
 function Test-WmtSettingsMember {
@@ -31561,6 +31850,165 @@ $fnInvokeStartupTabLoad = ${function:Invoke-StartupTabLoad}.GetNewClosure()
 $fnSetStartupView = ${function:Set-StartupView}.GetNewClosure()
 $fnInvokeStartupTaskSelection = ${function:Invoke-WmtStartupTaskSelection}.GetNewClosure()
 
+$invokeStartupApprovedAction = {
+    param($SelectedRows, [bool]$Enable)
+    $rows = @($SelectedRows)
+    if ($rows.Count -eq 0) { return }
+    $records = @($rows | ForEach-Object { [PSCustomObject]@{ Type=[string]$_['Type']; RootRunPath=[string]$_['RootRunPath']; ValueName=[string]$_['ValueName'] } })
+    $arguments = [object[]]::new(2)
+    $arguments[0] = $records
+    $arguments[1] = $Enable
+    $completed = {
+        param($results)
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededKeys'] } | Select-Object -Last 1)[0]
+        if (-not $result) { return }
+        $succeeded = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($result.SucceededKeys)) { [void]$succeeded.Add([string]$key) }
+        foreach ($index in 0..($rows.Count - 1)) {
+            $key = "$($records[$index].Type)|$($records[$index].RootRunPath)|$($records[$index].ValueName)"
+            if ($succeeded.Contains($key)) { $rows[$index]['Enabled'] = if ($Enable) { 'Yes' } else { 'No' } }
+        }
+        if (@($result.Failures).Count -gt 0) {
+            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Startup Manager" -Image Warning | Out-Null
+        }
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name ("StartupApproved_" + [guid]::NewGuid().ToString("N")) -Msg "Updating startup entries..." -ArgumentList $arguments -OnComplete $completed -OnError {
+        param($errorRecord)
+        Show-WmtMessageBox -Owner $dialog -Message "Could not update startup entries:`n$($errorRecord.Exception.Message)" -Title "Startup Manager" -Image Error | Out-Null
+    }.GetNewClosure() -Sb {
+        param($Entries, [bool]$EnableEntries)
+        $succeeded = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        foreach ($entry in $Entries) {
+            $approvedPath = if ($entry.Type -eq "Registry") {
+                if ($entry.RootRunPath -match "(?i)WOW6432Node") { $entry.RootRunPath -replace "(?i)WOW6432Node\\", "" -replace "(?i)CurrentVersion\\Run", "CurrentVersion\Explorer\StartupApproved\Run32" }
+                else { $entry.RootRunPath -replace "(?i)CurrentVersion\\Run", "CurrentVersion\Explorer\StartupApproved\Run" }
+            }
+            else {
+                if ($entry.RootRunPath -match "(?i)Roaming") { "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" }
+                else { "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" }
+            }
+            $root = $null
+            $subPath = $null
+            if ($approvedPath -match '(?i)^HKCU:\\?(.*)$') {
+                $root = [Microsoft.Win32.RegistryHive]::CurrentUser
+                $subPath = $Matches[1]
+            }
+            elseif ($approvedPath -match '(?i)^HKLM:\\?(.*)$') {
+                $root = [Microsoft.Win32.RegistryHive]::LocalMachine
+                $subPath = $Matches[1]
+            }
+            else {
+                [void]$failures.Add("$($entry.RootRunPath): unsupported registry path.")
+                continue
+            }
+            $baseKey = $null
+            $key = $null
+            try {
+                $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($root, [Microsoft.Win32.RegistryView]::Default)
+                $key = $baseKey.CreateSubKey($subPath)
+                if (-not $key) { throw "Could not create or open the StartupApproved registry key." }
+                $stateByte = if ($EnableEntries) { [byte]0x02 } else { [byte]0x03 }
+                $payload = [byte[]]($stateByte, 0x00, 0x00, 0x00) + [BitConverter]::GetBytes([DateTime]::Now.ToFileTime())
+                $key.SetValue([string]$entry.ValueName, $payload, [Microsoft.Win32.RegistryValueKind]::Binary)
+                [void]$succeeded.Add("$($entry.Type)|$($entry.RootRunPath)|$($entry.ValueName)")
+            }
+            catch { [void]$failures.Add("$($entry.RootRunPath): $($_.Exception.Message)") }
+            finally {
+                if ($key) { $key.Dispose() }
+                if ($baseKey) { $baseKey.Dispose() }
+            }
+        }
+        $verb = if ($EnableEntries) { 'enabled' } else { 'disabled' }
+        [pscustomobject]@{ Message = "$($succeeded.Count) startup entries $verb."; SucceededKeys = $succeeded.ToArray(); Failures = $failures.ToArray() }
+    } | Out-Null
+}.GetNewClosure()
+
+$invokeServiceStartupAction = {
+    param($SelectedRows, [string]$StartupType)
+    $rows = @($SelectedRows)
+    if ($rows.Count -eq 0) { return }
+    $names = [string[]]@($rows | ForEach-Object { [string]$_['Name'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $arguments = [object[]]::new(2)
+    $arguments[0] = $names
+    $arguments[1] = $StartupType
+    $completed = {
+        param($results)
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededNames'] } | Select-Object -Last 1)[0]
+        if (-not $result) { return }
+        foreach ($row in $rows) { if (@($result.SucceededNames) -contains [string]$row['Name']) { $row['StartType'] = $StartupType } }
+        if (@($result.Failures).Count -gt 0) {
+            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Services" -Image Warning | Out-Null
+        }
+    }.GetNewClosure()
+    Invoke-UiCommand {
+        param([string[]]$ServiceNames, [string]$Type)
+        $failures = [System.Collections.Generic.List[string]]::new()
+        $succeeded = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $ServiceNames) {
+            try { Set-Service -Name $name -StartupType $Type -ErrorAction Stop; [void]$succeeded.Add($name) }
+            catch { [void]$failures.Add("${name}: $($_.Exception.Message)") }
+        }
+        [pscustomobject]@{ Message = "Set startup type to $Type for $($succeeded.Count) service(s)."; SucceededNames=$succeeded.ToArray(); Failures=$failures.ToArray() }
+    } "Updating service startup types..." -ArgumentList $arguments -OnComplete $completed
+}.GetNewClosure()
+
+$invokeStartupRowDelete = {
+    param($Tab, $SelectedRows, [ValidateSet('Windows','ContextMenu','Services')][string]$Kind)
+    $rows = @($SelectedRows)
+    if ($rows.Count -eq 0) { return }
+    $records = @($rows | ForEach-Object {
+        $type = switch ($Kind) {
+            'Windows' { [string]$_['Type']; break }
+            'ContextMenu' { 'ContextMenu'; break }
+            'Services' { 'Service'; break }
+        }
+        $path = if ($Kind -eq 'Windows') { [string]$_['ItemPath'] } elseif ($Kind -eq 'ContextMenu') { [string]$_['Path'] } else { [string]$_['Name'] }
+        $valueName = if ($Kind -eq 'Windows') { [string]$_['ValueName'] } else { '' }
+        [PSCustomObject]@{ Kind=$type; Path=$path; ValueName=$valueName; Key="$type|$path|$valueName" }
+    })
+    $arguments = [object[]]::new(2)
+    $arguments[0] = $records
+    $arguments[1] = $Kind
+    $completed = {
+        param($results)
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['SucceededKeys'] } | Select-Object -Last 1)[0]
+        if (-not $result) { return }
+        $succeeded = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($result.SucceededKeys)) { [void]$succeeded.Add([string]$key) }
+        $removed = [System.Collections.Generic.List[object]]::new()
+        for ($index = 0; $index -lt $rows.Count; $index++) {
+            if ($succeeded.Contains([string]$records[$index].Key)) { [void]$removed.Add($rows[$index]) }
+        }
+        if ($removed.Count -gt 0) { & $fnRemoveWmtDataRows $Tab $removed.ToArray() }
+        if (@($result.Failures).Count -gt 0) {
+            Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Startup Manager" -Image Warning | Out-Null
+        }
+    }.GetNewClosure()
+    Invoke-UiCommand {
+        param($Entries, [string]$DeleteKind)
+        $succeeded = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        foreach ($entry in $Entries) {
+            try {
+                switch ($entry.Kind) {
+                    'StartupFolder' { Remove-Item -LiteralPath $entry.Path -Force -ErrorAction Stop }
+                    'Registry' { Remove-ItemProperty -LiteralPath $entry.Path -Name $entry.ValueName -ErrorAction Stop }
+                    'ContextMenu' { Remove-Item -LiteralPath $entry.Path -Recurse -Force -ErrorAction Stop }
+                    'Service' {
+                        $output = @(& sc.exe delete ([string]$entry.Path) 2>&1)
+                        if ($LASTEXITCODE -ne 0) { throw ($output -join ' ') }
+                    }
+                    default { throw "Unsupported delete type '$($entry.Kind)'." }
+                }
+                [void]$succeeded.Add([string]$entry.Key)
+            }
+            catch { [void]$failures.Add("$($entry.Path): $($_.Exception.Message)") }
+        }
+        [pscustomobject]@{ Message = "Deleted $($succeeded.Count) of $($Entries.Count) selected item(s)."; SucceededKeys=$succeeded.ToArray(); Failures=$failures.ToArray() }
+    } "Deleting selected startup entries..." -ArgumentList $arguments -OnComplete $completed
+}.GetNewClosure()
+
 $btnWinTab.Add_Click({ & $fnSetStartupView "Windows" }.GetNewClosure())
 $btnTaskTab.Add_Click({ & $fnSetStartupView "Scheduled Tasks" }.GetNewClosure())
 $btnCtxTab.Add_Click({ & $fnSetStartupView "Context Menu" }.GetNewClosure())
@@ -31619,20 +32067,13 @@ Add-GridContextMenu -TabObj $svcTab -Buttons @($btnSvcRefresh, $btnSvcDetails, $
 
 $btnWinRefresh.Add_Click({ & $fnInvokeStartupTabLoad "Windows" $true }.GetNewClosure())
 $btnWinDetails.Add_Click({ & $fnShowStartupRowDetails $winTab "Windows Startup Details" }.GetNewClosure())
-$btnWinEnable.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $winTab.Grid) { & $fnSetStartupApprovedState ([string]$row["Type"]) ([string]$row["RootRunPath"]) ([string]$row["ValueName"]) $true; $row["Enabled"] = "Yes" } }.GetNewClosure())
-$btnWinDisable.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $winTab.Grid) { & $fnSetStartupApprovedState ([string]$row["Type"]) ([string]$row["RootRunPath"]) ([string]$row["ValueName"]) $false; $row["Enabled"] = "No" } }.GetNewClosure())
+$btnWinEnable.Add_Click({ & $invokeStartupApprovedAction (Get-WmtDataGridSelectedRows $winTab.Grid) $true }.GetNewClosure())
+$btnWinDisable.Add_Click({ & $invokeStartupApprovedAction (Get-WmtDataGridSelectedRows $winTab.Grid) $false }.GetNewClosure())
 $btnWinDelete.Add_Click({
         $selected = @(Get-WmtDataGridSelectedRows $winTab.Grid)
         if ($selected.Count -eq 0) { return }
         if ((Show-WmtMessageBox -Owner $dialog -Message "Delete selected entries?" -Title "Confirm" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        foreach ($row in $selected) {
-            $type = [string]$row["Type"]
-            $itemPath = [string]$row["ItemPath"]
-            $valueName = [string]$row["ValueName"]
-            if ($type -eq "StartupFolder") { Remove-Item -LiteralPath $itemPath -Force -ErrorAction SilentlyContinue }
-            elseif ($type -eq "Registry" -and $itemPath -and $valueName) { Remove-ItemProperty -Path $itemPath -Name $valueName -ErrorAction SilentlyContinue }
-        }
-        & $fnRemoveWmtDataRows $winTab $selected
+        & $invokeStartupRowDelete $winTab $selected 'Windows'
     }.GetNewClosure())
 
 $btnTaskRefresh.Add_Click({ & $fnInvokeStartupTabLoad "Scheduled Tasks" $true }.GetNewClosure())
@@ -31654,14 +32095,37 @@ $btnTaskDelete.Add_Click({ & $fnInvokeStartupTaskSelection Delete }.GetNewClosur
 
 $btnCtxRefresh.Add_Click({ & $fnInvokeStartupTabLoad "Context Menu" $true }.GetNewClosure())
 $btnCtxDetails.Add_Click({ & $fnShowStartupRowDetails $ctxTab "Context Menu Details" }.GetNewClosure())
-$btnCtxEnable.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $ctxTab.Grid) { $path = [string]$row["Path"]; if ($path -and (Test-Path -LiteralPath $path)) { Remove-ItemProperty -LiteralPath $path -Name "LegacyDisable" -ErrorAction SilentlyContinue; $row["Enabled"] = "Yes" } } }.GetNewClosure())
-$btnCtxDisable.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $ctxTab.Grid) { $path = [string]$row["Path"]; if ($path -and (Test-Path -LiteralPath $path)) { Set-ItemProperty -Path $path -Name "LegacyDisable" -Value "" -ErrorAction SilentlyContinue; $row["Enabled"] = "No" } } }.GetNewClosure())
+$btnCtxEnable.Add_Click({
+    $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
+    $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $complete = {
+        param($results)
+        foreach ($row in $selected) { if ($records -contains [string]$row['Path']) { $row['Enabled'] = 'Yes' } }
+    }.GetNewClosure()
+    Invoke-UiCommand {
+        param([string[]]$Paths)
+        foreach ($path in $Paths) { Remove-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -ErrorAction SilentlyContinue }
+        [pscustomobject]@{ Message = "Enabled $($Paths.Count) context menu item(s)." }
+    } 'Enabling context menu entries...' -ArgumentList @($records) -OnComplete $complete
+}.GetNewClosure())
+$btnCtxDisable.Add_Click({
+    $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
+    $records = [string[]]@($selected | ForEach-Object { [string]$_['Path'] } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $complete = {
+        param($results)
+        foreach ($row in $selected) { if ($records -contains [string]$row['Path']) { $row['Enabled'] = 'No' } }
+    }.GetNewClosure()
+    Invoke-UiCommand {
+        param([string[]]$Paths)
+        foreach ($path in $Paths) { Set-ItemProperty -LiteralPath $path -Name 'LegacyDisable' -Value '' -ErrorAction SilentlyContinue }
+        [pscustomobject]@{ Message = "Disabled $($Paths.Count) context menu item(s)." }
+    } 'Disabling context menu entries...' -ArgumentList @($records) -OnComplete $complete
+}.GetNewClosure())
 $btnCtxDelete.Add_Click({
         $selected = @(Get-WmtDataGridSelectedRows $ctxTab.Grid)
         if ($selected.Count -eq 0) { return }
         if ((Show-WmtMessageBox -Owner $dialog -Message "Delete selected context menu entries?" -Title "Confirm" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        foreach ($row in $selected) { $path = [string]$row["Path"]; if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue } }
-        & $fnRemoveWmtDataRows $ctxTab $selected
+        & $invokeStartupRowDelete $ctxTab $selected 'ContextMenu'
     }.GetNewClosure())
 
 $btnSvcRefresh.Add_Click({ & $fnInvokeStartupTabLoad "Services" $true }.GetNewClosure())
@@ -31676,15 +32140,14 @@ $btnSvcConsole.Add_Click({
         }
         catch { Write-GuiLog "[Services] Could not open Services console: $($_.Exception.Message)" }
     }.GetNewClosure())
-$btnSvcEnable.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $svcTab.Grid) { $name = [string]$row["Name"]; if ($name) { Set-Service -Name $name -StartupType Automatic -ErrorAction SilentlyContinue; $row["StartType"] = "Automatic" } } }.GetNewClosure())
-$btnSvcManual.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $svcTab.Grid) { $name = [string]$row["Name"]; if ($name) { Set-Service -Name $name -StartupType Manual -ErrorAction SilentlyContinue; $row["StartType"] = "Manual" } } }.GetNewClosure())
-$btnSvcDisable.Add_Click({ foreach ($row in Get-WmtDataGridSelectedRows $svcTab.Grid) { $name = [string]$row["Name"]; if ($name) { Set-Service -Name $name -StartupType Disabled -ErrorAction SilentlyContinue; $row["StartType"] = "Disabled" } } }.GetNewClosure())
+$btnSvcEnable.Add_Click({ & $invokeServiceStartupAction (Get-WmtDataGridSelectedRows $svcTab.Grid) 'Automatic' }.GetNewClosure())
+$btnSvcManual.Add_Click({ & $invokeServiceStartupAction (Get-WmtDataGridSelectedRows $svcTab.Grid) 'Manual' }.GetNewClosure())
+$btnSvcDisable.Add_Click({ & $invokeServiceStartupAction (Get-WmtDataGridSelectedRows $svcTab.Grid) 'Disabled' }.GetNewClosure())
 $btnSvcDelete.Add_Click({
         $selected = @(Get-WmtDataGridSelectedRows $svcTab.Grid)
         if ($selected.Count -eq 0) { return }
         if ((Show-WmtMessageBox -Owner $dialog -Message "Delete selected services? This is risky." -Title "Confirm" -Button YesNo -Image Warning) -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        foreach ($row in $selected) { $name = [string]$row["Name"]; if ($name) { sc.exe delete $name | Out-Null } }
-        & $fnRemoveWmtDataRows $svcTab $selected
+        & $invokeStartupRowDelete $svcTab $selected 'Services'
     }.GetNewClosure())
 
 $dialog.Add_ContentRendered({
@@ -31722,6 +32185,35 @@ else {
 }
 }
 
+function Read-WmtRegistryKeyValuesLive {
+param([string]$Path)
+
+if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+$parts = Convert-WmtRegistryPath -Path $Path
+if (-not $parts) { return $null }
+
+$baseKey = $null
+$key = $null
+try {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
+    $key = $baseKey.OpenSubKey($parts.SubPath, $false)
+    if (-not $key) { return $null }
+
+    $values = @{}
+    foreach ($valueName in $key.GetValueNames()) {
+        $values[$valueName] = $key.GetValue(
+            $valueName, $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+        )
+    }
+    return $values
+}
+finally {
+    if ($key) { $key.Dispose() }
+    if ($baseKey) { $baseKey.Dispose() }
+}
+}
+
 function Get-WmtRegValue {
 param(
     [string]$Path,
@@ -31730,59 +32222,27 @@ param(
 )
 
 if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
-
 $item = Get-WmtRegistryKeyValuesCached -Path $Path
-if ($null -ne $item) {
-    # Registry snapshots may be dictionaries or legacy PSObjects. Read named
-    # entries correctly without converting the dictionary (default value uses "").
-    if ($item -is [System.Collections.IDictionary]) {
-        if ($item.Contains($Name)) { return $item[$Name] }
-        if ($Name -eq "(Default)" -and $item.Contains("")) { return $item[""] }
-        return $Default
-    }
-    $property = $item.PSObject.Properties[$Name]
-    if ($property) { return $property.Value }
-    return $Default
-}
-
-# Clear-WmtRegCache deliberately removes a path snapshot before click handlers
-# inspect the current value. A cache miss must therefore read that one registry
-# value live; returning $Default here makes toggles such as HideFileExt think the
-# setting is always at its Windows default and can flip the wrong way.
-$parts = $null
-$baseKey = $null
-$key = $null
-try {
-    $parts = Convert-WmtRegistryPath -Path $Path
-    if (-not $parts) { return $Default }
-    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($parts.Hive, [Microsoft.Win32.RegistryView]::Default)
-    $key = $baseKey.OpenSubKey($parts.SubPath, $false)
-    if (-not $key) { return $Default }
-
-    # Refresh the complete snapshot after invalidation so later state renders
-    # cannot fall back to defaults for the other values in this same registry key.
-    $values = @{}
-    foreach ($valueName in $key.GetValueNames()) {
-        $values[$valueName] = $key.GetValue(
-            $valueName,
-            $null,
-            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
-        )
+if ($null -eq $item) {
+    try { $item = Read-WmtRegistryKeyValuesLive -Path $Path }
+    catch {
+        $item = $null
+        Write-GuiLog "ERROR: Could not read registry key '$Path': $($_.Exception.Message)"
     }
     if (-not $script:TweakButtonStatesCache) { $script:TweakButtonStatesCache = @{} }
-    $script:TweakButtonStatesCache[$Path] = $values
+    $script:TweakButtonStatesCache[$Path] = $item
+}
 
-    $registryName = if ($Name -eq "(Default)") { "" } else { $Name }
-    if ($values.ContainsKey($registryName)) { return $values[$registryName] }
+# UI-thread lookups only consume the last complete background snapshot. A
+# cache miss stays at its supplied default until a worker refreshes the key.
+if ($item -is [System.Collections.IDictionary]) {
+    if ($item.Contains($Name)) { return $item[$Name] }
+    if ($Name -eq '(Default)' -and $item.Contains('')) { return $item[''] }
     return $Default
 }
-catch {
-    return $Default
-}
-finally {
-    if ($key) { try { $key.Close() } catch {} }
-    if ($baseKey) { try { $baseKey.Close() } catch {} }
-}
+$property = $item.PSObject.Properties[$Name]
+if ($property) { return $property.Value }
+return $Default
 }
 
 # Refresh or invalidate the registry snapshot after a registry write. Clearing only
@@ -36358,15 +36818,26 @@ if ($script:TweakButtonStatesCache -and $script:TweakButtonStatesCache.ContainsK
     return $script:TweakButtonStatesCache[$Path]
 }
 
-# Rendering and QuickFind must not perform synchronous registry I/O on cache misses.
-# A missing worker snapshot stays unknown until the next background refresh.
+# Callers that need a concrete value on a cache miss perform one live key read.
 return $null
 }
 
-# Invalidate specific registry path(s) from the tweak-states cache so the next
-# Get-WmtRegValue call reads fresh data from the registry instead of stale cache.
+# Invalidate specific registry path(s) from the tweak-states cache. Callers that
+# preserve a UI snapshot refresh those keys live so toggle decisions see external changes.
 function Clear-WmtRegCache {
-param([string[]]$Paths)
+param([string[]]$Paths, [switch]$PreserveUiSnapshot)
+if ($PreserveUiSnapshot) {
+    if (-not $script:TweakButtonStatesCache) { $script:TweakButtonStatesCache = @{} }
+    foreach ($p in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        try { $script:TweakButtonStatesCache[$p] = Read-WmtRegistryKeyValuesLive -Path $p }
+        catch {
+            $script:TweakButtonStatesCache[$p] = $null
+            Write-GuiLog "ERROR: Could not refresh registry key '$p': $($_.Exception.Message)"
+        }
+    }
+    return
+}
 if (-not $script:TweakButtonStatesCache) { return }
 foreach ($p in $Paths) {
     if ([string]::IsNullOrWhiteSpace($p)) { continue }
@@ -38077,7 +38548,7 @@ $btnToggleCopilot.Add_Click({
         $adv = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
         $polUser = "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot"
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $adv "ShowCopilotButton" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "TurnOffWindowsCopilot" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "TurnOffWindowsCopilot" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $adv "ShowCopilotButton" 1; Remove-WmtRegValue $polUser "TurnOffWindowsCopilot"; Remove-WmtRegValue $polMachine "TurnOffWindowsCopilot"; Write-GuiLog "Copilot enabled." } "Enabling Copilot..."
@@ -38094,7 +38565,7 @@ if ($btnToggleRecall) {
 $btnToggleRecall.Add_Click({
         $polUser = "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI"
-        Clear-WmtRegCache @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polMachine "AllowRecallEnablement" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "TurnOffSavingSnapshots" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polUser "DisableAIDataAnalysis" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $polMachine "AllowRecallEnablement"; Remove-WmtRegValue $polMachine "TurnOffSavingSnapshots"; Remove-WmtRegValue $polUser "DisableAIDataAnalysis"; Remove-WmtRegValue $polMachine "DisableAIDataAnalysis"; Write-GuiLog "Recall snapshot-saving policies cleared. The user may still need to enable Recall in Settings." } "Enabling Recall..."
@@ -38102,7 +38573,7 @@ $btnToggleRecall.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polUser "DisableAIDataAnalysis" 1; Set-WmtRegDword $polMachine "AllowRecallEnablement" 0; Set-WmtRegDword $polMachine "TurnOffSavingSnapshots" 1; Write-GuiLog "Recall disabled." } "Disabling Recall..."
         }
-        Clear-WmtRegCache @($polUser, $polMachine)
+        Clear-WmtRegCache -PreserveUiSnapshot @($polUser, $polMachine)
         $allowRecallNow = Get-WmtRegValue $polMachine "AllowRecallEnablement" 1
         $turnOffSnapshotsNow = Get-WmtRegValue $polMachine "TurnOffSavingSnapshots" 0
         $disableAiUserNow = Get-WmtRegValue $polUser "DisableAIDataAnalysis" 0
@@ -38117,7 +38588,7 @@ if ($btnToggleClickToDo) {
 $btnToggleClickToDo.Add_Click({
         $polUser = "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI"
-        Clear-WmtRegCache @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Policies\Microsoft\Windows\WindowsAI", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polUser "DisableClickToDo" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableClickToDo" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $polUser "DisableClickToDo"; Remove-WmtRegValue $polMachine "DisableClickToDo"; Write-GuiLog "Click To Do enabled." } "Enabling Click To Do..."
@@ -38133,7 +38604,7 @@ $btnToggleAISvcAutoStart = Get-Ctrl "btnToggleAISvcAutoStart"
 if ($btnToggleAISvcAutoStart) {
 $btnToggleAISvcAutoStart.Add_Click({
         $polMachine = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $polMachine "DisableAIDataAnalysis"; Write-GuiLog "Device AI data-analysis policy cleared." } "Allowing AI data analysis..."
@@ -38141,7 +38612,7 @@ $btnToggleAISvcAutoStart.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $polMachine "DisableAIDataAnalysis" 1; Write-GuiLog "Device AI data-analysis policy applied." } "Blocking AI data analysis..."
         }
-        Clear-WmtRegCache @($polMachine)
+        Clear-WmtRegCache -PreserveUiSnapshot @($polMachine)
         $disableAiServiceNow = ConvertTo-Int (Get-WmtRegValue $polMachine "DisableAIDataAnalysis" 0) 0
         Update-WmtTweakToggle $btnToggleAISvcAutoStart ($disableAiServiceNow -ne 1) "AI Analysis Allowed" "AI Analysis Blocked"
     })
@@ -38151,7 +38622,7 @@ $btnToggleEdgeAI = Get-Ctrl "btnToggleEdgeAI"
 if ($btnToggleEdgeAI) {
 $btnToggleEdgeAI.Add_Click({
         $p = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Edge")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Policies\Microsoft\Edge")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "HubsSidebarEnabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 1; Write-GuiLog "Edge sidebar forced on." } "Enabling Edge sidebar..."
@@ -38159,7 +38630,7 @@ $btnToggleEdgeAI.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword $p "HubsSidebarEnabled" 0; Write-GuiLog "Edge sidebar forced off." } "Disabling Edge sidebar..."
         }
-        Clear-WmtRegCache @($p)
+        Clear-WmtRegCache -PreserveUiSnapshot @($p)
         $sidebarEnabledNow = ConvertTo-Int (Get-WmtRegValue $p "HubsSidebarEnabled" 1) 1
         Update-WmtTweakToggle $btnToggleEdgeAI ($sidebarEnabledNow -ne 0) "Edge Sidebar On" "Edge Sidebar Off"
     })
@@ -38169,7 +38640,7 @@ $btnTogglePaintAI = Get-Ctrl "btnTogglePaintAI"
 if ($btnTogglePaintAI) {
 $btnTogglePaintAI.Add_Click({
         $p = "HKCU:\Software\Microsoft\Paint\App"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Paint\App")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Paint\App")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "EnableCopilot" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableCopilot" 1; Write-GuiLog "Paint AI enabled." } "Enabling Paint AI..."
@@ -38185,7 +38656,7 @@ $btnToggleNotepadAI = Get-Ctrl "btnToggleNotepadAI"
 if ($btnToggleNotepadAI) {
 $btnToggleNotepadAI.Add_Click({
         $p = "HKCU:\Software\Microsoft\Notepad"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Notepad")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Notepad")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "CocreatorEnabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "CocreatorEnabled" 1; Write-GuiLog "Notepad AI enabled." } "Enabling Notepad AI..."
@@ -38201,7 +38672,7 @@ $btnToggleFindMyDevice = Get-Ctrl "btnToggleFindMyDevice"
 if ($btnToggleFindMyDevice) {
 $btnToggleFindMyDevice.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\FindMyDevice\LocationSync"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\FindMyDevice\LocationSync")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\FindMyDevice\LocationSync")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "Enabled" 0) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 1; Write-GuiLog "Find My Device enabled." } "Enabling Find My Device..."
@@ -38217,7 +38688,7 @@ $btnToggleLocationSvc = Get-Ctrl "btnToggleLocationSvc"
 if ($btnToggleLocationSvc) {
 $btnToggleLocationSvc.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location")
         $locationConsent = ConvertTo-Str (Get-WmtRegValue $p "Value" "") ""
         $currentlyOff = ($locationConsent -ine "Allow")
         if ($currentlyOff) {
@@ -38234,7 +38705,7 @@ $btnToggleModernStandby = Get-Ctrl "btnToggleModernStandby"
 if ($btnToggleModernStandby) {
 $btnToggleModernStandby.Add_Click({
         $p1 = "HKLM:\SYSTEM\CurrentControlSet\Control\Power"
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p1 "EnableAwakeNetworkOnDisconnect" 1) 0) -eq 0) -and ((ConvertTo-Int (Get-WmtRegValue $p1 "EnforceConnectedStandby" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p1 "EnableAwakeNetworkOnDisconnect" 1; Set-WmtRegDword $p1 "EnforceConnectedStandby" 1; Write-GuiLog "Modern Standby networking enabled." } "Enabling Modern Standby networking..."
@@ -38250,7 +38721,7 @@ $btnToggleDeviceAutoApp = Get-Ctrl "btnToggleDeviceAutoApp"
 if ($btnToggleDeviceAutoApp) {
 $btnToggleDeviceAutoApp.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceInstall\Settings"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceInstall\Settings")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceInstall\Settings")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "DisableDeviceAutoInstall" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $p "DisableDeviceAutoInstall"; Write-GuiLog "Device auto-app download enabled." } "Enabling device auto-apps..."
@@ -38266,7 +38737,7 @@ $btnToggleEndTask = Get-Ctrl "btnToggleEndTask"
 if ($btnToggleEndTask) {
 $btnToggleEndTask.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "TaskbarEndTask" 0) 0) -eq 1))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "TaskbarEndTask" 0; Write-GuiLog "End Task on taskbar disabled." } "Disabling End Task..."
@@ -38282,7 +38753,7 @@ $btnToggleLastActiveClick = Get-Ctrl "btnToggleLastActiveClick"
 if ($btnToggleLastActiveClick) {
 $btnToggleLastActiveClick.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "LastActiveClick" 0) 0) -eq 1))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "LastActiveClick" 0; Write-GuiLog "Last Active Click disabled." } "Disabling Last Active Click..."
@@ -38298,7 +38769,7 @@ $btnToggleGallery = Get-Ctrl "btnToggleGallery"
 if ($btnToggleGallery) {
 $btnToggleGallery.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $p "GalleryEnabled" 1) 0) -eq 0))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $p "GalleryEnabled" 1; Write-GuiLog "File Explorer Gallery shown." } "Showing Gallery..."
@@ -38315,7 +38786,7 @@ if ($btnToggleHomeExplorer) {
 $btnToggleHomeExplorer.Add_Click({
         $pUser = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
         $pMachine = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $pUser "ShowHomeFolder" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $pMachine "Start_HomeClassicMode" 0) 0) -eq 1))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $pUser "ShowHomeFolder" 1; Remove-WmtRegValue $pMachine "Start_HomeClassicMode"; Write-GuiLog "File Explorer Home shown." } "Showing Home..."
@@ -38331,7 +38802,7 @@ $btnToggleOneDriveFolder = Get-Ctrl "btnToggleOneDriveFolder"
 if ($btnToggleOneDriveFolder) {
 $btnToggleOneDriveFolder.Add_Click({
         $p = "HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}"
-        Clear-WmtRegCache @("HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}")
         $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $p "System.IsPinnedToNameSpaceTree" 1) 0) -eq 0))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $p "System.IsPinnedToNameSpaceTree" 1; Write-GuiLog "OneDrive folder shown in Explorer." } "Showing OneDrive folder..."
@@ -38348,7 +38819,7 @@ if ($btnToggle3DObjects) {
 $btnToggle3DObjects.Add_Click({
         if (-not $btnToggle3DObjects.IsEnabled) { return }
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{31C0DD25-9439-4F12-BF41-7FF4EDA38762}\PropertyBag")
         $currentlyHidden = (((ConvertTo-Str (Get-WmtRegValue $p "ThisPCPolicy" "Show") "") -ne "Show"))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegString $p "ThisPCPolicy" "Show"; Write-GuiLog "3D Objects folder shown." } "Showing 3D Objects..."
@@ -38364,7 +38835,7 @@ $btnToggleDupDrive = Get-Ctrl "btnToggleDupDrive"
 if ($btnToggleDupDrive) {
 $btnToggleDupDrive.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $p "HideDuplicatedRemovableDrives" 0) 0) -eq 1))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $p "HideDuplicatedRemovableDrives" 0; Write-GuiLog "Duplicate removable drives shown." } "Showing duplicate drive..."
@@ -38380,7 +38851,7 @@ $btnToggleSnapAssist = Get-Ctrl "btnToggleSnapAssist"
 if ($btnToggleSnapAssist) {
 $btnToggleSnapAssist.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "SnapAssist" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "SnapAssist" 1; Write-GuiLog "Snap Assist enabled." } "Enabling Snap Assist..."
@@ -38396,7 +38867,7 @@ $btnToggleSnapLayouts = Get-Ctrl "btnToggleSnapLayouts"
 if ($btnToggleSnapLayouts) {
 $btnToggleSnapLayouts.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "EnableSnapLayouts" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableSnapLayouts" 1; Write-GuiLog "Snap Layouts enabled." } "Enabling Snap Layouts..."
@@ -38412,7 +38883,7 @@ $btnToggleWindowSnapping = Get-Ctrl "btnToggleWindowSnapping"
 if ($btnToggleWindowSnapping) {
 $btnToggleWindowSnapping.Add_Click({
         $p = "HKCU:\Control Panel\Desktop"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Desktop")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Desktop")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "WindowArrangementActive" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "WindowArrangementActive" 1; Write-GuiLog "Window snapping enabled." } "Enabling window snapping..."
@@ -38428,7 +38899,7 @@ $btnToggleDarkMode = Get-Ctrl "btnToggleDarkMode"
 if ($btnToggleDarkMode) {
 $btnToggleDarkMode.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
         $currentlyDark = (((ConvertTo-Int (Get-WmtRegValue $p "AppsUseLightTheme" 1) 0) -eq 0))
         if ($currentlyDark) {
             Invoke-UiCommand { Set-WmtRegDword $p "AppsUseLightTheme" 1; Set-WmtRegDword $p "SystemUsesLightTheme" 1; Write-GuiLog "Light mode enabled." } "Switching to light mode..."
@@ -38444,7 +38915,7 @@ $btnToggleTransparency = Get-Ctrl "btnToggleTransparency"
 if ($btnToggleTransparency) {
 $btnToggleTransparency.Add_Click({
         $p = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-        Clear-WmtRegCache @("HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "EnableTransparency" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableTransparency" 1; Write-GuiLog "Transparency enabled." } "Enabling transparency..."
@@ -38460,7 +38931,7 @@ $btnToggleAnimations = Get-Ctrl "btnToggleAnimations"
 if ($btnToggleAnimations) {
 $btnToggleAnimations.Add_Click({
         $p = "HKCU:\Control Panel\Desktop\WindowMetrics"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Desktop\WindowMetrics")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Desktop\WindowMetrics")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "MinAnimate" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "MinAnimate" 1; Write-GuiLog "Window animations enabled." } "Enabling animations..."
@@ -38477,7 +38948,7 @@ if ($btnToggleLockscreenTips) {
 $btnToggleLockscreenTips.Add_Click({
         $p1 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Toast"
         $p2 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Tips"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Tips", "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Toast")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Tips", "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SystemRotators\LockScreen\Toast")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p1 "Enabled" 0) 0) -eq 0) -and ((ConvertTo-Int (Get-WmtRegValue $p2 "Enabled" 0) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p1 "Enabled" 1; Set-WmtRegDword $p2 "Enabled" 1; Write-GuiLog "Lockscreen tips enabled." } "Enabling lockscreen tips..."
@@ -38493,7 +38964,7 @@ $btnToggleSearchHighlights = Get-Ctrl "btnToggleSearchHighlights"
 if ($btnToggleSearchHighlights) {
 $btnToggleSearchHighlights.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "IsDynamicSearchBoxEnabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "IsDynamicSearchBoxEnabled" 1; Write-GuiLog "Search highlights enabled." } "Enabling search highlights..."
@@ -38509,7 +38980,7 @@ $btnToggleSearchHistory = Get-Ctrl "btnToggleSearchHistory"
 if ($btnToggleSearchHistory) {
 $btnToggleSearchHistory.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "IsDeviceSearchHistoryEnabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "IsDeviceSearchHistoryEnabled" 1; Write-GuiLog "Search history enabled." } "Enabling search history..."
@@ -38526,7 +38997,7 @@ if ($btnToggleGameBarIntegration) {
 $btnToggleGameBarIntegration.Add_Click({
         $p1 = "HKCU:\Software\Microsoft\GameBar"
         $p2 = "HKCU:\System\GameConfigStore"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\GameBar", "HKCU:\System\GameConfigStore")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\GameBar", "HKCU:\System\GameConfigStore")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p1 "AllowAutoGameMode" 1) 0) -eq 0) -or ((ConvertTo-Int (Get-WmtRegValue $p2 "GameDVR_Enabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p1 "AllowAutoGameMode" 1; Set-WmtRegDword $p1 "AutoGameModeEnabled" 1; Set-WmtRegDword $p2 "GameDVR_Enabled" 1; Write-GuiLog "Game Bar integration enabled." } "Enabling Game Bar integration..."
@@ -38543,7 +39014,7 @@ if ($btnToggleDVR) {
 $btnToggleDVR.Add_Click({
         $p1 = "HKCU:\System\GameConfigStore"
         $p2 = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR"
-        Clear-WmtRegCache @("HKCU:\System\GameConfigStore")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\System\GameConfigStore")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p1 "GameDVR_Enabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p1 "GameDVR_Enabled" 1; Set-WmtRegDword $p2 "AllowGameDVR" 1; Write-GuiLog "Game DVR enabled." } "Enabling Game DVR..."
@@ -38559,7 +39030,7 @@ $btnToggleBitlocker = Get-Ctrl "btnToggleBitlocker"
 if ($btnToggleBitlocker) {
 $btnToggleBitlocker.Add_Click({
         $p = "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker"
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "PreventDeviceEncryption" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $p "PreventDeviceEncryption"; Write-GuiLog "Bitlocker auto-encryption restored to default." } "Enabling Bitlocker auto..."
@@ -38575,7 +39046,7 @@ $btnToggleStickyKeys = Get-Ctrl "btnToggleStickyKeys"
 if ($btnToggleStickyKeys) {
 $btnToggleStickyKeys.Add_Click({
         $p = "HKCU:\Control Panel\Accessibility\StickyKeys"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Accessibility\StickyKeys")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Accessibility\StickyKeys")
         $currentlyOff = (((ConvertTo-Str (Get-WmtRegValue $p "Flags" "510") "") -ne "510"))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "510"; Write-GuiLog "Sticky Keys shortcut enabled." } "Enabling Sticky Keys..."
@@ -38591,7 +39062,7 @@ $btnToggleDeliveryOpt = Get-Ctrl "btnToggleDeliveryOpt"
 if ($btnToggleDeliveryOpt) {
 $btnToggleDeliveryOpt.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "DODownloadMode" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "DODownloadMode" 1; Write-GuiLog "Delivery Optimization enabled (LAN only)." } "Enabling Delivery Optimization..."
@@ -38607,7 +39078,7 @@ $btnToggleUpdateASAP = Get-Ctrl "btnToggleUpdateASAP"
 if ($btnToggleUpdateASAP) {
 $btnToggleUpdateASAP.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "AllowAutoWindowsUpdateDownloadOverMeteredNetwork" 0) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "AllowAutoWindowsUpdateDownloadOverMeteredNetwork" 1; Write-GuiLog "Update ASAP enabled (auto-download over metered connections)." } "Enabling Update ASAP..."
@@ -38623,7 +39094,7 @@ $btnToggleStartRecommended = Get-Ctrl "btnToggleStartRecommended"
 if ($btnToggleStartRecommended) {
 $btnToggleStartRecommended.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $p "Start_TrackProgs" 1) 0) -eq 0))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 1; Write-GuiLog "Start menu Recommended section shown." } "Showing Recommended..."
@@ -38640,7 +39111,7 @@ if ($btnToggleStartAllApps) {
 $btnToggleStartAllApps.Add_Click({
         $pUser = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
         $pPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer")
         $currentlyHidden = (((ConvertTo-Int (Get-WmtRegValue $pUser "Start_ShowAllApps" 0) 0) -eq 1) -or ((ConvertTo-Int (Get-WmtRegValue $pPol "HideStartAllApps" 0) 0) -eq 1))
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $pUser "Start_ShowAllApps" 0; Remove-WmtRegValue $pPol "HideStartAllApps"; Write-GuiLog "Start menu All Apps list shown." } "Showing All Apps..."
@@ -38656,7 +39127,7 @@ $btnTogglePhoneLink = Get-Ctrl "btnTogglePhoneLink"
 if ($btnTogglePhoneLink) {
 $btnTogglePhoneLink.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Start\Companions\Microsoft.YourPhone_8wekyb3d8bbwe"
-        Clear-WmtRegCache @($p)
+        Clear-WmtRegCache -PreserveUiSnapshot @($p)
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $p "IsEnabled" 1) 0) -eq 0)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $p "IsEnabled" 1; Write-GuiLog "Phone Link mobile-device companion enabled in Start menu." } "Showing Phone Link..."
@@ -38690,7 +39161,7 @@ $btnToggleIPv6 = Get-Ctrl "btnToggleIPv6"
 if ($btnToggleIPv6) {
 $btnToggleIPv6.Add_Click({
         $p = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "DisabledComponents" 0) 0) -band 0xFF) -ne 0)
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $p "DisabledComponents"; Write-GuiLog "IPv6 enabled (reboot required)." } "Enabling IPv6..."
@@ -38706,7 +39177,7 @@ $btnToggleNetThrottling = Get-Ctrl "btnToggleNetThrottling"
 if ($btnToggleNetThrottling) {
 $btnToggleNetThrottling.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile")
         $currentlyOff = Test-WmtDwordAllBitsSet (Get-WmtRegValue $p "NetworkThrottlingIndex" 10)
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "NetworkThrottlingIndex" 10; Write-GuiLog "Network throttling enabled." } "Enabling network throttling..."
@@ -38722,7 +39193,7 @@ $btnToggleNetLocationWizard = Get-Ctrl "btnToggleNetLocationWizard"
 if ($btnToggleNetLocationWizard) {
 $btnToggleNetLocationWizard.Add_Click({
         $p = "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters"
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "ShowNetworkLocationWizard" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowNetworkLocationWizard" 1; Write-GuiLog "Network Location Wizard enabled." } "Enabling network location wizard..."
@@ -38738,7 +39209,7 @@ $btnToggleWifiSense = Get-Ctrl "btnToggleWifiSense"
 if ($btnToggleWifiSense) {
 $btnToggleWifiSense.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "AutoConnectAllowedOEM" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "AutoConnectAllowedOEM" 1; Set-WmtRegDword $p "WiFISenseAllowed" 1; Write-GuiLog "Wi-Fi Sense enabled." } "Enabling Wi-Fi Sense..."
@@ -38754,7 +39225,7 @@ $btnToggleAutoWifi = Get-Ctrl "btnToggleAutoWifi"
 if ($btnToggleAutoWifi) {
 $btnToggleAutoWifi.Add_Click({
         $p = "HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config"
-        Clear-WmtRegCache @("HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "AutoConnectAllowedOEM" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "AutoConnectAllowedOEM" 1; Write-GuiLog "Suggested WiFi auto-connect enabled." } "Enabling suggested WiFi..."
@@ -38772,7 +39243,7 @@ if ($btnToggleDiagData) {
 $btnToggleDiagData.Add_Click({
         $p1 = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
         $p2 = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection")
         $currentlyRequired = (((ConvertTo-Int (Get-WmtRegValue $p1 "AllowTelemetry" 3) 0) -le 1) -or ((ConvertTo-Int (Get-WmtRegValue $p2 "AllowTelemetry" 3) 0) -le 1))
         if ($currentlyRequired) {
             Invoke-UiCommand { Remove-WmtRegValue $p1 "AllowTelemetry"; Remove-WmtRegValue $p2 "AllowTelemetry"; Write-GuiLog "Diagnostic data restored to default (Optional)." } "Restoring default diagnostic data..."
@@ -38789,7 +39260,7 @@ $btnToggleInkingPersonal = Get-Ctrl "btnToggleInkingPersonal"
 if ($btnToggleInkingPersonal) {
 $btnToggleInkingPersonal.Add_Click({
         $p = "HKCU:\Software\Microsoft\InputPersonalization"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\InputPersonalization")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\InputPersonalization")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "RestrictImplicitInkCollection" 0) 0) -eq 1) -and ((ConvertTo-Int (Get-WmtRegValue $p "RestrictImplicitTextCollection" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "RestrictImplicitInkCollection" 0; Set-WmtRegDword $p "RestrictImplicitTextCollection" 0; Write-GuiLog "Inking personalization enabled." } "Enabling inking personalization..."
@@ -38806,7 +39277,7 @@ if ($btnToggleSpeechOnline) {
 $btnToggleSpeechOnline.Add_Click({
         if (-not $btnToggleSpeechOnline.IsEnabled) { return }
         $p = "HKCU:\Software\Microsoft\Speech_OneSet"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Speech_OneSet")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Speech_OneSet")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "AcceptPrivacyNotice" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "AcceptPrivacyNotice" 1; Write-GuiLog "Online speech recognition enabled." } "Enabling online speech recognition..."
@@ -38822,7 +39293,7 @@ $btnToggleAppDiagnostics = Get-Ctrl "btnToggleAppDiagnostics"
 if ($btnToggleAppDiagnostics) {
 $btnToggleAppDiagnostics.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics")
         $currentlyOff = (((ConvertTo-Str (Get-WmtRegValue $p "Value" "Allow") "") -ne "Allow"))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegString $p "Value" "Allow"; Write-GuiLog "App diagnostics access enabled." } "Enabling app diagnostics..."
@@ -38838,7 +39309,7 @@ $btnToggleBackgroundApps = Get-Ctrl "btnToggleBackgroundApps"
 if ($btnToggleBackgroundApps) {
 $btnToggleBackgroundApps.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "GlobalUserDisabled" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "GlobalUserDisabled" 0; Write-GuiLog "Background apps enabled." } "Enabling background apps..."
@@ -38854,7 +39325,7 @@ $btnToggleFeedbackNotify = Get-Ctrl "btnToggleFeedbackNotify"
 if ($btnToggleFeedbackNotify) {
 $btnToggleFeedbackNotify.Add_Click({
         $p = "HKCU:\Software\Microsoft\Siuf\Rules"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Siuf\Rules")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Siuf\Rules")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "NumberOfSIUFInPeriod" -1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Remove-WmtRegValue $p "NumberOfSIUFInPeriod"; Remove-WmtRegValue $p "PeriodInNanoSeconds"; Write-GuiLog "Feedback notifications enabled." } "Enabling feedback notifications..."
@@ -38870,7 +39341,7 @@ $btnToggleCompatTelemetry = Get-Ctrl "btnToggleCompatTelemetry"
 if ($btnToggleCompatTelemetry) {
 $btnToggleCompatTelemetry.Add_Click({
         $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "AITEnable" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "AITEnable" 1; Write-GuiLog "Compatibility telemetry enabled." } "Enabling compatibility telemetry..."
@@ -38887,7 +39358,7 @@ if ($btnToggleCEIP) {
 $btnToggleCEIP.Add_Click({
         if (-not $btnToggleCEIP.IsEnabled) { return }
         $p = "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows")
         $currentlyOff = (((ConvertTo-Str (Get-WmtRegValue $p "CEIPEnable" "1") "") -ne "1"))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegString $p "CEIPEnable" "1"; Write-GuiLog "Customer Experience Improvement Program enabled." } "Enabling CEIP..."
@@ -38938,7 +39409,7 @@ $btnToggleThumbCache = Get-Ctrl "btnToggleThumbCache"
 if ($btnToggleThumbCache) {
 $btnToggleThumbCache.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "DisableThumbnails" 0) 0) -eq 1))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "DisableThumbnails" 0; Write-GuiLog "Thumbnail cache enabled." } "Enabling thumbnail cache..."
@@ -38954,7 +39425,7 @@ $btnToggleDriveLettersFirst = Get-Ctrl "btnToggleDriveLettersFirst"
 if ($btnToggleDriveLettersFirst) {
 $btnToggleDriveLettersFirst.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
         $currentlyFirst = (((ConvertTo-Int (Get-WmtRegValue $p "ShowDriveLettersFirst" 0) 0) -eq 1))
         if ($currentlyFirst) {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowDriveLettersFirst" 0; Write-GuiLog "Drive letters shown after names (default)." } "Resetting drive letters..."
@@ -39054,7 +39525,7 @@ $btnToggleStartupSound = Get-Ctrl "btnToggleStartupSound"
 if ($btnToggleStartupSound) {
 $btnToggleStartupSound.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\LogonSound")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "Enabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 1; Write-GuiLog "Startup sound enabled." } "Enabling startup sound..."
@@ -39070,7 +39541,7 @@ $btnToggleNotifySound = Get-Ctrl "btnToggleNotifySound"
 if ($btnToggleNotifySound) {
 $btnToggleNotifySound.Add_Click({
         $p = "HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current"
-        Clear-WmtRegCache @("HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\AppEvents\Schemes\Apps\.Default\Notification.Default\.current")
         $currentlyOff = (((ConvertTo-Str (Get-WmtRegValue $p "(Default)" "") "") -eq ""))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDefaultValue $p ".default"; Write-GuiLog "Notification sounds enabled." } "Enabling notification sounds..."
@@ -39086,7 +39557,7 @@ $btnToggleDeviceSound = Get-Ctrl "btnToggleDeviceSound"
 if ($btnToggleDeviceSound) {
 $btnToggleDeviceSound.Add_Click({
         $p = "HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current"
-        Clear-WmtRegCache @("HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\AppEvents\Schemes\Apps\.Default\DeviceConnect\.current")
         $currentlyOff = (((ConvertTo-Str (Get-WmtRegValue $p "(Default)" "") "") -eq ""))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDefaultValue $p ".default"; Write-GuiLog "Device connect sounds enabled." } "Enabling device connect sounds..."
@@ -39102,7 +39573,7 @@ $btnToggleSpatialAudio = Get-Ctrl "btnToggleSpatialAudio"
 if ($btnToggleSpatialAudio) {
 $btnToggleSpatialAudio.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\SpatialSound")
         $currentlyOn = (((ConvertTo-Str (Get-WmtRegValue $p "SpatialAudioFormat" "") "") -ne ""))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegString $p "SpatialAudioFormat" ""; Write-GuiLog "Spatial audio disabled." } "Disabling spatial audio..."
@@ -39125,7 +39596,7 @@ $btnToggleNightLight = Get-Ctrl "btnToggleNightLight"
 if ($btnToggleNightLight) {
 $btnToggleNightLight.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default\`$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "Data" 0) 0) -ne 0))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "Data" 0; Write-GuiLog "Night Light disabled." } "Disabling Night Light..."
@@ -39155,7 +39626,7 @@ $btnToggleFilterKeys = Get-Ctrl "btnToggleFilterKeys"
 if ($btnToggleFilterKeys) {
 $btnToggleFilterKeys.Add_Click({
         $p = "HKCU:\Control Panel\Accessibility\Keyboard Response"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Accessibility\Keyboard Response")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Accessibility\Keyboard Response")
         $currentlyOn = (((ConvertTo-Str (Get-WmtRegValue $p "Flags" "122") "") -match "63"))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "122"; Write-GuiLog "Filter Keys disabled." } "Disabling Filter Keys..."
@@ -39171,7 +39642,7 @@ $btnToggleToggleKeys = Get-Ctrl "btnToggleToggleKeys"
 if ($btnToggleToggleKeys) {
 $btnToggleToggleKeys.Add_Click({
         $p = "HKCU:\Control Panel\Accessibility\ToggleKeys"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Accessibility\ToggleKeys")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Accessibility\ToggleKeys")
         $currentlyOn = (((ConvertTo-Str (Get-WmtRegValue $p "Flags" "58") "") -match "63"))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegString $p "Flags" "58"; Write-GuiLog "Toggle Keys disabled." } "Disabling Toggle Keys..."
@@ -39188,7 +39659,7 @@ if ($btnToggleNumLockStartup) {
 $btnToggleNumLockStartup.Add_Click({
         $p1 = "HKCU:\Control Panel\Keyboard"
         $p2 = "HKU:\.DEFAULT\Control Panel\Keyboard"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Keyboard")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Keyboard")
         $currentlyOn = (((ConvertTo-Str (Get-WmtRegValue $p1 "InitialKeyboardIndicators" "2") "") -eq "2"))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegString $p1 "InitialKeyboardIndicators" "0"; Set-WmtRegString $p2 "InitialKeyboardIndicators" "0"; Write-GuiLog "NumLock at startup disabled." } "Disabling NumLock at startup..."
@@ -39205,7 +39676,7 @@ if ($btnToggleCapsLockStartup) {
 $btnToggleCapsLockStartup.Add_Click({
         $p1 = "HKCU:\Control Panel\Keyboard"
         $p2 = "HKU:\.DEFAULT\Control Panel\Keyboard"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Keyboard")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Keyboard")
         $currentlyOn = (((ConvertTo-Str (Get-WmtRegValue $p1 "InitialKeyboardIndicators" "2") "") -eq "2147483650"))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegString $p1 "InitialKeyboardIndicators" "2"; Set-WmtRegString $p2 "InitialKeyboardIndicators" "2"; Write-GuiLog "CapsLock at startup disabled." } "Disabling CapsLock at startup..."
@@ -39224,7 +39695,7 @@ $btnToggleHighContrast = Get-Ctrl "btnToggleHighContrast"
 if ($btnToggleHighContrast) {
 $btnToggleHighContrast.Add_Click({
         $p = "HKCU:\Control Panel\Accessibility\HighContrast"
-        Clear-WmtRegCache @("HKCU:\Control Panel\Accessibility\HighContrast")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Accessibility\HighContrast")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "Flags" 0) 0) -band 1) -ne 0)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "Flags" 0; Write-GuiLog "High contrast mode disabled." } "Disabling high contrast..."
@@ -39240,7 +39711,7 @@ $btnToggleColorFilter = Get-Ctrl "btnToggleColorFilter"
 if ($btnToggleColorFilter) {
 $btnToggleColorFilter.Add_Click({
         $p = "HKCU:\Software\Microsoft\ColorFiltering"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\ColorFiltering")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\ColorFiltering")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "Active" 0) 0) -eq 1))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "Active" 0; Write-GuiLog "Color filter disabled." } "Disabling color filter..."
@@ -39300,7 +39771,7 @@ $btnToggleSudo = Get-Ctrl "btnToggleSudo"
 if ($btnToggleSudo) {
 $btnToggleSudo.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "Enabled" 0) 0) -ne 0))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Windows Sudo disabled." } "Disabling Sudo..."
@@ -39316,7 +39787,7 @@ $btnToggleWSH = Get-Ctrl "btnToggleWSH"
 if ($btnToggleWSH) {
 $btnToggleWSH.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows Script Host\Settings"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows Script Host\Settings")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows Script Host\Settings")
         $currentlyOff = (((ConvertTo-Int (Get-WmtRegValue $p "Enabled" 1) 0) -eq 0))
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 1; Write-GuiLog "Windows Script Host enabled." } "Enabling WSH..."
@@ -39347,7 +39818,7 @@ $btnPowerUserShowDevices = Get-Ctrl "btnPowerUserShowDevices"
 if ($btnPowerUserShowDevices) {
 $btnPowerUserShowDevices.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\DeviceManager")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "ShowHiddenDevices" 0) 0) -eq 1))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowHiddenDevices" 0; Write-GuiLog "Hidden devices hidden in Device Manager." } "Hiding hidden devices..."
@@ -39382,7 +39853,7 @@ $btnPowerUserSigDriver = Get-Ctrl "btnPowerUserSigDriver"
 if ($btnPowerUserSigDriver) {
 $btnPowerUserSigDriver.Add_Click({
         $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceManager")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "AllowNonSignedDrivers" 0) 0) -eq 1))
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "AllowNonSignedDrivers" 0; Write-GuiLog "Driver signature enforcement restored (reboot required)." } "Restoring driver signature enforcement..."
@@ -48621,7 +49092,9 @@ foreach ($provider in $providerDefinitions) {
             if ($chkMain -and [bool]$chkMain.IsChecked) { $newEnabled += $key }
         }
 
-        $current = Get-WmtSettings
+        # Build a small patch from the live controls. Reading/merging the
+        # settings file and writing it are disk I/O, so do that off-dispatcher.
+        $current = @{}
         $current.EnabledProviders = $newEnabled
         if ($current -is [System.Collections.IDictionary]) {
             $current["WingetIncludeUnknown"] = [bool]$chkIncludeUnknown.IsChecked
@@ -48750,12 +49223,27 @@ foreach ($provider in $providerDefinitions) {
             $current | Add-Member -MemberType NoteProperty -Name "ReduceRamInTray" -Value ([bool]$chkReduceRamInTray.IsChecked) -Force
         }
 
-        Save-WmtSettings -Settings $current
-        if (-not (Get-WmtUpdateScansDisabled -Settings $current)) {
-            Start-WmtUpdateAutoScanTimer -ResetNextRun
-        }
-        if (-not (Get-WmtRunInTrayOnClose -Settings $current)) { Remove-WmtTrayIcon }
-        $win.Close()
+        $settingsPatch = $current
+        $settingsCacheVariable = Get-Variable -Name WmtSettingsCache -Scope Script
+        $settingsStampVariable = Get-Variable -Name WmtSettingsCacheStamp -Scope Script
+        $settingsSaved = {
+            param($results)
+            $saved = @($results | Where-Object { $_ -and $_.PSObject.Properties['SettingsStamp'] } | Select-Object -Last 1)[0]
+            if (-not $saved) { return }
+
+            $settingsCacheVariable.Value = Copy-WmtSettings -Settings $saved.Settings
+            $settingsStampVariable.Value = [string]$saved.SettingsStamp
+            if (-not (Get-WmtUpdateScansDisabled -Settings $saved.Settings)) {
+                Start-WmtUpdateAutoScanTimer -ResetNextRun
+            }
+            if (-not (Get-WmtRunInTrayOnClose -Settings $saved.Settings)) { Remove-WmtTrayIcon }
+            $win.Close()
+        }.GetNewClosure()
+        Invoke-WmtSettingsPatchSave -Patch $settingsPatch -Name ("ProviderSettings_" + [guid]::NewGuid().ToString("N")) -Message 'Saving provider settings...' -OnComplete $settingsSaved -OnError {
+            param($errorRecord)
+            $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+            Show-WmtMessageBox -Owner $win -Message "Could not save provider settings:`n$message" -Title "Provider Settings" -Image Error | Out-Null
+        }.GetNewClosure()
     })
 
 $win.ShowDialog() | Out-Null
@@ -49850,6 +50338,169 @@ $script:ScanTimer.Add_Tick({
 
 # 2. BUTTON CLICK (Launch Parallel Threads)
 $btnWingetScan.Add_Click({
+    if (-not $script:WmtWingetScanPreparedState) {
+        if ($script:WmtWingetScanPreparationPending) { return }
+
+        $script:WmtWingetScanPreparationPending = $true
+        $btnWingetScan.IsEnabled = $false
+        $lblWingetStatus.Text = "Preparing scan inputs..."
+        $lblWingetStatus.Visibility = "Visible"
+        $scanSettings = $script:WmtSettingsCache
+        if (-not $scanSettings) { $scanSettings = Get-WmtSettings }
+        $scanSettingsJson = ConvertTo-Json -InputObject $scanSettings -Depth 8 -Compress
+        $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
+        $hasSteamCache = [bool]$script:WmtSteamLibraryCache -or (Test-Path -LiteralPath $steamCacheFile -PathType Leaf)
+        if ($hasSteamCache) { $script:WmtWingetScanSteamCacheAttempted = $false }
+        elseif (-not $script:WmtWingetScanSteamCacheAttempted) {
+            $previousLibraryBuild = $script:WmtLibraryCacheAsyncResult
+            try { Start-WmtLibraryCacheBuilder -SteamOnly }
+            catch { Write-GuiLog "Could not start Steam ownership cache build: $($_.Exception.Message)" }
+            if ($script:WmtLibraryCacheAsyncResult -and -not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
+                if ($script:WmtLibraryCacheAsyncResult -ne $previousLibraryBuild) {
+                    $script:WmtWingetScanSteamCacheAttempted = $true
+                }
+                $lblWingetStatus.Text = "Waiting for Steam ownership data..."
+                Register-WmtUiPollOperation -Name "WingetScanSteamCacheWait" -IntervalMs 500 -TimeoutMs 300000 -TestComplete {
+                    -not $script:WmtLibraryCacheAsyncResult -or $script:WmtLibraryCacheAsyncResult.IsCompleted
+                } -OnComplete {
+                    $script:WmtWingetScanPreparationPending = $false
+                    $btnWingetScan.IsEnabled = $true
+                    $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+                } -OnTimeout {
+                    $script:WmtWingetScanSteamCacheAttempted = $true
+                    $script:WmtWingetScanPreparationPending = $false
+                    $btnWingetScan.IsEnabled = $true
+                    Write-GuiLog "[Winget] Steam ownership cache is still building; continuing this scan without it."
+                    $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+                } -OnError {
+                    param($operation, $errorRecord)
+                    $script:WmtWingetScanSteamCacheAttempted = $true
+                    $script:WmtWingetScanPreparationPending = $false
+                    $btnWingetScan.IsEnabled = $true
+                    Write-GuiLog "[Winget] Could not wait for Steam ownership data: $($errorRecord.Exception.Message)"
+                    $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+                } | Out-Null
+                return
+            }
+        }
+        $steamOwnershipJson = if ($script:WmtSteamLibraryCache) {
+            ConvertTo-Json -InputObject @($script:WmtSteamLibraryCache) -Depth 4 -Compress
+        } else { "" }
+        $preparationArguments = [object[]]::new(3)
+        $preparationArguments[0] = $scanSettingsJson
+        $preparationArguments[1] = $steamCacheFile
+        $preparationArguments[2] = $steamOwnershipJson
+        Invoke-WmtUiBackgroundCommand -Name "WingetScanPreparation" -Msg "Preparing update scan..." -ArgumentList $preparationArguments -Sb {
+            param([string]$SettingsJson, [string]$SteamCacheFile, [string]$SteamOwnershipJson)
+            $settings = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
+            $steamOwnership = @()
+            if (-not [string]::IsNullOrWhiteSpace($SteamOwnershipJson)) {
+                try { $steamOwnership = @(ConvertFrom-Json -InputObject $SteamOwnershipJson -ErrorAction Stop) } catch {}
+            }
+            if ($steamOwnership.Count -eq 0 -and (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
+                try {
+                    $steamOwnership = @([System.IO.File]::ReadAllText($SteamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
+                }
+                catch {}
+            }
+            if ($steamOwnership.Count -eq 0) {
+                $steamOwnership = @()
+            }
+
+            $nameOwners = @{}
+            $installedNameKeys = @{}
+            $ownerIds = @{}
+            $seededOwners = 0
+            foreach ($owned in @($steamOwnership)) {
+                if (-not $owned) { continue }
+                if ($owned.PSObject.Properties["IsInstalled"] -and -not [bool]$owned.IsInstalled) { continue }
+                $ownedName = if ($owned.PSObject.Properties["Title"]) { ([string]$owned.Title).Trim() } elseif ($owned.PSObject.Properties["Name"]) { ([string]$owned.Name).Trim() } else { "" }
+                if ([string]::IsNullOrWhiteSpace($ownedName)) { continue }
+                $ownedId = if ($owned.PSObject.Properties["Id"]) { ([string]$owned.Id).Trim() } else { "" }
+                $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+                if ([string]::IsNullOrWhiteSpace($nameKey)) { continue }
+                $nameOwners[$nameKey] = [PSCustomObject]@{ Provider="steam"; Id=$ownedId; Path=""; Name=$ownedName }
+                $installedNameKeys[$nameKey] = $ownedId
+                if (-not [string]::IsNullOrWhiteSpace($ownedId)) { $ownerIds["steam|$($ownedId.ToLowerInvariant())"] = $true }
+                $seededOwners++
+            }
+            [pscustomobject]@{
+                Message = ''
+                ScanSettings = $settings
+                ProviderOwnershipIndex = @{ Name=$nameOwners; Id=$ownerIds; Path=@{} }
+                SteamInstalledNameKeys = $installedNameKeys
+                SeededSteamOwners = $seededOwners
+            }
+        } -OnComplete {
+            # NOTE: this callback and -OnError below are deliberately plain scriptblocks, NOT .GetNewClosure().
+            # A closure runs in its own dynamic module, so its $script: writes never reach this script's
+            # scope - the re-raised Click would then see "still pending, nothing prepared" and return,
+            # leaving the UI stuck on "Preparing scan inputs...".
+            param($results)
+            $prepared = @($results | Where-Object { $_ -and $_.PSObject.Properties['ScanSettings'] } | Select-Object -Last 1)[0]
+            if (-not $prepared) {
+                # Do not throw here: an exception from -OnComplete is only logged and never reaches -OnError.
+                Write-GuiLog '[Winget] Scan preparation returned no settings.'
+                $script:WmtWingetScanSteamCacheAttempted = $false
+                $script:WmtWingetScanPreparedState = $null
+                $script:WmtWingetScanPreparationPending = $false
+                $btnWingetScan.IsEnabled = $true
+                $lblWingetStatus.Text = 'Scan preparation failed. Click Scan to retry.'
+                $lblWingetStatus.Visibility = 'Visible'
+                return
+            }
+            $script:WmtWingetScanSteamCacheAttempted = $false
+            $script:WmtWingetScanPreparedState = $prepared
+            $script:WmtWingetScanPreparationPending = $false
+            $btnWingetScan.IsEnabled = $true
+            $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+        } -OnError {
+            param($errorRecord)
+            $script:WmtWingetScanSteamCacheAttempted = $false
+            $script:WmtWingetScanPreparedState = $null
+            $script:WmtWingetScanPreparationPending = $false
+            $btnWingetScan.IsEnabled = $true
+            $lblWingetStatus.Text = 'Scan preparation failed. Click Scan to retry.'
+            $lblWingetStatus.Visibility = 'Visible'
+        } | Out-Null
+        return
+    }
+    if ($script:WmtWingetScanRunspaceWaitPending) { return }
+    $scanRunspacePool = Get-WmtReadyRunspacePool -PoolKind Background -TimeoutMs 0
+    if ($scanRunspacePool -isnot [System.Management.Automation.Runspaces.RunspacePool]) {
+        if ($script:WmtPoolOpenAsync -and $script:WmtPoolOpenAsync.ContainsKey('Background')) {
+            $script:WmtWingetScanRunspaceWaitPending = $true
+            $btnWingetScan.IsEnabled = $false
+            $lblWingetStatus.Text = 'Waiting for a background worker...'
+            $readyTest = {
+                (Get-WmtReadyRunspacePool -PoolKind Background -TimeoutMs 0) -is [System.Management.Automation.Runspaces.RunspacePool]
+            }.GetNewClosure()
+            # Plain scriptblocks on purpose: a .GetNewClosure() block would write these $script: flags into
+            # its own private module scope, so the pending flag would never clear.
+            $readyCallback = {
+                $script:WmtWingetScanRunspaceWaitPending = $false
+                $btnWingetScan.IsEnabled = $true
+                $btnWingetScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+            }
+            $readyTimeout = {
+                $script:WmtWingetScanRunspaceWaitPending = $false
+                $script:WmtWingetScanPreparedState = $null
+                $btnWingetScan.IsEnabled = $true
+                $lblWingetStatus.Text = 'Background workers did not become ready. Click Scan to retry.'
+                Write-GuiLog '[Winget] Background runspace pool did not become ready within 30 seconds.'
+            }
+            Register-WmtUiPollOperation -Name 'WingetScanRunspaceWait' -TestComplete $readyTest -OnComplete $readyCallback -TimeoutMs 30000 -OnTimeout $readyTimeout | Out-Null
+            return
+        }
+        $script:WmtWingetScanPreparedState = $null
+        $btnWingetScan.IsEnabled = $true
+        $lblWingetStatus.Text = 'Background workers are unavailable. Click Scan to retry.'
+        Write-GuiLog '[Winget] Background runspace pool is unavailable.'
+        return
+    }
+    $scanPrepared = $script:WmtWingetScanPreparedState
+    $script:WmtWingetScanPreparedState = $null
+
     # UI Prep
     # Clear any stale "package search active" flag so auto-scans are no
     # longer blocked once the user explicitly starts a new scan.
@@ -49886,7 +50537,7 @@ $btnWingetScan.Add_Click({
     # Stuck winget processes are cleaned at app start and install/update actions handle their own cleanup.
 
     # --- Load Settings ---
-    $settings = Get-WmtSettings
+    $settings = $scanPrepared.ScanSettings
     $enabled = if ($settings.EnabledProviders -and $settings.EnabledProviders.Count -gt 0) { 
         $settings.EnabledProviders 
     }
@@ -49945,83 +50596,13 @@ $btnWingetScan.Add_Click({
     $script:ActiveScans.Clear()
     $script:ScanCancelled = $false
     $script:ScanStartTime = Get-Date
-    $script:WmtSteamInstalledNameKeys = @{}
-    $script:WmtProviderOwnershipIndex = @{
-        Name = @{}
-        Id   = @{}
-        Path = @{}
+    $script:WmtSteamInstalledNameKeys = $scanPrepared.SteamInstalledNameKeys
+    $script:WmtProviderOwnershipIndex = $scanPrepared.ProviderOwnershipIndex
+    if ([int]$scanPrepared.SeededSteamOwners -gt 0) {
+        Write-GuiLog "[Winget] Seeded $($scanPrepared.SeededSteamOwners) installed Steam ownership record(s) for cross-provider duplicate filtering."
     }
-
-    # Seed Steam ownership independently of the Steam update-scan toggle.
-    # Winget --include-unknown can surface Steam-installed games as fake
-    # "Unknown -> version" upgrades (Warframe is a known example). The
-    # suppression pass must therefore know about installed Steam games even
-    # when the Steam provider itself is not being scanned for pending updates.
-    try {
-        $steamOwnership = @()
-
-        # Prefer the live appmanifest files. This is both faster and more reliable
-        # than trusting steam_library.json, which may be up to 24 hours old and
-        # can therefore miss a newly installed Steam game such as Warframe.
-        try { $steamOwnership = @(Get-WmtSteamInstalledGames) } catch {}
-
-        # Fall back to the in-memory/on-disk library cache only when live Steam
-        # discovery is unavailable (for example if Steam is temporarily missing).
-        if ($steamOwnership.Count -eq 0) {
-            if ($script:WmtSteamLibraryCache) {
-                $steamOwnership = @($script:WmtSteamLibraryCache)
-            }
-            else {
-                $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
-                if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
-                    try {
-                        $steamOwnership = @([System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
-                    }
-                    catch {}
-                }
-            }
-        }
-
-        # Last resort: rebuild WMT's Steam library model from local Steam data.
-        if ($steamOwnership.Count -eq 0) {
-            try { $steamOwnership = @(Get-WmtSteamLibrary -Force) } catch {}
-        }
-
-        $seededSteamOwners = 0
-        foreach ($owned in @($steamOwnership)) {
-            if (-not $owned) { continue }
-            if ($owned.PSObject.Properties["IsInstalled"] -and -not [bool]$owned.IsInstalled) { continue }
-
-            $ownedName = ""
-            if ($owned.PSObject.Properties["Title"]) { $ownedName = ([string]$owned.Title).Trim() }
-            elseif ($owned.PSObject.Properties["Name"]) { $ownedName = ([string]$owned.Name).Trim() }
-            if ([string]::IsNullOrWhiteSpace($ownedName)) { continue }
-
-            $ownedId = if ($owned.PSObject.Properties["Id"]) { ([string]$owned.Id).Trim() } else { "" }
-            $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
-            if ([string]::IsNullOrWhiteSpace($nameKey)) { continue }
-
-            $script:WmtProviderOwnershipIndex.Name[$nameKey] = [PSCustomObject]@{
-                Provider = "steam"
-                Id       = $ownedId
-                Path     = ""
-                Name     = $ownedName
-            }
-            $script:WmtSteamInstalledNameKeys[$nameKey] = $ownedId
-            if (-not [string]::IsNullOrWhiteSpace($ownedId)) {
-                $script:WmtProviderOwnershipIndex.Id["steam|$($ownedId.ToLowerInvariant())"] = $true
-            }
-            $seededSteamOwners++
-        }
-        if ($seededSteamOwners -gt 0) {
-            Write-GuiLog "[Winget] Seeded $seededSteamOwners installed Steam ownership record(s) for cross-provider duplicate filtering."
-        }
-        else {
-            Write-GuiLog "[Winget] No installed Steam ownership records were discovered; cross-provider unknown-version suppression cannot match Steam games."
-        }
-    }
-    catch {
-        Write-GuiLog "[Winget] Steam ownership pre-seed failed: $($_.Exception.Message)"
+    else {
+        Write-GuiLog "[Winget] No installed Steam ownership records were discovered; cross-provider unknown-version suppression cannot match Steam games."
     }
 
     # --- Global Timeout Timer (120 seconds) ---
@@ -51879,59 +52460,27 @@ $btnWingetIgnore.Add_Click({
 
     $msg = "Ignore $($selected.Count) package(s)?`n`nThese updates will be hidden from future scans."
     if ((Show-WmtMessageBox -Message $msg -Title "Ignore Updates" -Button YesNo -Image Question) -eq [System.Windows.MessageBoxResult]::Yes) {
-
-        # 1. Get fresh settings
-        $settings = Get-WmtSettings
-
-        # 2. Create a fresh ArrayList to ensure it is editable
-        $newList = New-Object System.Collections.ArrayList
-
-        # Add existing items (checking for nulls)
-        if ($settings.WingetIgnore) {
-            foreach ($existing in $settings.WingetIgnore) {
-                if (-not [string]::IsNullOrWhiteSpace($existing)) {
-                    [void]$newList.Add($existing.ToString())
-                }
+        $selectedIds = [string[]]@($selected | ForEach-Object { [string]$_.Id } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        $complete = {
+            param($results)
+            foreach ($item in @($selected)) {
+                if ($selectedIds -contains [string]$item.Id) { [void]$lstWinget.Items.Remove($item) }
             }
+            $lstWinget.Items.Refresh()
+        }.GetNewClosure()
+        $listOperation = @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = $selectedIds })
+        Invoke-WmtSettingsPatchSave -Patch @{} -ListOperations $listOperation -Name ("WingetIgnore_" + [guid]::NewGuid().ToString("N")) -Message "Saving ignored packages..." -OnComplete $complete -OnError {
+            param($errorRecord)
+            $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+            Show-WmtMessageBox -Message "Could not save ignored packages:`n$message" -Title "Ignore Updates" -Image Error | Out-Null
         }
-
-        # 3. Add NEW items
-        foreach ($item in $selected) {
-            $id = $item.Id
-            # Avoid duplicates
-            if ($id -and ($id -notin $newList)) {
-                [void]$newList.Add($id)
-            }
-            # Remove from GUI immediately
-            $lstWinget.Items.Remove($item)
-        }
-
-        # 4. Save back as a standard array
-        $settings.WingetIgnore = $newList.ToArray()
-        Save-WmtSettings -Settings $settings
-
-        Write-GuiLog "Ignored $($selected.Count) packages. Saved to settings.json."
     }
 })
 
 # --- MANAGE IGNORED (UNIGNORE) ---
 if (-not $btnWingetUnignore) { $btnWingetUnignore = Get-Ctrl "btnWingetUnignore" }
 $btnWingetUnignore.Add_Click({
-    $jsonPath = Join-Path (Get-DataPath) "settings.json"
     $listItems = @()
-
-    if (Test-Path $jsonPath) {
-        try {
-            $json = Get-Content $jsonPath -Raw | ConvertFrom-Json
-            if ($json.WingetIgnore) { $listItems = @($json.WingetIgnore) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" } }
-        }
-        catch { Write-GuiLog "Error: $($_.Exception.Message)" }
-    }
-
-    if ($listItems.Count -eq 0) {
-        Show-WmtMessageBox -Message "No ignored packages found." -Title "Manage Ignored" -Image Information | Out-Null
-        return
-    }
 
     $content = @"
 <Grid Margin="16">
@@ -51948,23 +52497,74 @@ $btnWingetUnignore.Add_Click({
     $lb = $dialog.FindName("lbIgnored")
     $btnRestore = $dialog.FindName("btnRestore")
     $btnClose = $dialog.FindName("btnClose")
-    foreach ($item in $listItems) { [void]$lb.Items.Add($item) }
+    $btnRestore.IsEnabled = $false
+    [void]$lb.Items.Add("Loading ignored packages...")
     $refreshNeeded = @{ Value = $false }
 
     $btnRestore.Add_Click({
             $selected = @($lb.SelectedItems)
             if ($selected.Count -eq 0) { return }
-            $s = Get-WmtSettings
-            $current = [System.Collections.ArrayList]@($s.WingetIgnore)
-            foreach ($item in $selected) {
-                if ($current.Contains($item)) { $current.Remove($item) }
-                $lb.Items.Remove($item)
-            }
-            $s.WingetIgnore = $current.ToArray()
-            Save-WmtSettings -Settings $s
-            $refreshNeeded.Value = $true
+            $selectedIds = [string[]]@($selected | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+            $btnRestore.IsEnabled = $false
+            $saved = {
+                param($results)
+                foreach ($item in $selectedIds) { [void]$lb.Items.Remove($item) }
+                $refreshNeeded.Value = $true
+                $btnRestore.IsEnabled = ($lb.Items.Count -gt 0)
+            }.GetNewClosure()
+            $listOperation = @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Remove'; Values = $selectedIds })
+            Invoke-WmtSettingsPatchSave -Patch @{} -ListOperations $listOperation -Name ("WingetUnignore_" + [guid]::NewGuid().ToString("N")) -Message 'Saving ignored packages...' -OnComplete $saved -OnError {
+                param($errorRecord)
+                $btnRestore.IsEnabled = ($lb.SelectedItems.Count -gt 0)
+                $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+                Show-WmtMessageBox -Owner $dialog -Message "Could not save ignored packages:`n$message" -Title "Manage Ignored Updates" -Image Error | Out-Null
+            }.GetNewClosure()
         }.GetNewClosure())
     $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
+
+    $loaded = {
+        param($results)
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['IgnoredItems'] } | Select-Object -Last 1)[0]
+        if (-not $result) { return }
+        $lb.Items.Clear()
+        $listItems = @($result.IgnoredItems)
+        foreach ($item in $listItems) { [void]$lb.Items.Add([string]$item) }
+        $btnRestore.IsEnabled = ($listItems.Count -gt 0)
+        if ($listItems.Count -eq 0) {
+            Show-WmtMessageBox -Message "No ignored packages found." -Title "Manage Ignored" -Image Information | Out-Null
+            $dialog.Close()
+        }
+    }.GetNewClosure()
+    $loadFailed = {
+        param($errorRecord)
+        $dialog.Close()
+        Show-WmtMessageBox -Message "Could not load ignored packages:`n$($errorRecord.Exception.Message)" -Title "Manage Ignored" -Image Error | Out-Null
+    }.GetNewClosure()
+    $settingsPath = Join-Path (Get-DataPath) "settings.json"
+    Invoke-WmtUiBackgroundCommand -Name ("WingetIgnoredLoad_" + [guid]::NewGuid().ToString("N")) -Msg 'Loading ignored packages...' -ArgumentList @($settingsPath) -OnComplete $loaded -OnError $loadFailed -Sb {
+        param([string]$Path)
+        $settings = $null
+        if ([System.IO.File]::Exists($Path)) {
+            try {
+                $raw = [System.IO.File]::ReadAllText($Path)
+                if ([string]::IsNullOrWhiteSpace($raw)) { throw "settings.json is empty." }
+                $settings = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+            }
+            catch {
+                $backupPath = "$Path.bak"
+                if (-not [System.IO.File]::Exists($backupPath)) { throw }
+                $backupRaw = [System.IO.File]::ReadAllText($backupPath)
+                if ([string]::IsNullOrWhiteSpace($backupRaw)) { throw "settings backup is empty." }
+                $settings = ConvertFrom-Json -InputObject $backupRaw -ErrorAction Stop
+            }
+        }
+        $ignored = @('228980')
+        if ($settings -and $settings.PSObject.Properties['WingetIgnore']) {
+            $ignored = @($settings.WingetIgnore)
+        }
+        $items = @($ignored | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        [pscustomobject]@{ Message = ''; IgnoredItems = $items }
+    } | Out-Null
     $dialog.ShowDialog() | Out-Null
 
     if ($refreshNeeded.Value) {
@@ -59028,14 +59628,12 @@ $btnPerfServicesRevert.Add_Click({
 $btnToggleHibernate = Get-Ctrl "btnToggleHibernate"
 if ($btnToggleHibernate) {
 $btnToggleHibernate.Add_Click({
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
         $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0)
         $enabling = ($h -ne 1)
         $done = {
             param($results)
-            Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power")
-            $actual = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0)
-            Update-WmtTweakToggle $btnToggleHibernate ($actual -ne 0) "Disable Hibernation" "Enable Hibernation"
+            Update-WmtTweakToggle $btnToggleHibernate $enabling "Disable Hibernation" "Enable Hibernation"
         }.GetNewClosure()
         if ($enabling) {
             Invoke-WmtUiBackgroundCommand -Name "EnableHibernate" -Msg "Enabling hibernation..." -Sb {
@@ -59055,23 +59653,29 @@ $btnToggleHibernate.Add_Click({
 }
 
 if ($btnToggleSuperfetch) { $btnToggleSuperfetch.Add_Click({
-    $svc = Get-Service "SysMain" -ErrorAction SilentlyContinue
-    $wasDisabled = ($svc -and $svc.StartType -eq "Disabled")
-    if ($wasDisabled) {
-        Invoke-WmtUiBackgroundCommand -Name "EnableSysMain" -Msg "Enabling Superfetch..." -Sb {
-            Set-Service -Name SysMain -StartupType Automatic
+    $complete = {
+        param($results)
+        $state = @($results | Where-Object { $_ -and $null -ne $_.IsOn } | Select-Object -Last 1)[0]
+        if ($state) { Update-WmtTweakToggle $btnToggleSuperfetch ([bool]$state.IsOn) "Disable Superfetch" "Enable Superfetch" }
+    }.GetNewClosure()
+    $failed = {
+        param($errorRecord)
+        Set-WmtTweakUnknownState "btnToggleSuperfetch" "Unknown" "WMT could not read or update the SysMain service."
+    }.GetNewClosure()
+    Invoke-UiCommand {
+        $service = Get-Service "SysMain" -ErrorAction Stop
+        $enable = ($service.StartType -eq "Disabled")
+        if ($enable) {
+            Set-Service -Name SysMain -StartupType Automatic -ErrorAction Stop
             Start-Service -Name SysMain -ErrorAction SilentlyContinue
-            Write-Output "Superfetch/SysMain enabled."
-        } | Out-Null
-    }
-    else {
-        Invoke-WmtUiBackgroundCommand -Name "DisableSysMain" -Msg "Disabling Superfetch..." -Sb {
+        }
+        else {
             Stop-Service -Name SysMain -Force -ErrorAction SilentlyContinue
-            Set-Service -Name SysMain -StartupType Disabled
-            Write-Output "Superfetch/SysMain disabled."
-        } | Out-Null
-    }
-    Update-WmtTweakToggle $btnToggleSuperfetch $wasDisabled "Disable Superfetch" "Enable Superfetch"
+            Set-Service -Name SysMain -StartupType Disabled -ErrorAction Stop
+        }
+        $actual = Get-Service "SysMain" -ErrorAction Stop
+        [pscustomobject]@{ Message = "Superfetch/SysMain $(if ($actual.StartType -eq 'Disabled') { 'disabled' } else { 'enabled' })."; IsOn = ($actual.StartType -ne 'Disabled') }
+    } "Updating Superfetch..." -OnComplete $complete -OnError $failed
 }) }
 
 if ($btnPerfUltimatePower) { $btnPerfUltimatePower.Add_Click({
@@ -59103,7 +59707,7 @@ if ($btnPerfUltimatePower) { $btnPerfUltimatePower.Add_Click({
         }
         Write-Output "Ultimate Performance power plan enabled."
     } | Out-Null
-    Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Power"); $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0); if ($btnToggleHibernate) { Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Disable Hibernation" "Enable Hibernation" }
+    Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\Power"); $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled" 0) 0); if ($btnToggleHibernate) { Update-WmtTweakToggle $btnToggleHibernate ($h -ne 0) "Disable Hibernation" "Enable Hibernation" }
 }) }
 
 function Get-WmtRemovableAppxPackages {
@@ -59443,10 +60047,28 @@ if ($btnTasksView) { $btnTasksView.Add_Click({
 
 # --- WINDOWS UPDATE PRESETS ---
 if ($btnWUDefault) { $btnWUDefault.Add_Click({
-    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate"
-    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates"
-    Remove-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferQualityUpdates"
     Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDefault" -Msg "Applying default Windows Update settings..." -Sb {
+        $baseKey = $null
+        $key = $null
+        try {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
+            foreach ($entry in @(
+                @{ Path = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name = 'NoAutoUpdate' },
+                @{ Path = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DeferFeatureUpdates' },
+                @{ Path = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DeferQualityUpdates' }
+            )) {
+                $key = $baseKey.OpenSubKey($entry.Path, $true)
+                if ($key) {
+                    $key.DeleteValue($entry.Name, $false)
+                    $key.Dispose()
+                    $key = $null
+                }
+            }
+        }
+        finally {
+            if ($key) { $key.Dispose() }
+            if ($baseKey) { $baseKey.Dispose() }
+        }
         Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
         Start-Service -Name wuauserv -ErrorAction SilentlyContinue
         Write-Output "Windows Update set to Default."
@@ -59454,10 +60076,24 @@ if ($btnWUDefault) { $btnWUDefault.Add_Click({
 }) }
 
 if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
-    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdates" 1
-    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "DeferFeatureUpdatesPeriodInDays" 365
-    Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 0
-    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateSecurityOnly" -Msg "Applying security-only update settings..." -Sb {
+    Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateSecurity" -Msg "Applying security-only update settings..." -Sb {
+        $baseKey = $null
+        $key = $null
+        try {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
+            $key = $baseKey.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate')
+            if (-not $key) { throw "Could not open the Windows Update policy registry key." }
+            $key.SetValue('DeferFeatureUpdates', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $key.SetValue('DeferFeatureUpdatesPeriodInDays', 365, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $key.Dispose()
+            $key = $baseKey.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU')
+            if (-not $key) { throw "Could not open the Windows Update AU policy registry key." }
+            $key.SetValue('NoAutoUpdate', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+        }
+        finally {
+            if ($key) { $key.Dispose() }
+            if ($baseKey) { $baseKey.Dispose() }
+        }
         Set-Service -Name wuauserv -StartupType Automatic -ErrorAction SilentlyContinue
         Write-Output "Windows Update set to Security Only (deferring features)."
     } | Out-Null
@@ -59465,8 +60101,19 @@ if ($btnWUSecurity) { $btnWUSecurity.Add_Click({
 
 if ($btnWUDisable) { $btnWUDisable.Add_Click({
     if ((Show-WmtMessageBox -Message "Disable ALL Windows Updates? This is not recommended for security." -Title "Warning" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) {
-        Set-WmtRegDword "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "NoAutoUpdate" 1
         Invoke-WmtUiBackgroundCommand -Name "WindowsUpdateDisable" -Msg "Disabling Windows Update..." -Sb {
+            $baseKey = $null
+            $key = $null
+            try {
+                $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Default)
+                $key = $baseKey.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU')
+                if (-not $key) { throw "Could not open the Windows Update AU policy registry key." }
+                $key.SetValue('NoAutoUpdate', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+            }
+            finally {
+                if ($key) { $key.Dispose() }
+                if ($baseKey) { $baseKey.Dispose() }
+            }
             Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
             Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
             Write-Output "Windows Update DISABLED."
@@ -59490,14 +60137,37 @@ $btnMouseSpeedFast = Get-Ctrl "btnMouseSpeedFast"
 $btnToggleCombine = Get-Ctrl "btnToggleCombine"
 
 # --- Mouse & Explorer Tweak Click Handlers (registered once at startup) ---
+function Update-WmtMouseSpeedButtonStates {
+    param([int]$Speed)
+    $script:WmtMouseSpeedValue = $Speed
+    if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($Speed -ne 6) }
+    if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($Speed -ne 10) }
+    if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($Speed -ne 15) }
+}
+
+function Invoke-WmtMouseSpeedChange {
+    param([int]$Speed, [string]$Label)
+    $completed = {
+        param($results)
+        Update-WmtMouseSpeedButtonStates $Speed
+    }.GetNewClosure()
+    Invoke-WmtUiBackgroundCommand -Name ("MouseSpeed_" + [guid]::NewGuid().ToString("N")) -Msg "Setting mouse speed $Label..." -ArgumentList @($Speed, $Label) -OnComplete $completed -Sb {
+        param([int]$Value, [string]$SpeedLabel)
+        [WmtNativeMouse.Params]::SetSpeed([uint32]$Value)
+        "Mouse pointer speed set to $Value ($SpeedLabel)."
+    } | Out-Null
+}
+
 if ($btnMouseSpeedSlow) {
-$btnMouseSpeedSlow.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 6; Write-GuiLog "Mouse pointer speed set to 6 (slow)." } "Setting mouse speed slow..." ; Clear-WmtRegCache @("HKCU:\Control Panel\Mouse"); $s = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\Mouse" "MouseSensitivity" 10) 0); $script:WmtMouseSpeedValue = [int]$s; if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($s -ne 6) }; if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($s -ne 10) }; if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($s -ne 15) } })
+$btnMouseSpeedSlow.Add_Click({ Invoke-WmtMouseSpeedChange 6 "slow" })
 }
+
 if ($btnMouseSpeedDefault) {
-$btnMouseSpeedDefault.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 10; Write-GuiLog "Mouse pointer speed set to 10 (default)." } "Setting mouse speed default..." ; Clear-WmtRegCache @("HKCU:\Control Panel\Mouse"); $s = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\Mouse" "MouseSensitivity" 10) 0); $script:WmtMouseSpeedValue = [int]$s; if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($s -ne 6) }; if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($s -ne 10) }; if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($s -ne 15) } })
+$btnMouseSpeedDefault.Add_Click({ Invoke-WmtMouseSpeedChange 10 "default" })
 }
+
 if ($btnMouseSpeedFast) {
-$btnMouseSpeedFast.Add_Click({ Invoke-UiCommand { Set-WmtMouseSpeed 15; Write-GuiLog "Mouse pointer speed set to 15 (fast)." } "Setting mouse speed fast..." ; Clear-WmtRegCache @("HKCU:\Control Panel\Mouse"); $s = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\Mouse" "MouseSensitivity" 10) 0); $script:WmtMouseSpeedValue = [int]$s; if ($btnMouseSpeedSlow) { $btnMouseSpeedSlow.IsEnabled = ($s -ne 6) }; if ($btnMouseSpeedDefault) { $btnMouseSpeedDefault.IsEnabled = ($s -ne 10) }; if ($btnMouseSpeedFast) { $btnMouseSpeedFast.IsEnabled = ($s -ne 15) } })
+$btnMouseSpeedFast.Add_Click({ Invoke-WmtMouseSpeedChange 15 "fast" })
 }
 if ($btnMouseSettings) { $btnMouseSettings.Add_Click({ Start-Process "main.cpl" }) }
 if ($btnSearchIndexRebuild) {
@@ -59518,7 +60188,7 @@ $btnToggleExtensions = Get-Ctrl "btnToggleExtensions"
 if ($btnToggleExtensions) {
 $btnToggleExtensions.Add_Click({
         $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $ap "HideFileExt" 1) 0) -ne 0)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $ap "HideFileExt" 0; Write-GuiLog "File extensions shown." } "Showing file extensions..."
@@ -59539,7 +60209,7 @@ $btnToggleHiddenFiles = Get-Ctrl "btnToggleHiddenFiles"
 if ($btnToggleHiddenFiles) {
 $btnToggleHiddenFiles.Add_Click({
         $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $ap "Hidden" 2) 0) -eq 2)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $ap "Hidden" 1; Write-GuiLog "Hidden files shown." } "Showing hidden files..."
@@ -59560,7 +60230,7 @@ $btnToggleExplorerLaunch = Get-Ctrl "btnToggleExplorerLaunch"
 if ($btnToggleExplorerLaunch) {
 $btnToggleExplorerLaunch.Add_Click({
         $ap = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyThisPc = ((ConvertTo-Int (Get-WmtRegValue $ap "LaunchTo" 2) 0) -eq 1)
         if ($currentlyThisPc) {
             Invoke-UiCommand { Set-WmtRegDword $ap "LaunchTo" 2; Write-GuiLog "Explorer opens to Quick Access." } "Setting Quick Access..."
@@ -59576,7 +60246,7 @@ $btnToggleFullPath = Get-Ctrl "btnToggleFullPath"
 if ($btnToggleFullPath) {
 $btnToggleFullPath.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState")
         $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p "FullPath" 0) 0) -eq 1)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "FullPath" 0; Write-GuiLog "Full path in title bar disabled." } "Disabling full path..."
@@ -59592,7 +60262,7 @@ $btnToggleRecents = Get-Ctrl "btnToggleRecents"
 if ($btnToggleRecents) {
 $btnToggleRecents.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue $p "ShowRecent" 1) 0) -eq 0 -and (ConvertTo-Int (Get-WmtRegValue $p "ShowFrequent" 1) 0) -eq 0)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword $p "ShowRecent" 1; Set-WmtRegDword $p "ShowFrequent" 1; Write-GuiLog "Recent files shown." } "Showing recents..."
@@ -59608,7 +60278,7 @@ $btnToggleMouseAccel = Get-Ctrl "btnToggleMouseAccel"
 if ($btnToggleMouseAccel) {
 $btnToggleMouseAccel.Add_Click({
         $p = "HKCU:\Control Panel\Mouse"
-        Clear-WmtRegCache @($p)
+        Clear-WmtRegCache -PreserveUiSnapshot @($p)
         $accelSpeed = ConvertTo-Str (Get-WmtRegValue $p "MouseSpeed" "1") ""
         $accelT1 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold1" "6") ""
         $accelT2 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold2" "10") ""
@@ -59619,7 +60289,7 @@ $btnToggleMouseAccel.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtMouseAcceleration $true; Write-GuiLog "Mouse acceleration enabled." } "Enabling mouse acceleration..."
         }
-        Clear-WmtRegCache @($p)
+        Clear-WmtRegCache -PreserveUiSnapshot @($p)
         $actualAccelSpeed = ConvertTo-Str (Get-WmtRegValue $p "MouseSpeed" $null) ""
         $actualAccelT1 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold1" $null) ""
         $actualAccelT2 = ConvertTo-Str (Get-WmtRegValue $p "MouseThreshold2" $null) ""
@@ -59636,7 +60306,7 @@ $btnToggleClickMode = Get-Ctrl "btnToggleClickMode"
 if ($btnToggleClickMode) {
 $btnToggleClickMode.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer")
         $shellState = Get-WmtRegValue $p "ShellState"
         $singleClick = ($shellState -and $shellState.Length -gt 4 -and [int]$shellState[4] -eq 0x1E)
         if ($singleClick) {
@@ -59645,7 +60315,7 @@ $btnToggleClickMode.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtExplorerClickMode $true; Write-GuiLog "Single-click folder opening enabled." } "Enabling single-click..."
         }
-        Clear-WmtRegCache @($p)
+        Clear-WmtRegCache -PreserveUiSnapshot @($p)
         $actualShellState = Get-WmtRegValue $p "ShellState" $null
         if ($actualShellState -and $actualShellState.Length -gt 4 -and ([int]$actualShellState[4] -eq 0x1E -or [int]$actualShellState[4] -eq 0x3E)) {
             $actualSingleClick = ([int]$actualShellState[4] -eq 0x1E)
@@ -59728,7 +60398,7 @@ $btnToggleAds = Get-Ctrl "btnToggleAds"
 if ($btnToggleAds) {
 $btnToggleAds.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo")
         $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p "Enabled" 1) 0) -ne 0)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "Enabled" 0; Write-GuiLog "Advertising ID disabled." } "Disabling advertising ID..."
@@ -59746,7 +60416,7 @@ $btnToggleSuggested.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
         $names = @("ContentDeliveryAllowed", "FeatureManagementEnabled", "OemPreInstalledAppsEnabled", "PreInstalledAppsEnabled", "PreInstalledAppsEverEnabled", "SilentInstalledAppsEnabled", "SoftLandingEnabled", "SubscribedContent-310093Enabled", "SubscribedContent-338388Enabled", "SubscribedContent-338389Enabled", "SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled", "SystemPaneSuggestionsEnabled")
         $anyOn = $false
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
         foreach ($n in $names) { if ((ConvertTo-Int (Get-WmtRegValue $p $n 1) 0) -ne 0) { $anyOn = $true; break } }
         if ($anyOn) {
             Invoke-UiCommand { foreach ($n in $names) { Set-WmtRegDword $p $n 0 }; Write-GuiLog "Suggested content disabled." } "Disabling suggestions..."
@@ -59763,7 +60433,7 @@ if ($btnToggleTailored) {
 $btnToggleTailored.Add_Click({
         $p1 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy"
         $p2 = "HKCU:\Software\Policies\Microsoft\Windows\CloudContent"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy", "HKCU:\Software\Policies\Microsoft\Windows\CloudContent")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy", "HKCU:\Software\Policies\Microsoft\Windows\CloudContent")
         $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p1 "TailoredExperiencesWithDiagnosticDataEnabled" 1) 0) -ne 0 -and (ConvertTo-Int (Get-WmtRegValue $p2 "DisableTailoredExperiencesWithDiagnosticData" 0) 0) -ne 1)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p1 "TailoredExperiencesWithDiagnosticDataEnabled" 0; Set-WmtRegDword $p2 "DisableTailoredExperiencesWithDiagnosticData" 1; Write-GuiLog "Tailored experiences disabled." } "Disabling tailored experiences..."
@@ -59780,7 +60450,7 @@ if ($btnToggleActivity) {
 $btnToggleActivity.Add_Click({
         if (-not $btnToggleActivity.IsEnabled) { return }
         $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\System")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\System")
         $currentlyOff = ((ConvertTo-Int (Get-WmtRegValue $p "EnableActivityFeed" 1) 0) -eq 0 -and (ConvertTo-Int (Get-WmtRegValue $p "PublishUserActivities" 1) 0) -eq 0 -and (ConvertTo-Int (Get-WmtRegValue $p "UploadUserActivities" 1) 0) -eq 0)
         if ($currentlyOff) {
             Invoke-UiCommand { Set-WmtRegDword $p "EnableActivityFeed" 1; Set-WmtRegDword $p "PublishUserActivities" 1; Set-WmtRegDword $p "UploadUserActivities" 1; Write-GuiLog "Activity history enabled." } "Enabling activity history..."
@@ -59796,7 +60466,7 @@ $btnToggleAppLaunch = Get-Ctrl "btnToggleAppLaunch"
 if ($btnToggleAppLaunch) {
 $btnToggleAppLaunch.Add_Click({
         $p = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p "Start_TrackProgs" 1) 0) -ne 0)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p "Start_TrackProgs" 0; Write-GuiLog "App launch tracking disabled." } "Disabling app launch tracking..."
@@ -59813,7 +60483,7 @@ if ($btnToggleWebSearch) {
 $btnToggleWebSearch.Add_Click({
         $p1 = "HKCU:\Software\Policies\Microsoft\Windows\Explorer"
         $p2 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search", "HKCU:\Software\Policies\Microsoft\Windows\Explorer")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search", "HKCU:\Software\Policies\Microsoft\Windows\Explorer")
         $currentlyOn = ((ConvertTo-Int (Get-WmtRegValue $p1 "DisableSearchBoxSuggestions" 0) 0) -ne 1 -and (ConvertTo-Int (Get-WmtRegValue $p2 "BingSearchEnabled" 1) 0) -ne 0)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword $p1 "DisableSearchBoxSuggestions" 1; Set-WmtRegDword $p2 "BingSearchEnabled" 0; Write-GuiLog "Web search in Start Menu disabled." } "Disabling web search..."
@@ -59828,15 +60498,28 @@ $btnToggleWebSearch.Add_Click({
 $btnToggleSearchIndex = Get-Ctrl "btnToggleSearchIndex"
 if ($btnToggleSearchIndex) {
 $btnToggleSearchIndex.Add_Click({
-        $svc = Get-Service "WSearch" -ErrorAction SilentlyContinue
-        $currentlyOn = [bool]($svc -and $svc.StartType -eq "Automatic")
-        if (-not $currentlyOn) {
-            Invoke-WmtUiBackgroundCommand -Name "EnableSearchIndex" -Msg "Enabling search index..." -Sb { Set-Service -Name WSearch -StartupType Automatic; Start-Service -Name WSearch -ErrorAction SilentlyContinue; Write-Output "Search index set to Automatic." } | Out-Null
-        }
-        else {
-            Invoke-WmtUiBackgroundCommand -Name "ReduceSearchIndex" -Msg "Reducing search index..." -Sb { Set-Service -Name WSearch -StartupType Manual; Write-Output "Search index set to Manual." } | Out-Null
-        }
-        Update-WmtTweakToggle $btnToggleSearchIndex (-not $currentlyOn) "Reduce Indexing" "Default Indexing"
+        $complete = {
+            param($results)
+            $state = @($results | Where-Object { $_ -and $null -ne $_.IsOn } | Select-Object -Last 1)[0]
+            if ($state) { Update-WmtTweakToggle $btnToggleSearchIndex ([bool]$state.IsOn) "Reduce Indexing" "Default Indexing" }
+        }.GetNewClosure()
+        $failed = {
+            param($errorRecord)
+            Set-WmtTweakUnknownState "btnToggleSearchIndex" "Unknown" "WMT could not read or update the Windows Search service."
+        }.GetNewClosure()
+        Invoke-UiCommand {
+            $service = Get-Service "WSearch" -ErrorAction Stop
+            $currentlyOn = [bool]($service.StartType -eq "Automatic")
+            if (-not $currentlyOn) {
+                Set-Service -Name WSearch -StartupType Automatic -ErrorAction Stop
+                Start-Service -Name WSearch -ErrorAction SilentlyContinue
+            }
+            else {
+                Set-Service -Name WSearch -StartupType Manual -ErrorAction Stop
+            }
+            $actual = Get-Service "WSearch" -ErrorAction Stop
+            [pscustomobject]@{ Message = "Search index set to $($actual.StartType)."; IsOn = ($actual.StartType -eq 'Automatic') }
+        } "Updating search indexing..." -OnComplete $complete -OnError $failed
     })
 }
 
@@ -59845,7 +60528,7 @@ Register-WmtTweakButton "btnSearchIndexOptions" { Start-Process "control.exe" "s
 $btnToggleGameMode = Get-Ctrl "btnToggleGameMode"
 if ($btnToggleGameMode) {
 $btnToggleGameMode.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\GameBar")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\GameBar")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" 0) 0)) -eq 1 -or ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" 0) 0)) -eq 1)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -59867,7 +60550,7 @@ $btnToggleGameMode.Add_Click({
 $btnToggleGameBar = Get-Ctrl "btnToggleGameBar"
 if ($btnToggleGameBar) {
 $btnToggleGameBar.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR", "HKCU:\System\GameConfigStore")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR", "HKCU:\System\GameConfigStore")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 1) 0)) -ne 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1) 0)) -ne 0)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -59891,7 +60574,7 @@ $btnToggleGameBar.Add_Click({
 $btnToggleGameCapture = Get-Ctrl "btnToggleGameCapture"
 if ($btnToggleGameCapture) {
 $btnToggleGameCapture.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 1) 0)) -eq 0)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "HistoricalCaptureEnabled" 1; Write-GuiLog "Background capture restored." } "Restoring background capture..."
@@ -59906,7 +60589,7 @@ $btnToggleFso = Get-Ctrl "btnToggleFso"
 if ($btnToggleFso) {
 $btnToggleFso.Add_Click({
         $fsoPath = "HKCU:\System\GameConfigStore"
-        Clear-WmtRegCache @("HKCU:\System\GameConfigStore")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\System\GameConfigStore")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $fsoPath "GameDVR_FSEBehaviorMode" 0) 0)) -eq 2 -and ((ConvertTo-Int (Get-WmtRegValue $fsoPath "GameDVR_HonorUserFSEBehaviorMode" 0) 0)) -eq 1)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -59940,7 +60623,7 @@ Register-WmtTweakButton "btnNotifyFocusSettings" { Start-Process "ms-settings:no
 $btnToggleTips = Get-Ctrl "btnToggleTips"
 if ($btnToggleTips) {
 $btnToggleTips.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SoftLandingEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338389Enabled" 1) 0)) -eq 0)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -59962,7 +60645,7 @@ $btnToggleTips.Add_Click({
 $btnToggleSetupPrompts = Get-Ctrl "btnToggleSetupPrompts"
 if ($btnToggleSetupPrompts) {
 $btnToggleSetupPrompts.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement")
         $setupOff = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1) 0) -eq 0)
         if ($setupOff) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1; Write-GuiLog "Finish setup prompts restored." } "Restoring setup prompts..."
@@ -59976,7 +60659,7 @@ $btnToggleSetupPrompts.Add_Click({
 $btnToggleLockFacts = Get-Ctrl "btnToggleLockFacts"
 if ($btnToggleLockFacts) {
 $btnToggleLockFacts.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -59998,7 +60681,7 @@ $btnToggleLockFacts.Add_Click({
 $btnToggleLockSpotlight = Get-Ctrl "btnToggleLockSpotlight"
 if ($btnToggleLockSpotlight) {
 $btnToggleLockSpotlight.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -60020,7 +60703,7 @@ $btnToggleLockSpotlight.Add_Click({
 $btnToggleLockScreen = Get-Ctrl "btnToggleLockScreen"
 if ($btnToggleLockScreen) {
 $btnToggleLockScreen.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
         $lockFactsOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
         $spotlightOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
         $currentlyOn = ($lockFactsOff -and $spotlightOff)
@@ -60042,7 +60725,7 @@ $btnToggleLockScreen.Add_Click({
                 Write-GuiLog "Plain lock screen preset applied."
             } "Applying plain lock screen..."
         }
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent")
         $lfOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 1) 0)) -eq 0 -and ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 1) 0)) -eq 0)
         if ($btnToggleLockFacts) { Update-WmtTweakToggle $btnToggleLockFacts (-not $lfOff) "Lock Facts On" "Lock Facts Off" }
         $spOff = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenEnabled" 1) 0)) -eq 0 -or ((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 0) 0)) -eq 1)
@@ -60054,21 +60737,27 @@ $btnToggleLockScreen.Add_Click({
 $btnToggleFastStartup = Get-Ctrl "btnToggleFastStartup"
 if ($btnToggleFastStartup) {
 $btnToggleFastStartup.Add_Click({
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1) 0)) -eq 0)
         if ($currentlyOn) {
             $done = {
                 param($results)
-                Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
-                Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
-                $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
-                Update-WmtTweakToggle $btnToggleFastStartup ($actual -ne 0) "Fast Startup On" "Fast Startup Off"
+                try {
+                    Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
+                    Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+                    $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
+                    if ($actual -ne 1) { throw "Windows did not confirm that Fast Startup was enabled." }
+                    Update-WmtTweakToggle $btnToggleFastStartup $true "Fast Startup On" "Fast Startup Off"
+                    Write-GuiLog "Fast Startup enabled."
+                }
+                catch {
+                    Write-GuiLog "ERROR: Could not save the Fast Startup setting: $($_.Exception.Message)"
+                    Set-WmtTweakUnknownState "btnToggleFastStartup" "Unknown" "WMT could not change or verify the Fast Startup setting."
+                }
             }.GetNewClosure()
             $failed = {
                 param($errorRecord)
-                Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
-                $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
-                Update-WmtTweakToggle $btnToggleFastStartup ($actual -ne 0) "Fast Startup On" "Fast Startup Off"
+                Set-WmtTweakUnknownState "btnToggleFastStartup" "Unknown" "WMT could not change or verify the Fast Startup setting."
             }.GetNewClosure()
             Invoke-WmtUiBackgroundCommand -Name "EnableFastStartupHibernate" -Msg "Enabling Fast Startup..." -Sb {
                 $output = @(powercfg /hibernate on 2>&1)
@@ -60078,7 +60767,7 @@ $btnToggleFastStartup.Add_Click({
         }
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0; Write-GuiLog "Fast Startup disabled." } "Disabling Fast Startup..."
-            Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
+            Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power")
             $actual = ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0) 0
             Update-WmtTweakToggle $btnToggleFastStartup ($actual -ne 0) "Fast Startup On" "Fast Startup Off"
         }
@@ -60087,7 +60776,7 @@ $btnToggleFastStartup.Add_Click({
 $btnToggleRestoreFolders = Get-Ctrl "btnToggleRestoreFolders"
 if ($btnToggleRestoreFolders) {
 $btnToggleRestoreFolders.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "PersistBrowsers" 0) 0)) -ne 0)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "PersistBrowsers" 0; Write-GuiLog "Previous folder windows will not restore at logon." } "Disabling folder restore at logon..."
@@ -60104,10 +60793,11 @@ $btnSecurityUacStatus = Get-Ctrl "btnSecurityUacStatus"
 if ($btnSecurityUacStatus) {
 $btnSecurityUacStatus.Add_Click({
         $systemPolicy = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System")
-        Write-GuiLog "UAC EnableLUA: $(Get-WmtRegValue $systemPolicy "EnableLUA" "Unknown")"
-        Write-GuiLog "UAC ConsentPromptBehaviorAdmin: $(Get-WmtRegValue $systemPolicy "ConsentPromptBehaviorAdmin" "Unknown")"
-        Write-GuiLog "UAC PromptOnSecureDesktop: $(Get-WmtRegValue $systemPolicy "PromptOnSecureDesktop" "Unknown")"
+        Invoke-UiCommand {
+            Write-GuiLog "UAC EnableLUA: $(Get-WmtRegValue $systemPolicy "EnableLUA" "Unknown")"
+            Write-GuiLog "UAC ConsentPromptBehaviorAdmin: $(Get-WmtRegValue $systemPolicy "ConsentPromptBehaviorAdmin" "Unknown")"
+            Write-GuiLog "UAC PromptOnSecureDesktop: $(Get-WmtRegValue $systemPolicy "PromptOnSecureDesktop" "Unknown")"
+        } "Reading UAC policy..."
     })
 }
 Register-WmtTweakButton "btnSecuritySmartScreenOpen" {
@@ -60116,13 +60806,14 @@ try { Start-Process "windowsdefender://AppAndBrowser" } catch { Start-Process "m
 $btnSecuritySmartScreenStatus = Get-Ctrl "btnSecuritySmartScreenStatus"
 if ($btnSecuritySmartScreenStatus) {
 $btnSecuritySmartScreenStatus.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AppHost", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer")
-        Write-GuiLog "Explorer SmartScreen: $(Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "SmartScreenEnabled" "Unknown")"
-        Write-GuiLog "AppHost Web Content Evaluation: $(Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AppHost" "EnableWebContentEvaluation" "Unknown")"
-        if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
-            $mp = Get-MpPreference -ErrorAction SilentlyContinue
-            if ($mp) { Write-GuiLog "Defender PUA protection: $($mp.PUAProtection)" }
-        }
+        Invoke-UiCommand {
+            Write-GuiLog "Explorer SmartScreen: $(Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "SmartScreenEnabled" "Unknown")"
+            Write-GuiLog "AppHost Web Content Evaluation: $(Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AppHost" "EnableWebContentEvaluation" "Unknown")"
+            if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
+                $mp = Get-MpPreference -ErrorAction SilentlyContinue
+                if ($mp) { Write-GuiLog "Defender PUA protection: $($mp.PUAProtection)" }
+            }
+        } "Reading SmartScreen and Defender status..."
     })
 }
 Register-WmtTweakButton "btnSecurityCfaOpen" {
@@ -60132,39 +60823,95 @@ try { Start-Process "windowsdefender://RansomwareProtection" } catch { Start-Pro
 Register-WmtTweakButton "btnPowerBatterySaverOff" { Invoke-UiCommand { Set-WmtPowerSettingIndex "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" 0 -DCOnly; Write-GuiLog "Battery saver threshold set to 0%." } "Setting battery saver threshold..." }
 Register-WmtTweakButton "btnPowerBatterySaver20" { Invoke-UiCommand { Set-WmtPowerSettingIndex "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" 20 -DCOnly; Write-GuiLog "Battery saver threshold set to 20%." } "Setting battery saver threshold..." }
 Register-WmtTweakButton "btnPowerBatterySaver50" { Invoke-UiCommand { Set-WmtPowerSettingIndex "SUB_ENERGYSAVER" "ESBATTTHRESHOLD" 50 -DCOnly; Write-GuiLog "Battery saver threshold set to 50%." } "Setting battery saver threshold..." }
+
+function Invoke-WmtPowerSettingToggle {
+    param(
+        [Parameter(Mandatory = $true)]$Button,
+        [Parameter(Mandatory = $true)][string]$ButtonName,
+        [Parameter(Mandatory = $true)][string]$SubGroup,
+        [Parameter(Mandatory = $true)][string]$Setting,
+        [Parameter(Mandatory = $true)][string]$OnLabel,
+        [Parameter(Mandatory = $true)][string]$OffLabel,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $completed = {
+        param($results)
+        $state = @($results | Where-Object { $_ -and $null -ne $_.IsKnown } | Select-Object -Last 1)[0]
+        if (-not $state -or -not [bool]$state.IsKnown) {
+            Set-WmtTweakUnknownState $ButtonName "Not confirmed" "Powercfg did not return both AC and DC values."
+            return
+        }
+        Update-WmtTweakToggle $Button ([bool]$state.IsOn) $OnLabel $OffLabel
+    }.GetNewClosure()
+    $failed = {
+        param($errorRecord)
+        Set-WmtTweakUnknownState $ButtonName "Not confirmed" "Powercfg could not read or update this setting."
+    }.GetNewClosure()
+    $arguments = [object[]]::new(2)
+    $arguments[0] = $SubGroup
+    $arguments[1] = $Setting
+    Invoke-WmtUiBackgroundCommand -Name ("PowerSetting_" + [guid]::NewGuid().ToString("N")) -Msg $Message -ArgumentList $arguments -OnComplete $completed -OnError $failed -Sb {
+        param([string]$Group, [string]$SettingName)
+
+        function Get-PowerSettingIndex {
+            param([string]$SubGroup, [string]$Setting, [ValidateSet("AC", "DC")][string]$Mode)
+            $output = @(powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>$null)
+            if ($LASTEXITCODE -ne 0) { $output = @(powercfg /qh SCHEME_CURRENT $SubGroup $Setting 2>$null) }
+            if ($LASTEXITCODE -ne 0) { return $null }
+            $label = if ($Mode -eq "DC") { "Current DC Power Setting Index" } else { "Current AC Power Setting Index" }
+            $pattern = [regex]::Escape($label) + "\s*:\s*0x([0-9a-fA-F]+)"
+            foreach ($line in $output) {
+                if ($line -match $pattern) { return [Convert]::ToInt32($matches[1], 16) }
+            }
+            return $null
+        }
+
+        function Set-PowerSettingIndex {
+            param([string]$SubGroup, [string]$Setting, [int]$Value)
+            $output = @(powercfg /setacvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the AC value: $($output -join ' ')" }
+            $output = @(powercfg /setdcvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "powercfg could not set the DC value: $($output -join ' ')" }
+            $output = @(powercfg /S SCHEME_CURRENT 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "powercfg could not activate the current power plan: $($output -join ' ')" }
+        }
+
+        $currentAc = Get-PowerSettingIndex $Group $SettingName "AC"
+        $currentDc = Get-PowerSettingIndex $Group $SettingName "DC"
+        if ($null -eq $currentAc -or $null -eq $currentDc) { throw "Powercfg could not read both AC and DC setting values." }
+        $currentlyOn = ($currentAc -eq 1 -and $currentDc -eq 1)
+        $targetValue = if ($currentlyOn) { 0 } else { 1 }
+        Set-PowerSettingIndex $Group $SettingName $targetValue
+        $actualAc = Get-PowerSettingIndex $Group $SettingName "AC"
+        $actualDc = Get-PowerSettingIndex $Group $SettingName "DC"
+        [pscustomobject]@{
+            Message = "$SettingName set to $targetValue for AC and DC."
+            IsKnown = ($null -ne $actualAc -and $null -ne $actualDc)
+            IsOn = ($null -ne $actualAc -and $null -ne $actualDc -and $actualAc -eq 1 -and $actualDc -eq 1)
+        }
+    } | Out-Null
+}
+
 $btnToggleUsbSuspend = Get-Ctrl "btnToggleUsbSuspend"
 if ($btnToggleUsbSuspend) {
 $btnToggleUsbSuspend.Add_Click({
         $usbSub = "2a737441-1930-4402-8d77-b2bebba308a3"; $usbSetting = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
-        $usbAc = Get-WmtPowerSettingIndex $usbSub $usbSetting "AC"; $usbDc = Get-WmtPowerSettingIndex $usbSub $usbSetting "DC"
-        $currentlyOn = ($usbAc -eq 1 -and $usbDc -eq 1)
-        $targetValue = if ($currentlyOn) { 0 } else { 1 }
-        $operationMessage = if ($targetValue -eq 0) { "Disabling USB selective suspend..." } else { "Enabling USB selective suspend..." }
-        Invoke-UiCommand { Set-WmtPowerSettingIndex $usbSub $usbSetting $targetValue; Write-GuiLog "USB selective suspend set to $targetValue for AC and DC." } $operationMessage
-        $actualAc = Get-WmtPowerSettingIndex $usbSub $usbSetting "AC"; $actualDc = Get-WmtPowerSettingIndex $usbSub $usbSetting "DC"
-        if ($null -eq $actualAc -or $null -eq $actualDc) { Set-WmtTweakUnknownState "btnToggleUsbSuspend" "Not confirmed" "Powercfg did not return both AC and DC values." }
-        else { Update-WmtTweakToggle $btnToggleUsbSuspend ($actualAc -eq 1 -and $actualDc -eq 1) "USB Suspend On" "USB Suspend Off" }
+        Invoke-WmtPowerSettingToggle -Button $btnToggleUsbSuspend -ButtonName "btnToggleUsbSuspend" -SubGroup $usbSub -Setting $usbSetting -OnLabel "USB Suspend On" -OffLabel "USB Suspend Off" -Message "Updating USB selective suspend..."
     })
 }
 $btnTogglePcie = Get-Ctrl "btnTogglePcie"
 if ($btnTogglePcie) {
 $btnTogglePcie.Add_Click({
         $pcieSub = "501a4d13-42af-4429-9fd1-a8218c268e20"; $pcieSetting = "ee12f906-d277-404b-b6da-e5fa1a576df5"
-        $pcieAc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "AC"; $pcieDc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "DC"
-        $currentlyOn = ($pcieAc -eq 1 -and $pcieDc -eq 1)
-        $targetValue = if ($currentlyOn) { 0 } else { 1 }
-        $operationMessage = if ($targetValue -eq 0) { "Disabling PCIe link state savings..." } else { "Enabling PCIe link state savings..." }
-        Invoke-UiCommand { Set-WmtPowerSettingIndex $pcieSub $pcieSetting $targetValue; Write-GuiLog "PCIe link state value set to $targetValue for AC and DC." } $operationMessage
-        $actualAc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "AC"; $actualDc = Get-WmtPowerSettingIndex $pcieSub $pcieSetting "DC"
-        if ($null -eq $actualAc -or $null -eq $actualDc) { Set-WmtTweakUnknownState "btnTogglePcie" "Not confirmed" "Powercfg did not return both AC and DC values." }
-        else { Update-WmtTweakToggle $btnTogglePcie ($actualAc -eq 1 -and $actualDc -eq 1) "PCIe Savings" "PCIe Savings Off" }
+        Invoke-WmtPowerSettingToggle -Button $btnTogglePcie -ButtonName "btnTogglePcie" -SubGroup $pcieSub -Setting $pcieSetting -OnLabel "PCIe Savings" -OffLabel "PCIe Savings Off" -Message "Updating PCIe link state savings..."
     })
 }
 
 $btnToggleLongPaths = Get-Ctrl "btnToggleLongPaths"
 if ($btnToggleLongPaths) {
 $btnToggleLongPaths.Add_Click({
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled" 0) 0)) -eq 1)
         if ($currentlyOn) {
             Invoke-UiCommand { Set-WmtRegDword "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled" 0; Write-GuiLog "Win32 long paths disabled." } "Disabling long paths..."
@@ -60178,7 +60925,7 @@ $btnToggleLongPaths.Add_Click({
 $btnToggleDevMode = Get-Ctrl "btnToggleDevMode"
 if ($btnToggleDevMode) {
 $btnToggleDevMode.Add_Click({
-        Clear-WmtRegCache @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock")
         $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" "AllowDevelopmentWithoutDevLicense" 0) 0)) -eq 1)
         if ($currentlyOn) {
             Invoke-UiCommand {
@@ -60756,27 +61503,32 @@ $btnLibraryRefresh.Add_Click({
 # search debounce and every list population path share one live value.
 if ($btnToggleFabAssets) {
 $btnToggleFabAssets.Add_Click({
+        $previousHideAssets = [bool]$global:WmtHideUeAssets
         $global:WmtHideUeAssets = -not $global:WmtHideUeAssets
-        try {
-            $wmtUeSettings = Get-WmtSettings
-            if ($wmtUeSettings -is [System.Collections.IDictionary]) { $wmtUeSettings["HideLegendaryUeAssets"] = [bool]$global:WmtHideUeAssets }
-            else { $wmtUeSettings | Add-Member -MemberType NoteProperty -Name "HideLegendaryUeAssets" -Value ([bool]$global:WmtHideUeAssets) -Force }
-            Save-WmtSettings -Settings $wmtUeSettings
-        }
-        catch {}
+        $hideAssets = [bool]$global:WmtHideUeAssets
         Set-WmtFabAssetsButtonLabel
         # Re-apply the filter instantly; Update-WmtLibrarySearch respects any
         # active search text and the shared hide flag.
         Update-WmtLibrarySearch
-        # Rebuild the Legendary cache to match the new visibility: Hidden
-        # (default) builds it without --include-ue, Shown with UE/Fab rows.
-        # The builder's completion handler refreshes the open library view,
-        # so flipping the toggle both ways takes effect without a restart.
-        try { Start-WmtLibraryCacheBuilder } catch { Write-GuiLog "Fab assets cache refresh failed: $($_.Exception.Message)" }
         if ($lblLibraryStatus -and $brdLibraryList -and $brdLibraryList.Visibility -eq "Visible" -and $lstLibrary -and $lstLibrary.Items.Count -gt 0) {
             $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
         }
-        Write-GuiLog ("Unreal Engine / Fab assets are now " + $(if ($global:WmtHideUeAssets) { "hidden" } else { "shown" }) + " in Your Library. Update checks are unaffected.")
+        $saved = {
+            param($results)
+            # The cache follows the persisted visibility; its completion refreshes an open library.
+            try { Start-WmtLibraryCacheBuilder }
+            catch { Write-GuiLog "Fab assets cache refresh failed: $($_.Exception.Message)" }
+            Write-GuiLog ("Unreal Engine / Fab assets are now " + $(if ($global:WmtHideUeAssets) { "hidden" } else { "shown" }) + " in Your Library. Update checks are unaffected.")
+        }.GetNewClosure()
+        $saveFailed = {
+            param($errorRecord)
+            $global:WmtHideUeAssets = $previousHideAssets
+            Set-WmtFabAssetsButtonLabel
+            Update-WmtLibrarySearch
+            $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
+            Show-WmtMessageBox -Message "Could not save library visibility:`n$message" -Title "Library Settings" -Image Error | Out-Null
+        }.GetNewClosure()
+        Invoke-WmtSettingsPatchSave -Patch @{ HideLegendaryUeAssets = $hideAssets } -Name ("FabAssetVisibility_" + [guid]::NewGuid().ToString("N")) -Message "Saving library visibility setting..." -OnComplete $saved -OnError $saveFailed
     })
 }
 
@@ -63834,7 +64586,7 @@ $btnToggleMemCompress.Add_Click({
 $btnToggleHags = Get-Ctrl "btnToggleHags"
 if ($btnToggleHags) {
 $btnToggleHags.Add_Click({
-        Clear-WmtRegCache @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers")
         $h = (ConvertTo-Int (Get-WmtRegValue "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 0) 0)
         if ($h -eq 2) {
             Set-Hags -Enable $false
@@ -63850,7 +64602,7 @@ $btnToggleWidgets = Get-Ctrl "btnToggleWidgets"
 if ($btnToggleWidgets) {
 $btnToggleWidgets.Add_Click({
         if (-not $btnToggleWidgets.IsEnabled) { return }
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 1) 0) -eq 0)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 1; Write-GuiLog "Widgets shown." } "Showing widgets..."
@@ -63865,7 +64617,7 @@ $btnToggleWidgets.Add_Click({
 $btnToggleTaskView = Get-Ctrl "btnToggleTaskView"
 if ($btnToggleTaskView) {
 $btnToggleTaskView.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1) 0) -eq 0)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1; Write-GuiLog "Task View shown." } "Showing Task View..."
@@ -63881,7 +64633,7 @@ $btnToggleChat = Get-Ctrl "btnToggleChat"
 if ($btnToggleChat) {
 $btnToggleChat.Add_Click({
         if (-not $btnToggleChat.IsEnabled) { return }
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $currentlyHidden = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 1) 0) -eq 0)
         if ($currentlyHidden) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 1; Write-GuiLog "Chat shown." } "Showing Chat..."
@@ -63896,7 +64648,7 @@ $btnToggleChat.Add_Click({
 $btnToggleCombine = Get-Ctrl "btnToggleCombine"
 if ($btnToggleCombine) {
 $btnToggleCombine.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $tc = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0) 0)
         if ($tc -eq 2) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarGlomLevel" 0; Write-GuiLog "Taskbar set to Always Combine." } "Setting taskbar to Always Combine..."
@@ -63911,7 +64663,7 @@ $btnToggleCombine.Add_Click({
 $btnToggleTaskbarAlign = Get-Ctrl "btnToggleTaskbarAlign"
 if ($btnToggleTaskbarAlign) {
 $btnToggleTaskbarAlign.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $ta = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 0) 0)
         if ($ta -eq 0) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAl" 1; Write-GuiLog "Taskbar aligned to center." } "Aligning taskbar to center..."
@@ -63926,7 +64678,7 @@ $btnToggleTaskbarAlign.Add_Click({
 $btnToggleClockFormat = Get-Ctrl "btnToggleClockFormat"
 if ($btnToggleClockFormat) {
 $btnToggleClockFormat.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Control Panel\International")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\International")
         $is24 = ((ConvertTo-Int (Get-WmtRegValue "HKCU:\Control Panel\International" "iTime" 0) 0) -eq 1)
         $intlPath = "HKCU:\Control Panel\International"
         # Compile the P/Invoke once (shared by both branches)
@@ -63962,7 +64714,7 @@ $btnToggleClockFormat.Add_Click({
 $btnToggleSearchDisplay = Get-Ctrl "btnToggleSearchDisplay"
 if ($btnToggleSearchDisplay) {
 $btnToggleSearchDisplay.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
         $smode = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1) 0)
         if ($smode -eq 0) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1; Write-GuiLog "Search set to icon." } "Setting search to icon..."
@@ -63973,7 +64725,7 @@ $btnToggleSearchDisplay.Add_Click({
         else {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0; Write-GuiLog "Search hidden." } "Hiding search..."
         }
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Search")
         $newMode = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1) 0)
         $script:WmtSearchDisplayMode = if ($newMode -in @(0, 1, 2)) { [int]$newMode } else { $null }
         try {
@@ -63988,7 +64740,7 @@ $btnToggleSearchDisplay.Add_Click({
 $btnToggleClockSecs = Get-Ctrl "btnToggleClockSecs"
 if ($btnToggleClockSecs) {
 $btnToggleClockSecs.Add_Click({
-        Clear-WmtRegCache @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
+        Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
         $cs = (ConvertTo-Int (Get-WmtRegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" 0) 0)
         if ($cs -eq 1) {
             Invoke-UiCommand { Set-WmtRegDword "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" 0; Write-GuiLog "Hid seconds on the system clock." } "Hiding seconds on the system clock..."
@@ -65270,7 +66022,7 @@ $script:WmtLibraryCacheRunspace = $null
 $script:WmtLibraryCacheAsyncResult = $null
 
 function Start-WmtLibraryCacheBuilder {
-param([switch]$Force)
+param([switch]$Force, [switch]$SteamOnly)
 try {
     if ($script:WmtLibraryCacheAsyncResult) {
         if (-not $script:WmtLibraryCacheAsyncResult.IsCompleted) {
@@ -65401,6 +66153,13 @@ try {
         $needSteam = (-not $fileExists) -or $isStale
     }
 
+    if ($SteamOnly) {
+        $needLeg = $false
+        $needGog = $false
+        $needPypi = $false
+        $needSteam = $true
+    }
+
     if (-not $needLeg -and -not $needGog -and -not $needPypi -and -not $needSteam) { return }
 
     if ($script:WmtLibraryCacheRunspace) {
@@ -65430,7 +66189,7 @@ try {
         if (Test-Path -LiteralPath $heroicAuthPath -PathType Leaf) { $gogAuthPath = $heroicAuthPath }
     }
 
-    Write-GuiLog "Building Legendary/GOGDL library caches in background..."
+    Write-GuiLog "Building provider library caches in background..."
     $ps = New-WmtPooledPowerShell
 
     # Self-contained scriptBlock: provider state is passed as arguments.
