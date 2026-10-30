@@ -40764,7 +40764,6 @@ function Update-WmtQuickFindResults {
                 $description = [System.Windows.Controls.TextBlock]::new()
                 $description.Text = [string]$entry.Description
                 $description.TextWrapping = "Wrap"
-                $description.MaxHeight = 44
                 $description.FontSize = 12
                 $description.Margin = [System.Windows.Thickness]::new(0,6,0,8)
                 $description.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, "TextSecondary")
