@@ -702,15 +702,36 @@ try {
                 $results = @($record.Result)
                 if (-not $suppressLog) {
                     $wroteOutput = $false
+                    $hadExplicitMessage = $false
                     foreach ($item in $results) {
                         if ($null -eq $item) { continue }
+                        $messageProperty = $null
+                        $hasMessageProperty = $false
+                        if ($item -is [System.Collections.IDictionary]) {
+                            if ($item.Contains('Message')) {
+                                $hasMessageProperty = $true
+                                $messageProperty = $item['Message']
+                            }
+                        }
+                        elseif ($item.PSObject.Properties['Message']) {
+                            $hasMessageProperty = $true
+                            $messageProperty = $item.Message
+                        }
+                        if ($hasMessageProperty) {
+                            $hadExplicitMessage = $true
+                            if (-not [string]::IsNullOrWhiteSpace([string]$messageProperty)) {
+                                Write-GuiLog ([string]$messageProperty)
+                                $wroteOutput = $true
+                            }
+                            continue
+                        }
                         $text = if ($item -is [string]) { [string]$item } else { (($item | Out-String).Trim()) }
                         if (-not [string]::IsNullOrWhiteSpace($text)) {
                             Write-GuiLog $text
                             $wroteOutput = $true
                         }
                     }
-                    if (-not $wroteOutput) { Write-GuiLog "Done." }
+                    if (-not $wroteOutput -and -not $hadExplicitMessage) { Write-GuiLog "Done." }
                 }
                 elseif (-not $completeCallback) { Write-GuiLog "Done." }
                 if ($completeCallback) { & $completeCallback $results }
