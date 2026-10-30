@@ -103,6 +103,8 @@ public class TokenManipulator {
     internal static extern bool AdjustTokenPrivileges(IntPtr htok, bool disall, ref TokPriv1Luid newst, int len, IntPtr prev, IntPtr relen);
     [DllImport("kernel32.dll", ExactSpelling = true)]
     internal static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    internal static extern void SetLastError(int dwErrCode);
     [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern bool CloseHandle(IntPtr hObject);
     [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
@@ -120,8 +122,9 @@ public class TokenManipulator {
             if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref htok)) return false;
             TokPriv1Luid tp; tp.Count = 1; tp.Attr = SE_PRIVILEGE_ENABLED; tp.Luid = 0;
             if (!LookupPrivilegeValue(null, privilege, ref tp.Luid)) return false;
+            SetLastError(0);
             if (!AdjustTokenPrivileges(htok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
-            return true;
+            return Marshal.GetLastWin32Error() != 1300;
         } catch { return false; }
         finally {
             if (htok != IntPtr.Zero) CloseHandle(htok);
@@ -19704,6 +19707,151 @@ foreach ($view in $views) {
 return $false
 }
 
+function Remove-WmtProtectedBamDamValueNative {
+param(
+    [string]$Path,
+    [string]$ValueName
+)
+if ([string]::IsNullOrWhiteSpace($Path) -or $null -eq $ValueName) { return $false }
+
+$parts = Convert-WmtRegistryPath -Path $Path
+if (-not $parts -or $parts.Hive -ne [Microsoft.Win32.RegistryHive]::LocalMachine -or
+    $parts.SubPath -notmatch '^(?i)SYSTEM\\CurrentControlSet\\Services\\(?:bam|dam)\\(?:State\\)?UserSettings\\S-1-(?:\d+-)+\d+$') {
+    throw "Refusing temporary ACL changes outside a per-user BAM/DAM UserSettings key: $Path"
+}
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Temporary BAM/DAM value cleanup requires an elevated administrator."
+}
+if (-not [WmtNativeStartup.TokenManipulator]::EnablePrivilege("SeTakeOwnershipPrivilege") -or
+    -not [WmtNativeStartup.TokenManipulator]::EnablePrivilege("SeRestorePrivilege")) {
+    throw "Could not enable the privileges required to temporarily update the BAM/DAM registry ACL."
+}
+
+$baseKey = $null
+$ownerKey = $null
+$ownershipKey = $null
+$valueKey = $null
+$originalOwnerSddl = $null
+$originalAccessSddl = $null
+$operationError = $null
+$restoreErrors = @()
+$valueDeleted = $false
+$ownerChanged = $false
+$currentSid = $identity.User
+$readAndTakeOwnership = [System.Security.AccessControl.RegistryRights]::TakeOwnership -bor
+    [System.Security.AccessControl.RegistryRights]::ReadKey
+
+try {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Default
+    )
+    $ownerKey = $baseKey.OpenSubKey(
+        $parts.SubPath,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        $readAndTakeOwnership
+    )
+    if (-not $ownerKey) { throw "Could not open BAM/DAM key for an ownership-only ACL update: $Path" }
+
+    $originalSecurity = $ownerKey.GetAccessControl(
+        [System.Security.AccessControl.AccessControlSections]::Owner -bor
+        [System.Security.AccessControl.AccessControlSections]::Access
+    )
+    $originalOwnerSddl = $originalSecurity.GetSecurityDescriptorSddlForm(
+        [System.Security.AccessControl.AccessControlSections]::Owner
+    )
+    $originalAccessSddl = $originalSecurity.GetSecurityDescriptorSddlForm(
+        [System.Security.AccessControl.AccessControlSections]::Access
+    )
+    $ownerSecurity = $ownerKey.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+    $ownerSecurity.SetOwner($currentSid)
+    $ownerChanged = $true
+    $ownerKey.SetAccessControl($ownerSecurity)
+
+    $ownershipRights = [System.Security.AccessControl.RegistryRights]::TakeOwnership -bor
+        [System.Security.AccessControl.RegistryRights]::ChangePermissions -bor
+        [System.Security.AccessControl.RegistryRights]::ReadKey
+    $ownershipKey = $baseKey.OpenSubKey(
+        $parts.SubPath,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        $ownershipRights
+    )
+    if (-not $ownershipKey) { throw "Could not reopen BAM/DAM key after taking temporary ownership: $Path" }
+
+    $accessSecurity = $ownershipKey.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+    $valueAccessRule = [System.Security.AccessControl.RegistryAccessRule]::new(
+        $currentSid,
+        [System.Security.AccessControl.RegistryRights]::SetValue,
+        [System.Security.AccessControl.InheritanceFlags]::None,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $accessSecurity.AddAccessRule($valueAccessRule)
+    $ownershipKey.SetAccessControl($accessSecurity)
+
+    $valueKey = $baseKey.OpenSubKey(
+        $parts.SubPath,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        [System.Security.AccessControl.RegistryRights]::SetValue
+    )
+    if (-not $valueKey) { throw "Could not reopen BAM/DAM key to delete the selected value: $Path" }
+    $valueKey.DeleteValue($ValueName, $false)
+    $valueDeleted = $true
+}
+catch {
+    $operationError = $_.Exception.Message
+}
+finally {
+    if ($valueKey) {
+        try { $valueKey.Dispose() } catch {}
+        $valueKey = $null
+    }
+
+    if ($ownershipKey -and $originalAccessSddl) {
+        try {
+            $restoreAccessSecurity = [System.Security.AccessControl.RegistrySecurity]::new()
+            $restoreAccessSecurity.SetSecurityDescriptorSddlForm(
+                $originalAccessSddl,
+                [System.Security.AccessControl.AccessControlSections]::Access
+            )
+            $ownershipKey.SetAccessControl($restoreAccessSecurity)
+        }
+        catch { $restoreErrors += "DACL: $($_.Exception.Message)" }
+    }
+    if ($ownerChanged -and $ownerKey -and $originalOwnerSddl) {
+        try {
+            $restoreOwnerSecurity = [System.Security.AccessControl.RegistrySecurity]::new()
+            $restoreOwnerSecurity.SetSecurityDescriptorSddlForm(
+                $originalOwnerSddl,
+                [System.Security.AccessControl.AccessControlSections]::Owner
+            )
+            $ownerKey.SetAccessControl($restoreOwnerSecurity)
+        }
+        catch { $restoreErrors += "Owner: $($_.Exception.Message)" }
+    }
+    if ($ownershipKey) {
+        try { $ownershipKey.Dispose() } catch {}
+    }
+    if ($ownerKey) {
+        try { $ownerKey.Dispose() } catch {}
+    }
+    if ($baseKey) {
+        try { $baseKey.Dispose() } catch {}
+    }
+    $identity.Dispose()
+}
+
+if ($restoreErrors.Count -gt 0) {
+    throw "BAM/DAM value operation ended with '$operationError'; restoring the original registry owner/ACL failed: $($restoreErrors -join '; ')"
+}
+if ($operationError) { throw "BAM/DAM value deletion failed: $operationError" }
+if (-not $valueDeleted) { return $false }
+return (-not (Test-WmtRegistryValueExists -Path $Path -ValueName $ValueName))
+}
+
 function Test-WmtRegistryKeyExistsNative {
 param(
     [Microsoft.Win32.RegistryHive]$Hive,
@@ -20641,6 +20789,16 @@ try {
                 if (Test-WmtRegistryValueExists -Path $targetPath -ValueName $ValName) {
                     [void](Remove-WmtRegistryValueRegExe -Path $targetPath -ValueName $ValName)
                 }
+                if ((Test-WmtRegistryValueExists -Path $targetPath -ValueName $ValName) -and
+                    $targetPath -match '^(?i)HKLM:\\SYSTEM\\CurrentControlSet\\Services\\(?:bam|dam)\\(?:State\\)?UserSettings\\S-1-(?:\d+-)+\d+$') {
+                    try {
+                        $protectedValueResult = Remove-WmtProtectedBamDamValueNative -Path $targetPath -ValueName $ValName
+                        & $AddAttempt "delete-protected-BAM-value=$targetPath value=$ValName result=$protectedValueResult"
+                    }
+                    catch {
+                        & $AddAttempt "delete-protected-BAM-value-failed=$targetPath value=$ValName error=$($_.Exception.Message)"
+                    }
+                }
                 if (Test-WmtRegistryValueExists -Path $targetPath -ValueName $ValName) {
                     $globalValueSuccess = $false
                     & $AddAttempt "value-still-exists=$targetPath value=$ValName"
@@ -20961,6 +21119,7 @@ $functionNames = @(
     "Convert-WmtRegistryPathToRegExePath",
     "Test-WmtRegistryValueExists",
     "Remove-WmtRegistryValueNative",
+    "Remove-WmtProtectedBamDamValueNative",
     "Test-WmtRegistryKeyExistsNative",
     "Remove-WmtRegistryKeyNative",
     "Grant-WmtRegistryKeyFullControlNative",

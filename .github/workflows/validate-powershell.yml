@@ -111,6 +111,25 @@ jobs:
               throw 'Registry cleanup must verify a nonempty export before deleting and must surface delete failures.'
           }
 
+          $bamValueDelete = Find-FunctionText 'Remove-WmtProtectedBamDamValueNative'
+          $deleteHelper = Find-FunctionText 'Remove-RegKeyForced'
+          if (-not $bamValueDelete.Contains('CurrentControlSet\\Services\\') -or
+              -not $bamValueDelete.Contains('(?:bam|dam)') -or
+              -not $bamValueDelete.Contains('UserSettings') -or
+              $bamValueDelete -notmatch 'TakeOwnership' -or
+              $bamValueDelete -notmatch 'ChangePermissions' -or
+              $bamValueDelete -notmatch 'GetAccessControl' -or
+              $bamValueDelete -notmatch 'originalAccessSddl' -or
+              $bamValueDelete -notmatch 'originalOwnerSddl' -or
+              $bamValueDelete -notmatch 'SetSecurityDescriptorSddlForm' -or
+              $bamValueDelete -notmatch 'DACL:' -or
+              $bamValueDelete -notmatch 'Owner:' -or
+              -not $source.Contains('SetLastError(0);') -or
+              -not $source.Contains('return Marshal.GetLastWin32Error() != 1300;') -or
+              $deleteHelper -notmatch 'Remove-WmtProtectedBamDamValueNative -Path \$targetPath') {
+              throw 'Protected BAM/DAM value deletion must be narrowly scoped and restore the original owner and DACL.'
+          }
+
           $updateRepair = Find-FunctionText 'Start-UpdateRepair'
           if ($updateRepair -notmatch 'Stop-Service -Name \$serviceName -Force -ErrorAction Stop' -or
               $updateRepair -notmatch 'netsh\.exe.*winsock reset' -or
