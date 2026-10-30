@@ -31838,11 +31838,16 @@ function Show-StartupRowDetails {
     $editor.ShowDialog() | Out-Null
 }
 
-function Remove-WmtDataRows {
+function global:Remove-WmtDataRows {
     param($TabObj, [object[]]$Rows)
     foreach ($row in @($Rows)) { try { $row.Delete() } catch {} }
     $TabObj.Meta.Table.AcceptChanges()
-    & $fnUpdateStartupTabFilter $TabObj
+    if ([string]::IsNullOrWhiteSpace($TabObj.SearchBox.Text.Trim())) {
+        $TabObj.CountLabel.Text = "$($TabObj.Meta.Table.Rows.Count) items"
+    }
+    else {
+        $TabObj.CountLabel.Text = "$($TabObj.Meta.View.Count) shown / $($TabObj.Meta.Table.Rows.Count) total"
+    }
 }
 
 function Get-StartupApprovedState {
@@ -31874,7 +31879,7 @@ function Set-StartupApprovedState {
     }
     if (-not (Test-Path $approvedPath)) { New-Item -Path $approvedPath -Force | Out-Null }
     $stateByte = if ($Enable) { [byte]0x02 } else { [byte]0x03 }
-    $payload = [byte[]]($stateByte, 0x00, 0x00, 0x00) + [BitConverter]::GetBytes([DateTime]::Now.ToFileTime())
+    $payload = [byte[]](($stateByte, 0x00, 0x00, 0x00) + [BitConverter]::GetBytes([DateTime]::Now.ToFileTime()))
     Set-ItemProperty -Path $approvedPath -Name $ValueName -Value $payload -Type Binary -ErrorAction SilentlyContinue
 }
 
@@ -32125,7 +32130,6 @@ $fnUpdateStartupTabFilter = ${function:Update-StartupTabFilter}.GetNewClosure()
 $fnShowStartupRowDetails = ${function:Show-StartupRowDetails}.GetNewClosure()
 $fnGetStartupApprovedState = ${function:Get-StartupApprovedState}.GetNewClosure()
 $fnSetStartupApprovedState = ${function:Set-StartupApprovedState}.GetNewClosure()
-$fnRemoveWmtDataRows = ${function:Remove-WmtDataRows}.GetNewClosure()
 $fnGetRegRunEntries = ${function:Get-RegRunEntries}.GetNewClosure()
 $fnGetStartupFolderEntries = ${function:Get-StartupFolderEntries}.GetNewClosure()
 $LoadWindowsStartup = ${function:Invoke-StartupWindowsLoad}.GetNewClosure()
@@ -32195,7 +32199,7 @@ $invokeStartupApprovedAction = {
                 $key = $baseKey.CreateSubKey($subPath)
                 if (-not $key) { throw "Could not create or open the StartupApproved registry key." }
                 $stateByte = if ($EnableEntries) { [byte]0x02 } else { [byte]0x03 }
-                $payload = [byte[]]($stateByte, 0x00, 0x00, 0x00) + [BitConverter]::GetBytes([DateTime]::Now.ToFileTime())
+                $payload = [byte[]](($stateByte, 0x00, 0x00, 0x00) + [BitConverter]::GetBytes([DateTime]::Now.ToFileTime()))
                 $key.SetValue([string]$entry.ValueName, $payload, [Microsoft.Win32.RegistryValueKind]::Binary)
                 [void]$succeeded.Add("$($entry.Type)|$($entry.RootRunPath)|$($entry.ValueName)")
             }
@@ -32244,13 +32248,14 @@ $invokeStartupRowDelete = {
     $rows = @($SelectedRows)
     if ($rows.Count -eq 0) { return }
     $records = @($rows | ForEach-Object {
+        $selectedRow = $_
         $type = switch ($Kind) {
-            'Windows' { [string]$_['Type']; break }
+            'Windows' { Get-StartupCellValue $selectedRow 'Type'; break }
             'ContextMenu' { 'ContextMenu'; break }
             'Services' { 'Service'; break }
         }
-        $path = if ($Kind -eq 'Windows') { [string]$_['ItemPath'] } elseif ($Kind -eq 'ContextMenu') { [string]$_['Path'] } else { [string]$_['Name'] }
-        $valueName = if ($Kind -eq 'Windows') { [string]$_['ValueName'] } else { '' }
+        $path = if ($Kind -eq 'Windows') { Get-StartupCellValue $selectedRow 'ItemPath' } elseif ($Kind -eq 'ContextMenu') { Get-StartupCellValue $selectedRow 'Path' } else { Get-StartupCellValue $selectedRow 'Name' }
+        $valueName = if ($Kind -eq 'Windows') { Get-StartupCellValue $selectedRow 'ValueName' } else { '' }
         [PSCustomObject]@{ Kind=$type; Path=$path; ValueName=$valueName; Key="$type|$path|$valueName" }
     })
     $arguments = [object[]]::new(2)
@@ -32266,7 +32271,7 @@ $invokeStartupRowDelete = {
         for ($index = 0; $index -lt $rows.Count; $index++) {
             if ($succeeded.Contains([string]$records[$index].Key)) { [void]$removed.Add($rows[$index]) }
         }
-        if ($removed.Count -gt 0) { & $fnRemoveWmtDataRows $Tab $removed.ToArray() }
+        if ($removed.Count -gt 0) { Remove-WmtDataRows -TabObj $Tab -Rows $removed.ToArray() }
         if (@($result.Failures).Count -gt 0) {
             Show-WmtMessageBox -Owner $dialog -Message (@($result.Failures) -join "`r`n") -Title "Startup Manager" -Image Warning | Out-Null
         }
