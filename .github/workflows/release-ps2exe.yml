@@ -494,6 +494,7 @@ jobs:
               <title>Windows Maintenance Tool</title>
               <authors>Chaython</authors>
               <owners>Chaython</owners>
+              <copyright>Copyright (c) 2025-2026 ios12checker, Chaython Meredith</copyright>
               <projectUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectUrl>
               <projectSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</projectSourceUrl>
               <packageSourceUrl>https://github.com/Chaython/Windows-Maintenance-Tool</packageSourceUrl>

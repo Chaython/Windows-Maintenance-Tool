@@ -28428,7 +28428,7 @@ $btnDelete.Add_Click({
             Show-WmtMessageBox -Owner $dialog -Message "Could not delete selected shortcuts:`n$($errorRecord.Exception.Message)" -Title "Delete Failed" -Image Error | Out-Null
         }.GetNewClosure()
         $job = Invoke-WmtUiBackgroundCommand -Name ("BrokenShortcutDelete_" + [guid]::NewGuid().ToString("N")) `
-            -Msg "Deleting selected shortcuts..." -ArgumentList @($deleteRecords) -SuppressResultLog `
+            -Msg "Deleting selected shortcuts..." -ArgumentList (,$deleteRecords) -SuppressResultLog `
             -OnComplete $deleteComplete -OnError $deleteError -Sb {
             param($Entries)
             $deletedPaths = [System.Collections.Generic.List[string]]::new()
@@ -28507,7 +28507,7 @@ Invoke-UiCommand {
         if ($shell) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
     }
     [PSCustomObject]@{ Fixed = $fixed.ToArray(); Failures = $failures.ToArray() }
-} "Applying shortcut fixes..." -ArgumentList $toFix -OnComplete {
+} "Applying shortcut fixes..." -ArgumentList (,$toFix) -OnComplete {
     param($results)
     $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['Fixed'] } | Select-Object -Last 1)[0]
     if (-not $result) { Write-GuiLog "[Broken Shortcuts] Fix operation returned no results."; return }
@@ -32903,7 +32903,7 @@ $btnCtxEnable.Add_Click({
             catch { [void]$failures.Add("${path}: $($_.Exception.Message)") }
         }
         [pscustomobject]@{ Message = "Enabled $($succeeded.Count) context menu item(s)."; SucceededPaths=$succeeded.ToArray(); Failures=$failures.ToArray() }
-    } 'Enabling context menu entries...' -ArgumentList @($records) -OnComplete $complete -OnError {
+    } 'Enabling context menu entries...' -ArgumentList (,$records) -OnComplete $complete -OnError {
         param($errorRecord)
         Show-WmtMessageBox -Owner $contextDialog -Message "Could not enable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
     }.GetNewClosure()
@@ -32941,7 +32941,7 @@ $btnCtxDisable.Add_Click({
             catch { [void]$failures.Add("${path}: $($_.Exception.Message)") }
         }
         [pscustomobject]@{ Message = "Disabled $($succeeded.Count) context menu item(s)."; SucceededPaths=$succeeded.ToArray(); Failures=$failures.ToArray() }
-    } 'Disabling context menu entries...' -ArgumentList @($records) -OnComplete $complete -OnError {
+    } 'Disabling context menu entries...' -ArgumentList (,$records) -OnComplete $complete -OnError {
         param($errorRecord)
         Show-WmtMessageBox -Owner $contextDialog -Message "Could not disable context menu entries:`n$($errorRecord.Exception.Message)" -Title "Context Menu" -Image Error | Out-Null
     }.GetNewClosure()
