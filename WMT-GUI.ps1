@@ -5190,6 +5190,12 @@ $dialog = New-WmtWindowFromFullXaml -Xaml ([xml]$dialogXaml) -NoOwner
 if ($Owner -and $Owner.IsVisible) { $dialog.Owner = $Owner }
 elseif (-not $Owner -and $window -and $window.IsVisible) { $dialog.Owner = $window }
 if ($dialog.Owner) { $dialog.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterOwner }
+else {
+    # No visible owner (for example the app is hidden in the tray): a modal popup with no
+    # taskbar entry could sit behind other windows, so make it findable.
+    $dialog.ShowInTaskbar = $true
+    $dialog.Topmost = $true
+}
 $dialog.FindName('lblTitle').Text = $Title
 $dialog.FindName('lblMessage').Text = $Message
 $iconLabel = $dialog.FindName('lblIcon')
@@ -5197,6 +5203,7 @@ $iconLabel.Text = $icon.Glyph
 Set-WmtThemedBrush -Object $iconLabel -Property ([System.Windows.Controls.TextBlock]::ForegroundProperty) -ColorOrKey $icon.Resource
 $buttonsPanel = $dialog.FindName('spButtons')
 $firstButton = $true
+$defaultButtonControl = $null
 foreach ($choice in $choices) {
     $buttonControl = [System.Windows.Controls.Button]::new()
     $buttonControl.Content = $choice.Label
@@ -5211,6 +5218,7 @@ foreach ($choice in $choices) {
         Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::BackgroundProperty) -ColorOrKey 'Accent'
         Set-WmtThemedBrush -Object $buttonControl -Property ([System.Windows.Controls.Control]::ForegroundProperty) -ColorOrKey 'AccentText'
         $buttonControl.IsDefault = $true
+        $defaultButtonControl = $buttonControl
         $firstButton = $false
     }
     else {
@@ -5232,6 +5240,25 @@ $dragHandler = { param($s, $e) $null = $s; if ($e.LeftButton -eq [System.Windows
 $titleBar.Add_MouseLeftButtonDown($dragHandler)
 $dialog.Add_KeyDown({ param($s, $e) if ($e.Key -eq [System.Windows.Input.Key]::Escape) { $s.Tag = $closeResult; $s.Close(); $e.Handled = $true } }.GetNewClosure())
 $dialog.Add_Closed({ param($s, $e) $null = $e; if ($null -eq $s.Tag) { $s.Tag = $closeResult } }.GetNewClosure())
+# Ctrl+C and right-click copy the whole message, so a long error can be pasted into a report.
+$copyText = [string]$Message
+$dialog.Add_KeyDown({
+        param($s, $e)
+        $null = $s
+        if ($e.Key -eq [System.Windows.Input.Key]::C -and ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control)) {
+            try { [System.Windows.Clipboard]::SetText($copyText) } catch {}
+            $e.Handled = $true
+        }
+    }.GetNewClosure())
+try {
+    $copyMenu = New-WmtContextMenu -Items @(@{ Header = 'Copy message'; Action = { try { [System.Windows.Clipboard]::SetText($copyText) } catch {} }.GetNewClosure() })
+    $dialog.FindName('lblMessage').ContextMenu = $copyMenu
+}
+catch {}
+$dialog.Add_ContentRendered({
+        try { if ($defaultButtonControl) { [void]$defaultButtonControl.Focus() } } catch {}
+        try { [void]$dialog.Activate() } catch {}
+    }.GetNewClosure())
 [void]$dialog.ShowDialog()
 return [System.Windows.MessageBoxResult]$dialog.Tag
 }
@@ -28266,9 +28293,14 @@ $scan = {
                 return
             }
             foreach ($item in @($result.Rows)) { [void]$scanRows.Add($item) }
+            $scanFailureCount = @($result.Failures).Count
             $scanStatus.Text = "Scan complete. Scanned $($result.Scanned) shortcut(s); found $($scanRows.Count)."
+            if ($scanFailureCount -gt 0) { $scanStatus.Text += " $scanFailureCount location(s) could not be read (see Activity Log)." }
             foreach ($failure in @($result.Failures)) { Write-GuiLog "[Broken Shortcuts] $failure" }
-            if ($scanRows.Count -eq 0) { Show-WmtMessageBox -Owner $scanDialog -Message "Scan complete. No broken shortcuts found." -Title "All Clean" -Image Information | Out-Null }
+            if ($scanRows.Count -eq 0) {
+                if ($scanFailureCount -gt 0) { Show-WmtMessageBox -Owner $scanDialog -Message "No broken shortcuts were found, but $scanFailureCount location(s) could not be read, so the scan may be incomplete.`n`nDetails are in the Activity Log." -Title "Scan Incomplete" -Image Warning | Out-Null }
+                else { Show-WmtMessageBox -Owner $scanDialog -Message "Scan complete. No broken shortcuts found." -Title "All Clean" -Image Information | Out-Null }
+            }
         }
         catch {
             $scanStatus.Text = "Scan finished, but results could not be displayed."
@@ -28323,10 +28355,23 @@ $scan = {
                         $action = "None"
                         $details = "Review Needed"
                         $newTarget = ""
+                        # A target on a disconnected drive or offline share is not "broken"; do not guess a fix.
+                        $targetUnavailable = $false
+                        try {
+                            $targetRoot = [System.IO.Path]::GetPathRoot($expanded)
+                            if ($targetRoot) {
+                                if ($targetRoot.StartsWith('\\')) { $targetUnavailable = -not [System.IO.Directory]::Exists($targetRoot) }
+                                else { $targetUnavailable = -not [System.IO.DriveInfo]::new($targetRoot).IsReady }
+                            }
+                        }
+                        catch {}
                         if ($Fixes.ContainsKey($link.BaseName)) {
                             $action = "Fix"
                             $details = "Restore System Path"
                             $newTarget = [string]$Fixes[$link.BaseName]
+                        }
+                        elseif ($targetUnavailable) {
+                            $details = "Target drive or share unavailable"
                         }
                         else {
                             $guess = [System.IO.Path]::GetFileName($expanded)
@@ -31315,7 +31360,7 @@ function Update-StartupTabFilter {
     $q = $TabObj.SearchBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($q)) {
         $TabObj.Meta.View.RowFilter = ""
-        $TabObj.CountLabel.Text = "$($TabObj.Meta.Table.Rows.Count) items"
+        $TabObj.CountLabel.Text = Get-WmtStartupCountText -TabObj $TabObj -Filtered $false
         return
     }
     $safe = $q.Replace("'", "''").Replace("[", "[[]").Replace("%", "[%]").Replace("*", "[*]")
@@ -31324,7 +31369,7 @@ function Update-StartupTabFilter {
         if ($TabObj.Meta.Table.Columns.Contains($col)) { $clauses += "CONVERT([$col], 'System.String') LIKE '%$safe%'" }
     }
     try { $TabObj.Meta.View.RowFilter = ($clauses -join " OR ") } catch { $TabObj.Meta.View.RowFilter = "" }
-    $TabObj.CountLabel.Text = "$($TabObj.Meta.View.Count) shown / $($TabObj.Meta.Table.Rows.Count) total"
+    $TabObj.CountLabel.Text = Get-WmtStartupCountText -TabObj $TabObj -Filtered $true
 }
 
 # --- Startup Manager shared helpers (GLOBAL scope) ---
@@ -32021,13 +32066,25 @@ function global:Remove-WmtDataRows {
     Update-WmtStartupTabFilter -TabObj $TabObj
 }
 
+function global:Get-WmtStartupCountText {
+    param($TabObj, [bool]$Filtered)
+    $total = $TabObj.Meta.Table.Rows.Count
+    $text = if ($Filtered) { "$($TabObj.Meta.View.Count) shown / $total total" }
+    elseif ($total -eq 0) { "No items found" }
+    else { "$total items" }
+    $note = ""
+    if ($TabObj.Meta.PSObject.Properties['Note']) { $note = [string]$TabObj.Meta.Note }
+    if ($note) { $text = "$text  |  $note" }
+    return $text
+}
+
 function global:Update-WmtStartupTabFilter {
     param($TabObj)
     if (-not $TabObj -or -not $TabObj.Meta) { return }
     $query = ([string]$TabObj.SearchBox.Text).Trim()
     if ([string]::IsNullOrWhiteSpace($query)) {
         $TabObj.Meta.View.RowFilter = ""
-        $TabObj.CountLabel.Text = "$($TabObj.Meta.Table.Rows.Count) items"
+        $TabObj.CountLabel.Text = Get-WmtStartupCountText -TabObj $TabObj -Filtered $false
         return
     }
     $safe = $query.Replace("'", "''").Replace("[", "[[]").Replace("%", "[%]").Replace("*", "[*]")
@@ -32037,7 +32094,7 @@ function global:Update-WmtStartupTabFilter {
     }
     try { $TabObj.Meta.View.RowFilter = ($clauses -join " OR ") }
     catch { $TabObj.Meta.View.RowFilter = "" }
-    $TabObj.CountLabel.Text = "$($TabObj.Meta.View.Count) shown / $($TabObj.Meta.Table.Rows.Count) total"
+    $TabObj.CountLabel.Text = Get-WmtStartupCountText -TabObj $TabObj -Filtered $true
 }
 
 function global:Set-WmtStartupTabRows {
@@ -32061,7 +32118,7 @@ function global:Set-WmtStartupTabRows {
     }
     $TabObj.Grid.ItemsSource = $table.DefaultView
     Set-WmtDataGridColumns -DataGrid $TabObj.Grid -Columns $Columns -Widths $Widths -Hidden $HiddenColumns
-    $TabObj.Meta = [PSCustomObject]@{ Table = $table; View = $table.DefaultView; SearchColumns = $SearchColumns }
+    $TabObj.Meta = [PSCustomObject]@{ Table = $table; View = $table.DefaultView; SearchColumns = $SearchColumns; Note = "" }
     Update-WmtStartupTabFilter -TabObj $TabObj
 }
 
@@ -32238,6 +32295,13 @@ function Invoke-StartupTabLoad {
                         -Widths @{ DisplayName = "56*"; Name = "24*"; StartType = "10*"; State = "10*" }
                 }
             }
+            $loadWarnings = @()
+            if ($result.PSObject.Properties['Warnings']) { $loadWarnings = @(@($result.Warnings) | Where-Object { $_ }) }
+            foreach ($loadWarning in $loadWarnings) { Write-GuiLog "[Startup Manager] '$loadTabName': $loadWarning" }
+            if ($loadTab.Meta -and $loadTab.Meta.PSObject.Properties['Note']) {
+                $loadTab.Meta.Note = if ($loadWarnings.Count -gt 0) { "$($loadWarnings.Count) location(s) could not be read - see Activity Log" } else { "" }
+                Update-WmtStartupTabFilter -TabObj $loadTab
+            }
             if ($loadedStates.ContainsKey($loadTabName)) { $loadedStates[$loadTabName] = $true }
         }
         catch {
@@ -32263,6 +32327,7 @@ function Invoke-StartupTabLoad {
         -OnComplete $completed -OnError $onError -Sb {
         param([string]$Name, [string[]]$StartupFolders)
         $rows = [System.Collections.Generic.List[object]]::new()
+        $warnings = [System.Collections.Generic.List[string]]::new()
         $openRegistryPath = {
             param([string]$Path)
             if ($Path -notmatch '^(HKCU|HKLM|HKCR):\\?(.*)$') { throw "Unsupported registry path '$Path'." }
@@ -32386,7 +32451,12 @@ function Invoke-StartupTabLoad {
                                     }
                                 }
                             }
-                            catch {}
+                            catch {
+                                $taskReadError = [string]$_.Exception.Message
+                                $taskFolderLabel = '\'
+                                try { $taskFolderLabel = [string]$folder.Path } catch {}
+                                [void]$warnings.Add("Tasks in '$taskFolderLabel' could not be read: $taskReadError")
+                            }
                             finally {
                                 if ($tasks) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($tasks) } catch {} }
                             }
@@ -32395,7 +32465,12 @@ function Invoke-StartupTabLoad {
                                 $children = $folder.GetFolders(0)
                                 foreach ($child in $children) { $pending.Push($child) }
                             }
-                            catch {}
+                            catch {
+                                $childReadError = [string]$_.Exception.Message
+                                $childFolderLabel = '\'
+                                try { $childFolderLabel = [string]$folder.Path } catch {}
+                                [void]$warnings.Add("Subfolders of '$childFolderLabel' could not be listed: $childReadError")
+                            }
                             finally {
                                 if ($children) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($children) } catch {} }
                             }
@@ -32471,7 +32546,7 @@ function Invoke-StartupTabLoad {
             }
             default { throw "Unknown Startup Manager tab '$Name'." }
         }
-        [PSCustomObject]@{ Rows = $rows.ToArray() }
+        [PSCustomObject]@{ Rows = $rows.ToArray(); Warnings = $warnings.ToArray() }
     }
     if (-not $job) {
         $loadingTabs[$TabName] = $false
@@ -50658,7 +50733,7 @@ $minutes = Get-WmtUpdateAutoScanMinutes
 if ($minutes -le 0 -and -not ($Force -or $Startup)) { return }
 if ($Startup -and (Get-WmtDisableBackgroundJobs)) { return }
 
-if (Get-WmtUpdateScansDisabled -and -not $Force) { return }
+if ((Get-WmtUpdateScansDisabled) -and -not $Force) { return }
 
 if (Test-WmtUpdateAutoScanBusy) {
     if (Test-WmtPackageSearchActive) {
@@ -58178,7 +58253,7 @@ $btnCleanupOneDrive.Add_Click({
     })
 }
 if ($btnCleanXbox) { $btnCleanXbox.Add_Click({
-    if (Show-WmtMessageBox -Message "Delete stored Xbox credentials? This signs you out of Xbox services." -Title "Xbox Cleanup" -Button YesNo -Image Warning -eq [System.Windows.MessageBoxResult]::Yes) { Start-XboxClean }
+    if ((Show-WmtMessageBox -Message "Delete stored Xbox credentials? This signs you out of Xbox services." -Title "Xbox Cleanup" -Button YesNo -Image Warning) -eq [System.Windows.MessageBoxResult]::Yes) { Start-XboxClean }
 }) }
 
 # --- Utilities ---
@@ -60157,6 +60232,7 @@ function Start-WmtStartWithWindowsTaskOperation {
     $arguments[3] = if ($command) { [string]$command.Arguments } else { "" }
     $completed = {
         param($results)
+        $button.IsEnabled = $true
         $result = @($results | Where-Object { $_ -and $_.PSObject.Properties["Enabled"] } | Select-Object -Last 1)[0]
         if (-not $result) {
             Write-GuiLog "[Start with Windows] Task Scheduler returned no state."
@@ -60172,6 +60248,7 @@ function Start-WmtStartWithWindowsTaskOperation {
     }.GetNewClosure()
     $onError = {
         param($errorRecord)
+        $button.IsEnabled = $true
         $message = [string]$errorRecord.Exception.Message
         Write-GuiLog "[Start with Windows] Task Scheduler operation failed: $message"
         Show-WmtMessageBox -Message "Could not check or update the startup task:`n$message" -Title "Start with Windows" -Image Error | Out-Null
@@ -60209,7 +60286,7 @@ function Start-WmtStartWithWindowsTaskOperation {
                 $actions = @($task.Definition.Actions)
                 if ($actions.Count -gt 0 -and
                     ([string]$actions[0].Path).Trim() -ieq $FilePath.Trim() -and
-                    ([string]$actions[0].Arguments).Trim() -ceq $CommandArguments.Trim()) {
+                    ([string]$actions[0].Arguments).Trim() -ieq $CommandArguments.Trim()) {
                     [PSCustomObject]@{ Enabled = $true; Message = "" }
                     return
                 }
@@ -60245,7 +60322,11 @@ function Start-WmtStartWithWindowsTaskOperation {
             if ($service) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) } catch {} }
         }
     }
-    if (-not $job) {
+    if ($job) {
+        # Greyed out until the background operation reports back, so a click is never silently dropped.
+        $button.IsEnabled = $false
+    }
+    else {
         Write-GuiLog "[Start with Windows] Could not start background Task Scheduler operation."
     }
 }
@@ -65949,7 +66030,7 @@ $script:WmtStartupFeaturePreloadStartedAt = [DateTime]::UtcNow
 $script:WmtStartupPreloadTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:WmtStartupPreloadTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
 $script:WmtStartupPreloadTimer.Add_Tick({
-        if (Test-WmtAggressiveTrayMemoryMode -or (Get-WmtDisableBackgroundJobs)) {
+        if ((Test-WmtAggressiveTrayMemoryMode) -or (Get-WmtDisableBackgroundJobs)) {
             Stop-WmtStartupBackgroundPreload
             return
         }
