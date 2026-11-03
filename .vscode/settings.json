@@ -1,0 +1,15 @@
+{
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "search.exclude": {
+    "**/.temp/**": true,
+    "**/data/**": true,
+    "**/dist/**": true
+  },
+  "files.watcherExclude": {
+    "**/.temp/**": true,
+    "**/data/**": true,
+    "**/dist/**": true
+  }
+}

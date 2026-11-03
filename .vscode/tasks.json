@@ -1,0 +1,19 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Workspace: validate",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$ErrorActionPreference = 'Stop'; $failed = $false; foreach ($file in @('.\\WMT-GUI.ps1', '.\\PS2EXE\\Build-Exe.ps1', '.\\tools\\diagnostics\\Measure-WmtResources.ps1')) { if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw \"Missing expected PowerShell file: $file\" }; $tokens = $null; $parseErrors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $file).Path, [ref]$tokens, [ref]$parseErrors); if ($parseErrors.Count -gt 0) { $failed = $true; foreach ($err in $parseErrors) { Write-Host ('{0}:{1}:{2}: {3}' -f $file, $err.Extent.StartLineNumber, $err.Extent.StartColumnNumber, $err.Message) } } else { Write-Host \"OK: $file\" } }; if ($failed) { exit 1 }"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "group": { "kind": "test", "isDefault": true }
+    }
+  ]
+}

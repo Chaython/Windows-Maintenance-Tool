@@ -1,2 +1,8 @@
 /data/
 /dist/
+
+.temp/*
+!.temp/.gitkeep
+
+.DS_Store
+Thumbs.db
