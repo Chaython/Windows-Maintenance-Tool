@@ -69,10 +69,10 @@ Alternatively, with internet access, `gh attestation verify .\WindowsMaintenance
 ## Highlights
 
 - Modern searchable GUI with persistent dark/light themes, tray support, start-with-Windows, and start-minimized controls.
-- Updates panel covering Windows/package managers, language ecosystems, PowerShell tooling, Steam, Epic/Legendary, and GOG/GOGDL.
+- Updates panel covering Windows/package managers, language ecosystems, PowerShell tooling, Steam, Epic/Legendary, GOG/GOGDL, and EA/Ubisoft client applications through supported package providers.
 - Per-provider update, package-search, library-search, and metadata controls where supported.
 - Custom per-package PowerShell updater commands with placeholders for package metadata.
-- Unified game/software library with Steam, Epic/Legendary, GOG, and package-provider integration, including owned-title install flows and installed-state recovery.
+- Unified game/software library with Steam, Epic/Legendary, GOG, EA app, and Ubisoft Connect discovery, including owned-title install flows and installed-state recovery.
 - Rebuilt Drivers page that inventories third-party Driver Store packages and classifies in-use, old/superseded, unattached, and inactive packages.
 - Advanced cleanup with internal rules, Winapp2, Winapp3, BleachBit CleanerML, preview/analyze mode, configurable cache/update refresh intervals, and optional automatic cleanup.
 - Compact Compression utility for folders and drives with persistent tracking, skip lists, change-aware recompression, and scheduled auto-recompression that can run without the WMT window being open.
@@ -111,7 +111,7 @@ Alternatively, with internet access, `gh attestation verify .\WindowsMaintenance
 <details>
 <summary><strong>Game & Software Library</strong></summary>
 
-- View installed Steam games plus owned/installed Epic/Legendary and GOG titles in one combined library.
+- View installed Steam games plus owned/installed Epic/Legendary, GOG, EA app, and Ubisoft Connect games in one combined library. EA/Ubisoft discovery uses known local registry entries and only lists games whose install folders exist.
 - Search/filter the library by title/provider and sort list columns.
 - Install owned Epic games through a themed Legendary options dialog with library-root/folder selection, platform, workers, shared-memory limit, owned DLC selection, and optional file reordering.
 - Install owned GOG games through the GOGDL options dialog with install root, language, build/version, owned DLC selection, and download-worker controls.
@@ -120,6 +120,7 @@ Alternatively, with internet access, `gh attestation verify .\WindowsMaintenance
 - Optionally create a desktop shortcut and/or a **Start menu > Programs > WMT Games** entry after a successful Legendary or GOGDL install.
 - Legendary install preflight validates saved Epic credentials and metadata when possible and can offer re-authentication when the saved login is missing or invalid.
 - Launch installed titles and use supported install/uninstall/folder actions. Legendary folder actions can recover missing or stale paths from Legendary's local installed-game registry.
+- EA and Ubisoft game rows open the official client; use that client for game launch, install/update, repair, and uninstall. **Game Clients** opens EA app/Ubisoft Connect or runs WMT's normal update scan across enabled providers for client application updates. WMT does not independently install or update EA/Ubisoft games.
 - Explicit library refreshes rebuild provider caches; Legendary installed state is merged from the local installed-game database so installed games remain visible even when live metadata is incomplete or unavailable.
 - Open supported Steam/Epic/GOG store pages directly from library/provider rows.
 - Include owned Legendary/GOG titles in package search when library searching is enabled; installing those search results opens the same full Legendary/GOGDL installer used by **Your Library** instead of a separate headless/provider-specific path.
@@ -415,7 +416,7 @@ WMT stores generated data next to the script in its local `data` folder.
 | Winget scan fails | Verify App Installer/Winget is installed and internet access is working. |
 | Package provider hangs/fails | Retry that provider; WMT includes timeouts but some provider CLIs still require manual intervention. |
 | A Steam game appears as a Winget update | Refresh scans/library data; v6.7 includes additional Steam ownership filtering for duplicate/unknown-version rows. |
-| Epic/GOG game is missing | Refresh the library and verify Legendary/GOGDL authentication, local manifests, and provider toggles. |
+| A game is missing from the library | Refresh the library and verify the provider's local data. EA/Ubisoft entries require a recognized registry record and an existing install folder; confirm the game is installed in its official client. |
 | Cleaner definitions look stale | Review the cleaner local-refresh/upstream-check intervals and ensure Background Jobs/downloads are enabled. |
 | Automatic cleanup does not run | Confirm an auto-clean interval is set, Background Jobs are enabled, and at least one cleaner selection has been saved/enabled. |
 | Compact scheduled recompression does not run | Re-save the Compact schedule and verify the generated Windows scheduled task/worker files still exist. |

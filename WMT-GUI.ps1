@@ -35330,7 +35330,7 @@ catch { & $failed $_ }
                         <Button Name="btnCatGames" Content="Gaming" Width="80" Style="{StaticResource ActionBtn}" ToolTip="Filter: Game platforms and gaming tools"/>
                         <Button Name="btnCatSecurity" Content="Security" Width="90" Style="{StaticResource ActionBtn}" ToolTip="Filter: Antivirus, password managers, security tools"/>
                     </StackPanel>
-                    <Button Name="btnShowLibrary" Content="Your Library" Grid.Column="1" Style="{StaticResource ActionBtn}" ToolTip="Show games you own from Steam, Epic (Legendary), and GOG (GOGDL)"/>
+                    <Button Name="btnShowLibrary" Content="Your Library" Grid.Column="1" Style="{StaticResource ActionBtn}" ToolTip="Show installed games from Steam, Epic (Legendary), GOG (GOGDL), EA app, and Ubisoft Connect"/>
                 </Grid>
 
                 <!-- Catalog List -->
@@ -35420,7 +35420,8 @@ catch { & $failed $_ }
                         <!-- Navigation on the left, library-only refresh beside it. -->
                         <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left">
                             <Button Name="btnBackToUpdates" Content="Back to Updates" Style="{StaticResource ActionBtn}" ToolTip="Return to the package updates view"/>
-                            <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan Steam manifests and refresh Legendary/GOGDL caches" Visibility="Collapsed"/>
+                            <Button Name="btnLibraryRefresh" Content="Refresh Library" Style="{StaticResource ActionBtn}" ToolTip="Re-scan installed games from local provider data" Visibility="Collapsed"/>
+                            <Button Name="btnLibraryClients" Content="Game Clients" Style="{StaticResource ActionBtn}" ToolTip="Open EA app or Ubisoft Connect, or check launcher updates in WMT" Visibility="Collapsed"/>
                         </StackPanel>
                         <!-- Install and Locate / Import together on the right. -->
                         <StackPanel Name="pnlCatalogActions" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
@@ -40100,8 +40101,64 @@ $miLibCopyId = Get-Ctrl "miLibCopyId"
 $miLibCopyRows = Get-Ctrl "miLibCopyRows"
 if ($lstLibrary -and $ctxLibrary) { $lstLibrary.ContextMenu = $ctxLibrary }
 $btnLibraryRefresh = Get-Ctrl "btnLibraryRefresh"
+$btnLibraryClients = Get-Ctrl "btnLibraryClients"
 $btnLibraryLocate = Get-Ctrl "btnLibraryLocate"
 $lblLibraryStatus = Get-Ctrl "lblLibraryStatus"
+
+$ctxLibraryClients = New-Object System.Windows.Controls.ContextMenu
+$miOpenEaClient = New-Object System.Windows.Controls.MenuItem
+$miOpenEaClient.Header = "Open EA app"
+$miOpenUbisoftClient = New-Object System.Windows.Controls.MenuItem
+$miOpenUbisoftClient.Header = "Open Ubisoft Connect"
+$miCheckGameClientUpdates = New-Object System.Windows.Controls.MenuItem
+$miCheckGameClientUpdates.Header = "Check for updates in WMT"
+$miCheckGameClientUpdates.ToolTip = "Runs WMT's normal update scan across enabled providers; game downloads and maintenance stay in the official clients."
+[void]$ctxLibraryClients.Items.Add($miOpenEaClient)
+[void]$ctxLibraryClients.Items.Add($miOpenUbisoftClient)
+[void]$ctxLibraryClients.Items.Add((New-Object System.Windows.Controls.Separator))
+[void]$ctxLibraryClients.Items.Add($miCheckGameClientUpdates)
+if ($btnLibraryClients) { $btnLibraryClients.ContextMenu = $ctxLibraryClients }
+try { Set-WmtContextMenuChrome -ContextMenu $ctxLibraryClients } catch {}
+
+$miOpenEaClient.Add_Click({ [void](Start-WmtOfficialGameClient -Client "EA app") }.GetNewClosure())
+$miOpenUbisoftClient.Add_Click({ [void](Start-WmtOfficialGameClient -Client "Ubisoft Connect") }.GetNewClosure())
+$miCheckGameClientUpdates.Add_Click({
+        $updatesBackButton = Get-Ctrl "btnBackToUpdates"
+        $updatesScanButton = Get-Ctrl "btnWingetScan"
+        if (-not $updatesBackButton -or -not $updatesScanButton) {
+            Show-WmtMessageBox -Message "The Updates page is not available in this window." -Title "Updates Unavailable" -Image Warning | Out-Null
+            return
+        }
+        if (Get-WmtUpdateScansDisabled) {
+            Show-WmtMessageBox -Message "Update scans are disabled. Enable them in Settings before checking launcher updates." -Title "Updates Disabled" -Image Information | Out-Null
+            return
+        }
+        if (Test-WmtUpdateScanEngineBusy) {
+            $updatesBackButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+            Show-WmtMessageBox -Message "An update scan or package action is already running. Check the Updates page when it finishes." -Title "Update Scan In Progress" -Image Information | Out-Null
+            return
+        }
+        if (-not $updatesScanButton.IsEnabled) {
+            Show-WmtMessageBox -Message "The update scan action is currently unavailable." -Title "Updates Unavailable" -Image Warning | Out-Null
+            return
+        }
+        $updatesBackButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+        $updatesScanButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+    }.GetNewClosure())
+
+if ($btnLibraryClients) {
+    $btnLibraryClients.Add_Click({
+            $eaClientPath = Get-WmtOfficialGameClientPath -Client "EA app"
+            $ubisoftClientPath = Get-WmtOfficialGameClientPath -Client "Ubisoft Connect"
+            $miOpenEaClient.IsEnabled = -not [string]::IsNullOrWhiteSpace($eaClientPath)
+            $miOpenEaClient.ToolTip = if ($miOpenEaClient.IsEnabled) { $eaClientPath } else { "EA app was not found." }
+            $miOpenUbisoftClient.IsEnabled = -not [string]::IsNullOrWhiteSpace($ubisoftClientPath)
+            $miOpenUbisoftClient.ToolTip = if ($miOpenUbisoftClient.IsEnabled) { $ubisoftClientPath } else { "Ubisoft Connect was not found." }
+            $ctxLibraryClients.PlacementTarget = $btnLibraryClients
+            $ctxLibraryClients.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+            $ctxLibraryClients.IsOpen = $true
+        }.GetNewClosure())
+}
 
 $btnShowCatalog = Get-Ctrl "btnShowCatalog"
 $btnBackToUpdates = Get-Ctrl "btnBackToUpdates"
@@ -40307,6 +40364,7 @@ function Reset-WmtLibraryToCatalog {
         $brdLibraryList.Visibility = "Collapsed"
         if ($brdCatalogList) { $brdCatalogList.Visibility = "Visible" }
         if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Collapsed" }
+        if ($btnLibraryClients) { $btnLibraryClients.Visibility = "Collapsed" }
         if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Collapsed" }
         if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Collapsed" }
         if ($lblLibraryStatus) { $lblLibraryStatus.Text = "" }
@@ -67800,6 +67858,113 @@ $ps = New-WmtPooledPowerShell
 
         $all = [System.Collections.Generic.List[object]]::new()
 
+        function Get-WmtClientRegistryValue {
+            param($Key, [string[]]$Names)
+
+            foreach ($valueName in $Names) {
+                $value = $Key.GetValue($valueName, $null)
+                if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                    return ([string]$value).Trim()
+                }
+            }
+            return ""
+        }
+
+        function ConvertFrom-WmtClientRegistryEntry {
+            param(
+                [string]$Source,
+                [string]$ProviderKey,
+                [string]$Id,
+                [string]$Name,
+                [string]$Version,
+                [string]$InstallPath
+            )
+
+            $id = ([string]$Id).Trim()
+            $installPath = [Environment]::ExpandEnvironmentVariables(([string]$InstallPath).Trim().Trim('"').Trim("'"))
+            if ([string]::IsNullOrWhiteSpace($id) -or [string]::IsNullOrWhiteSpace($installPath) -or
+                -not (Test-Path -LiteralPath $installPath -PathType Container)) { return $null }
+
+            $name = ([string]$Name).Trim()
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $name = [System.IO.Path]::GetFileName($installPath.TrimEnd([char[]]@('\', '/')))
+            }
+            if ([string]::IsNullOrWhiteSpace($name) -or $name -match '(?i)^(EA app|EA Desktop|Origin|Ubisoft Connect|Uplay)$') { return $null }
+
+            $version = ([string]$Version).Trim()
+            if ([string]::IsNullOrWhiteSpace($version)) { $version = "Installed" }
+            $installPath = [System.IO.Path]::GetFullPath($installPath).TrimEnd('\')
+
+            return [PSCustomObject]@{
+                Source      = $Source
+                Name        = $name
+                Id          = $id
+                Version     = $version
+                Available   = "-"
+                IsInstalled = $true
+                InstallPath = $installPath
+                ProviderKey = $ProviderKey
+            }
+        }
+
+        function Get-WmtClientLibraryGames {
+            param([string]$Source, [string]$ProviderKey, [string[]]$RegistryRoots)
+
+            $games = [System.Collections.Generic.List[object]]::new()
+            $seenPaths = @{}
+            foreach ($root in @($RegistryRoots)) {
+                if (-not (Test-Path -LiteralPath $root)) { continue }
+                try {
+                    $rootKey = Get-Item -LiteralPath $root -ErrorAction Stop
+                    foreach ($entry in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+                        try {
+                            $gameKey = Get-Item -LiteralPath $entry.PSPath -ErrorAction Stop
+                            $installPath = Get-WmtClientRegistryValue -Key $gameKey -Names @(
+                                "InstallDir", "Install Dir", "InstallLocation", "Install Path",
+                                "GameInstallPath", "InstallPath"
+                            )
+                            if ([string]::IsNullOrWhiteSpace($installPath)) {
+                                $installPath = [string]$gameKey.GetValue("", $null)
+                            }
+                            $game = ConvertFrom-WmtClientRegistryEntry -Source $Source -ProviderKey $ProviderKey `
+                                -Id ([string]$entry.PSChildName) `
+                                -Name (Get-WmtClientRegistryValue -Key $gameKey -Names @("DisplayName", "GameName", "ProductName", "Title", "Name")) `
+                                -Version (Get-WmtClientRegistryValue -Key $gameKey -Names @("InstalledVersion", "DisplayVersion", "Version")) `
+                                -InstallPath $installPath
+                            if (-not $game) { continue }
+                            $pathKey = ([string]$game.InstallPath).TrimEnd('\').ToLowerInvariant()
+                            if ($seenPaths.ContainsKey($pathKey)) { continue }
+                            $seenPaths[$pathKey] = $true
+                            [void]$games.Add($game)
+                        }
+                        catch {
+                            Write-Output "LOG:$Source registry entry '$([string]$entry.PSChildName)' could not be read: $($_.Exception.Message)"
+                        }
+                    }
+
+                    foreach ($valueName in @($rootKey.GetValueNames())) {
+                        try {
+                            $installPath = [string]$rootKey.GetValue($valueName, $null)
+                            $game = ConvertFrom-WmtClientRegistryEntry -Source $Source -ProviderKey $ProviderKey `
+                                -Id ([string]$valueName) -Name "" -Version "" -InstallPath $installPath
+                            if (-not $game) { continue }
+                            $pathKey = ([string]$game.InstallPath).TrimEnd('\').ToLowerInvariant()
+                            if ($seenPaths.ContainsKey($pathKey)) { continue }
+                            $seenPaths[$pathKey] = $true
+                            [void]$games.Add($game)
+                        }
+                        catch {
+                            Write-Output "LOG:$Source registry value '$valueName' could not be read: $($_.Exception.Message)"
+                        }
+                    }
+                }
+                catch {
+                    Write-Output "LOG:$Source registry scan failed at '$root': $($_.Exception.Message)"
+                }
+            }
+            return $games.ToArray()
+        }
+
         # --- Steam (read from cache file) ---
         try {
             if ($SteamCacheFile -and (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
@@ -67979,6 +68144,49 @@ $ps = New-WmtPooledPowerShell
             Write-Output "LOG:GOG library read failed: $($_.Exception.Message)"
         }
 
+        # --- EA app and Ubisoft Connect (installed games from local registry) ---
+        $eaGameCount = 0
+        try {
+            $eaGames = @(Get-WmtClientLibraryGames -Source "EA app" -ProviderKey "eaapp" -RegistryRoots @(
+                "HKLM:\SOFTWARE\WOW6432Node\Origin Games",
+                "HKLM:\SOFTWARE\Origin Games",
+                "HKLM:\SOFTWARE\WOW6432Node\EA Games",
+                "HKLM:\SOFTWARE\EA Games",
+                "HKLM:\SOFTWARE\WOW6432Node\Electronic Arts\EA Games",
+                "HKLM:\SOFTWARE\Electronic Arts\EA Games",
+                "HKCU:\SOFTWARE\Origin Games",
+                "HKCU:\SOFTWARE\EA Games",
+                "HKCU:\SOFTWARE\Electronic Arts\EA Games"
+            ))
+            foreach ($game in $eaGames) {
+                if ($game -is [string]) { if ($game.StartsWith("LOG:")) { Write-Output $game }; continue }
+                [void]$all.Add($game)
+                $eaGameCount++
+            }
+        }
+        catch {
+            Write-Output "LOG:EA app library read failed: $($_.Exception.Message)"
+        }
+        Write-Output "LOG:EA app: $eaGameCount installed game(s)."
+
+        $ubisoftGameCount = 0
+        try {
+            $ubisoftGames = @(Get-WmtClientLibraryGames -Source "Ubisoft Connect" -ProviderKey "ubisoft" -RegistryRoots @(
+                "HKLM:\SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs",
+                "HKLM:\SOFTWARE\Ubisoft\Launcher\Installs",
+                "HKCU:\SOFTWARE\Ubisoft\Launcher\Installs"
+            ))
+            foreach ($game in $ubisoftGames) {
+                if ($game -is [string]) { if ($game.StartsWith("LOG:")) { Write-Output $game }; continue }
+                [void]$all.Add($game)
+                $ubisoftGameCount++
+            }
+        }
+        catch {
+            Write-Output "LOG:Ubisoft Connect library read failed: $($_.Exception.Message)"
+        }
+        Write-Output "LOG:Ubisoft Connect: $ubisoftGameCount installed game(s)."
+
         Write-Output "COUNT:$($all.Count)"
         foreach ($item in $all) { Write-Output $item }
     }).AddArgument($legCacheFile).AddArgument($gogCacheFile).AddArgument($steamCacheFile).AddArgument($gogInstalledIds.ToArray()).AddArgument($gogPendingIds.ToArray())
@@ -68024,7 +68232,7 @@ Register-WmtUiPollOperation -Name "LibraryScan" -IntervalMs 500 -TestComplete { 
                         $lblLibraryStatus.Text = "$($lstLibrary.Items.Count) game(s) in your library."
                     }
                     else {
-                        $lblLibraryStatus.Text = "No games found. Install Steam/Legendary/GOGDL and enable them in Providers."
+                        $lblLibraryStatus.Text = "No installed games found. Install a supported client or check its game-library data."
                     }
                 }
                 Write-GuiLog "Library scan complete: $($lstLibrary.Items.Count) game(s)."
@@ -68070,6 +68278,7 @@ $btnShowLibrary.Add_Click({
             $brdCatalogList.Visibility = "Collapsed"
             $brdLibraryList.Visibility = "Visible"
             if ($btnLibraryRefresh) { $btnLibraryRefresh.Visibility = "Visible" }
+            if ($btnLibraryClients) { $btnLibraryClients.Visibility = "Visible" }
             if ($btnLibraryLocate) { $btnLibraryLocate.Visibility = "Visible" }
             if ($btnToggleFabAssets) { $btnToggleFabAssets.Visibility = "Visible" }
             if ($btnCatalogInstall) { $btnCatalogInstall.ToolTip = "Install the selected uninstalled game(s) using their library provider." }
@@ -68432,11 +68641,119 @@ if ($btnLibraryLocate) {
     }.GetNewClosure())
 }
 
+if ($lstLibrary -and $btnLibraryLocate) {
+    $lstLibrary.Add_SelectionChanged({
+            $selected = @($lstLibrary.SelectedItems | Where-Object { $null -ne $_ })
+            $supportedSources = @("steam", "epic", "legendary", "gog", "gogdl")
+            $btnLibraryLocate.IsEnabled = ($selected.Count -eq 0 -or
+                ($selected.Count -eq 1 -and ([string]$selected[0].Source).Trim().ToLowerInvariant() -in $supportedSources))
+        }.GetNewClosure())
+}
+
 # --- Library context menu ---
 # Helper: get the selected library item.
 function Get-WmtSelectedLibraryItem {
     if (-not $lstLibrary) { return $null }
     return @($lstLibrary.SelectedItems | Select-Object -First 1)[0]
+}
+
+function Get-WmtOfficialGameClientPath {
+    param([ValidateSet("EA app", "Ubisoft Connect")][string]$Client)
+
+    $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+    $programFilesX86 = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+    if ($Client -eq "EA app") {
+        $exeNames = @("EADesktop.exe", "EALauncher.exe", "Origin.exe")
+        $knownPaths = @(
+            (Join-Path $programFiles "Electronic Arts\EA Desktop\EA Desktop\EADesktop.exe"),
+            (Join-Path $programFiles "Electronic Arts\EA Desktop\EALauncher.exe"),
+            (Join-Path $programFilesX86 "Electronic Arts\EA Desktop\EA Desktop\EADesktop.exe"),
+            (Join-Path $programFilesX86 "Origin\Origin.exe")
+        )
+        $displayNamePattern = '(?i)^(EA app|EA Desktop|Origin)(?:\s|$)'
+    }
+    else {
+        $exeNames = @("UbisoftConnect.exe", "Uplay.exe")
+        $knownPaths = @(
+            (Join-Path $programFilesX86 "Ubisoft\Ubisoft Game Launcher\UbisoftConnect.exe"),
+            (Join-Path $programFilesX86 "Ubisoft\Ubisoft Game Launcher\Uplay.exe"),
+            (Join-Path $programFiles "Ubisoft\Ubisoft Game Launcher\UbisoftConnect.exe"),
+            (Join-Path $programFiles "Ubisoft\Ubisoft Game Launcher\Uplay.exe")
+        )
+        $displayNamePattern = '(?i)^(Ubisoft Connect|Uplay)(?:\s|$)'
+    }
+
+    foreach ($candidate in $knownPaths) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
+        }
+    }
+
+    $uninstallRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($root in $uninstallRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        try {
+            foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+                try {
+                    $app = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                    if ([string]$app.DisplayName -notmatch $displayNamePattern) { continue }
+
+                    $candidates = [System.Collections.Generic.List[string]]::new()
+                    $installLocation = [Environment]::ExpandEnvironmentVariables(([string]$app.InstallLocation).Trim().Trim('"'))
+                    if (-not [string]::IsNullOrWhiteSpace($installLocation)) {
+                        foreach ($exeName in $exeNames) {
+                            [void]$candidates.Add((Join-Path $installLocation $exeName))
+                            [void]$candidates.Add((Join-Path (Join-Path $installLocation "EA Desktop") $exeName))
+                            [void]$candidates.Add((Join-Path (Join-Path $installLocation "Ubisoft Game Launcher") $exeName))
+                        }
+                    }
+
+                    $displayIcon = ([string]$app.DisplayIcon).Trim()
+                    if ($displayIcon -match '^\s*"([^"]+\.exe)"') {
+                        [void]$candidates.Add($matches[1])
+                    }
+                    elseif ($displayIcon -match '^\s*(.+?\.exe)(?:\s*,\s*-?\d+)?\s*$') {
+                        [void]$candidates.Add($matches[1].Trim().Trim('"'))
+                    }
+
+                    foreach ($candidate in $candidates) {
+                        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+                    }
+                }
+                catch {
+                    Write-GuiLog "$Client install metadata could not be read from '$($key.PSChildName)': $($_.Exception.Message)"
+                }
+            }
+        }
+        catch {
+            Write-GuiLog "$Client install metadata scan failed at '$root': $($_.Exception.Message)"
+        }
+    }
+    return ""
+}
+
+function Start-WmtOfficialGameClient {
+    param([ValidateSet("EA app", "Ubisoft Connect")][string]$Client)
+
+    try {
+        $clientPath = Get-WmtOfficialGameClientPath -Client $Client
+        if ([string]::IsNullOrWhiteSpace($clientPath)) {
+            Show-WmtMessageBox -Message "$Client was not found. Install it from its official source, then try again." -Title "Game Client Not Found" -Image Information | Out-Null
+            return $false
+        }
+        Start-Process -FilePath $clientPath -ErrorAction Stop | Out-Null
+        Write-GuiLog "Opened ${Client}: $clientPath"
+        return $true
+    }
+    catch {
+        Write-GuiLog "Could not open $Client at '$clientPath': $($_.Exception.Message)"
+        Show-WmtMessageBox -Message "Could not open ${Client}:`n$($_.Exception.Message)" -Title "Game Client Launch Failed" -Image Warning | Out-Null
+        return $false
+    }
 }
 
 # Helper: resolve the install directory for a game.
@@ -68445,6 +68762,13 @@ function Get-WmtLibraryItemInstallDir {
     if (-not $Item) { return "" }
     $source = ([string]$Item.Source).Trim().ToLowerInvariant()
     $id = [string]$Item.Id
+
+    if ($source -eq "ea app" -or $source -eq "ubisoft connect") {
+        $clientManagedPath = ([string]$Item.InstallPath).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($clientManagedPath) -and
+            (Test-Path -LiteralPath $clientManagedPath -PathType Container)) { return $clientManagedPath }
+        return ""
+    }
 
     if ($source -eq "steam") {
         foreach ($manifest in @(Get-WmtSteamInstalledManifests)) {
@@ -68522,7 +68846,13 @@ function Invoke-WmtLibraryLaunch {
     $id = [string]$Item.Id
     $name = [string]$Item.Name
 
-    if ($source -eq "Steam") {
+    if ($source -eq "EA app") {
+        [void](Start-WmtOfficialGameClient -Client "EA app")
+    }
+    elseif ($source -eq "Ubisoft Connect") {
+        [void](Start-WmtOfficialGameClient -Client "Ubisoft Connect")
+    }
+    elseif ($source -eq "Steam") {
         Start-Process "steam://run/$id"
         Write-GuiLog "Launching Steam game: $name (app $id)"
     }
@@ -70951,10 +71281,27 @@ if ($ctxLibrary -and $lstLibrary) {
                 catch {}
             }
 
-            # Show Launch + Uninstall + Repair + Go to Dir only if installed.
-            if ($miLibLaunch) { $miLibLaunch.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
-            if ($miLibUninstall) { $miLibUninstall.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
-            if ($miLibRepair) { $miLibRepair.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            $source = ([string]$item.Source).Trim().ToLowerInvariant()
+            $clientManaged = $source -in @("ea app", "ubisoft connect")
+
+            # EA and Ubisoft game operations are performed by their official clients.
+            if ($miLibLaunch) {
+                $miLibLaunch.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+                if ($source -eq "ea app") {
+                    $miLibLaunch.Header = "Open EA app"
+                    $miLibLaunch.ToolTip = "Open the official client to launch or manage this game."
+                }
+                elseif ($source -eq "ubisoft connect") {
+                    $miLibLaunch.Header = "Open Ubisoft Connect"
+                    $miLibLaunch.ToolTip = "Open the official client to launch or manage this game."
+                }
+                else {
+                    $miLibLaunch.Header = "Launch / Play"
+                    $miLibLaunch.ToolTip = "Launch the game if it is installed"
+                }
+            }
+            if ($miLibUninstall) { $miLibUninstall.Visibility = if ($isInstalled -and -not $clientManaged) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
+            if ($miLibRepair) { $miLibRepair.Visibility = if ($isInstalled -and -not $clientManaged) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
             if ($miLibGoToDir) { $miLibGoToDir.Visibility = if ($isInstalled) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
 
             # Show Install only if NOT installed and not already downloading.
@@ -70962,7 +71309,7 @@ if ($ctxLibrary -and $lstLibrary) {
             if ($miLibLocate) { $miLibLocate.Visibility = if (([string]$item.Source).Trim().ToLowerInvariant() -in @("steam", "epic", "legendary", "gog", "gogdl") -and -not $isPending) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed } }
 
             # Store page + Copy ID + Copy Row Data always visible.
-            if ($miLibStorePage) { $miLibStorePage.Visibility = [System.Windows.Visibility]::Visible }
+            if ($miLibStorePage) { $miLibStorePage.Visibility = if ($clientManaged) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible } }
             if ($miLibCopyId) { $miLibCopyId.Visibility = [System.Windows.Visibility]::Visible }
             if ($miLibCopyRows) { $miLibCopyRows.Visibility = [System.Windows.Visibility]::Visible }
         }.GetNewClosure())
