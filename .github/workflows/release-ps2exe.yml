@@ -415,7 +415,7 @@ jobs:
 
           # WingetCreate copies Documentation links from the previous manifest.
           # The old docs/wiki page was deleted, and winget-pkgs rejects 404 URLs,
-          # so retarget that link at the repository README before submitting.
+          # so retarget that link at the repository wiki before submitting.
           $localeManifest = @(Get-ChildItem -LiteralPath $manifestOutput -Filter "*.locale.en-US.yaml" -File -Recurse)[0]
           if (-not $localeManifest) {
               throw "WingetCreate did not generate a locale manifest."
@@ -423,11 +423,11 @@ jobs:
           $localeText = [IO.File]::ReadAllText($localeManifest.FullName)
           $fixedLocaleText = $localeText.Replace(
               "/blob/Main/docs/wiki/README.md",
-              "/blob/Main/README.md"
+              "/wiki"
           )
           if ($fixedLocaleText -ne $localeText) {
               [IO.File]::WriteAllText($localeManifest.FullName, $fixedLocaleText, [Text.UTF8Encoding]::new($false))
-              Write-Host "Retargeted the stale docs/wiki manifest URL to README.md."
+              Write-Host "Retargeted the stale docs/wiki manifest URL to the repository wiki."
           }
 
           $prTitle = "New version: Chaython.WindowsMaintenanceTool version $env:RELEASE_VERSION"
