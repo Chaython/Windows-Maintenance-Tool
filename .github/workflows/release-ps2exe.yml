@@ -353,7 +353,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Submit WinGet update
+      - name: Generate WinGet manifest
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.prerelease && inputs.submit_winget }}
         shell: powershell
         env:
@@ -430,17 +430,8 @@ jobs:
               Write-Host "Retargeted the stale docs/wiki manifest URL to the repository wiki."
           }
 
-          $prTitle = "New version: Chaython.WindowsMaintenanceTool version $env:RELEASE_VERSION"
-          & ".\wingetcreate.exe" submit $manifestOutput --prtitle $prTitle --no-open
-          if ($LASTEXITCODE -ne 0) {
-              throw "WingetCreate submission failed with exit code $LASTEXITCODE."
-          }
-
-      - name: Validate manifest, test local installation, and complete PR checklist
+      - name: Validate manifest and test local installation
         shell: powershell
-        env:
-          RELEASE_VERSION: ${{ needs.build-release.outputs.release_version }}
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           $manifestOutput = Join-Path $env:RUNNER_TEMP "wmt-winget-manifest"
@@ -492,6 +483,30 @@ jobs:
           & winget.exe install --manifest $manifestDir --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
           if ($LASTEXITCODE -ne 0) { throw "Local manifest installation failed with exit code $LASTEXITCODE." }
 
+      - name: Submit WinGet update
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ needs.build-release.outputs.release_version }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+              throw "WINGET_TOKEN is unavailable; cannot submit the WinGet update."
+          }
+          $manifestOutput = Join-Path $env:RUNNER_TEMP "wmt-winget-manifest"
+          $prTitle = "New version: Chaython.WindowsMaintenanceTool version $env:RELEASE_VERSION"
+          & ".\wingetcreate.exe" submit $manifestOutput --prtitle $prTitle --no-open
+          if ($LASTEXITCODE -ne 0) {
+              throw "WingetCreate submission failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Complete WinGet PR checklist
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ needs.build-release.outputs.release_version }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
               throw "WINGET_TOKEN is unavailable; cannot update the submitted WinGet PR checklist."
           }
@@ -502,13 +517,20 @@ jobs:
               "User-Agent" = "Windows-Maintenance-Tool-release"
           }
           $pullsUri = "https://api.github.com/repos/microsoft/winget-pkgs/pulls?state=open&per_page=100&sort=created&direction=desc"
-          $pulls = Invoke-RestMethod -Uri $pullsUri -Headers $headers -TimeoutSec 30
           $expectedTitle = "New version: Chaython.WindowsMaintenanceTool version $env:RELEASE_VERSION"
-          $matchingPulls = @($pulls | Where-Object {
-              $_.title -eq $expectedTitle -and
-              $_.user.login -eq "Chaython" -and
-              $_.head.repo.full_name -eq "Chaython/winget-pkgs"
-          })
+          # The PR may not be visible through the API for a few seconds after
+          # wingetcreate returns, so retry briefly before giving up.
+          $matchingPulls = @()
+          for ($attempt = 0; $attempt -lt 12; $attempt++) {
+              $pulls = Invoke-RestMethod -Uri $pullsUri -Headers $headers -TimeoutSec 30
+              $matchingPulls = @($pulls | Where-Object {
+                  $_.title -eq $expectedTitle -and
+                  $_.user.login -eq "Chaython" -and
+                  $_.head.repo.full_name -eq "Chaython/winget-pkgs"
+              })
+              if ($matchingPulls.Count -gt 0) { break }
+              Start-Sleep -Seconds 5
+          }
           if ($matchingPulls.Count -ne 1) {
               throw "Expected one open WinGet PR titled '$expectedTitle' from Chaython/winget-pkgs; found $($matchingPulls.Count)."
           }
