@@ -408,7 +408,30 @@ jobs:
           $manifestOutput = Join-Path $env:RUNNER_TEMP "wmt-winget-manifest"
           New-Item -ItemType Directory -Path $manifestOutput -Force | Out-Null
 
-          & ".\wingetcreate.exe" update Chaython.WindowsMaintenanceTool --urls "$installerUrl|x64" --version $env:RELEASE_VERSION --out $manifestOutput --submit --no-open
+          & ".\wingetcreate.exe" update Chaython.WindowsMaintenanceTool --urls "$installerUrl|x64" --version $env:RELEASE_VERSION --out $manifestOutput --no-open
+          if ($LASTEXITCODE -ne 0) {
+              throw "WingetCreate manifest generation failed with exit code $LASTEXITCODE."
+          }
+
+          # WingetCreate copies Documentation links from the previous manifest.
+          # The old docs/wiki page was deleted, and winget-pkgs rejects 404 URLs,
+          # so retarget that link at the repository README before submitting.
+          $localeManifest = @(Get-ChildItem -LiteralPath $manifestOutput -Filter "*.locale.en-US.yaml" -File -Recurse)[0]
+          if (-not $localeManifest) {
+              throw "WingetCreate did not generate a locale manifest."
+          }
+          $localeText = [IO.File]::ReadAllText($localeManifest.FullName)
+          $fixedLocaleText = $localeText.Replace(
+              "/blob/Main/docs/wiki/README.md",
+              "/blob/Main/README.md"
+          )
+          if ($fixedLocaleText -ne $localeText) {
+              [IO.File]::WriteAllText($localeManifest.FullName, $fixedLocaleText, [Text.UTF8Encoding]::new($false))
+              Write-Host "Retargeted the stale docs/wiki manifest URL to README.md."
+          }
+
+          $prTitle = "New version: Chaython.WindowsMaintenanceTool version $env:RELEASE_VERSION"
+          & ".\wingetcreate.exe" submit $manifestOutput --prtitle $prTitle --no-open
           if ($LASTEXITCODE -ne 0) {
               throw "WingetCreate submission failed with exit code $LASTEXITCODE."
           }
@@ -448,9 +471,18 @@ jobs:
           if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
               throw "winget.exe is unavailable; cannot truthfully mark local validation and installation as tested."
           }
+          & winget.exe --version
           Write-Host "Validating generated WinGet manifest..."
           & winget.exe validate --manifest $manifestDir
-          if ($LASTEXITCODE -ne 0) { throw "winget validate failed with exit code $LASTEXITCODE." }
+          $validateExitCode = $LASTEXITCODE
+          # 0x8A150028 means validation produced warnings only. Hosted runners
+          # can carry an older winget that warns about newer manifest schemas.
+          if ($validateExitCode -eq -1978335192) {
+              Write-Warning "winget validate reported warnings only (0x8A150028); continuing."
+          }
+          elseif ($validateExitCode -ne 0) {
+              throw "winget validate failed with exit code $validateExitCode."
+          }
 
           Write-Host "Enabling local manifest installation..."
           & winget.exe settings --enable LocalManifestFiles
