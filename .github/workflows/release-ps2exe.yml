@@ -24,7 +24,7 @@ on:
       push_scoop:
         description: "Submit a Scoop Extras update after the release (requires SCOOP_TOKEN and an approved Extras issue)"
         required: false
-        default: true
+        default: false
         type: boolean
       scoop_issue:
         description: "Approved open ScoopInstaller/Extras Package Request issue number (required when Scoop is enabled)"
