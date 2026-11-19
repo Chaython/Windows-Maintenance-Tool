@@ -17,7 +17,7 @@ param(
 # ==========================================
 # 1. SETUP
 # ==========================================
-$AppVersion = "6.9"
+$AppVersion = "6.10"
 $ErrorActionPreference = "SilentlyContinue"
 # Theme/DWM diagnostics are opt-in: launch WMT with -Debug to write HRESULTs.
 $script:WmtThemeDebug = [bool]$Debug
