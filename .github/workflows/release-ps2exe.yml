@@ -518,8 +518,12 @@ jobs:
               $_.number -ne $pr.number -and
               $_.title -like "New version: Chaython.WindowsMaintenanceTool version *"
           })
-          if ($otherMatchingPulls.Count -gt 0) {
-              throw "Another open WinGet PR for this package was found; refusing to claim the duplicate check passed."
+          $duplicateCheckPassed = $otherMatchingPulls.Count -eq 0
+          if (-not $duplicateCheckPassed) {
+              # Another version is still awaiting review. The submission itself
+              # already succeeded, so keep the release green but leave the
+              # duplicate-PR checklist item unchecked.
+              Write-Warning "Another open WinGet PR for this package was found; leaving the duplicate-check box unchecked."
           }
 
           # Wait briefly for Microsoft's CLA bot. Never mark the CLA item unless it passes.
@@ -541,9 +545,11 @@ jobs:
 
           $body = [string]$pr.body
           $body = $body.Replace("- [ ] Linked to an issue (if applicable)", "- [x] Linked to an issue (if applicable) - no related issue applies to this release.")
-          $body = [regex]::Replace($body, '(?m)^\\s*<!-- Example: Resolves #[^>]+ -->\\r?\\n', '')
+          $body = [regex]::Replace($body, '(?m)^\s*<!-- Example: Resolves #[^>]+ -->\r?\n', '')
           $body = $body.Replace("  - Resolves #[Issue Number]", "")
-          $body = $body.Replace("- [ ] Checked that there aren't other [pull requests]", "- [x] Checked that there aren't other [pull requests]")
+          if ($duplicateCheckPassed) {
+              $body = $body.Replace("- [ ] Checked that there aren't other open [pull requests]", "- [x] Checked that there aren't other open [pull requests]")
+          }
           $body = $body.Replace("- [ ] This PR only modifies one (1) manifest", "- [x] This PR only modifies one (1) manifest")
           $body = $body.Replace("- [ ] Validated manifest locally with", "- [x] Validated manifest locally with")
           $body = $body.Replace("- [ ] Tested manifest locally with", "- [x] Tested manifest locally with")
