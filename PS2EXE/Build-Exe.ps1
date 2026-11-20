@@ -268,6 +268,10 @@ $minifiedInput = Remove-WmtCommentsFromScript -Path $resolvedInput
 $stagingOutput = Join-Path $outputDirectory (
     "{0}.build-{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($resolvedOutput), [System.Guid]::NewGuid().ToString("N")
 )
+# PS2EXE writes the -LongPaths configuration beside the staged EXE, so it must
+# be renamed along with the executable or the final EXE loses its config.
+$stagingConfig = $stagingOutput + ".config"
+$resolvedConfig = $resolvedOutput + ".config"
 
 try {
     $invokeArguments = @{
@@ -311,10 +315,17 @@ try {
     }
 
     if (Test-Path -LiteralPath $resolvedOutput -PathType Leaf) {
-        [System.IO.File]::Replace($stagingOutput, $resolvedOutput, $null)
+        # [NullString]::Value keeps the third argument a true null reference;
+        # Windows PowerShell 5.1 coerces $null to an empty string, which
+        # File.Replace rejects as an illegal path.
+        [System.IO.File]::Replace($stagingOutput, $resolvedOutput, [NullString]::Value)
     }
     else {
         Move-Item -LiteralPath $stagingOutput -Destination $resolvedOutput
+    }
+
+    if (Test-Path -LiteralPath $stagingConfig -PathType Leaf) {
+        Move-Item -LiteralPath $stagingConfig -Destination $resolvedConfig -Force
     }
 
     Write-Host "Built: $resolvedOutput"
@@ -322,6 +333,10 @@ try {
 finally {
     if (Test-Path -LiteralPath $stagingOutput -PathType Leaf) {
         Remove-Item -LiteralPath $stagingOutput -Force
+    }
+
+    if (Test-Path -LiteralPath $stagingConfig -PathType Leaf) {
+        Remove-Item -LiteralPath $stagingConfig -Force
     }
 
     if ($minifiedInput -ne $resolvedInput -and (Test-Path -LiteralPath $minifiedInput -PathType Leaf)) {
