@@ -2980,7 +2980,9 @@ jobs:
               (Join-Path $repoRoot 'WMT-GUI.ps1'), [ref]$tokens, [ref]$parseErrors)
           if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
           foreach ($name in @('Invoke-WmtLegendaryLibraryJson', 'Invoke-WmtLegendaryInstalledData',
-                  'Get-WmtLegendaryCachedLibrary', 'Merge-WmtLegendaryCachedDetails', 'Set-WmtJsonCacheFile', 'New-WmtRunspaceInitialState', 'Start-WmtLibraryCacheBuilder', 'Get-WmtLibraryItemInstallDir')) {
+                  'Get-WmtLegendaryCachedLibrary', 'Merge-WmtLegendaryCachedDetails',
+                  'Get-WmtLegendaryGameVersion', 'Test-WmtLegendaryUeAsset', 'Test-WmtLegendaryGameIsUe',
+                  'Set-WmtJsonCacheFile', 'New-WmtRunspaceInitialState', 'Start-WmtLibraryCacheBuilder', 'Get-WmtLibraryItemInstallDir')) {
               $fn = $ast.Find({ param($n)
                   $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
               }, $true)
@@ -2999,7 +3001,7 @@ jobs:
           }, $true)
           $scanWorker = $scan.Find({ param($n)
               $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
-              $n.ScriptBlock.ParamBlock.Parameters.Count -eq 5
+              $n.ScriptBlock.ParamBlock.Parameters.Count -eq 6
           }, $true).ScriptBlock.Extent.Text
           $scanWorker = $scanWorker.Substring(1, $scanWorker.Length - 2)
 
@@ -3061,7 +3063,7 @@ jobs:
                   $ps = [PowerShell]::Create()
                   try {
                       [void]$ps.AddScript($scanWorker).AddArgument($libraryFile).
-                          AddArgument((Join-Path $testRoot 'missing-gog.json')).AddArgument('').AddArgument(@()).AddArgument(@())
+                          AddArgument((Join-Path $testRoot 'missing-gog.json')).AddArgument('').AddArgument(@()).AddArgument(@()).AddArgument(@{})
                       $scanOutput = @($ps.Invoke())
                       if ($ps.HadErrors) { throw ($ps.Streams.Error -join '; ') }
                       $row = $scanOutput | Where-Object { $_ -isnot [string] -and $_.Id -eq 'game1' }
@@ -3212,6 +3214,99 @@ jobs:
               }
           }
           if ($failures.Count) { throw ($failures -join [Environment]::NewLine) }
+
+      - name: Test GOG installed-state detection
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = (Get-Location).Path
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $repoRoot 'WMT-GUI.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
+          foreach ($name in @('Get-WmtGogInstalledMap', 'New-WmtRunspaceInitialState', 'Test-WmtLegendaryUeAsset')) {
+              $fn = $ast.Find({ param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $fn) { throw "Missing helper: $name" }
+              Invoke-Expression $fn.Extent.Text
+          }
+
+          # Background workers must be able to resolve the GOG helper themselves.
+          $iss = New-WmtRunspaceInitialState
+          $registered = @($iss.Commands | Where-Object { $_.Name -eq 'Get-WmtGogInstalledMap' })
+          if ($registered.Count -ne 1) { throw 'Get-WmtGogInstalledMap was not registered for pooled runspaces.' }
+
+          $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('WmtGogTests-' + [guid]::NewGuid().ToString('N'))
+          try {
+              [void][IO.Directory]::CreateDirectory($testRoot)
+              $trackerPath = Join-Path $testRoot 'gogdl_installs.json'
+              $tracker = @{
+                  '1111' = @{ Status = 'Installed'; Version = '2.0' }
+                  '2222' = @{ Status = 'Pending'; Version = '9.9.9' }
+                  '3333' = @{ Status = 'Failed'; Version = '0.1' }
+              } | ConvertTo-Json -Depth 4
+              [IO.File]::WriteAllText($trackerPath, $tracker)
+
+              $map = Get-WmtGogInstalledMap -TrackerPath $trackerPath
+              if (-not $map.ContainsKey('1111')) { throw 'Installed tracker entry is missing from the GOG map.' }
+              if ([string]$map['1111'] -ne '2.0') { throw "GOG tracker version mismatch: '$($map['1111'])'" }
+              if ($map.ContainsKey('2222')) { throw 'Pending tracker entry was treated as installed.' }
+              if ($map.ContainsKey('3333')) { throw 'Failed tracker entry was treated as installed.' }
+
+              # The library scan must show the installed version and the pending state.
+              $scan = $ast.Find({ param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-WmtLibraryScan'
+              }, $true)
+              $scanWorker = $scan.Find({ param($n)
+                  $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+                  $n.ScriptBlock.ParamBlock.Parameters.Count -eq 6
+              }, $true).ScriptBlock.Extent.Text
+              $scanWorker = $scanWorker.Substring(1, $scanWorker.Length - 2)
+
+              $gogCache = Join-Path $testRoot 'gog_library.json'
+              $gogRows = @(
+                  @{ Id = '1111'; Title = 'Installed GOG game'; Version = '2.1' }
+                  @{ Id = '2222'; Title = 'Pending GOG game'; Version = '9.9.9' }
+                  @{ Id = '4444'; Title = 'Owned GOG game'; Version = '1.0' }
+              )
+              [IO.File]::WriteAllText($gogCache, ($gogRows | ConvertTo-Json -Depth 4))
+
+              $ps = [PowerShell]::Create()
+              try {
+                  [void]$ps.AddScript($scanWorker).
+                      AddArgument((Join-Path $testRoot 'missing-legendary.json')).
+                      AddArgument($gogCache).
+                      AddArgument('').
+                      AddArgument(@('1111')).
+                      AddArgument(@('2222')).
+                      AddArgument(@{ '1111' = '2.0' })
+                  $output = @($ps.Invoke())
+                  if ($ps.HadErrors) { throw ($ps.Streams.Error -join '; ') }
+                  $rows = @($output | Where-Object { $_ -isnot [string] })
+                  $installed = @($rows | Where-Object { $_.Id -eq '1111' })
+                  if ($installed.Count -ne 1) { throw 'The installed GOG row is missing.' }
+                  if (-not $installed[0].IsInstalled) { throw 'The installed GOG row was not marked installed.' }
+                  if ([string]$installed[0].Version -ne '2.0') { throw "The installed GOG version was lost: '$($installed[0].Version)'" }
+                  $pending = @($rows | Where-Object { $_.Id -eq '2222' })
+                  if ($pending.Count -ne 1 -or -not $pending[0].IsPending) { throw 'The pending GOG row lost its state.' }
+                  if ([string]$pending[0].Version -ne 'Downloading') { throw "The pending GOG state was lost: '$($pending[0].Version)'" }
+                  $owned = @($rows | Where-Object { $_.Id -eq '4444' })
+                  if ($owned.Count -ne 1 -or $owned[0].IsInstalled) { throw 'The owned GOG row was reported as installed.' }
+                  if ([string]$owned[0].Version -ne 'Owned') { throw "The owned GOG state was lost: '$($owned[0].Version)'" }
+              }
+              finally { $ps.Dispose() }
+          }
+          finally {
+              $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
+              $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+              if ($resolvedTestRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                  [IO.Path]::GetFileName($resolvedTestRoot).StartsWith('WmtGogTests-')) {
+                  Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
+              }
+          }
+          Write-Host 'OK: GOG installed-state detection works.'
 
       - name: Test pagefile configuration contracts
         shell: powershell

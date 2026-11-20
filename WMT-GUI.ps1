@@ -2831,17 +2831,31 @@ try {
         if ($badMetadata) { $result.Error = "Skipped $badMetadata unreadable Legendary metadata file(s)." }
     }
 
-    $rows = [System.Collections.Generic.List[object]]::new()
-    $seen = @{}
+    # assets.json lists the same Marketplace asset twice: once under the UE
+    # marketplace namespace and once under 'ue'. Merge the variants first so
+    # the untagged copy cannot hide the UE tag (and real games keep their own
+    # namespace and stay visible).
+    $assetsByApp = [ordered]@{}
     foreach ($asset in $windowsAssets) {
         $appName = ([string]$asset.app_name).Trim()
-        if (-not $appName -or $seen.ContainsKey($appName)) { continue }
-        $seen[$appName] = $true
+        if (-not $appName) { continue }
+        $variantIsUe = Test-WmtLegendaryUeAsset -Namespace ([string]$asset.namespace) -BuildVersion ([string]$asset.build_version)
+        if (-not $assetsByApp.Contains($appName)) {
+            $assetsByApp[$appName] = [PSCustomObject]@{ Asset = $asset; IsUe = $variantIsUe }
+        }
+        elseif ($variantIsUe -and -not $assetsByApp[$appName].IsUe) {
+            $assetsByApp[$appName].IsUe = $true
+            $assetsByApp[$appName].Asset = $asset
+        }
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $assetsByApp.Values) {
+        $asset = $entry.Asset
+        $appName = ([string]$asset.app_name).Trim()
         $game = $metadataByApp[$appName]
         if (-not $game) { $game = $metadataByCatalog[([string]$asset.namespace + ':' + [string]$asset.catalog_item_id)] }
-        # New Fab assets can have a different namespace but still carry the
-        # Unreal UserContent build marker. Retain the tag in the fallback JSON.
-        $isUe = ([string]$asset.namespace -eq 'ue' -or [string]$asset.build_version -match '(?i)\+UE\d+-UserContent')
+        $isUe = [bool]$entry.IsUe
         if (-not $IncludeUe -and $isUe) { continue }
         # Match Legendary's top-level game list; DLC remains part of its parent.
         if ($game -and $game.metadata.mainGameItem) { continue }
@@ -2887,6 +2901,119 @@ try {
     }
 }
 catch { return "Legendary previous cache could not be merged: $($_.Exception.Message)" }
+}
+
+function Get-WmtLegendaryGameVersion {
+param($Game)
+
+if (-not $Game) { return "" }
+
+# `legendary list --json` serializes Game.__dict__, which exposes asset_infos
+# (per-platform GameAsset dicts) instead of the app_version() method. The
+# offline catalog fallback emits a flat app_version; older builds emit version.
+try {
+    if ($Game.PSObject.Properties["asset_infos"] -and $Game.asset_infos) {
+        foreach ($platformName in @("Windows", "Win32", "Mac", "Linux")) {
+            $assetInfo = $null
+            try { $assetInfo = $Game.asset_infos.$platformName } catch {}
+            if (-not $assetInfo) { continue }
+            $buildVersion = ""
+            if ($assetInfo -is [string]) {
+                $match = [regex]::Match($assetInfo, "build_version\s*=\s*'(?<version>[^']*)'")
+                if ($match.Success) { $buildVersion = $match.Groups["version"].Value }
+            }
+            elseif ($assetInfo.PSObject.Properties["build_version"]) {
+                $buildVersion = [string]$assetInfo.build_version
+            }
+            if (-not [string]::IsNullOrWhiteSpace($buildVersion)) { return $buildVersion.Trim() }
+        }
+        # Some libraries only carry a non-Windows platform asset.
+        foreach ($assetProp in @($Game.asset_infos.PSObject.Properties)) {
+            $assetInfo = $assetProp.Value
+            if ($assetInfo -is [string]) {
+                $match = [regex]::Match($assetInfo, "build_version\s*=\s*'(?<version>[^']*)'")
+                if ($match.Success -and -not [string]::IsNullOrWhiteSpace($match.Groups["version"].Value)) { return $match.Groups["version"].Value.Trim() }
+            }
+            elseif ($assetInfo -and $assetInfo.PSObject.Properties["build_version"]) {
+                $buildVersion = [string]$assetInfo.build_version
+                if (-not [string]::IsNullOrWhiteSpace($buildVersion)) { return $buildVersion.Trim() }
+            }
+        }
+    }
+}
+catch {}
+
+foreach ($fieldName in @("app_version", "version")) {
+    try {
+        if ($Game.PSObject.Properties[$fieldName]) {
+            $value = ([string]$Game.$fieldName).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+        }
+    }
+    catch {}
+}
+return ""
+}
+
+function Test-WmtLegendaryUeAsset {
+param([string]$Namespace, [string]$BuildVersion)
+
+# Epic lists Unreal Engine Marketplace/Fab content under the fixed UE
+# marketplace namespace or the newer 'ue' namespace. Real games use their
+# own namespace, so an app_name that merely looks like a hex ID must never
+# be treated as engine content.
+$ns = ([string]$Namespace).Trim().ToLowerInvariant()
+if ($ns -eq "ue" -or $ns -eq "89efe5924d3d467c839449ab6ab52e7f") { return $true }
+
+# UserContent/Dev-Marketplace build markers only appear on Marketplace/Fab
+# builds ('+++depot+UE4-UserContent-Windows', '+++UE5+Dev-Marketplace-Windows').
+# '+UE4+Release-...' entries are games built with Unreal Engine and must stay
+# visible.
+return ([string]$BuildVersion -match '(?i)\+UE\d+[-+](?:UserContent|Dev-Marketplace)')
+}
+
+function Test-WmtLegendaryGameIsUe {
+param($Game, [string]$BuildVersion)
+
+if (-not $Game) { return $false }
+
+try { if ($Game.PSObject.Properties["is_ue"] -and [bool]$Game.is_ue) { return $true } } catch {}
+
+# asset_infos carries the per-platform namespace/build metadata. legendary
+# serializes GameAsset objects as dicts, but older builds emit str() output,
+# so the Python repr form is parsed as text too.
+try {
+    if ($Game.PSObject.Properties["asset_infos"] -and $Game.asset_infos) {
+        foreach ($aiProp in @($Game.asset_infos.PSObject.Properties)) {
+            $aiNamespace = ""
+            $aiBuild = ""
+            if ($aiProp.Value -is [string]) {
+                $nsMatch = [regex]::Match($aiProp.Value, "namespace\s*=\s*'(?<ns>[^']*)'")
+                if ($nsMatch.Success) { $aiNamespace = $nsMatch.Groups["ns"].Value }
+                $bvMatch = [regex]::Match($aiProp.Value, "build_version\s*=\s*'(?<bv>[^']*)'")
+                if ($bvMatch.Success) { $aiBuild = $bvMatch.Groups["bv"].Value }
+            }
+            elseif ($aiProp.Value -and $aiProp.Value.PSObject) {
+                try { if ($aiProp.Value.PSObject.Properties["namespace"]) { $aiNamespace = [string]$aiProp.Value.namespace } } catch {}
+                try { if ($aiProp.Value.PSObject.Properties["build_version"]) { $aiBuild = [string]$aiProp.Value.build_version } } catch {}
+            }
+            if (Test-WmtLegendaryUeAsset -Namespace $aiNamespace -BuildVersion $aiBuild) { return $true }
+        }
+    }
+}
+catch {}
+
+# Fall back to the EGS metadata namespace and the build marker.
+try {
+    if ($Game.PSObject.Properties["metadata"] -and $Game.metadata) {
+        $metaNamespace = ""
+        try { if ($Game.metadata.PSObject.Properties["namespace"]) { $metaNamespace = [string]$Game.metadata.namespace } } catch {}
+        if (Test-WmtLegendaryUeAsset -Namespace $metaNamespace -BuildVersion $BuildVersion) { return $true }
+    }
+}
+catch {}
+
+return $false
 }
 
 function Invoke-WmtLegendaryLibraryJson {
@@ -3443,6 +3570,135 @@ function ConvertFrom-WmtWingetTableRow {
 Invoke-Expression $script:WmtSteamCommonHelpers
 Invoke-Expression $script:WmtWingetCommonHelpers
 
+# Installed GOG games and their version. Sources:
+#  - WMT's own gogdl install tracker (games WMT installed)
+#  - the GOG registry (games installed by the GOG client/Galaxy)
+#  - Heroic's GOG store library (games installed through Heroic)
+# The registry and Heroic entries fill the gap left by the tracker so the
+# library view and the package search report the same installed state.
+# Defined here, before any runspace pool exists, so New-WmtRunspaceInitialState
+# can resolve it for pooled workers.
+function Get-WmtGogInstalledMap {
+param([string]$TrackerPath = "")
+
+$map = @{}
+
+if (-not [string]::IsNullOrWhiteSpace($TrackerPath) -and (Test-Path -LiteralPath $TrackerPath -PathType Leaf)) {
+    try {
+        $tracker = [System.IO.File]::ReadAllText($TrackerPath) | ConvertFrom-Json -ErrorAction Stop
+        foreach ($property in @($tracker.PSObject.Properties)) {
+            $entry = $property.Value
+            if ([string]$entry.Status -ne "Installed") { continue }
+            $id = ([string]$property.Name).Trim()
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            $version = ""
+            try { if ($entry.PSObject.Properties["Version"]) { $version = ([string]$entry.Version).Trim() } } catch {}
+            $map[$id] = $version
+        }
+    }
+    catch {}
+}
+
+# GOG Galaxy writes the installed game version into the registry value "ver"
+# (older builds used "version"); "gameID" is the GOG product id.
+foreach ($root in @(
+    "HKLM:\SOFTWARE\WOW6432Node\GOG.com\Games",
+    "HKLM:\SOFTWARE\GOG.com\Games",
+    "HKCU:\SOFTWARE\GOG.com\Games",
+    "HKCU:\SOFTWARE\WOW6432Node\GOG.com\Games"
+)) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+        try {
+            $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+            $gameId = ([string]$props.gameID).Trim()
+            if ([string]::IsNullOrWhiteSpace($gameId)) { $gameId = Split-Path -Leaf $key.Name }
+            if ([string]::IsNullOrWhiteSpace($gameId)) { continue }
+            if ($map.ContainsKey($gameId)) { continue }
+            $version = ""
+            foreach ($versionProp in @("ver", "version")) {
+                try {
+                    if ($props.PSObject.Properties[$versionProp]) {
+                        $candidate = ([string]$props.$versionProp).Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($candidate)) { $version = $candidate; break }
+                    }
+                }
+                catch {}
+            }
+            $map[$gameId] = $version
+        }
+        catch {}
+    }
+}
+
+# Heroic keeps its GOG state in two electron-store files under %APPDATA%\heroic:
+#  - gog_store\installed.json  -> { "installed": [ { appName, version, ... } ] }
+#  - store_cache\gog_library.json -> { "games": [ { app_name, is_installed, install: {...} } ] }
+# The library cache holds every owned game, so only the entries flagged as
+# installed count; the dedicated installed.json store is the authoritative list.
+try {
+    if ($env:APPDATA) {
+        $heroicRoot = Join-Path $env:APPDATA "heroic"
+
+        $heroicInstalledFile = Join-Path $heroicRoot "gog_store\installed.json"
+        if (Test-Path -LiteralPath $heroicInstalledFile -PathType Leaf) {
+            try {
+                $heroicInstalled = [System.IO.File]::ReadAllText($heroicInstalledFile) | ConvertFrom-Json -ErrorAction Stop
+                $entries = @()
+                if ($heroicInstalled -and $heroicInstalled.PSObject.Properties["installed"]) { $entries = @($heroicInstalled.installed) }
+                else { $entries = @($heroicInstalled) }
+                foreach ($entry in $entries) {
+                    if (-not $entry) { continue }
+                    $gameId = ([string]$entry.appName).Trim()
+                    if ([string]::IsNullOrWhiteSpace($gameId)) { $gameId = ([string]$entry.app_name).Trim() }
+                    if ([string]::IsNullOrWhiteSpace($gameId)) { continue }
+                    if ($map.ContainsKey($gameId)) { continue }
+                    $version = ""
+                    try { if ($entry.PSObject.Properties["version"]) { $version = ([string]$entry.version).Trim() } } catch {}
+                    $map[$gameId] = $version
+                }
+            }
+            catch {}
+        }
+
+        $heroicLibraryFile = Join-Path $heroicRoot "store_cache\gog_library.json"
+        if (Test-Path -LiteralPath $heroicLibraryFile -PathType Leaf) {
+            try {
+                $heroicLibrary = [System.IO.File]::ReadAllText($heroicLibraryFile) | ConvertFrom-Json -ErrorAction Stop
+                $games = @()
+                if ($heroicLibrary -and $heroicLibrary.PSObject.Properties["games"]) { $games = @($heroicLibrary.games) }
+                else { $games = @($heroicLibrary) }
+                foreach ($heroicGame in $games) {
+                    if (-not $heroicGame) { continue }
+                    $gameId = ([string]$heroicGame.app_name).Trim()
+                    if ([string]::IsNullOrWhiteSpace($gameId)) { $gameId = ([string]$heroicGame.appName).Trim() }
+                    if ([string]::IsNullOrWhiteSpace($gameId)) { continue }
+                    $isInstalled = $false
+                    try { if ($heroicGame.PSObject.Properties["is_installed"]) { $isInstalled = [bool]$heroicGame.is_installed } } catch {}
+                    if (-not $isInstalled) { continue }
+                    if ($map.ContainsKey($gameId)) { continue }
+                    $version = ""
+                    try {
+                        if ($heroicGame.PSObject.Properties["install"] -and $heroicGame.install -and $heroicGame.install.PSObject.Properties["version"]) {
+                            $version = ([string]$heroicGame.install.version).Trim()
+                        }
+                    }
+                    catch {}
+                    if ([string]::IsNullOrWhiteSpace($version)) {
+                        try { if ($heroicGame.PSObject.Properties["version"]) { $version = ([string]$heroicGame.version).Trim() } } catch {}
+                    }
+                    $map[$gameId] = $version
+                }
+            }
+            catch {}
+        }
+    }
+}
+catch {}
+
+return $map
+}
+
 # ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
@@ -3497,7 +3753,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -10736,7 +10992,7 @@ if (-not $isUe -and ([string]$Item.Source).Trim() -match "(?i)^(epic|legendary)$
     $id = [string]$Item.Id
     $isUe = ($id -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or
         $id -match '(?i)(?:^|_)(?:5\.\d+)$' -or
-        $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
+        $title -match '(?i)\b(plugin|materials?|vfx|environment|\benv\b|sample|textures?|shaders?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
 }
 return $isUe
 }
@@ -49030,32 +49286,13 @@ try {
                     $installedRecord = if ([string]::IsNullOrWhiteSpace($gameId)) { $null } else { $installedByApp[$gameId.ToLowerInvariant()] }
                     $isInstalled = ($null -ne $installedRecord)
                     $installedVer = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
-                    $latestVer = [string]$game.app_version
+                    $latestVer = Get-WmtLegendaryGameVersion -Game $game
                     if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                     # Tag UE/Fab assets (namespace 'ue', legendary's own skip
                     # marker). 'namespace' is not a top-level JSON key (it is a
                     # Python property there); it lives in asset_infos (per
                     # platform) and in the EGS metadata blob.
-                    $legIsUe = [bool]$game.is_ue
-                    try {
-                        if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
-                            foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
-                                # Object form: read .namespace directly. String form:
-                                # legendary serializes GameAsset objects via str() (json
-                                # default=str), so the value arrives as a Python repr - match
-                                # the namespace field inside that text instead.
-                                if ($aiProp.Value -is [string]) {
-                                    if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
-                                }
-                                elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
-                            }
-                        }
-                    } catch {}
-                    if (-not $legIsUe) {
-                        try {
-                            if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
-                        } catch {}
-                    }
+                    $legIsUe = Test-WmtLegendaryGameIsUe -Game $game -BuildVersion $latestVer
                     $result.Add([PSCustomObject]@{
                             Provider         = "legendary"
                             Title            = $title
@@ -49108,7 +49345,7 @@ try {
                         $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
                     }
                     foreach ($asset in @($uePlatformAssets)) {
-                        if (([string]$asset.namespace) -eq 'ue') {
+                        if (Test-WmtLegendaryUeAsset -Namespace ([string]$asset.namespace) -BuildVersion ([string]$asset.build_version)) {
                             $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
                             if ($ueKey) { $ueAppNames[$ueKey] = $true }
                         }
@@ -49129,14 +49366,14 @@ try {
             $app = $match.Groups["app"].Value.Trim()
             $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
             if ([string]::IsNullOrWhiteSpace($title)) { continue }
-            $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
+            $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|environment|\benv\b|sample|textures?|shaders?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
             if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                 foreach ($ueMetaRoot in $ueMetaRoots) {
                     $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
                     if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
                     try {
                         $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
-                        if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                        if ($ueMetaJson -and $ueMetaJson.metadata -and (Test-WmtLegendaryUeAsset -Namespace ([string]$ueMetaJson.metadata.namespace))) { $legIsUe = $true }
                     }
                     catch {}
                     break
@@ -49357,44 +49594,16 @@ try {
     }
 
     # Step 4: Combine owned + installed into result.
+    # Installed manifests are always merged in, even when localconfig.vdf
+    # lists other apps: a game can be installed without appearing in the
+    # "apps" list (redistributables, apps registered by another client, or
+    # an entry only present in libraryfolders.vdf). Dropping those would hide
+    # a real installation from Your Library.
     $seenIds = @{}
-    if ($ownedAppIds.Count -gt 0) {
-        foreach ($aid in $ownedAppIds) {
-            if ($seenIds.ContainsKey($aid)) { continue }
-            $seenIds[$aid] = $true
-            if ($installedApps.ContainsKey($aid)) {
-                $info = $installedApps[$aid]
-                $result.Add([PSCustomObject]@{
-                        Provider         = "steam"
-                        Title            = [string]$info.Name
-                        Id               = $aid
-                        Version          = [string]$info.BuildId
-                        Source           = "steam"
-                        Kind             = "Library"
-                        IsInstalled      = $true
-                        InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" }
-                    })
-            }
-            else {
-                $name = if ($appNames.ContainsKey($aid)) { $appNames[$aid] } else { "Steam App $aid" }
-                $result.Add([PSCustomObject]@{
-                        Provider         = "steam"
-                        Title            = $name
-                        Id               = $aid
-                        Version          = ""
-                        Source           = "steam"
-                        Kind             = "Library"
-                        IsInstalled      = $false
-                        InstalledVersion = "Not installed"
-                    })
-            }
-        }
-    }
-    else {
-        # No localconfig.vdf found � fall back to installed games only.
-        foreach ($aid in @($installedApps.Keys)) {
-            if ($seenIds.ContainsKey($aid)) { continue }
-            $seenIds[$aid] = $true
+    foreach ($aid in $ownedAppIds) {
+        if ($seenIds.ContainsKey($aid)) { continue }
+        $seenIds[$aid] = $true
+        if ($installedApps.ContainsKey($aid)) {
             $info = $installedApps[$aid]
             $result.Add([PSCustomObject]@{
                     Provider         = "steam"
@@ -49407,6 +49616,34 @@ try {
                     InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" }
                 })
         }
+        else {
+            $name = if ($appNames.ContainsKey($aid)) { $appNames[$aid] } else { "Steam App $aid" }
+            $result.Add([PSCustomObject]@{
+                    Provider         = "steam"
+                    Title            = $name
+                    Id               = $aid
+                    Version          = ""
+                    Source           = "steam"
+                    Kind             = "Library"
+                    IsInstalled      = $false
+                    InstalledVersion = "Not installed"
+                })
+        }
+    }
+    foreach ($aid in @($installedApps.Keys)) {
+        if ($seenIds.ContainsKey($aid)) { continue }
+        $seenIds[$aid] = $true
+        $info = $installedApps[$aid]
+        $result.Add([PSCustomObject]@{
+                Provider         = "steam"
+                Title            = [string]$info.Name
+                Id               = $aid
+                Version          = [string]$info.BuildId
+                Source           = "steam"
+                Kind             = "Library"
+                IsInstalled      = $true
+                InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" }
+            })
     }
 }
 catch {
@@ -56002,6 +56239,29 @@ $script:InvokeWingetSearch = {
                             elseif ($legendaryResult.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$legendaryResult.StdErr)) {
                                 Write-Output "LOG:Legendary library fetch failed: $(([string]$legendaryResult.StdErr).Trim())"
                             }
+                            # `legendary list` never includes install state (Game.__dict__
+                            # has no is_installed/version). Read the local install
+                            # database separately so this cache - the one search reads -
+                            # carries accurate IsInstalled/InstalledVersion values.
+                            $installedByApp = @{}
+                            try {
+                                $installedResult = Invoke-WmtLegendaryInstalledData -LegendaryExe $LegendaryExe -TimeoutMs 30000
+                                if ($installedResult.ExitCode -eq 0) {
+                                    foreach ($installedGame in @($installedResult.Rows)) {
+                                        $installedId = ([string]$installedGame.'App name').Trim()
+                                        if ([string]::IsNullOrWhiteSpace($installedId)) { continue }
+                                        $installedByApp[$installedId.ToLowerInvariant()] = [PSCustomObject]@{
+                                            Id               = $installedId
+                                            Title            = ([string]$installedGame.'App title').Trim()
+                                            Version          = ([string]$installedGame.'Installed version').Trim()
+                                            AvailableVersion = ([string]$installedGame.'Available version').Trim()
+                                            InstallPath      = ([string]$installedGame.'Install path').Trim()
+                                            Platform         = ([string]$installedGame.Platform).Trim()
+                                        }
+                                    }
+                                }
+                            }
+                            catch {}
                             $parsed = $false
                             if (-not $parsed -and -not [string]::IsNullOrWhiteSpace($stdout)) {
                                 try {
@@ -56011,37 +56271,39 @@ $script:InvokeWingetSearch = {
                                             $title = [string]$game.app_title
                                             if ([string]::IsNullOrWhiteSpace($title)) { $title = [string]$game.title }
                                             if ([string]::IsNullOrWhiteSpace($title)) { continue }
-                                            $isInstalled = $false
-                                            try { if ($game.PSObject.Properties["is_installed"]) { $isInstalled = [bool]$game.is_installed } } catch {}
-                                            $installedVer = ""
-                                            $latestVer = [string]$game.app_version
-                                            if ($isInstalled) {
-                                                try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
-                                                if ([string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
+                                            $gameId = ([string]$game.app_name).Trim()
+                                            $installedRecord = $null
+                                            if (-not [string]::IsNullOrWhiteSpace($gameId)) { $installedRecord = $installedByApp[$gameId.ToLowerInvariant()] }
+                                            $isInstalled = ($null -ne $installedRecord)
+                                            if (-not $isInstalled) {
+                                                # Compatibility with builds that do expose is_installed.
+                                                try { if ($game.PSObject.Properties["is_installed"]) { $isInstalled = [bool]$game.is_installed } } catch {}
                                             }
+                                            $installedVer = ""
+                                            $latestVer = Get-WmtLegendaryGameVersion -Game $game
+                                            if ($installedRecord) {
+                                                $installedVer = [string]$installedRecord.Version
+                                            }
+                                            elseif ($isInstalled) {
+                                                try { if ($game.PSObject.Properties["version"]) { $installedVer = [string]$game.version } } catch {}
+                                            }
+                                            if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                                             # Tag UE/Fab assets from the JSON namespace data
                                             # (asset_infos per platform, or the metadata blob).
-                                            $legIsUe = [bool]$game.is_ue
-                                            try {
-                                                if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
-                                                    foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
-                                                        # Object form: read .namespace directly. String form:
-                                                        # legendary serializes GameAsset objects via str() (json
-                                                        # default=str), so the value arrives as a Python repr - match
-                                                        # the namespace field inside that text instead.
-                                                        if ($aiProp.Value -is [string]) {
-                                                            if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
-                                                        }
-                                                        elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
-                                                    }
-                                                }
-                                            } catch {}
-                                            if (-not $legIsUe) {
-                                                try {
-                                                    if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
-                                                } catch {}
-                                            }
-                                            $result.Add([PSCustomObject]@{ Provider = "legendary"; Title = $title; Id = [string]$game.app_name; Version = $latestVer; InstalledVersion = $installedVer; IsInstalled = $isInstalled; Source = "legendary"; Kind = "Library"; IsUe = $legIsUe })
+                                            $legIsUe = Test-WmtLegendaryGameIsUe -Game $game -BuildVersion $latestVer
+                                            $result.Add([PSCustomObject]@{
+                                                    Provider         = "legendary"
+                                                    Title            = $title
+                                                    Id               = $gameId
+                                                    Version          = $latestVer
+                                                    InstalledVersion = $installedVer
+                                                    IsInstalled      = $isInstalled
+                                                    InstallPath      = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                                                    Platform         = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
+                                                    Source           = "legendary"
+                                                    Kind             = "Library"
+                                                    IsUe             = $legIsUe
+                                                })
                                         }
                                         if ($result.Count -gt 0) { $parsed = $true }
                                     }
@@ -56075,7 +56337,7 @@ $script:InvokeWingetSearch = {
                                                 $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
                                             }
                                             foreach ($asset in @($uePlatformAssets)) {
-                                                if (([string]$asset.namespace) -eq 'ue') {
+                                                if (Test-WmtLegendaryUeAsset -Namespace ([string]$asset.namespace) -BuildVersion ([string]$asset.build_version)) {
                                                     $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
                                                     if ($ueKey) { $ueAppNames[$ueKey] = $true }
                                                 }
@@ -56096,27 +56358,74 @@ $script:InvokeWingetSearch = {
                                     if ([string]::IsNullOrWhiteSpace($title)) { continue }
                                     $app = $match.Groups["app"].Value.Trim()
                                     $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
-                                    $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
+                                    $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|environment|\benv\b|sample|textures?|shaders?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
                                     if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                                         foreach ($ueMetaRoot in $ueMetaRoots) {
                                             $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
                                             if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
                                             try {
                                                 $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
-                                                if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                                if ($ueMetaJson -and $ueMetaJson.metadata -and (Test-WmtLegendaryUeAsset -Namespace ([string]$ueMetaJson.metadata.namespace))) { $legIsUe = $true }
                                             }
                                             catch {}
                                             break
                                         }
                                     }
+                                    $appKey = ([string]$app).Trim()
+                                    $installedRecord = $null
+                                    if (-not [string]::IsNullOrWhiteSpace($appKey)) { $installedRecord = $installedByApp[$appKey.ToLowerInvariant()] }
                                     $result.Add([PSCustomObject]@{
-                                            Provider = "legendary"
-                                            Title    = $title
-                                            Id       = $app
-                                            Version  = $ver
-                                            Source   = "legendary"
-                                            Kind     = "Library"
-                                            IsUe     = $legIsUe
+                                            Provider         = "legendary"
+                                            Title            = $title
+                                            Id               = $app
+                                            Version          = $ver
+                                            InstalledVersion = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
+                                            IsInstalled      = ($null -ne $installedRecord)
+                                            InstallPath      = if ($installedRecord) { [string]$installedRecord.InstallPath } else { "" }
+                                            Platform         = if ($installedRecord) { [string]$installedRecord.Platform } else { "" }
+                                            Source           = "legendary"
+                                            Kind             = "Library"
+                                            IsUe             = $legIsUe
+                                        })
+                                }
+                            }
+                            # Add installed-only entries (DLC and launcher add-ons
+                            # that `list` omits) and normalize install fields.
+                            if ($result.Count -gt 0 -and $installedByApp.Count -gt 0) {
+                                $seenIds = @{}
+                                foreach ($existing in $result.ToArray()) {
+                                    $existingId = ([string]$existing.Id).Trim()
+                                    if ([string]::IsNullOrWhiteSpace($existingId)) { continue }
+                                    $existingKey = $existingId.ToLowerInvariant()
+                                    $seenIds[$existingKey] = $true
+                                    $installedRecord = $installedByApp[$existingKey]
+                                    if ($installedRecord) {
+                                        $existing | Add-Member -NotePropertyName IsInstalled -NotePropertyValue $true -Force
+                                        $existing | Add-Member -NotePropertyName InstalledVersion -NotePropertyValue ([string]$installedRecord.Version) -Force
+                                        $existing | Add-Member -NotePropertyName InstallPath -NotePropertyValue ([string]$installedRecord.InstallPath) -Force
+                                        $existing | Add-Member -NotePropertyName Platform -NotePropertyValue ([string]$installedRecord.Platform) -Force
+                                    }
+                                }
+                                foreach ($installedRecord in @($installedByApp.Values)) {
+                                    $installedKey = ([string]$installedRecord.Id).Trim().ToLowerInvariant()
+                                    if ([string]::IsNullOrWhiteSpace($installedKey) -or $seenIds.ContainsKey($installedKey)) { continue }
+                                    $seenIds[$installedKey] = $true
+                                    $installedTitle = ([string]$installedRecord.Title).Trim()
+                                    if ([string]::IsNullOrWhiteSpace($installedTitle)) { $installedTitle = [string]$installedRecord.Id }
+                                    $latest = ([string]$installedRecord.AvailableVersion).Trim()
+                                    if ([string]::IsNullOrWhiteSpace($latest)) { $latest = [string]$installedRecord.Version }
+                                    $result.Add([PSCustomObject]@{
+                                            Provider         = "legendary"
+                                            Title            = $installedTitle
+                                            Id               = [string]$installedRecord.Id
+                                            Version          = $latest
+                                            InstalledVersion = [string]$installedRecord.Version
+                                            IsInstalled      = $true
+                                            InstallPath      = [string]$installedRecord.InstallPath
+                                            Platform         = [string]$installedRecord.Platform
+                                            Source           = "legendary"
+                                            Kind             = "Library"
+                                            IsUe             = $false
                                         })
                                 }
                             }
@@ -56398,39 +56707,42 @@ $script:InvokeWingetSearch = {
                             }
                         }
                     }
-                    "gogdl" {
-                        try {
-                            if ($GogCacheFile) {
-                                $trackerPath = Join-Path (Split-Path -Parent $GogCacheFile) "gogdl_installs.json"
-                                if (Test-Path -LiteralPath $trackerPath -PathType Leaf) {
-                                    $tracker = [System.IO.File]::ReadAllText($trackerPath) | ConvertFrom-Json -ErrorAction Stop
-                                    foreach ($p in @($tracker.PSObject.Properties)) {
-                                        $entry = $p.Value
-                                        if ([string]$entry.Status -eq "Installed") {
-                                            Add-WmtSearchInstalledEntry -Map $map -Id ([string]$p.Name) -Version "Installed"
-                                        }
-                                    }
+                    "legendary" {
+                        # Legendary's local install database is the authoritative
+                        # source; `list` output carries no install state. Read it
+                        # directly so stale library caches cannot hide installs.
+                        $configRoots = @()
+                        try { if ($env:LEGENDARY_CONFIG_PATH) { $configRoots += $env:LEGENDARY_CONFIG_PATH } } catch {}
+                        try { if ($env:XDG_CONFIG_HOME) { $configRoots += (Join-Path $env:XDG_CONFIG_HOME "legendary") } } catch {}
+                        try { if ($env:USERPROFILE) { $configRoots += (Join-Path $env:USERPROFILE ".config\legendary"); $configRoots += (Join-Path $env:USERPROFILE ".legendary") } } catch {}
+                        try { if ($env:APPDATA) { $configRoots += (Join-Path $env:APPDATA "heroic\legendaryConfig\legendary") } } catch {}
+                        foreach ($configRoot in $configRoots) {
+                            $installedFile = Join-Path $configRoot "installed.json"
+                            if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) { continue }
+                            try {
+                                $installedJson = [System.IO.File]::ReadAllText($installedFile) | ConvertFrom-Json -ErrorAction Stop
+                                foreach ($installedProp in @($installedJson.PSObject.Properties)) {
+                                    $entry = $installedProp.Value
+                                    $appName = ([string]$entry.app_name).Trim()
+                                    if ([string]::IsNullOrWhiteSpace($appName)) { $appName = [string]$installedProp.Name }
+                                    Add-WmtSearchInstalledEntry -Map $map -Id $appName -Version ([string]$entry.version)
                                 }
+                            }
+                            catch {}
+                        }
+                    }
+                    "gogdl" {
+                        # Tracker + GOG registry + Heroic library, so games
+                        # installed outside WMT still report as installed.
+                        try {
+                            $trackerPath = ""
+                            if ($GogCacheFile) { $trackerPath = Join-Path (Split-Path -Parent $GogCacheFile) "gogdl_installs.json" }
+                            $gogInstalled = Get-WmtGogInstalledMap -TrackerPath $trackerPath
+                            foreach ($gogId in @($gogInstalled.Keys)) {
+                                Add-WmtSearchInstalledEntry -Map $map -Id ([string]$gogId) -Version ([string]$gogInstalled[$gogId])
                             }
                         }
                         catch {}
-                        foreach ($root in @(
-                            "HKLM:\SOFTWARE\WOW6432Node\GOG.com\Games",
-                            "HKLM:\SOFTWARE\GOG.com\Games",
-                            "HKCU:\SOFTWARE\GOG.com\Games",
-                            "HKCU:\SOFTWARE\WOW6432Node\GOG.com\Games"
-                        )) {
-                            if (-not (Test-Path -LiteralPath $root)) { continue }
-                            foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-                                try {
-                                    $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
-                                    $gameId = ([string]$props.gameID).Trim()
-                                    if ([string]::IsNullOrWhiteSpace($gameId)) { $gameId = Split-Path -Leaf $key.Name }
-                                    Add-WmtSearchInstalledEntry -Map $map -Id $gameId -Version "Installed"
-                                }
-                                catch {}
-                            }
-                        }
                     }
                 }
             }
@@ -56874,7 +57186,7 @@ $script:InvokeWingetSearch = {
                             $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
                         }
                         foreach ($asset in @($uePlatformAssets)) {
-                            if (([string]$asset.namespace) -eq 'ue') {
+                            if (Test-WmtLegendaryUeAsset -Namespace ([string]$asset.namespace) -BuildVersion ([string]$asset.build_version)) {
                                 $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
                                 if ($ueKey) { $ueAppNames[$ueKey] = $true }
                             }
@@ -56905,14 +57217,14 @@ $script:InvokeWingetSearch = {
                             # assets.json namespace set and name patterns as fallbacks.
                             $legIsUe = $false
                             try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
-                            if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
+                            if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|environment|\benv\b|sample|textures?|shaders?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
                             if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                                 foreach ($ueMetaRoot in $ueMetaRoots) {
                                     $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
                                     if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
                                     try {
                                         $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
-                                        if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                        if ($ueMetaJson -and $ueMetaJson.metadata -and (Test-WmtLegendaryUeAsset -Namespace ([string]$ueMetaJson.metadata.namespace))) { $legIsUe = $true }
                                     }
                                     catch {}
                                     break
@@ -56925,6 +57237,26 @@ $script:InvokeWingetSearch = {
                                 try { if ($game.PSObject.Properties["IsInstalled"]) { $isInst = [bool]$game.IsInstalled } } catch {}
                                 $instVer = ""
                                 try { if ($game.PSObject.Properties["InstalledVersion"]) { $instVer = [string]$game.InstalledVersion } } catch {}
+                                # Older caches were built from `legendary list --json`,
+                                # which has no install state. installed.json is local
+                                # and authoritative; correct stale cache rows.
+                                $installedMap = Get-WmtSearchInstalledMap -Provider "legendary"
+                                $instKey = ([string]$game.Id).Trim().ToLowerInvariant()
+                                if ($installedMap.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($instKey)) {
+                                    if ($installedMap.ContainsKey($instKey)) {
+                                        if (-not $isInst) {
+                                            $isInst = $true
+                                            $instVer = [string]$installedMap[$instKey]
+                                        }
+                                        elseif ([string]::IsNullOrWhiteSpace($instVer)) {
+                                            $instVer = [string]$installedMap[$instKey]
+                                        }
+                                    }
+                                    elseif ($isInst) {
+                                        $isInst = $false
+                                        $instVer = ""
+                                    }
+                                }
                                 $latestVer = [string]$game.Version
                                 $availCol = if (-not [string]::IsNullOrWhiteSpace($latestVer)) { $latestVer } else { "-" }
                                 New-WmtPackageSearchResult -Source "legendary" -Name $title -Id ([string]$game.Id) -RemoteVersion $availCol -InstalledState $isInst -InstalledVersion $instVer
@@ -68107,6 +68439,17 @@ $steamCacheFile = Join-Path $dataPath "steam_library.json"
 
 $gogInstalledIds = [System.Collections.Generic.List[string]]::new()
 $gogPendingIds = [System.Collections.Generic.List[string]]::new()
+# GOG installs are not limited to what WMT installed: the GOG registry and
+# Heroic's library are consulted too, so Your Library and the package search
+# report the same installed state.
+$gogInstalledVersions = @{}
+try {
+    $gogInstalledVersions = Get-WmtGogInstalledMap -TrackerPath (Get-WmtGogdlInstallMapPath)
+    foreach ($gogId in @($gogInstalledVersions.Keys)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$gogId)) { [void]$gogInstalledIds.Add([string]$gogId) }
+    }
+}
+catch {}
 try {
     $trackedGog = Get-WmtGogdlInstallMap
     foreach ($trackedId in @($trackedGog.Keys)) {
@@ -68116,7 +68459,7 @@ try {
             [void]$gogPendingIds.Add($idText)
         }
         elseif (-not [string]::IsNullOrWhiteSpace((Get-WmtGogdlTrackedInstallPath -Id $idText))) {
-            [void]$gogInstalledIds.Add($idText)
+            if (-not $gogInstalledIds.Contains($idText)) { [void]$gogInstalledIds.Add($idText) }
         }
     }
 }
@@ -68124,7 +68467,7 @@ catch {}
 
 $ps = New-WmtPooledPowerShell
 [void]$ps.AddScript({
-        param($LegCacheFile, $GogCacheFile, $SteamCacheFile, $GogInstalledIds, $GogPendingIds)
+        param($LegCacheFile, $GogCacheFile, $SteamCacheFile, $GogInstalledIds, $GogPendingIds, $GogInstalledVersions)
 
         $all = [System.Collections.Generic.List[object]]::new()
 
@@ -68199,7 +68542,7 @@ $ps = New-WmtPooledPowerShell
                                 $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
                             }
                             foreach ($asset in @($uePlatformAssets)) {
-                                if (([string]$asset.namespace) -eq 'ue') {
+                                if (Test-WmtLegendaryUeAsset -Namespace ([string]$asset.namespace) -BuildVersion ([string]$asset.build_version)) {
                                     $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
                                     if ($ueKey) { $ueAppNames[$ueKey] = $true }
                                 }
@@ -68232,14 +68575,14 @@ $ps = New-WmtPooledPowerShell
                     # a text-parsed cache does not veto the other sources.
                     $legIsUe = $false
                     try { if ($game.PSObject.Properties["IsUe"]) { $legIsUe = [bool]$game.IsUe } } catch {}
-                    if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '^[0-9a-fA-F]{32}$' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
+                    if (-not $legIsUe) { $legIsUe = ($ueAppNames.ContainsKey($legId.ToLowerInvariant()) -or $legId -match '^UE[_-]?\d' -or $title -match '^\s*Unreal Engine\b' -or $legId -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $legId -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|environment|\benv\b|sample|textures?|shaders?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b') }
                     if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                         foreach ($ueMetaRoot in $ueMetaRoots) {
                             $ueMetaCandidate = Join-Path $ueMetaRoot "$legId.json"
                             if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
                             try {
                                 $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
-                                if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                if ($ueMetaJson -and $ueMetaJson.metadata -and (Test-WmtLegendaryUeAsset -Namespace ([string]$ueMetaJson.metadata.namespace))) { $legIsUe = $true }
                             }
                             catch {}
                             break
@@ -68285,11 +68628,15 @@ $ps = New-WmtPooledPowerShell
                     $gameId = [string]$game.Id
                     $isInstalled = ($GogInstalledIds -contains $gameId)
                     $isPending = (-not $isInstalled -and ($GogPendingIds -contains $gameId))
+                    $gogVersion = ""
+                    if ($isInstalled -and $GogInstalledVersions) {
+                        try { $gogVersion = ([string]$GogInstalledVersions[$gameId]).Trim() } catch {}
+                    }
                     $all.Add([PSCustomObject]@{
                             Source      = "GOG"
                             Name        = $title
                             Id          = $gameId
-                            Version     = if ($isInstalled) { "Installed" } elseif ($isPending) { "Downloading" } else { "Owned" }
+                            Version     = if ($isInstalled) { if ([string]::IsNullOrWhiteSpace($gogVersion)) { "Installed" } else { $gogVersion } } elseif ($isPending) { "Downloading" } else { "Owned" }
                             Available   = [string]$game.Version
                             IsInstalled = $isInstalled
                             IsPending   = $isPending
@@ -68309,7 +68656,7 @@ $ps = New-WmtPooledPowerShell
 
         Write-Output "COUNT:$($all.Count)"
         foreach ($item in $all) { Write-Output $item }
-    }).AddArgument($legCacheFile).AddArgument($gogCacheFile).AddArgument($steamCacheFile).AddArgument($gogInstalledIds.ToArray()).AddArgument($gogPendingIds.ToArray())
+    }).AddArgument($legCacheFile).AddArgument($gogCacheFile).AddArgument($steamCacheFile).AddArgument($gogInstalledIds.ToArray()).AddArgument($gogPendingIds.ToArray()).AddArgument($gogInstalledVersions)
 
 $script:WmtLibraryScanRunspace = $ps
 $script:WmtLibraryScanAsyncResult = $ps.BeginInvoke()
@@ -73252,30 +73599,11 @@ try {
                                         $installedRecord = if ([string]::IsNullOrWhiteSpace($gameId)) { $null } else { $installedByApp[$gameId.ToLowerInvariant()] }
                                         $isInstalled = ($null -ne $installedRecord)
                                         $installedVer = if ($installedRecord) { [string]$installedRecord.Version } else { "" }
-                                        $latestVer = [string]$game.app_version
+                                        $latestVer = Get-WmtLegendaryGameVersion -Game $game
                                         if ($isInstalled -and [string]::IsNullOrWhiteSpace($installedVer)) { $installedVer = $latestVer }
                                         # Tag UE/Fab assets from the JSON namespace data
                                         # (asset_infos per platform, or the metadata blob).
-                                        $legIsUe = [bool]$game.is_ue
-                                        try {
-                                            if ($game.PSObject.Properties["asset_infos"] -and $game.asset_infos) {
-                                                foreach ($aiProp in @($game.asset_infos.PSObject.Properties)) {
-                                                    # Object form: read .namespace directly. String form:
-                                                    # legendary serializes GameAsset objects via str() (json
-                                                    # default=str), so the value arrives as a Python repr - match
-                                                    # the namespace field inside that text instead.
-                                                    if ($aiProp.Value -is [string]) {
-                                                        if ($aiProp.Value -match "(?i)namespace\s*=\s*'ue'") { $legIsUe = $true; break }
-                                                    }
-                                                    elseif (([string]$aiProp.Value.namespace) -eq 'ue') { $legIsUe = $true; break }
-                                                }
-                                            }
-                                        } catch {}
-                                        if (-not $legIsUe) {
-                                            try {
-                                                if ($game.PSObject.Properties["metadata"] -and $game.metadata -and $game.metadata.PSObject.Properties["namespace"] -and ([string]$game.metadata.namespace) -eq 'ue') { $legIsUe = $true }
-                                            } catch {}
-                                        }
+                                        $legIsUe = Test-WmtLegendaryGameIsUe -Game $game -BuildVersion $latestVer
                                         $result.Add([PSCustomObject]@{
                                                 Provider         = "legendary"
                                                 Title            = $title
@@ -73322,7 +73650,7 @@ try {
                                             $uePlatformAssets = @($platformProp.Value.PSObject.Properties | ForEach-Object { $_.Value })
                                         }
                                         foreach ($asset in @($uePlatformAssets)) {
-                                            if (([string]$asset.namespace) -eq 'ue') {
+                                            if (Test-WmtLegendaryUeAsset -Namespace ([string]$asset.namespace) -BuildVersion ([string]$asset.build_version)) {
                                                 $ueKey = ([string]$asset.app_name).Trim().ToLowerInvariant()
                                                 if ($ueKey) { $ueAppNames[$ueKey] = $true }
                                             }
@@ -73343,14 +73671,14 @@ try {
                                 if ([string]::IsNullOrWhiteSpace($title)) { continue }
                                 $app = $match.Groups["app"].Value.Trim()
                                 $ver = if ($match.Groups["version"].Success) { $match.Groups["version"].Value.Trim() } else { "" }
-                                $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '^[0-9a-fA-F]{32}$' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|assets?|environment|\benv\b|sample|pack|props?|textures?|shaders?|animations?|sounds?|characters?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
+                                $legIsUe = ($ueAppNames.ContainsKey($app.ToLowerInvariant()) -or $app -match '^UE[_-]?\d' -or $title -match '^\s*(Unreal Engine|UE[_-]?\d)' -or $app -match '(?i)^[A-Za-z0-9][A-Za-z0-9_-]{8,}V\d+$' -or $app -match '(?i)(?:^|_)(?:5\.\d+)$' -or $title -match '(?i)\b(plugin|materials?|vfx|environment|\benv\b|sample|textures?|shaders?|icvfx|metahumans?|importer|dialogue\s+tree|production\s+test)\b')
                                 if (-not $legIsUe -and $ueMetaRoots.Count -gt 0) {
                                     foreach ($ueMetaRoot in $ueMetaRoots) {
                                         $ueMetaCandidate = Join-Path $ueMetaRoot "$app.json"
                                         if (-not (Test-Path -LiteralPath $ueMetaCandidate -PathType Leaf)) { continue }
                                         try {
                                             $ueMetaJson = [System.IO.File]::ReadAllText($ueMetaCandidate) | ConvertFrom-Json -ErrorAction Stop
-                                            if ($ueMetaJson -and $ueMetaJson.metadata -and $ueMetaJson.metadata.PSObject.Properties["namespace"] -and ([string]$ueMetaJson.metadata.namespace) -eq 'ue') { $legIsUe = $true }
+                                            if ($ueMetaJson -and $ueMetaJson.metadata -and (Test-WmtLegendaryUeAsset -Namespace ([string]$ueMetaJson.metadata.namespace))) { $legIsUe = $true }
                                         }
                                         catch {}
                                         break
@@ -73667,30 +73995,30 @@ try {
                             catch {}
                         }
 
-                        # Build result.
+                        # Build result. Installed manifests are always merged in,
+                        # even when localconfig.vdf lists other apps: a game can
+                        # be installed without appearing in the "apps" list
+                        # (redistributables or apps registered by another
+                        # client), and dropping it would hide a real install.
                         $sResult = [System.Collections.Generic.List[object]]::new()
                         $sSeen = @{}
-                        if ($ownedIds.Count -gt 0) {
-                            foreach ($aid in $ownedIds) {
-                                if ($sSeen.ContainsKey($aid)) { continue }
-                                $sSeen[$aid] = $true
-                                if ($installedApps.ContainsKey($aid)) {
-                                    $info = $installedApps[$aid]
-                                    $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = [string]$info.Name; Id = $aid; Version = [string]$info.BuildId; Source = "steam"; Kind = "Library"; IsInstalled = $true; InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" } })
-                                }
-                                else {
-                                    $n = if ($appNames.ContainsKey($aid)) { $appNames[$aid] } else { "Steam App $aid" }
-                                    $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = $n; Id = $aid; Version = ""; Source = "steam"; Kind = "Library"; IsInstalled = $false; InstalledVersion = "Not installed" })
-                                }
-                            }
-                        }
-                        else {
-                            foreach ($aid in @($installedApps.Keys)) {
-                                if ($sSeen.ContainsKey($aid)) { continue }
-                                $sSeen[$aid] = $true
+                        foreach ($aid in $ownedIds) {
+                            if ($sSeen.ContainsKey($aid)) { continue }
+                            $sSeen[$aid] = $true
+                            if ($installedApps.ContainsKey($aid)) {
                                 $info = $installedApps[$aid]
                                 $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = [string]$info.Name; Id = $aid; Version = [string]$info.BuildId; Source = "steam"; Kind = "Library"; IsInstalled = $true; InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" } })
                             }
+                            else {
+                                $n = if ($appNames.ContainsKey($aid)) { $appNames[$aid] } else { "Steam App $aid" }
+                                $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = $n; Id = $aid; Version = ""; Source = "steam"; Kind = "Library"; IsInstalled = $false; InstalledVersion = "Not installed" })
+                            }
+                        }
+                        foreach ($aid in @($installedApps.Keys)) {
+                            if ($sSeen.ContainsKey($aid)) { continue }
+                            $sSeen[$aid] = $true
+                            $info = $installedApps[$aid]
+                            $sResult.Add([PSCustomObject]@{ Provider = "steam"; Title = [string]$info.Name; Id = $aid; Version = [string]$info.BuildId; Source = "steam"; Kind = "Library"; IsInstalled = $true; InstalledVersion = if (-not [string]::IsNullOrWhiteSpace([string]$info.BuildId) -and [string]$info.BuildId -ne "0") { "Build " + [string]$info.BuildId } else { "Installed" } })
                         }
                         $steamArray = $sResult.ToArray()
                         if ($steamArray.Count -gt 0 -or -not (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
