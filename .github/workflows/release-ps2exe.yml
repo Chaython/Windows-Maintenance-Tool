@@ -584,8 +584,11 @@ jobs:
           }
 
           $patchBody = @{ body = $body } | ConvertTo-Json -Depth 5
+          # Windows PowerShell sends string bodies as ANSI, which corrupts the
+          # emoji in wingetcreate's PR template. Send explicit UTF-8 bytes.
+          $patchBytes = [Text.Encoding]::UTF8.GetBytes($patchBody)
           $updateUri = "https://api.github.com/repos/microsoft/winget-pkgs/pulls/$($pr.number)"
-          Invoke-RestMethod -Method Patch -Uri $updateUri -Headers $headers -ContentType "application/json" -Body $patchBody -TimeoutSec 30 | Out-Null
+          Invoke-RestMethod -Method Patch -Uri $updateUri -Headers $headers -ContentType "application/json; charset=utf-8" -Body $patchBytes -TimeoutSec 30 | Out-Null
           Write-Host "Updated WinGet PR checklist: https://github.com/microsoft/winget-pkgs/pull/$($pr.number)"
   push-chocolatey:
     needs: build-release
