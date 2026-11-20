@@ -66826,7 +66826,10 @@ function Invoke-WmtWindowsUpdatePreset {
     Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments -OnComplete $completed -Sb {
         param([string]$ChangesJson, [string]$DesiredStartupType, [bool]$DesiredRunning)
 
-        $changes = @(ConvertFrom-Json -InputObject $ChangesJson -ErrorAction Stop)
+        # Do not wrap this in @(): Windows PowerShell 5.1 emits a top-level
+        # JSON array as a single object, which made every change property an
+        # array (for example Action became 'Set Set Set').
+        $changes = ConvertFrom-Json -InputObject $ChangesJson -ErrorAction Stop
         $snapshots = [System.Collections.Generic.List[object]]::new()
         $rollbackErrors = [System.Collections.Generic.List[string]]::new()
         $service = Get-Service -Name 'wuauserv' -ErrorAction Stop
