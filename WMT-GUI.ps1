@@ -2551,6 +2551,100 @@ catch { return $Default }
 }
 
 # ============================================================================
+# Shared state helpers (tweaks, optional-feature workers, package scans).
+# Must be defined BEFORE Initialize-WmtBackgroundRunspacePool so the
+# pre-load check (Get-Command) succeeds when populating the runspace.
+# ============================================================================
+# Map a Windows capability state to the state WMT shows and the action that
+# reverses it. Unknown states are reported as unknown instead of throwing so
+# one unfamiliar state can never break the Tweaks page or block a toggle.
+function Get-WmtCapabilityStateInfo {
+param([string]$State)
+switch ($State) {
+    "Installed" { return @{ Known = $true; Enabled = $true; Pending = ""; Action = "Remove"; Reason = "" } }
+    "NotPresent" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Install"; Reason = "" } }
+    "Staged" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Install"; Reason = "" } }
+    "Resolved" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Install"; Reason = "" } }
+    "Removed" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Install"; Reason = "" } }
+    "InstallPending" { return @{ Known = $true; Enabled = $true; Pending = "InstallPending"; Action = "Remove"; Reason = "" } }
+    "UninstallPending" { return @{ Known = $true; Enabled = $false; Pending = "UninstallPending"; Action = "Install"; Reason = "" } }
+    "Superseded" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = ""; Reason = "Capability has been superseded" } }
+    "PartiallyInstalled" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = ""; Reason = "Capability is partially installed; repair is required before it can be changed" } }
+    default { return @{ Known = $false; Enabled = $false; Pending = ""; Action = ""; Reason = "" } }
+}
+}
+
+# Map the FeatureState values returned by Get-WindowsOptionalFeature. DISM
+# can leave an enable or disable pending until the next restart, so those
+# states expose the eventual outcome and the action that reverses it.
+function Get-WmtOptionalFeatureStateInfo {
+param([string]$State)
+switch ($State) {
+    "Enabled" { return @{ Known = $true; Enabled = $true; Pending = ""; Action = "Disable"; Reason = "" } }
+    "EnablePending" { return @{ Known = $true; Enabled = $true; Pending = "EnablePending"; Action = "Disable"; Reason = "" } }
+    "Enable Pending" { return @{ Known = $true; Enabled = $true; Pending = "EnablePending"; Action = "Disable"; Reason = "" } }
+    "Disabled" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Enable"; Reason = "" } }
+    "DisablePending" { return @{ Known = $true; Enabled = $false; Pending = "DisablePending"; Action = "Enable"; Reason = "" } }
+    "Disable Pending" { return @{ Known = $true; Enabled = $false; Pending = "DisablePending"; Action = "Enable"; Reason = "" } }
+    "DisabledWithPayloadRemoved" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Enable"; Reason = "" } }
+    "Disabled with Payload Removed" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Enable"; Reason = "" } }
+    "NotPresent" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Enable"; Reason = "" } }
+    "Superseded" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = ""; Reason = "Feature has been superseded" } }
+    "PartiallyInstalled" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = ""; Reason = "Feature is partially installed; repair is required before it can be changed" } }
+    default { return @{ Known = $false; Enabled = $false; Pending = ""; Action = ""; Reason = "" } }
+}
+}
+
+# Compute the next High Contrast Flags value. Only HCF_HIGHCONTRASTON (bit 0)
+# changes, so the hotkey and confirm-hotkey bits survive a toggle cycle.
+function Get-WmtHighContrastFlags {
+param($CurrentFlags, [bool]$Enable)
+$flags = ConvertTo-Int $CurrentFlags 0
+if ($Enable) { return ($flags -bor 1) }
+return ($flags -band (-bnot 1))
+}
+
+# Parse one line of 'scoop status'. Current Scoop uses the columns
+# "Name Installed Version Latest Version Missing Dependencies Info"; older
+# releases used "Name Version Source". Headers, separators, success messages,
+# and WARN/WARNING/ERROR diagnostics return $null so they never turn into
+# package rows or inflate the update count.
+function ConvertFrom-WmtScoopStatusLine {
+param([string]$Line)
+if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+$line = $Line.Trim()
+if ($line -match "^Name\s+Version(?:\s+Source)?$" -or
+    $line -match "^Name\s+Installed\s+Version\b" -or
+    $line -match "^----" -or
+    $line -match "^Everything is ok!$" -or
+    $line -match "Scoop is up to date" -or
+    $line -match "^(?:WARN|WARNING|ERROR)\b") {
+    return $null
+}
+if ($line -match '^(\S+)\s+(\S+)\s+(\S+)') {
+    return [PSCustomObject]@{ Name = $matches[1]; Version = $matches[2]; Available = $matches[3] }
+}
+return $null
+}
+
+# Convert complete 'scoop status' output into update rows. Keeping the whole
+# conversion here makes the current Scoop table format testable and ensures
+# headers, success messages, and diagnostics never reach the updates table.
+function ConvertFrom-WmtScoopStatus {
+param(
+    [string]$Output,
+    [string[]]$IgnoreList = @()
+)
+if ([string]::IsNullOrWhiteSpace($Output)) { return }
+foreach ($line in ($Output -split "`r?`n")) {
+    $row = ConvertFrom-WmtScoopStatusLine -Line $line
+    if (-not $row) { continue }
+    if ($IgnoreList -contains $row.Name) { continue }
+    [PSCustomObject]@{ Source = "scoop"; Name = $row.Name; Id = $row.Name; Version = $row.Version; Available = $row.Available }
+}
+}
+
+# ============================================================================
 # Safe external CLI text capture (OEM-encoding aware for non-English systems)
 # PowerShell 5.1 misinterprets external CLI encoding in WPF contexts, causing
 # accented characters (e.g. ì, à, è) to be garbled.  This helper uses
@@ -3753,7 +3847,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -42151,14 +42245,12 @@ $btnToggleHighContrast.Add_Click({
         Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Accessibility\HighContrast")
         $flags = ConvertTo-Int (Get-WmtRegValue $p "Flags" 0) 0
         $currentlyOn = (($flags -band 1) -ne 0)
+        # Only HCF_HIGHCONTRASTON changes so the hotkey/confirm bits survive.
+        $newFlags = Get-WmtHighContrastFlags -CurrentFlags $flags -Enable (-not $currentlyOn)
         if ($currentlyOn) {
-            # Clear only HCF_HIGHCONTRASTON so the hotkey/confirm bits survive.
-            $newFlags = $flags -band (-bnot 1)
             Invoke-UiCommand { Set-WmtRegDword $p "Flags" $newFlags; Write-GuiLog "High contrast mode disabled." } "Disabling high contrast..."
         }
         else {
-            # Set only HCF_HIGHCONTRASTON instead of replacing the whole value.
-            $newFlags = $flags -bor 1
             Invoke-UiCommand { Set-WmtRegDword $p "Flags" $newFlags; Write-GuiLog "High contrast mode enabled." } "Enabling high contrast..."
         }
         Update-WmtTweakToggle $btnToggleHighContrast (-not $currentlyOn) "High Contrast On" "High Contrast Off"
@@ -42554,7 +42646,23 @@ function Update-WmtQuickFindStateLabels {
             $label.Text = "State: $($script:OptionalFeatureUnavailableCache[$name])"
         }
         elseif ($optional -and $script:OptionalFeatureStateCache -and $script:OptionalFeatureStateCache.ContainsKey($name)) {
-            $label.Text = if ($script:OptionalFeatureStateCache[$name]) { "State: Enabled" } else { "State: Disabled" }
+            $pending = if ($script:OptionalFeaturePendingCache -and
+                $script:OptionalFeaturePendingCache.ContainsKey($name)) {
+                [string]$script:OptionalFeaturePendingCache[$name]
+            } else { "" }
+            $label.Text = if ($pending -in @("InstallPending", "EnablePending")) {
+                "State: Pending restart (will be enabled)"
+            } elseif ($pending -in @("UninstallPending", "DisablePending")) {
+                "State: Pending restart (will be disabled)"
+            } elseif ($script:OptionalFeatureStateCache[$name]) {
+                "State: Enabled"
+            } else {
+                "State: Disabled"
+            }
+            if ($script:OptionalFeatureUnknownCache -and
+                $script:OptionalFeatureUnknownCache.ContainsKey($name)) {
+                $label.Text += " (last verified; current state unrecognized)"
+            }
         }
         elseif (-not $optional -and $script:TweakCurrentStates -and $script:TweakCurrentStates.Contains($name)) {
             $state = $script:TweakCurrentStates[$name]
@@ -54235,16 +54343,7 @@ $btnWingetScan.Add_Click({
                     $outTask = $p.StandardOutput.ReadToEndAsync()
                     if (-not $p.WaitForExit(30000)) { try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }; Write-Output "LOG:Scoop scan timed out."; return }
                     $out = $outTask.GetAwaiter().GetResult()
-                    $lines = $out -split "`r`n"
-                    foreach ($line in $lines) {
-                        $line = $line.Trim()
-                        if ([string]::IsNullOrWhiteSpace($line) -or $line -match "^Name\s+Version" -or $line -match "^----" -or $line -match "Scoop is up to date" -or $line -match "^(?:WARN|WARNING|ERROR)\b") { continue }
-                        if ($line -match '^(\S+)\s+(\S+)\s+(\S+)') {
-                            $n = $matches[1]; $v = $matches[2]; $l = $matches[3]
-                            if ($IgnoreList -contains $n) { continue }
-                            [PSCustomObject]@{Source = "scoop"; Name = $n; Id = $n; Version = $v; Available = $l }
-                        }
-                    }
+                    ConvertFrom-WmtScoopStatus -Output $out -IgnoreList $IgnoreList
                 }
                 catch { Write-Output "LOG:Scoop check failed." }
             }).AddArgument($ignoreList)
@@ -66970,11 +67069,27 @@ if (-not $known) {
     return
 }
 $isEnabled = [bool]$script:OptionalFeatureStateCache[$ButtonName]
+$pending = if ($script:OptionalFeaturePendingCache -and
+    $script:OptionalFeaturePendingCache.ContainsKey($ButtonName)) {
+    [string]$script:OptionalFeaturePendingCache[$ButtonName]
+} else { "" }
 $btn.Style = ($window.FindResource($(if ($isEnabled) { "AccentBtn" } else { "ActionBtn" })) -as [System.Windows.Style])
-$btn.ToolTip = if ($isEnabled) {
+$btn.ToolTip = if ($pending -eq "InstallPending") {
+    "Current state: Install pending restart. Click to undo; restart to finish enabling."
+} elseif ($pending -eq "EnablePending") {
+    "Current state: Enable pending restart. Click to undo; restart to finish enabling."
+} elseif ($pending -eq "UninstallPending") {
+    "Current state: Removal pending restart. Click to undo; restart to finish removing."
+} elseif ($pending -eq "DisablePending") {
+    "Current state: Disable pending restart. Click to undo; restart to finish disabling."
+} elseif ($isEnabled) {
     "Current state: Enabled. Click to disable; restart may be required."
 } else {
     "Current state: Disabled. Click to enable; restart may be required."
+}
+if ($script:OptionalFeatureUnknownCache -and
+    $script:OptionalFeatureUnknownCache.ContainsKey($ButtonName)) {
+    $btn.ToolTip += " WARNING: $($script:OptionalFeatureUnknownCache[$ButtonName])."
 }
 }
 function Switch-WindowsFeature($FeatureName, $DisplayName) {
@@ -67002,6 +67117,8 @@ $done = {
     $script:OptionalFeatureStateCache = @{}
     $script:OptionalFeatureUnavailableCache = @{}
     $script:OptionalFeatureProviderCache = @{}
+    $script:OptionalFeaturePendingCache = @{}
+    $script:OptionalFeatureUnknownCache = @{}
     Sync-WmtOptionalFeatureButtons
     Start-OptionalFeaturesBackgroundCheck
     Sync-WmtTweakOverlayHide
@@ -67014,20 +67131,45 @@ Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $
         $cap = Get-WindowsCapability -Online -Name $providerName -ErrorAction Stop |
             Where-Object { $_.Name -eq $providerName } | Select-Object -First 1
         if (-not $cap) { throw "Cannot verify installed capability $dn; no changes were made." }
-        switch ([string]$cap.State) {
-            "Installed" {
+        $stateInfo = Get-WmtCapabilityStateInfo -State ([string]$cap.State)
+        if (-not $stateInfo.Known) {
+            Write-Output "Unrecognized capability state '$($cap.State)' for $dn; no changes were made."
+            return
+        }
+        if (-not $stateInfo.Action) {
+            $reason = if ($stateInfo.Reason) { $stateInfo.Reason } else { "Capability state '$($cap.State)' is not actionable" }
+            Write-Output "$reason for $dn; no changes were made."
+            return
+        }
+        # A pending install/removal is staged for the next restart. WMT shows
+        # the pending outcome and the next click reverses it instead of
+        # failing on a state Windows produces routinely.
+        $pendingNote = ""
+        if ($stateInfo.Pending -eq "InstallPending") { $pendingNote = " (install was pending restart)" }
+        elseif ($stateInfo.Pending -eq "UninstallPending") { $pendingNote = " (uninstall was pending restart)" }
+        if ($stateInfo.Action -eq "Remove") {
+            try {
                 Remove-WindowsCapability -Online -Name $providerName -ErrorAction Stop | Out-Null
-                Write-Output "Removed: $dn"
+                Write-Output "Removed: $dn$pendingNote"
             }
-            "NotPresent" {
+            catch {
+                if ($stateInfo.Pending) {
+                    throw "The install of $dn is pending a restart and could not be cancelled: $($_.Exception.Message) Restart Windows to finish the install, then toggle it again."
+                }
+                throw
+            }
+        }
+        else {
+            try {
                 Add-WindowsCapability -Online -Name $providerName -ErrorAction Stop | Out-Null
-                Write-Output "Installed: $dn"
+                Write-Output "Installed: $dn$pendingNote"
             }
-            "Staged" {
-                Add-WindowsCapability -Online -Name $providerName -ErrorAction Stop | Out-Null
-                Write-Output "Installed: $dn"
+            catch {
+                if ($stateInfo.Pending) {
+                    throw "The removal of $dn is pending a restart and could not be cancelled: $($_.Exception.Message) Restart Windows to finish the removal, then toggle it again."
+                }
+                throw
             }
-            default { throw "Unrecognized capability state '$($cap.State)' for $dn; no changes were made." }
         }
         return
     }
@@ -67035,7 +67177,8 @@ Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $
     $state = $null
     if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
         try {
-            $feature = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction Stop
+            $feature = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction Stop |
+                Select-Object -First 1
             if ($feature) { $state = [string]$feature.State }
         }
         catch { Write-Output "PowerShell state lookup failed; checking DISM before any change." }
@@ -67043,33 +67186,52 @@ Invoke-WmtUiBackgroundCommand -Name ("Feature_" + $FeatureName) -Msg "Toggling $
     if (-not $state) {
         $featureInfo = Invoke-WmtCliText -FilePath "dism" -Arguments "/Online /Get-FeatureInfo /FeatureName:$fn" -TimeoutMs 30000
         if ($global:LASTEXITCODE -ne 0 -or
-            $featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Disabled(?:\s+with\s+Payload\s+Removed)?)\s*$') {
+            $featureInfo -notmatch '(?im)^\s*State\s*:\s*(Enabled|Enable\s*Pending|Disable\s*Pending|Disabled(?:\s*With\s*Payload\s*Removed)?|Superseded|PartiallyInstalled)\s*$') {
             throw "Cannot verify the current state of $dn using DISM; no changes were made."
         }
         $state = [string]$Matches[1]
     }
-    if ($state -notmatch '^(Enabled|Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)$') {
-        throw "Unrecognized feature state '$state' for $dn; no changes were made."
+    $stateInfo = Get-WmtOptionalFeatureStateInfo -State $state
+    if (-not $stateInfo.Known) {
+        Write-Output "Unrecognized feature state '$state' for $dn; no changes were made."
+        return
     }
-    $disable = ($state -eq "Enabled")
-    $cmdlet = if ($disable) { "Disable-WindowsOptionalFeature" } else { "Enable-WindowsOptionalFeature" }
-    if (Get-Command $cmdlet -ErrorAction SilentlyContinue) {
-        if ($disable) {
-            Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
+    if (-not $stateInfo.Action) {
+        $reason = if ($stateInfo.Reason) { $stateInfo.Reason } else { "Feature state '$state' is not actionable" }
+        Write-Output "$reason for $dn; no changes were made."
+        return
+    }
+    $disable = ($stateInfo.Action -eq "Disable")
+    $pendingNote = ""
+    if ($stateInfo.Pending -eq "EnablePending") { $pendingNote = " (enable was pending restart)" }
+    elseif ($stateInfo.Pending -eq "DisablePending") { $pendingNote = " (disable was pending restart)" }
+    try {
+        $cmdlet = if ($disable) { "Disable-WindowsOptionalFeature" } else { "Enable-WindowsOptionalFeature" }
+        if (Get-Command $cmdlet -ErrorAction SilentlyContinue) {
+            if ($disable) {
+                Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction Stop | Out-Null
+            } else {
+                Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
+            }
         } else {
-            Enable-WindowsOptionalFeature -Online -FeatureName $fn -All -NoRestart -ErrorAction Stop | Out-Null
-        }
-    } else {
-        # Query must have succeeded before fallback; execution must also succeed.
-        $a = if ($disable) { @("/Online", "/Disable-Feature", "/FeatureName:$fn", "/NoRestart") } else {
-            @("/Online", "/Enable-Feature", "/FeatureName:$fn", "/All", "/NoRestart")
-        }
-        & dism.exe @a | Out-Null
-        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
-            throw "DISM could not change $dn (exit code $LASTEXITCODE)."
+            # Query must have succeeded before fallback; execution must also succeed.
+            $a = if ($disable) { @("/Online", "/Disable-Feature", "/FeatureName:$fn", "/NoRestart") } else {
+                @("/Online", "/Enable-Feature", "/FeatureName:$fn", "/All", "/NoRestart")
+            }
+            & dism.exe @a | Out-Null
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+                throw "DISM could not change $dn (exit code $LASTEXITCODE)."
+            }
         }
     }
-    Write-Output "$(if ($disable) { 'Disabled' } else { 'Enabled' }): $dn"
+    catch {
+        if ($stateInfo.Pending) {
+            $pendingAction = if ($stateInfo.Pending -eq "EnablePending") { "enable" } else { "disable" }
+            throw "The $pendingAction of $dn is pending a restart and could not be cancelled: $($_.Exception.Message) Restart Windows to finish the change, then toggle it again."
+        }
+        throw
+    }
+    Write-Output "$(if ($disable) { 'Disabled' } else { 'Enabled' }): $dn$pendingNote"
 } -ArgumentList $FeatureName, $DisplayName, $kind, $targetName -OnComplete $done | Out-Null
 }
 
@@ -72281,6 +72443,8 @@ try {
                 $script:OptionalFeaturesReady = $false
                 $script:OptionalFeatureUnavailableCache = @{}
                 $script:OptionalFeatureProviderCache = @{}
+                $script:OptionalFeaturePendingCache = @{}
+                $script:OptionalFeatureUnknownCache = @{}
                 Start-OptionalFeaturesBackgroundCheck
             }
             Sync-WmtQuickFindStateAvailability
@@ -72855,6 +73019,114 @@ function Sync-WmtOptionalFeatureButtons {
 # Prevent toggles before feature states are known.
 Sync-WmtOptionalFeatureButtons
 
+# Validate an optional-feature scan result before it is trusted. Every mapped
+# feature must be classified exactly once as a verified state, unavailable
+# package, or unrecognized current state. A pending state may only be reported
+# for a feature that also has a matching verified state.
+function Test-WmtOptionalFeatureScanResult {
+param(
+    $Result,
+    [string[]]$ValidButtons = @()
+)
+if ($Result -isnot [System.Collections.IDictionary] -or
+    $Result.States -isnot [System.Collections.IDictionary] -or
+    $Result.Unavailable -isnot [System.Collections.IDictionary] -or
+    $Result.Providers -isnot [System.Collections.IDictionary] -or
+    $Result.Pending -isnot [System.Collections.IDictionary] -or
+    $Result.Unknown -isnot [System.Collections.IDictionary]) {
+    throw "Scan result type is invalid."
+}
+foreach ($button in $Result.States.Keys) {
+    if ($button -notin $ValidButtons -or $Result.Providers.ContainsKey($button) -eq $false) {
+        throw "Scan returned an unrecognized or providerless feature."
+    }
+}
+foreach ($button in $Result.Unavailable.Keys) {
+    if ($button -notin $ValidButtons -or $Result.States.ContainsKey($button) -or
+        $Result.Unknown.ContainsKey($button)) {
+        throw "Scan returned contradictory or unknown feature data."
+    }
+}
+foreach ($button in $Result.Unknown.Keys) {
+    if ($button -notin $ValidButtons -or $Result.States.ContainsKey($button) -or
+        $Result.Unavailable.ContainsKey($button)) {
+        throw "Scan returned contradictory unrecognized-state data."
+    }
+}
+foreach ($button in $Result.Pending.Keys) {
+    if ($button -notin $ValidButtons -or -not $Result.States.ContainsKey($button) -or
+        $Result.Unavailable.ContainsKey($button) -or $Result.Unknown.ContainsKey($button)) {
+        throw "Scan returned contradictory pending-state data."
+    }
+    $pendingState = [string]$Result.Pending[$button]
+    $expectedEnabled = switch ($pendingState) {
+        "InstallPending" { $true }
+        "EnablePending" { $true }
+        "UninstallPending" { $false }
+        "DisablePending" { $false }
+        default { $null }
+    }
+    if ($null -eq $expectedEnabled) {
+        throw "Scan returned an unknown pending-state marker '$pendingState'."
+    }
+    if ([bool]$Result.States[$button] -ne $expectedEnabled) {
+        throw "Scan returned a pending state that contradicts the displayed outcome."
+    }
+}
+if (($Result.States.Count + $Result.Unavailable.Count + $Result.Unknown.Count) -ne $ValidButtons.Count -or
+    $Result.Providers.Count -ne $Result.States.Count) {
+    throw "Only $($Result.States.Count + $Result.Unavailable.Count + $Result.Unknown.Count) / $($ValidButtons.Count) features were classified."
+}
+return $true
+}
+
+# Merge an unfamiliar current state with the last verified snapshot. The
+# toggle worker always re-queries Windows before changing anything, so a
+# retained state is safe to display while the warning remains visible in the
+# activity log. Without a prior snapshot, the feature remains unavailable.
+function Merge-WmtOptionalFeatureScanResult {
+param(
+    $Result,
+    $PreviousStates,
+    $PreviousProviders,
+    $PreviousPending
+)
+$states = @{}
+$providers = @{}
+$unavailable = @{}
+$pending = @{}
+$unknown = @{}
+foreach ($button in $Result.States.Keys) {
+    $states[[string]$button] = $Result.States[$button]
+}
+foreach ($button in $Result.Providers.Keys) {
+    $providers[[string]$button] = $Result.Providers[$button]
+}
+foreach ($button in $Result.Unavailable.Keys) {
+    $unavailable[[string]$button] = $Result.Unavailable[$button]
+}
+foreach ($button in $Result.Pending.Keys) {
+    $pending[[string]$button] = $Result.Pending[$button]
+}
+foreach ($button in $Result.Unknown.Keys) {
+    $key = [string]$button
+    $unknown[$key] = $Result.Unknown[$button]
+    if ($PreviousStates -is [System.Collections.IDictionary] -and
+        $PreviousProviders -is [System.Collections.IDictionary] -and
+        $PreviousStates.ContainsKey($key) -and $PreviousProviders.ContainsKey($key)) {
+        $states[$key] = $PreviousStates[$key]
+        $providers[$key] = $PreviousProviders[$key]
+        if ($PreviousPending -is [System.Collections.IDictionary] -and $PreviousPending.ContainsKey($key)) {
+            $pending[$key] = $PreviousPending[$key]
+        }
+    }
+    else {
+        $unavailable[$key] = [string]$Result.Unknown[$button]
+    }
+}
+return @{ States = $states; Providers = $providers; Unavailable = $unavailable; Pending = $pending; Unknown = $unknown }
+}
+
 function Start-OptionalFeaturesBackgroundCheck {
 # One bulk feature query and (where available) one bulk capability query.
 # Neither the scan nor its retry ever executes OS queries on the WPF thread.
@@ -72890,6 +73162,8 @@ catch {
     $states = @{}
     $providers = @{}
     $unavailable = @{}
+    $pending = @{}
+    $unknown = @{}
     $featureStates = @{}
     $featuresEnumerated = $false
 
@@ -72936,13 +73210,20 @@ catch {
     foreach ($name in $featureStates.Keys) {
         $button = [string]$map[$name]
         $state = [string]$featureStates[$name]
-        switch -Regex ($state) {
-            '^Enabled$' { $states[$button] = $true; break }
-            '^(Disabled|DisabledWithPayloadRemoved|Disabled with Payload Removed)$' {
-                $states[$button] = $false; break
-            }
-            default { throw "Unrecognized state '$state' returned for $name; scan cannot be trusted." }
+        $stateInfo = Get-WmtOptionalFeatureStateInfo -State $state
+        if (-not $stateInfo.Known) {
+            # Keep the classification separate from unsupported features. The
+            # UI can retain the last verified state for this button when one
+            # exists, while still logging the unfamiliar current state.
+            $unknown[$button] = "Unrecognized feature state '$state' for $name"
+            continue
         }
+        if (-not $stateInfo.Action) {
+            $unavailable[$button] = "$($stateInfo.Reason) for $name"
+            continue
+        }
+        $states[$button] = [bool]$stateInfo.Enabled
+        if ($stateInfo.Pending) { $pending[$button] = [string]$stateInfo.Pending }
         $providers[$button] = @{ Type = "Feature"; Name = $name }
     }
 
@@ -72968,13 +73249,28 @@ catch {
                 Select-Object -First 1
             if (-not $cap) { continue }
             $btn = [string]$map[$name]
-            switch ([string]$cap.State) {
-                "Installed" { $states[$btn] = $true }
-                "NotPresent" { $states[$btn] = $false }
-                "Staged" { $states[$btn] = $false }
-                default { throw "Unrecognized capability state '$($cap.State)' for $name." }
+            $capState = [string]$cap.State
+            $stateInfo = Get-WmtCapabilityStateInfo -State $capState
+            if (-not $stateInfo.Known) {
+                # Keep the rest of the scan usable instead of failing it. A
+                # capability fallback takes precedence over an unknown state
+                # reported by the optional-feature inventory.
+                $unavailable.Remove($btn)
+                $unknown[$btn] = "Unrecognized capability state '$capState' for $name"
             }
-            $providers[$btn] = @{ Type = "Capability"; Name = [string]$cap.Name }
+            elseif (-not $stateInfo.Action) {
+                $unavailable[$btn] = "$($stateInfo.Reason) for $name"
+                $unknown.Remove($btn)
+            }
+            else {
+                # Pending states show the outcome Windows will apply after the
+                # next restart and stay toggleable.
+                $unavailable.Remove($btn)
+                $unknown.Remove($btn)
+                $states[$btn] = [bool]$stateInfo.Enabled
+                if ($stateInfo.Pending) { $pending[$btn] = [string]$stateInfo.Pending }
+                $providers[$btn] = @{ Type = "Capability"; Name = [string]$cap.Name }
+            }
         }
     }
 
@@ -72982,15 +73278,17 @@ catch {
     # present on this OS. It is not a disabled state and cannot be toggled.
     foreach ($name in $map.Keys) {
         $button = [string]$map[$name]
-        if (-not $states.ContainsKey($button)) {
+        if (-not $states.ContainsKey($button) -and
+            -not $unavailable.ContainsKey($button) -and
+            -not $unknown.ContainsKey($button)) {
             $unavailable[$button] = "Unsupported / not present on this Windows build"
         }
     }
-    if (($states.Count + $unavailable.Count) -ne $map.Count -or
+    if (($states.Count + $unavailable.Count + $unknown.Count) -ne $map.Count -or
         $providers.Count -ne $states.Count) {
-        throw "Optional-feature scan incomplete: $($states.Count) states, $($unavailable.Count) unsupported of $($map.Count)."
+        throw "Optional-feature scan incomplete: $($states.Count) states, $($unavailable.Count) unsupported, $($unknown.Count) unrecognized of $($map.Count)."
     }
-    return @{ States = $states; Providers = $providers; Unavailable = $unavailable }
+    return @{ States = $states; Providers = $providers; Unavailable = $unavailable; Pending = $pending; Unknown = $unknown }
 })
 [void]$ps.AddArgument($featureMap)
 $async = $null
@@ -73011,41 +73309,33 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
     if ($script:FeaturesCheckAsync -and $script:FeaturesCheckAsync.IsCompleted) {
         Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck"
         $script:OptionalFeaturesReady = $false
-        $script:OptionalFeatureStateCache = @{}
-        $script:OptionalFeatureUnavailableCache = @{}
-        $script:OptionalFeatureProviderCache = @{}
         $scanError = ""
         try {
             $raw = $script:FeaturesCheckPS.EndInvoke($script:FeaturesCheckAsync)
             if (-not $raw -or $raw.Count -ne 1) { throw "Scan returned no complete result." }
             $result = $raw[0]
-            if ($result -isnot [System.Collections.IDictionary] -or
-                $result.States -isnot [System.Collections.IDictionary] -or
-                $result.Unavailable -isnot [System.Collections.IDictionary] -or
-                $result.Providers -isnot [System.Collections.IDictionary]) {
-                throw "Scan result type is invalid."
-            }
             $valid = @($script:OptionalFeaturesMap.Values)
-            foreach ($button in $result.States.Keys) {
-                if ($button -notin $valid -or $result.Providers.ContainsKey($button) -eq $false) {
-                    throw "Scan returned an unrecognized or providerless feature."
-                }
-            }
-            foreach ($button in $result.Unavailable.Keys) {
-                if ($button -notin $valid -or $result.States.ContainsKey($button)) {
-                    throw "Scan returned contradictory or unknown feature data."
-                }
-            }
-            if (($result.States.Count + $result.Unavailable.Count) -ne $valid.Count -or
-                $result.Providers.Count -ne $result.States.Count) {
-                throw "Only $($result.States.Count + $result.Unavailable.Count) / $($valid.Count) features were classified."
-            }
-            $script:OptionalFeatureStateCache = $result.States
-            $script:OptionalFeatureUnavailableCache = $result.Unavailable
-            $script:OptionalFeatureProviderCache = $result.Providers
+            [void](Test-WmtOptionalFeatureScanResult -Result $result -ValidButtons $valid)
+            $resolved = Merge-WmtOptionalFeatureScanResult -Result $result `
+                -PreviousStates $script:OptionalFeatureStateCache `
+                -PreviousProviders $script:OptionalFeatureProviderCache `
+                -PreviousPending $script:OptionalFeaturePendingCache
+            $script:OptionalFeatureStateCache = $resolved.States
+            $script:OptionalFeatureUnavailableCache = $resolved.Unavailable
+            $script:OptionalFeatureProviderCache = $resolved.Providers
+            $script:OptionalFeaturePendingCache = $resolved.Pending
+            $script:OptionalFeatureUnknownCache = $resolved.Unknown
             $script:OptionalFeaturesReady = $true
             try {
-                Write-GuiLog "[Optional Features] Verified $($result.States.Count) states; $($result.Unavailable.Count) not available on this Windows build."
+                Write-GuiLog "[Optional Features] Verified $($result.States.Count) current states; $($resolved.Unavailable.Count) not available; $($result.Unknown.Count) unrecognized."
+                foreach ($button in $result.Unknown.Keys) {
+                    $disposition = if ($resolved.States.ContainsKey($button)) {
+                        "last verified state retained"
+                    } else {
+                        "control remains unavailable"
+                    }
+                    Write-GuiLog "[Optional Features] WARNING: $($result.Unknown[$button]); $disposition."
+                }
             } catch {}
         }
         catch {
@@ -73084,6 +73374,8 @@ $script:FeaturesCheckTimeout.Add_Tick({
     $script:OptionalFeatureStateCache = @{}
     $script:OptionalFeatureUnavailableCache = @{}
     $script:OptionalFeatureProviderCache = @{}
+    $script:OptionalFeaturePendingCache = @{}
+    $script:OptionalFeatureUnknownCache = @{}
     Sync-WmtOptionalFeatureButtons
     try { Stop-WmtPowerShellInvocationAsync -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {
         try { Start-WmtPowerShellCleanupDetached -PowerShell $timedOutPs -Invocation $timedOutAsync -Name "Optional feature detection timeout" } catch {}
