@@ -42149,12 +42149,17 @@ if ($btnToggleHighContrast) {
 $btnToggleHighContrast.Add_Click({
         $p = "HKCU:\Control Panel\Accessibility\HighContrast"
         Clear-WmtRegCache -PreserveUiSnapshot @("HKCU:\Control Panel\Accessibility\HighContrast")
-        $currentlyOn = (((ConvertTo-Int (Get-WmtRegValue $p "Flags" 0) 0) -band 1) -ne 0)
+        $flags = ConvertTo-Int (Get-WmtRegValue $p "Flags" 0) 0
+        $currentlyOn = (($flags -band 1) -ne 0)
         if ($currentlyOn) {
-            Invoke-UiCommand { Set-WmtRegDword $p "Flags" 0; Write-GuiLog "High contrast mode disabled." } "Disabling high contrast..."
+            # Clear only HCF_HIGHCONTRASTON so the hotkey/confirm bits survive.
+            $newFlags = $flags -band (-bnot 1)
+            Invoke-UiCommand { Set-WmtRegDword $p "Flags" $newFlags; Write-GuiLog "High contrast mode disabled." } "Disabling high contrast..."
         }
         else {
-            Invoke-UiCommand { Set-WmtRegDword $p "Flags" 1; Write-GuiLog "High contrast mode enabled." } "Enabling high contrast..."
+            # Set only HCF_HIGHCONTRASTON instead of replacing the whole value.
+            $newFlags = $flags -bor 1
+            Invoke-UiCommand { Set-WmtRegDword $p "Flags" $newFlags; Write-GuiLog "High contrast mode enabled." } "Enabling high contrast..."
         }
         Update-WmtTweakToggle $btnToggleHighContrast (-not $currentlyOn) "High Contrast On" "High Contrast Off"
     })

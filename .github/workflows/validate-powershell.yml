@@ -1026,6 +1026,24 @@ jobs:
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
+      - name: Smoke test High Contrast bit preservation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $hcStart = $source.IndexOf('$btnToggleHighContrast = Get-Ctrl')
+          $hcEnd = $source.IndexOf('$btnToggleColorFilter = Get-Ctrl', $hcStart)
+          if ($hcStart -lt 0 -or $hcEnd -le $hcStart) {
+              throw 'Could not locate the High Contrast toggle handler.'
+          }
+          $hcHandler = $source.Substring($hcStart, $hcEnd - $hcStart)
+          if ($hcHandler -notmatch '\$flags -band \(-bnot 1\)' -or
+              $hcHandler -notmatch '\$flags -bor 1' -or
+              $hcHandler -match 'Set-WmtRegDword \$p "Flags" (?:0|1)\b') {
+              throw 'High Contrast must change only the HCF_HIGHCONTRASTON bit.'
+          }
+          Write-Host 'PASS: High Contrast preserves unrelated flag bits.'
+
       - name: Smoke test model-ID driver supersedence
         shell: powershell
         run: |
