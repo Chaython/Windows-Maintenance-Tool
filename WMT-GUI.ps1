@@ -34480,6 +34480,10 @@ if ($null -eq $item) {
 
 # UI-thread lookups only consume the last complete background snapshot. A
 # cache miss stays at its supplied default until a worker refreshes the key.
+# Missing keys produce no snapshot at all; treat every value in them as the
+# default instead of indexing into $null (which throws "Cannot index into a
+# null array" in toggles that read optional policy values).
+if ($null -eq $item) { return $Default }
 if ($item -is [System.Collections.IDictionary]) {
     if ($item.Contains($Name)) { return $item[$Name] }
     if ($Name -eq '(Default)' -and $item.Contains('')) { return $item[''] }

@@ -801,8 +801,14 @@ jobs:
               if ($afterWrite -ne 0) {
                   throw "A registry write left the cached HideFileExt state stale; expected 0, got $afterWrite."
               }
+              $missingPath = "HKCU:\Software\WMT-RegValue-Missing-" + [Guid]::NewGuid().ToString('N')
+              $missingRead = Get-WmtRegValue -Path $missingPath -Name 'Missing' -Default 4242
+              if ($missingRead -ne 4242) {
+                  throw "Get-WmtRegValue did not return the default for a missing key; got $missingRead."
+              }
               Write-Host 'PASS: registry writes refresh the cached snapshot before the next state read.'
               Write-Host 'PASS: registry-cache invalidation re-reads HideFileExt and refreshes the whole key.'
+              Write-Host 'PASS: missing registry keys return the supplied default instead of throwing.'
           }
           finally {
               if ($cacheTestKey) { $cacheTestKey.Dispose() }
