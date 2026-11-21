@@ -54238,7 +54238,7 @@ $btnWingetScan.Add_Click({
                     $lines = $out -split "`r`n"
                     foreach ($line in $lines) {
                         $line = $line.Trim()
-                        if ([string]::IsNullOrWhiteSpace($line) -or $line -match "^Name\s+Version" -or $line -match "^----" -or $line -match "Scoop is up to date") { continue }
+                        if ([string]::IsNullOrWhiteSpace($line) -or $line -match "^Name\s+Version" -or $line -match "^----" -or $line -match "Scoop is up to date" -or $line -match "^(?:WARN|WARNING|ERROR)\b") { continue }
                         if ($line -match '^(\S+)\s+(\S+)\s+(\S+)') {
                             $n = $matches[1]; $v = $matches[2]; $l = $matches[3]
                             if ($IgnoreList -contains $n) { continue }

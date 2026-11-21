@@ -1044,6 +1044,22 @@ jobs:
           }
           Write-Host 'PASS: High Contrast preserves unrelated flag bits.'
 
+      - name: Smoke test Scoop warning filtering
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
+          $scoopEnd = $source.IndexOf('# F. RUBY GEMS WORKER', $scoopStart)
+          if ($scoopStart -lt 0 -or $scoopEnd -le $scoopStart) {
+              throw 'Could not locate the Scoop update scan.'
+          }
+          $scoopWorker = $source.Substring($scoopStart, $scoopEnd - $scoopStart)
+          if ($scoopWorker -notmatch '\^\(\?:WARN\|WARNING\|ERROR\)') {
+              throw 'Scoop status warnings must be excluded from package update rows.'
+          }
+          Write-Host 'PASS: Scoop status warnings are excluded from update rows.'
+
       - name: Smoke test model-ID driver supersedence
         shell: powershell
         run: |
