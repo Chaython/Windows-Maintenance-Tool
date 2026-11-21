@@ -669,6 +669,30 @@ jobs:
               $background -notmatch 'Sync-WmtOptionalFeatureButtons') {
               throw 'A partial optional-feature scan can be marked ready.'
           }
+          if ($toggle -notmatch 'Get-WmtCapabilityStateInfo' -or
+              $toggle -notmatch 'Get-WmtOptionalFeatureStateInfo' -or
+              $toggle -notmatch 'install was pending restart' -or
+              $toggle -notmatch 'uninstall was pending restart' -or
+              $toggle -notmatch 'enable was pending restart' -or
+              $toggle -notmatch 'disable was pending restart') {
+              throw 'Feature toggle does not handle pending feature and capability states.'
+          }
+          $capabilityStates = Find-FunctionText 'Get-WmtCapabilityStateInfo'
+          $optionalFeatureStates = Find-FunctionText 'Get-WmtOptionalFeatureStateInfo'
+          if ($capabilityStates -notmatch 'InstallPending' -or
+              $capabilityStates -notmatch 'UninstallPending' -or
+              $optionalFeatureStates -notmatch 'EnablePending' -or
+              $optionalFeatureStates -notmatch 'DisablePending' -or
+              $background -notmatch 'Get-WmtCapabilityStateInfo' -or
+              $background -notmatch 'Get-WmtOptionalFeatureStateInfo' -or
+              $background -notmatch '\$unknown\[\$button\]') {
+              throw 'Optional-feature scan does not recognize pending states defensively.'
+          }
+          foreach ($helperName in @('Get-WmtCapabilityStateInfo', 'Get-WmtOptionalFeatureStateInfo', 'ConvertFrom-WmtScoopStatusLine', 'ConvertFrom-WmtScoopStatus')) {
+              if ($source -notmatch [regex]::Escape('"' + $helperName + '"')) {
+                  throw "Shared helper is not registered for pooled workers: $helperName"
+              }
+          }
           if ($source -match 'function Update-OptionalFeaturesSynchronously' -or
               $source -match '(?m)^\s*Update-OptionalFeaturesSynchronously\s*$') {
               throw 'Optional features are still scanned synchronously on the WPF thread.'
@@ -805,6 +829,10 @@ jobs:
               $missingRead = Get-WmtRegValue -Path $missingPath -Name 'Missing' -Default 4242
               if ($missingRead -ne 4242) {
                   throw "Get-WmtRegValue did not return the default for a missing key; got $missingRead."
+              }
+              $missingValue = Get-WmtRegValue -Path $cacheTestFullPath -Name 'NotThere' -Default 77
+              if ($missingValue -ne 77) {
+                  throw "Get-WmtRegValue did not return the default for a missing value; got $missingValue."
               }
               Write-Host 'PASS: registry writes refresh the cached snapshot before the next state read.'
               Write-Host 'PASS: registry-cache invalidation re-reads HideFileExt and refreshes the whole key.'
@@ -1026,39 +1054,623 @@ jobs:
           Write-Host 'PASS: My Device queue survives worker failures without hot-loop retries.'
           Write-Host 'PASS: nonblocking feature startup, fail-closed state checks, safe callback scope and guarded feature buttons.'
 
-      - name: Smoke test High Contrast bit preservation
+      - name: Smoke test optional-feature scan pending states
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName PresentationFramework
           $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
-          $hcStart = $source.IndexOf('$btnToggleHighContrast = Get-Ctrl')
-          $hcEnd = $source.IndexOf('$btnToggleColorFilter = Get-Ctrl', $hcStart)
-          if ($hcStart -lt 0 -or $hcEnd -le $hcStart) {
-              throw 'Could not locate the High Contrast toggle handler.'
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          function Find-FunctionText([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node.Extent.Text
           }
-          $hcHandler = $source.Substring($hcStart, $hcEnd - $hcStart)
-          if ($hcHandler -notmatch '\$flags -band \(-bnot 1\)' -or
-              $hcHandler -notmatch '\$flags -bor 1' -or
-              $hcHandler -match 'Set-WmtRegDword \$p "Flags" (?:0|1)\b') {
-              throw 'High Contrast must change only the HCF_HIGHCONTRASTON bit.'
+          # The servicing-state maps are shared by the scan and the toggle.
+          Invoke-Expression (Find-FunctionText 'Get-WmtCapabilityStateInfo')
+          Invoke-Expression (Find-FunctionText 'Get-WmtOptionalFeatureStateInfo')
+          $capabilityExpectations = @(
+              @{ State = 'Installed'; Known = $true; Enabled = $true; Pending = ''; Action = 'Remove' },
+              @{ State = 'NotPresent'; Known = $true; Enabled = $false; Pending = ''; Action = 'Install' },
+              @{ State = 'Staged'; Known = $true; Enabled = $false; Pending = ''; Action = 'Install' },
+              @{ State = 'Resolved'; Known = $true; Enabled = $false; Pending = ''; Action = 'Install' },
+              @{ State = 'Removed'; Known = $true; Enabled = $false; Pending = ''; Action = 'Install' },
+              @{ State = 'InstallPending'; Known = $true; Enabled = $true; Pending = 'InstallPending'; Action = 'Remove' },
+              @{ State = 'UninstallPending'; Known = $true; Enabled = $false; Pending = 'UninstallPending'; Action = 'Install' },
+              @{ State = 'Superseded'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
+              @{ State = 'PartiallyInstalled'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
+              @{ State = 'SomethingNew'; Known = $false; Enabled = $false; Pending = ''; Action = '' }
+          )
+          foreach ($case in $capabilityExpectations) {
+              $info = Get-WmtCapabilityStateInfo -State $case.State
+              if (-not $info -or $info.Known -ne $case.Known -or
+                  $info.Enabled -ne $case.Enabled -or $info.Pending -ne $case.Pending -or
+                  $info.Action -ne $case.Action) {
+                  throw "Capability state '$($case.State)' was mapped incorrectly."
+              }
           }
-          Write-Host 'PASS: High Contrast preserves unrelated flag bits.'
+          $featureExpectations = @(
+              @{ State = 'Enabled'; Known = $true; Enabled = $true; Pending = ''; Action = 'Disable' },
+              @{ State = 'EnablePending'; Known = $true; Enabled = $true; Pending = 'EnablePending'; Action = 'Disable' },
+              @{ State = 'Enable Pending'; Known = $true; Enabled = $true; Pending = 'EnablePending'; Action = 'Disable' },
+              @{ State = 'Disabled'; Known = $true; Enabled = $false; Pending = ''; Action = 'Enable' },
+              @{ State = 'DisablePending'; Known = $true; Enabled = $false; Pending = 'DisablePending'; Action = 'Enable' },
+              @{ State = 'Disable Pending'; Known = $true; Enabled = $false; Pending = 'DisablePending'; Action = 'Enable' },
+              @{ State = 'DisabledWithPayloadRemoved'; Known = $true; Enabled = $false; Pending = ''; Action = 'Enable' },
+              @{ State = 'Disabled with Payload Removed'; Known = $true; Enabled = $false; Pending = ''; Action = 'Enable' },
+              @{ State = 'Superseded'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
+              @{ State = 'PartiallyInstalled'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
+              @{ State = 'SomethingNew'; Known = $false; Enabled = $false; Pending = ''; Action = '' }
+          )
+          foreach ($case in $featureExpectations) {
+              $info = Get-WmtOptionalFeatureStateInfo -State $case.State
+              if (-not $info -or $info.Known -ne $case.Known -or
+                  $info.Enabled -ne $case.Enabled -or $info.Pending -ne $case.Pending -or
+                  $info.Action -ne $case.Action) {
+                  throw "Optional-feature state '$($case.State)' was mapped incorrectly."
+              }
+          }
+          Write-Host 'PASS: every documented feature and capability state maps safely.'
 
-      - name: Smoke test Scoop warning filtering
+          # Exercise the real toggle workers with mocked servicing cmdlets.
+          # Pending states dispatch the reversing action; unknown states are inert.
+          Invoke-Expression (Find-FunctionText 'Switch-WindowsFeature')
+          $script:OptionalFeaturesMap = @{
+              'XpsViewer' = 'btnFeatXPS'
+              'Microsoft-Hyper-V-All' = 'btnFeatHyperV'
+          }
+          $script:OptionalFeaturesReady = $true
+          $script:OptionalFeatureStateCache = @{
+              'btnFeatXPS' = $true
+              'btnFeatHyperV' = $true
+          }
+          $script:OptionalFeatureProviderCache = @{
+              'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' }
+              'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }
+          }
+          $script:MockCapabilityState = 'InstallPending'
+          $script:MockFeatureState = 'EnablePending'
+          $script:MockRemovedCapability = ''
+          $script:MockAddedCapability = ''
+          $script:MockDisabledFeature = ''
+          $script:MockEnabledFeature = ''
+          function Write-GuiLog { param([string]$Message) }
+          function Get-WindowsCapability {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$Name)
+              @([pscustomobject]@{ Name = $Name; State = $script:MockCapabilityState })
+          }
+          function Get-WindowsOptionalFeature {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$FeatureName)
+              @([pscustomobject]@{ FeatureName = $FeatureName; State = $script:MockFeatureState })
+          }
+          function Remove-WindowsCapability {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$Name)
+              $script:MockRemovedCapability = $Name
+          }
+          function Add-WindowsCapability {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$Name)
+              $script:MockAddedCapability = $Name
+          }
+          function Enable-WindowsOptionalFeature {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$FeatureName, [switch]$All, [switch]$NoRestart)
+              $script:MockEnabledFeature = $FeatureName
+          }
+          function Disable-WindowsOptionalFeature {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$FeatureName, [switch]$NoRestart)
+              $script:MockDisabledFeature = $FeatureName
+          }
+          function Invoke-WmtUiBackgroundCommand {
+              param(
+                  [scriptblock]$Sb,
+                  [object[]]$ArgumentList = @(),
+                  [string]$Name = '',
+                  [string]$Msg = '',
+                  [scriptblock]$OnComplete
+              )
+              & $Sb @ArgumentList
+          }
+          Switch-WindowsFeature 'XpsViewer' 'XPS Viewer'
+          if ($script:MockRemovedCapability -ne 'XPS.Viewer~~~~0.0.1.0' -or $script:MockAddedCapability) {
+              throw 'InstallPending did not dispatch the removal action.'
+          }
+          $script:MockCapabilityState = 'UninstallPending'
+          $script:OptionalFeatureStateCache['btnFeatXPS'] = $false
+          $script:MockRemovedCapability = ''
+          $script:MockAddedCapability = ''
+          Switch-WindowsFeature 'XpsViewer' 'XPS Viewer'
+          if ($script:MockAddedCapability -ne 'XPS.Viewer~~~~0.0.1.0' -or $script:MockRemovedCapability) {
+              throw 'UninstallPending did not dispatch the install action.'
+          }
+          $script:MockCapabilityState = 'SomethingNew'
+          $script:MockRemovedCapability = ''
+          $script:MockAddedCapability = ''
+          Switch-WindowsFeature 'XpsViewer' 'XPS Viewer'
+          if ($script:MockRemovedCapability -or $script:MockAddedCapability) {
+              throw 'An unknown capability state changed the system.'
+          }
+          $script:MockFeatureState = 'EnablePending'
+          $script:MockDisabledFeature = ''
+          $script:MockEnabledFeature = ''
+          Switch-WindowsFeature 'Microsoft-Hyper-V-All' 'Microsoft Hyper-V'
+          if ($script:MockDisabledFeature -ne 'Microsoft-Hyper-V-All' -or $script:MockEnabledFeature) {
+              throw 'EnablePending did not dispatch the disable action.'
+          }
+          $script:MockFeatureState = 'DisablePending'
+          $script:OptionalFeatureStateCache['btnFeatHyperV'] = $false
+          $script:MockDisabledFeature = ''
+          $script:MockEnabledFeature = ''
+          Switch-WindowsFeature 'Microsoft-Hyper-V-All' 'Microsoft Hyper-V'
+          if ($script:MockEnabledFeature -ne 'Microsoft-Hyper-V-All' -or $script:MockDisabledFeature) {
+              throw 'DisablePending did not dispatch the enable action.'
+          }
+          $script:MockFeatureState = 'SomethingNew'
+          $script:MockDisabledFeature = ''
+          $script:MockEnabledFeature = ''
+          Switch-WindowsFeature 'Microsoft-Hyper-V-All' 'Microsoft Hyper-V'
+          if ($script:MockDisabledFeature -or $script:MockEnabledFeature) {
+              throw 'An unknown optional-feature state changed the system.'
+          }
+          Write-Host 'PASS: pending feature and capability toggles dispatch safely and unknown states are inert.'
+
+          # Exercise the real scan worker with mocked Windows capability cmdlets.
+          $scanFunction = Find-FunctionText 'Start-OptionalFeaturesBackgroundCheck'
+          $scanTokens = $null; $scanErrors = $null
+          $scanAst = [System.Management.Automation.Language.Parser]::ParseInput($scanFunction, [ref]$scanTokens, [ref]$scanErrors)
+          if ($scanErrors.Count) { throw ($scanErrors.Message -join '; ') }
+          $addScript = $scanAst.Find({
+              param($n)
+              $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                  $n.Member.Value -eq 'AddScript'
+          }, $true)
+          if (-not $addScript) { throw 'Optional-feature scan script block was not found.' }
+          $scanText = $addScript.Arguments[0].Extent.Text
+          $scanText = $scanText.Substring(1, $scanText.Length - 2)
+          $scanBlock = [scriptblock]::Create($scanText)
+          $script:MockCapabilityState = 'InstallPending'
+          $script:MockCapabilityName = 'XPS.Viewer~~~~0.0.1.0'
+          $script:MockFeatureState = 'Enabled'
+          $script:MockIncludeXpsAsFeature = $false
+          $script:MockXpsFeatureState = 'SomethingNew'
+          function Get-WindowsOptionalFeature {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$FeatureName)
+              $features = @([pscustomobject]@{ FeatureName = 'Microsoft-Hyper-V-All'; State = $script:MockFeatureState })
+              if ($script:MockIncludeXpsAsFeature) {
+                  $features += [pscustomobject]@{ FeatureName = 'XpsViewer'; State = $script:MockXpsFeatureState }
+              }
+              $features
+          }
+          function Get-WindowsCapability {
+              [CmdletBinding()]
+              param([switch]$Online, [string]$Name)
+              @([pscustomobject]@{ Name = $script:MockCapabilityName; State = $script:MockCapabilityState })
+          }
+          $featureMap = @{
+              'Microsoft-Hyper-V-All' = 'btnFeatHyperV'
+              'XpsViewer' = 'btnFeatXPS'
+          }
+          $script:MockFeatureState = 'EnablePending'
+          $script:MockCapabilityState = 'Installed'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States['btnFeatHyperV'] -ne $true -or
+              $result.Pending['btnFeatHyperV'] -ne 'EnablePending' -or
+              $result.Unavailable.ContainsKey('btnFeatHyperV')) {
+              throw 'EnablePending optional feature was not classified as enabled and pending.'
+          }
+          $script:MockFeatureState = 'DisablePending'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States['btnFeatHyperV'] -ne $false -or
+              $result.Pending['btnFeatHyperV'] -ne 'DisablePending' -or
+              $result.Unavailable.ContainsKey('btnFeatHyperV')) {
+              throw 'DisablePending optional feature was not classified as disabled and pending.'
+          }
+          $script:MockFeatureState = 'Enabled'
+          $script:MockCapabilityState = 'InstallPending'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States['btnFeatXPS'] -ne $true -or
+              $result.Pending['btnFeatXPS'] -ne 'InstallPending' -or
+              $result.Unavailable.ContainsKey('btnFeatXPS') -or
+              $result.Unknown.ContainsKey('btnFeatXPS')) {
+              throw 'InstallPending capability was not classified as enabled and pending.'
+          }
+          $script:MockCapabilityState = 'UninstallPending'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States['btnFeatXPS'] -ne $false -or
+              $result.Pending['btnFeatXPS'] -ne 'UninstallPending' -or
+              $result.Unavailable.ContainsKey('btnFeatXPS')) {
+              throw 'UninstallPending capability was not classified as disabled and pending.'
+          }
+          $script:MockCapabilityState = 'SomethingNew'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States.ContainsKey('btnFeatXPS') -or
+              $result.Unavailable.ContainsKey('btnFeatXPS') -or
+              -not $result.Unknown.ContainsKey('btnFeatXPS')) {
+              throw 'An unknown capability state was not isolated for defensive handling.'
+          }
+          # A capability fallback must replace an unknown optional-feature
+          # state for the same button instead of producing contradictory data.
+          $script:MockFeatureState = 'Enabled'
+          $script:MockCapabilityState = 'Installed'
+          $script:MockIncludeXpsAsFeature = $true
+          $script:MockXpsFeatureState = 'SomethingNew'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States['btnFeatXPS'] -ne $true -or
+              $result.Unknown.ContainsKey('btnFeatXPS') -or
+              $result.Unavailable.ContainsKey('btnFeatXPS')) {
+              throw 'Capability fallback did not replace an unknown feature state cleanly.'
+          }
+          $script:MockIncludeXpsAsFeature = $false
+          $script:MockFeatureState = 'Superseded'
+          $script:MockCapabilityState = 'Installed'
+          $result = & $scanBlock $featureMap
+          if (-not $result -or -not $result.Unavailable.ContainsKey('btnFeatHyperV') -or
+              $result.Unknown.ContainsKey('btnFeatHyperV')) {
+              throw 'A known but non-actionable feature state was not marked unavailable safely.'
+          }
+          Write-Host 'PASS: the scan classifies pending states, keeps classifications exclusive, and isolates unknown states.'
+
+          # An unfamiliar current state retains the last verified snapshot when
+          # one exists; otherwise the control remains unavailable.
+          Invoke-Expression (Find-FunctionText 'Merge-WmtOptionalFeatureScanResult')
+          $script:MockFeatureState = 'Enabled'
+          $script:MockCapabilityState = 'SomethingNew'
+          $result = & $scanBlock $featureMap
+          $resolved = Merge-WmtOptionalFeatureScanResult -Result $result `
+              -PreviousStates @{} -PreviousProviders @{} -PreviousPending @{}
+          if (-not $resolved.Unavailable.ContainsKey('btnFeatXPS') -or
+              $resolved.States.ContainsKey('btnFeatXPS')) {
+              throw 'An unknown state without a prior snapshot did not remain unavailable.'
+          }
+          $resolved = Merge-WmtOptionalFeatureScanResult -Result $result `
+              -PreviousStates @{ 'btnFeatXPS' = $false } `
+              -PreviousProviders @{ 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } } `
+              -PreviousPending @{}
+          if (-not $resolved.States.ContainsKey('btnFeatXPS') -or
+              $resolved.States['btnFeatXPS'] -ne $false -or
+              -not $resolved.Providers.ContainsKey('btnFeatXPS') -or
+              $resolved.Unavailable.ContainsKey('btnFeatXPS')) {
+              throw 'An unknown state did not retain the last verified state and provider.'
+          }
+          Write-Host 'PASS: unknown states retain the last verified snapshot or remain unavailable.'
+
+          # Execute the production completion callback to verify that pending
+          # results reach the UI cache and unknown states retain prior data.
+          Invoke-Expression (Find-FunctionText 'Test-WmtOptionalFeatureScanResult')
+          $registerCall = $scanAst.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.CommandAst] -and
+                      $node.GetCommandName() -eq 'Register-WmtUiPollOperation'
+              }, $true)
+          if (-not $registerCall) { throw 'Optional-feature poll registration was not found.' }
+          $onTickIndex = -1
+          $registerElements = @($registerCall.CommandElements)
+          for ($i = 0; $i -lt $registerElements.Count; $i++) {
+              if ($registerElements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                  $registerElements[$i].ParameterName -eq 'OnTick') {
+                  $onTickIndex = $i + 1
+                  break
+              }
+          }
+          if ($onTickIndex -le 0 -or $onTickIndex -ge $registerElements.Count) {
+              throw 'Optional-feature completion callback was not found.'
+          }
+          $onTickText = $registerElements[$onTickIndex].Extent.Text
+          $onTickText = $onTickText.Substring(1, $onTickText.Length - 2)
+          $onTick = [scriptblock]::Create($onTickText)
+          function Unregister-WmtUiPollOperation { param([string]$Name) }
+          function Sync-WmtOptionalFeatureButtons { }
+          function Sync-WmtTweakOverlayHide { }
+          function Sync-WmtQuickFindStateAvailability { }
+          function Show-TweakStatesLoadError { param([string]$Message) }
+          $script:MockLogs = @()
+          function Write-GuiLog { param([string]$Message) $script:MockLogs += $Message }
+          $script:MockFeatureState = 'Enabled'
+          $script:MockCapabilityState = 'InstallPending'
+          $script:MockScanResult = @(& $scanBlock $featureMap)
+          $fakeScanPs = [pscustomobject]@{}
+          $fakeScanPs | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value {
+              param($Invocation)
+              Write-Output -NoEnumerate $script:MockScanResult
+          }
+          $fakeScanPs | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+          $script:FeaturesCheckPS = $fakeScanPs
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $true }
+          $script:FeaturesCheckTimeout = $null
+          $script:OptionalFeaturesMap = $featureMap
+          $script:OptionalFeatureStateCache = @{}
+          $script:OptionalFeatureUnavailableCache = @{}
+          $script:OptionalFeatureProviderCache = @{}
+          $script:OptionalFeaturePendingCache = @{}
+          $script:OptionalFeatureUnknownCache = @{}
+          & $onTick
+          if (-not $script:OptionalFeaturesReady -or
+              $script:OptionalFeaturePendingCache['btnFeatXPS'] -ne 'InstallPending' -or
+              $script:OptionalFeatureStateCache['btnFeatXPS'] -ne $true) {
+              throw 'The completion callback did not publish the pending capability state.'
+          }
+          $script:MockCapabilityState = 'SomethingNew'
+          $script:MockScanResult = @(& $scanBlock $featureMap)
+          $script:FeaturesCheckPS = $fakeScanPs
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $true }
+          & $onTick
+          if (-not $script:OptionalFeaturesReady -or
+              $script:OptionalFeatureStateCache['btnFeatXPS'] -ne $true -or
+              -not $script:OptionalFeatureUnknownCache.ContainsKey('btnFeatXPS') -or
+              -not (@($script:MockLogs) -match 'last verified state retained')) {
+              throw 'The completion callback did not retain and warn about the last verified state.'
+          }
+          Write-Host 'PASS: the production completion callback publishes pending state and retains unknown-state snapshots.'
+
+          # The result contract must reject contradictory or incomplete scans.
+          Invoke-Expression (Find-FunctionText 'Test-WmtOptionalFeatureScanResult')
+          $validButtons = @('btnFeatHyperV', 'btnFeatXPS')
+          $script:MockCapabilityState = 'InstallPending'
+          $result = & $scanBlock $featureMap
+          if (-not (Test-WmtOptionalFeatureScanResult -Result $result -ValidButtons $validButtons)) {
+              throw 'A valid pending-state scan result was rejected.'
+          }
+          $invalidResults = @(
+              @{ Label = 'pending without a state'; Expected = 'contradictory pending-state data';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' } }; Unavailable = @{ 'btnFeatXPS' = 'Unavailable feature' }; Pending = @{ 'btnFeatXPS' = 'InstallPending' }; Unknown = @{} } },
+              @{ Label = 'pending for an unknown button'; Expected = 'contradictory pending-state data';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{ 'btnFeatNope' = 'InstallPending' }; Unknown = @{} } },
+              @{ Label = 'missing pending map'; Expected = 'Scan result type is invalid';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' } }; Unavailable = @{ 'btnFeatXPS' = 'Unavailable feature' }; Unknown = @{} } },
+              @{ Label = 'unknown pending marker'; Expected = 'unknown pending-state marker';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{ 'btnFeatXPS' = 'SomethingPending' }; Unknown = @{} } },
+              @{ Label = 'pending outcome contradicts the state'; Expected = 'contradicts the displayed outcome';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $false }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{ 'btnFeatXPS' = 'InstallPending' }; Unknown = @{} } },
+              @{ Label = 'unknown state overlaps a verified state'; Expected = 'contradictory unrecognized-state data';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{}; Unknown = @{ 'btnFeatXPS' = 'Unknown state' } } },
+              @{ Label = 'incomplete classification'; Expected = 'features were classified';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' } }; Unavailable = @{}; Pending = @{}; Unknown = @{} } }
+          )
+          foreach ($case in $invalidResults) {
+              $rejected = $false
+              $errorMessage = ''
+              try { [void](Test-WmtOptionalFeatureScanResult -Result $case.Result -ValidButtons $validButtons) }
+              catch { $rejected = $true; $errorMessage = $_.Exception.Message }
+              if (-not $rejected) {
+                  throw "A contradictory scan result was accepted: $($case.Label)."
+              }
+              if ($errorMessage -notmatch [regex]::Escape($case.Expected)) {
+                  throw "The '$($case.Label)' fixture failed for the wrong reason: $errorMessage"
+              }
+          }
+          Write-Host 'PASS: contradictory and incomplete scan results are rejected for the intended reason.'
+
+          # Verify that pending results reach the UI cache and are rendered as
+          # pending-restart states rather than plain on/off labels.
+          Invoke-Expression (Find-FunctionText 'Update-SingleFeatureButtonState')
+          Invoke-Expression (Find-FunctionText 'Update-WmtQuickFindStateLabels')
+          $script:MockFeatureButton = [pscustomobject]@{
+              IsEnabled = $false
+              ToolTip = ''
+              Style = $null
+          }
+          function Get-Ctrl { param([string]$Name) return $script:MockFeatureButton }
+          $window = [pscustomobject]@{}
+          $window | Add-Member -MemberType ScriptMethod -Name FindResource -Value {
+              param($Name)
+              if ($Name -eq 'AccentBtn') { return 'AccentStyle' }
+              return 'ActionStyle'
+          }
+          $script:OptionalFeaturesReady = $true
+          $script:OptionalFeatureStateCache = @{ 'btnFeatXPS' = $true }
+          $script:OptionalFeatureUnavailableCache = @{}
+          $script:OptionalFeatureProviderCache = @{
+              'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' }
+          }
+          $script:OptionalFeaturePendingCache = @{ 'btnFeatXPS' = 'InstallPending' }
+          $script:OptionalFeatureUnknownCache = @{}
+          Update-SingleFeatureButtonState -ButtonName 'btnFeatXPS' -FeatureName ''
+          if (-not $script:MockFeatureButton.IsEnabled -or
+              $script:MockFeatureButton.ToolTip -notmatch 'Install pending restart') {
+              throw 'The native optional-feature button did not render the InstallPending state.'
+          }
+          $script:OptionalFeatureStateCache['btnFeatXPS'] = $false
+          $script:OptionalFeaturePendingCache['btnFeatXPS'] = 'DisablePending'
+          Update-SingleFeatureButtonState -ButtonName 'btnFeatXPS' -FeatureName ''
+          if ($script:MockFeatureButton.ToolTip -notmatch 'Disable pending restart') {
+              throw 'The native optional-feature button did not render the DisablePending state.'
+          }
+          $script:OptionalFeatureUnknownCache['btnFeatXPS'] = 'Unrecognized capability state'
+          Update-SingleFeatureButtonState -ButtonName 'btnFeatXPS' -FeatureName ''
+          if ($script:MockFeatureButton.ToolTip -notmatch 'WARNING: Unrecognized capability state') {
+              throw 'The native optional-feature button did not surface the retained-state warning.'
+          }
+          $pnlQuickFind = [pscustomobject]@{ IsVisible = $true }
+          $script:WmtQuickFindStateLabels = @{
+              'btnFeatXPS' = [pscustomobject]@{ Text = '' }
+          }
+          $script:OptionalFeaturePendingCache['btnFeatXPS'] = 'InstallPending'
+          Update-WmtQuickFindStateLabels
+          if ($script:WmtQuickFindStateLabels['btnFeatXPS'].Text -notmatch 'Pending restart \(will be enabled\)') {
+              throw 'Quick Find did not render the InstallPending outcome.'
+          }
+          $script:OptionalFeaturePendingCache['btnFeatXPS'] = 'DisablePending'
+          Update-WmtQuickFindStateLabels
+          if ($script:WmtQuickFindStateLabels['btnFeatXPS'].Text -notmatch 'Pending restart \(will be disabled\)') {
+              throw 'Quick Find did not render the DisablePending outcome.'
+          }
+          Write-Host 'PASS: pending states reach the UI cache and render restart-aware labels.'
+
+      - name: Smoke test High Contrast flag bit updates
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          function Find-FunctionText([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node.Extent.Text
+          }
+          Invoke-Expression (Find-FunctionText 'ConvertTo-Int')
+          Invoke-Expression (Find-FunctionText 'Get-WmtHighContrastFlags')
+          $cases = @(
+              @{ Flags = 4152; Enable = $true; Expected = 4153 },
+              @{ Flags = 4152; Enable = $false; Expected = 4152 },
+              @{ Flags = 4153; Enable = $true; Expected = 4153 },
+              @{ Flags = 4153; Enable = $false; Expected = 4152 },
+              @{ Flags = 1; Enable = $false; Expected = 0 },
+              @{ Flags = 0; Enable = $true; Expected = 1 },
+              @{ Flags = 0; Enable = $false; Expected = 0 },
+              @{ Flags = 16; Enable = $true; Expected = 17 },
+              @{ Flags = 16; Enable = $false; Expected = 16 }
+          )
+          foreach ($case in $cases) {
+              $actual = Get-WmtHighContrastFlags -CurrentFlags $case.Flags -Enable $case.Enable
+              if ($actual -ne $case.Expected) {
+                  throw "High Contrast flags $($case.Flags) (enable=$($case.Enable)) became $actual instead of $($case.Expected)."
+              }
+          }
+          # Execute the production click callback with mocked registry writes.
+          $hcClick = $ast.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                      $node.Member.Value -eq 'Add_Click' -and
+                      $node.Extent.Text -match 'Get-WmtHighContrastFlags'
+              }, $true)
+          if (-not $hcClick -or $hcClick.Arguments.Count -ne 1) {
+              throw 'Could not locate the High Contrast click callback.'
+          }
+          $handlerText = $hcClick.Arguments[0].Extent.Text
+          $handlerText = $handlerText.Substring(1, $handlerText.Length - 2)
+          $handler = [scriptblock]::Create($handlerText)
+          $script:MockHighContrastFlags = 4152
+          function Clear-WmtRegCache {
+              param([string[]]$Path = @(), [switch]$PreserveUiSnapshot)
+          }
+          function Get-WmtRegValue {
+              param($Path, $Name, $Default = $null)
+              return $script:MockHighContrastFlags
+          }
+          function Set-WmtRegDword {
+              param($Path, $Name, $Value)
+              $script:MockHighContrastFlags = [int]$Value
+          }
+          function Invoke-UiCommand {
+              param([scriptblock]$Sb, [string]$Msg = '')
+              & $Sb
+          }
+          function Write-GuiLog { param([string]$Message) }
+          function Update-WmtTweakToggle {
+              param($Button, [bool]$On, [string]$OnText, [string]$OffText)
+          }
+          & $handler
+          if ($script:MockHighContrastFlags -ne 4153) {
+              throw "High Contrast enable changed Flags to $($script:MockHighContrastFlags) instead of 4153."
+          }
+          & $handler
+          if ($script:MockHighContrastFlags -ne 4152) {
+              throw "High Contrast disable changed Flags to $($script:MockHighContrastFlags) instead of 4152."
+          }
+          $script:MockHighContrastFlags = 16
+          & $handler
+          if ($script:MockHighContrastFlags -ne 17) {
+              throw "High Contrast enable destroyed unrelated Flags bits: $($script:MockHighContrastFlags)."
+          }
+          & $handler
+          if ($script:MockHighContrastFlags -ne 16) {
+              throw "High Contrast disable destroyed unrelated Flags bits: $($script:MockHighContrastFlags)."
+          }
+          Write-Host 'PASS: the production High Contrast callback preserves every unrelated Flags bit.'
+
+      - name: Smoke test Scoop status line parsing
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          function Find-FunctionText([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node.Extent.Text
+          }
+          Invoke-Expression (Find-FunctionText 'ConvertFrom-WmtScoopStatusLine')
+          Invoke-Expression (Find-FunctionText 'ConvertFrom-WmtScoopStatus')
+          $ignored = @(
+              '',
+              '   ',
+              'Name                Version            Source',
+              'Name                Installed Version Latest Version Missing Dependencies Info',
+              '----                ------            ------',
+              'Scoop is up to date.',
+              'Everything is ok!',
+              "WARN  Scoop bucket(s) out of date. Run 'scoop update' to get the latest changes.",
+              'WARNING  Another diagnostic line.',
+              'ERROR  Broken manifest.'
+          )
+          foreach ($line in $ignored) {
+              $row = ConvertFrom-WmtScoopStatusLine -Line $line
+              if ($row) {
+                  throw "A Scoop status line was parsed as a package: '$line'."
+              }
+          }
+          $row = ConvertFrom-WmtScoopStatusLine -Line '7zip 23.01 24.08'
+          if (-not $row -or $row.Name -ne '7zip' -or $row.Version -ne '23.01' -or $row.Available -ne '24.08') {
+              throw 'A real Scoop package row was not parsed correctly.'
+          }
+          $row = ConvertFrom-WmtScoopStatusLine -Line '  git 2.46.0 2.47.0  '
+          if (-not $row -or $row.Name -ne 'git' -or $row.Version -ne '2.46.0' -or $row.Available -ne '2.47.0') {
+              throw 'A trimmed Scoop package row was not parsed correctly.'
+          }
+          # Execute the production output-to-row conversion with the current
+          # Scoop table shape and its diagnostic/success messages.
+          $scoopOutput = @'
+          WARN  Scoop bucket(s) out of date. Run 'scoop update' to get the latest changes.
+          Name                Installed Version Latest Version Missing Dependencies Info
+          ----                -------------- ------------- -------------------- --------------
+          7zip                23.01           24.08
+          git                 2.46.0          2.47.0
+          '@
+          $rows = @(ConvertFrom-WmtScoopStatus -Output $scoopOutput)
+          if ($rows.Count -ne 2 -or $rows[0].Source -ne 'scoop' -or
+              $rows[0].Name -ne '7zip' -or $rows[0].Version -ne '23.01' -or
+              $rows[0].Available -ne '24.08' -or $rows[1].Name -ne 'git') {
+              throw 'The production Scoop conversion included diagnostics or lost package rows.'
+          }
+          $rows = @(ConvertFrom-WmtScoopStatus -Output $scoopOutput -IgnoreList @('7zip'))
+          if ($rows.Count -ne 1 -or $rows[0].Name -ne 'git') {
+              throw 'The production Scoop conversion did not honor the ignore list.'
+          }
+          $rows = @(ConvertFrom-WmtScoopStatus -Output "Everything is ok!`r`n")
+          if ($rows.Count -ne 0) {
+              throw 'The production Scoop conversion treated the success message as an update.'
+          }
+          # The pooled scan worker must use the shared production converter.
           $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
           $scoopEnd = $source.IndexOf('# F. RUBY GEMS WORKER', $scoopStart)
           if ($scoopStart -lt 0 -or $scoopEnd -le $scoopStart) {
               throw 'Could not locate the Scoop update scan.'
           }
           $scoopWorker = $source.Substring($scoopStart, $scoopEnd - $scoopStart)
-          if ($scoopWorker -notmatch '\^\(\?:WARN\|WARNING\|ERROR\)') {
-              throw 'Scoop status warnings must be excluded from package update rows.'
+          if ($scoopWorker -notmatch 'ConvertFrom-WmtScoopStatus\b') {
+              throw 'The Scoop update scan must use the shared status converter.'
           }
-          Write-Host 'PASS: Scoop status warnings are excluded from update rows.'
+          Write-Host 'PASS: current and legacy Scoop output produce only real package update rows.'
 
       - name: Smoke test model-ID driver supersedence
         shell: powershell
@@ -4211,12 +4823,39 @@ jobs:
           $script:WmtSteamCommonHelpers = $source.Substring($bodyStart, $bodyEnd - $bodyStart).TrimEnd("`r", "`n")
           $script:MyDeviceCommonHelpers = ""
 
+          # The shared scan helpers are registered into every pooled worker.
+          # Assert that production declarations are top-level and precede the
+          # first session-state builder before loading them for this test.
+          $requiredPoolHelpers = @(
+              'ConvertTo-Int',
+              'Get-WmtCapabilityStateInfo',
+              'Get-WmtOptionalFeatureStateInfo',
+              'ConvertFrom-WmtScoopStatusLine',
+              'ConvertFrom-WmtScoopStatus'
+          )
+          foreach ($helperName in $requiredPoolHelpers) {
+              $helperAst = $ast.Find({
+                      param($node)
+                      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $helperName
+                  }, $true)
+              if (-not $helperAst) { throw "Missing shared runspace helper: $helperName" }
+              if ($helperAst.Parent -isnot [System.Management.Automation.Language.NamedBlockAst] -or
+                  $helperAst.Parent.Parent -isnot [System.Management.Automation.Language.ScriptBlockAst]) {
+                  throw "Shared runspace helper is not declared at script scope: $helperName"
+              }
+              if ($helperAst.Extent.StartOffset -ge $initFn.Extent.StartOffset) {
+                  throw "Shared runspace helper is declared too late for pool creation: $helperName"
+              }
+              Invoke-Expression $helperAst.Extent.Text
+          }
+
           # Load the real implementation from WMT rather than duplicating its logic.
           Invoke-Expression $initFn.Extent.Text
           $iss = New-WmtRunspaceInitialState
 
           $pool = $null
           $ps = $null
+          $helperPs = $null
           try {
               $pool = [runspacefactory]::CreateRunspacePool(1, 1, $iss, $Host)
               $pool.ApartmentState = "STA"
@@ -4237,8 +4876,30 @@ jobs:
               }
 
               Write-Host "OK: shared Steam helpers load and execute inside the pooled InitialSessionState."
+
+              # The optional-feature scan and the Scoop worker run in pooled
+              # workers, so all of their shared helpers must be registered there.
+              $helperPs = [PowerShell]::Create()
+              $helperPs.RunspacePool = $pool
+              [void]$helperPs.AddScript('$capability = Get-WmtCapabilityStateInfo -State "InstallPending"; $feature = Get-WmtOptionalFeatureStateInfo -State "EnablePending"; $row = ConvertFrom-WmtScoopStatusLine -Line "WARN  Scoop bucket(s) out of date."; $rows = @(ConvertFrom-WmtScoopStatus -Output "7zip 23.01 24.08"); [pscustomobject]@{ Integer = ConvertTo-Int "42" 0; CapabilityPending = $capability.Pending; CapabilityAction = $capability.Action; FeaturePending = $feature.Pending; FeatureAction = $feature.Action; ScoopRow = [bool]$row; ScoopRows = $rows.Count; ScoopName = $rows[0].Name }')
+              $helperResult = @($helperPs.Invoke())
+              if ($helperPs.HadErrors) {
+                  $helperErrors = @($helperPs.Streams.Error | ForEach-Object { $_.ToString() }) -join "; "
+                  throw "Shared scan helper runspace smoke test emitted errors: $helperErrors"
+              }
+              if ($helperResult.Count -ne 1 -or $helperResult[0].Integer -ne 42 -or
+                  $helperResult[0].CapabilityPending -ne 'InstallPending' -or
+                  $helperResult[0].CapabilityAction -ne 'Remove' -or
+                  $helperResult[0].FeaturePending -ne 'EnablePending' -or
+                  $helperResult[0].FeatureAction -ne 'Disable' -or
+                  $helperResult[0].ScoopRow -or $helperResult[0].ScoopRows -ne 1 -or
+                  $helperResult[0].ScoopName -ne '7zip') {
+                  throw "Shared scan helper runspace smoke test returned unexpected output: $($helperResult -join ', ')"
+              }
+              Write-Host "OK: shared conversion, servicing-state, and Scoop helpers execute inside the pooled InitialSessionState."
           }
           finally {
+              try { if ($helperPs) { $helperPs.Dispose() } } catch {}
               try { if ($ps) { $ps.Dispose() } } catch {}
               try { if ($pool) { $pool.Close() } } catch {}
               try { if ($pool) { $pool.Dispose() } } catch {}
