@@ -1604,13 +1604,17 @@ jobs:
           $script:MockLogs = @()
           $script:MockErrors = @()
           $script:MockStopCalls = @()
+          $script:MockUnregisterCalls = @()
           $script:MockRetryStartCount = 0
           function Write-GuiLog { param([string]$Message) $script:MockLogs += $Message }
           function Show-TweakStatesLoadError { param([string]$Message) $script:MockErrors += $Message }
           function Sync-WmtOptionalFeatureButtons { }
           function Sync-WmtTweakOverlayHide { }
           function Sync-WmtQuickFindStateAvailability { }
-          function Unregister-WmtUiPollOperation { param([string]$Name) }
+          function Unregister-WmtUiPollOperation {
+              param([string]$Name)
+              $script:MockUnregisterCalls += $Name
+          }
           function Stop-WmtPowerShellInvocationAsync {
               param($PowerShell, $Invocation, [string]$Name)
               $script:MockStopCalls += $Name
@@ -1633,6 +1637,59 @@ jobs:
               throw 'Optional-feature worker startup failure did not remain fail-closed and retryable.'
           }
 
+          # A failure while attaching the production script must roll back the
+          # worker and clear the running flag instead of stranding retries.
+          $script:MockErrors = @()
+          $script:MockDisposeCount = 0
+          $fakeSetupPs = [pscustomobject]@{}
+          $fakeSetupPs | Add-Member -MemberType ScriptMethod -Name AddScript -Value {
+              throw 'simulated script setup failure'
+          }
+          $fakeSetupPs | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+              $script:MockDisposeCount++
+          }
+          function New-WmtPooledPowerShell { param([string]$PoolKind) return $fakeSetupPs }
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $false
+          $script:FeaturesCheckPS = $null
+          $script:FeaturesCheckAsync = $null
+          $script:FeaturesCheckTimeout = $null
+          Start-OptionalFeaturesBackgroundCheck
+          if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              $script:MockDisposeCount -ne 1 -or
+              -not (@($script:MockErrors) -match 'Optional-feature scan could not start') -or
+              -not (@($script:MockErrors) -match 'simulated script setup failure')) {
+              throw 'Optional-feature script setup failure did not roll back and remain retryable.'
+          }
+
+          # Registration can fail after the invocation starts. The setup
+          # transaction must stop that invocation and clear the retry guard.
+          $script:MockErrors = @()
+          $script:MockStopCalls = @()
+          $script:MockUnregisterCalls = @()
+          $fakeRegisterPs = [pscustomobject]@{}
+          $fakeRegisterPs | Add-Member -MemberType ScriptMethod -Name AddScript -Value { param($ScriptBlock) }
+          $fakeRegisterPs | Add-Member -MemberType ScriptMethod -Name AddArgument -Value { param($Argument) }
+          $fakeRegisterPs | Add-Member -MemberType ScriptMethod -Name BeginInvoke -Value {
+              return [pscustomobject]@{ IsCompleted = $false }
+          }
+          $fakeRegisterPs | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+          function New-WmtPooledPowerShell { param([string]$PoolKind) return $fakeRegisterPs }
+          function Register-WmtUiPollOperation { throw 'simulated monitor registration failure' }
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $false
+          $script:FeaturesCheckPS = $null
+          $script:FeaturesCheckAsync = $null
+          $script:FeaturesCheckTimeout = $null
+          Start-OptionalFeaturesBackgroundCheck
+          if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              $null -ne $script:FeaturesCheckPS -or $null -ne $script:FeaturesCheckAsync -or
+              -not (@($script:MockStopCalls) -match 'Optional feature setup rollback') -or
+              @($script:MockUnregisterCalls) -contains 'OptionalFeaturesCheck' -or
+              -not (@($script:MockErrors) -match 'simulated monitor registration failure')) {
+              throw 'Optional-feature monitor registration failure did not roll back and remain retryable.'
+          }
+
           # The retry handler must preserve the last verified state, provider,
           # and pending marker while discarding stale unavailable/unknown data.
           Invoke-Expression (Find-FunctionText 'Show-TweakStatesLoadError')
@@ -1649,6 +1706,11 @@ jobs:
           }
           function Set-TweakStatesLoadingOverlay { param([bool]$Visible, [string]$ErrorMessage = '') }
           function Start-OptionalFeaturesBackgroundCheck { $script:MockRetryStartCount++ }
+          $script:MockTweakStartCount = 0
+          function Start-TweakButtonStatesBackgroundUpdate {
+              $script:MockTweakStartCount++
+              $script:TweakStatesBgStarted = $true
+          }
           $script:TweakOverlayRetryWired = $false
           $script:TweakStatesReady = $true
           $script:OptionalFeaturesReady = $false
@@ -1678,6 +1740,49 @@ jobs:
               $script:OptionalFeatureUnknownCache.ContainsKey('btnFeatXPS') -or
               -not (@($script:MockStopCalls) -match 'Optional features retry')) {
               throw 'The optional-feature retry did not preserve the last verified snapshot safely.'
+          }
+
+          # If the tweak-state worker is still live, the shared retry must stop
+          # and unregister it before starting its replacement so the old
+          # callback cannot consume the replacement's shared handles.
+          $script:MockRetryStartCount = 0
+          $script:MockTweakStartCount = 0
+          $script:MockStopCalls = @()
+          $script:MockUnregisterCalls = @()
+          $liveTweakPs = [pscustomobject]@{ LiveTweakWorker = $true }
+          $liveTweakAsync = [pscustomobject]@{ IsCompleted = $false }
+          $script:TweakStatesReady = $false
+          $script:TweakStatesBgStarted = $true
+          $script:TweakStatesBgPS = $liveTweakPs
+          $script:TweakStatesBgAsync = $liveTweakAsync
+          $script:TweakStatesBgTimeout = $null
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $true
+          $script:FeaturesCheckTimeout = $null
+          $script:FeaturesCheckPS = [pscustomobject]@{ FeatureWorker = $true }
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $false }
+          & $script:MockRetryHandler
+          if ($script:MockTweakStartCount -ne 1 -or
+              $null -ne $script:TweakStatesBgPS -or
+              $null -ne $script:TweakStatesBgAsync -or
+              $script:MockRetryStartCount -ne 1 -or
+              -not $script:TweakStatesBgStarted -or
+              -not (@($script:MockUnregisterCalls) -contains 'TweakStatesLoad') -or
+              -not (@($script:MockStopCalls) -match 'Tweak state preload retry')) {
+              throw 'The shared retry orphaned a live tweak-state worker or raced its replacement.'
+          }
+
+          # A genuinely failed tweak scan (no live worker) must still start one
+          # replacement when the user retries.
+          $script:MockTweakStartCount = 0
+          $script:TweakStatesReady = $false
+          $script:TweakStatesBgStarted = $false
+          $script:TweakStatesBgPS = $null
+          $script:TweakStatesBgAsync = $null
+          $script:OptionalFeaturesReady = $true
+          & $script:MockRetryHandler
+          if ($script:MockTweakStartCount -ne 1) {
+              throw 'The shared retry did not restart a genuinely failed tweak-state scan.'
           }
 
           # A later unfamiliar state must fall back to the snapshot retained by
@@ -1767,7 +1872,8 @@ jobs:
               -not (@($script:MockStopCalls) -match 'timeout')) {
               throw 'The optional-feature timeout did not fail closed and clear its cached state.'
           }
-          Write-Host 'PASS: worker startup failure remains fail-closed and retryable.'
+          Write-Host 'PASS: worker startup and setup failures remain fail-closed and retryable.'
+          Write-Host 'PASS: the shared retry stops a live tweak-state worker before replacement.'
           Write-Host 'PASS: retry preserves the last verified snapshot for a later unknown state.'
           Write-Host 'PASS: malformed completion fails closed and timeout clears all cached states.'
 

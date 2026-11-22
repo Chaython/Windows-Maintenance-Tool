@@ -72993,6 +72993,23 @@ try {
             $script:WmtTweakLoadError = ""
             Set-TweakStatesLoadingOverlay -Visible $true
             if ($retryTweaks) {
+                # A replacement must not race the old completion callback.
+                # Unregister its monitor first, stop its timeout, then detach
+                # and clear the old worker before starting the replacement.
+                try { Unregister-WmtUiPollOperation -Name "TweakStatesLoad" } catch {}
+                if ($script:TweakStatesBgTimeout) {
+                    try { $script:TweakStatesBgTimeout.Stop() } catch {}
+                    $script:TweakStatesBgTimeout = $null
+                }
+                $oldTweakPs = $script:TweakStatesBgPS
+                $oldTweakAsync = $script:TweakStatesBgAsync
+                $script:TweakStatesBgPS = $null
+                $script:TweakStatesBgAsync = $null
+                if ($oldTweakPs) {
+                    try { Stop-WmtPowerShellInvocationAsync -PowerShell $oldTweakPs -Invocation $oldTweakAsync -Name "Tweak state preload retry" } catch {
+                        try { Start-WmtPowerShellCleanupDetached -PowerShell $oldTweakPs -Invocation $oldTweakAsync -Name "Tweak state preload retry" } catch {}
+                    }
+                }
                 $script:TweakStatesBgStarted = $false
                 $script:TweakButtonStatesCache = $null
                 $script:TweakNonRegDataCache = $null
@@ -73748,6 +73765,9 @@ catch {
     Sync-WmtTweakOverlayHide
     return
 }
+$async = $null
+$monitorRegistered = $false
+try {
 [void]$ps.AddScript({
     param($map)
     $states = @{}
@@ -73884,19 +73904,8 @@ catch {
     return @{ States = $states; Providers = $providers; Unavailable = $unavailable; Pending = $pending; Unknown = $unknown }
 })
 [void]$ps.AddArgument($featureMap)
-$async = $null
-try { $async = $ps.BeginInvoke() }
-catch { try { Write-GuiLog "[Optional Features] Background query failed to start: $($_.Exception.Message)." } catch {} }
-if ($null -eq $async) {
-    try { $ps.Dispose() } catch {}
-    $script:OptionalFeaturesCheckStarted = $false
-    $script:OptionalFeaturesReady = $false
-    Show-TweakStatesLoadError -Message "Optional-feature scan could not start. Click Retry."
-    Sync-WmtTweakOverlayHide
-    return
-}
-$script:FeaturesCheckAsync = $async
-$script:FeaturesCheckPS = $ps
+$async = $ps.BeginInvoke()
+if ($null -eq $async) { throw "Optional-feature background query returned no invocation handle." }
 $script:FeaturesCheckTimer = $null
 Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -TestComplete { $false } -OnTick {
     if ($script:FeaturesCheckAsync -and $script:FeaturesCheckAsync.IsCompleted) {
@@ -73952,6 +73961,9 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
         Sync-WmtQuickFindStateAvailability
     }
 } | Out-Null
+$monitorRegistered = $true
+$script:FeaturesCheckAsync = $async
+$script:FeaturesCheckPS = $ps
 $script:FeaturesCheckTimeout = [System.Windows.Threading.DispatcherTimer]::new()
 $script:FeaturesCheckTimeout.Interval = [TimeSpan]::FromSeconds(150)
 $script:FeaturesCheckTimeout.Add_Tick({
@@ -73978,6 +73990,46 @@ $script:FeaturesCheckTimeout.Add_Tick({
     Sync-WmtQuickFindStateAvailability
 })
 $script:FeaturesCheckTimeout.Start()
+}
+catch {
+    $setupError = $_.Exception.Message
+    if ([string]::IsNullOrWhiteSpace($setupError)) { $setupError = "Unknown optional-feature worker setup error." }
+    try { Write-GuiLog "[Optional Features] Background worker setup failed: $setupError" } catch {}
+
+    $script:OptionalFeaturesCheckStarted = $false
+    $script:OptionalFeaturesReady = $false
+    if ($monitorRegistered) {
+        try { Unregister-WmtUiPollOperation -Name "OptionalFeaturesCheck" } catch {}
+    }
+    if ($script:FeaturesCheckTimeout) {
+        try { $script:FeaturesCheckTimeout.Stop() } catch {}
+        $script:FeaturesCheckTimeout = $null
+    }
+    # Only clear shared handles when they still refer to this setup attempt.
+    # A duplicate-monitor failure must not orphan a different live worker.
+    try {
+        if ($script:FeaturesCheckPS -and [object]::ReferenceEquals($script:FeaturesCheckPS, $ps)) {
+            $script:FeaturesCheckPS = $null
+        }
+        if ($script:FeaturesCheckAsync -and [object]::ReferenceEquals($script:FeaturesCheckAsync, $async)) {
+            $script:FeaturesCheckAsync = $null
+        }
+    }
+    catch {}
+    if ($ps) {
+        if ($async) {
+            try { Stop-WmtPowerShellInvocationAsync -PowerShell $ps -Invocation $async -Name "Optional feature setup rollback" } catch {
+                try { Start-WmtPowerShellCleanupDetached -PowerShell $ps -Invocation $async -Name "Optional feature setup rollback" } catch {}
+            }
+        }
+        else {
+            try { $ps.Dispose() } catch {}
+        }
+    }
+    Show-TweakStatesLoadError -Message "Optional-feature scan could not start: $setupError. Click Retry."
+    Sync-WmtTweakOverlayHide
+    return
+}
 }
 
 $onMainWindowContentRendered = {
