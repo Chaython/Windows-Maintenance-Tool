@@ -9768,22 +9768,31 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
         $listOperations = @(ConvertFrom-Json -InputObject $ListOperationsJson -ErrorAction Stop)
         foreach ($operation in $listOperations) {
             if (-not $operation -or [string]::IsNullOrWhiteSpace([string]$operation.Property)) { continue }
+            # Package IDs are matched case-insensitively by the providers. Use
+            # the same rule for persisted ignore entries so case-variant
+            # duplicates collapse and un-ignore removes every matching spelling.
             $list = [System.Collections.Generic.List[string]]::new()
+            $listKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $existing = $settings.PSObject.Properties[[string]$operation.Property]
             if ($existing) {
                 foreach ($value in @($existing.Value)) {
                     $text = ([string]$value).Trim()
-                    if (-not [string]::IsNullOrWhiteSpace($text) -and -not $list.Contains($text)) { [void]$list.Add($text) }
+                    if (-not [string]::IsNullOrWhiteSpace($text) -and $listKeys.Add($text)) { [void]$list.Add($text) }
                 }
             }
             foreach ($value in @($operation.Values)) {
                 $text = ([string]$value).Trim()
                 if ([string]::IsNullOrWhiteSpace($text)) { continue }
                 if ([string]$operation.Action -eq 'Add') {
-                    if (-not $list.Contains($text)) { [void]$list.Add($text) }
+                    if ($listKeys.Add($text)) { [void]$list.Add($text) }
                 }
                 elseif ([string]$operation.Action -eq 'Remove') {
-                    [void]$list.Remove($text)
+                    [void]$listKeys.Remove($text)
+                    for ($listIndex = $list.Count - 1; $listIndex -ge 0; $listIndex--) {
+                        if ([string]::Equals([string]$list[$listIndex], $text, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            $list.RemoveAt($listIndex)
+                        }
+                    }
                 }
                 else { throw "Unsupported settings list operation '$($operation.Action)'." }
             }
@@ -9841,6 +9850,37 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
                 }
             }
             $settings | Add-Member -MemberType NoteProperty -Name $propertyName -Value $map -Force
+        }
+
+        # Keep display names synchronized with the final ignore list. This
+        # removes stale names left by legacy settings or by an earlier failed
+        # transaction while retaining the map for unrelated future settings.
+        $ignoreNamesProperty = $settings.PSObject.Properties['WingetIgnoreNames']
+        $ignoreListProperty = $settings.PSObject.Properties['WingetIgnore']
+        if ($ignoreNamesProperty -and $ignoreListProperty) {
+            $finalIgnoredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $normalizedIgnoredIds = [System.Collections.Generic.List[string]]::new()
+            foreach ($ignoredId in @($ignoreListProperty.Value)) {
+                $idText = ([string]$ignoredId).Trim()
+                if ([string]::IsNullOrWhiteSpace($idText)) { continue }
+                if ($finalIgnoredIds.Add($idText)) { [void]$normalizedIgnoredIds.Add($idText) }
+            }
+            $settings | Add-Member -MemberType NoteProperty -Name 'WingetIgnore' -Value $normalizedIgnoredIds.ToArray() -Force
+            $prunedNames = [ordered]@{}
+            $rawNames = $ignoreNamesProperty.Value
+            if ($rawNames -is [System.Collections.IDictionary]) {
+                foreach ($key in @($rawNames.Keys)) {
+                    $idText = ([string]$key).Trim()
+                    if ($finalIgnoredIds.Contains($idText)) { $prunedNames[[string]$key] = $rawNames[$key] }
+                }
+            }
+            elseif ($rawNames -and -not ($rawNames -is [string])) {
+                foreach ($prop in @($rawNames.PSObject.Properties)) {
+                    $idText = ([string]$prop.Name).Trim()
+                    if ($finalIgnoredIds.Contains($idText)) { $prunedNames[$prop.Name] = $prop.Value }
+                }
+            }
+            $settings | Add-Member -MemberType NoteProperty -Name 'WingetIgnoreNames' -Value $prunedNames -Force
         }
         $json = ConvertTo-Json -InputObject $settings -Depth 8
         $directory = [System.IO.Path]::GetDirectoryName($Path)
@@ -10206,6 +10246,38 @@ foreach ($ignoredId in @($IgnoredIds)) {
     })
 }
 return $items.ToArray()
+}
+
+function Remove-WmtIgnoredPackageListItemsById {
+param(
+    $Items,
+    [string[]]$Ids = @()
+)
+
+if ($null -eq $Items) { return 0 }
+$idSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($id in @($Ids)) {
+    $idText = ([string]$id).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($idText)) { [void]$idSet.Add($idText) }
+}
+if ($idSet.Count -eq 0) { return 0 }
+
+$removed = 0
+foreach ($item in @($Items)) {
+    $itemId = ""
+    try {
+        if ($item -and $item.PSObject.Properties["Id"]) { $itemId = ([string]$item.Id).Trim() }
+        else { $itemId = ([string]$item).Trim() }
+    }
+    catch {}
+    if ([string]::IsNullOrWhiteSpace($itemId) -or -not $idSet.Contains($itemId)) { continue }
+    try {
+        [void]$Items.Remove($item)
+        $removed++
+    }
+    catch {}
+}
+return $removed
 }
 
 function Copy-WmtSettings {
@@ -55793,23 +55865,8 @@ function Set-WmtWingetUnignoreUiSaveCompleted {
     $state['RefreshNeeded'] = $true
     try {
         $targetList = $state['ListBox']
-        $selectedIdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($selectedId in @($state['SelectedIds'])) {
-            $idText = ([string]$selectedId).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($idText)) { [void]$selectedIdSet.Add($idText) }
-        }
         if ($targetList) {
-            foreach ($targetItem in @($targetList.Items)) {
-                $targetId = ""
-                try {
-                    if ($targetItem -and $targetItem.PSObject.Properties["Id"]) { $targetId = ([string]$targetItem.Id).Trim() }
-                    else { $targetId = ([string]$targetItem).Trim() }
-                }
-                catch {}
-                if (-not [string]::IsNullOrWhiteSpace($targetId) -and $selectedIdSet.Contains($targetId)) {
-                    [void]$targetList.Items.Remove($targetItem)
-                }
-            }
+            [void](Remove-WmtIgnoredPackageListItemsById -Items $targetList.Items -Ids @($state['SelectedIds']))
             try { $targetList.Items.Refresh() } catch {}
         }
         $restoreButton = $state['RestoreButton']

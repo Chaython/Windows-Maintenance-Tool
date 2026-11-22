@@ -4543,7 +4543,25 @@ jobs:
                   throw "Settings cache did not invalidate after an external file change."
               }
 
-              Write-Host "OK: settings persistence, interval retention, DebugMode persistence, backup recovery, and cache invalidation."
+              # A legacy settings file has no WingetIgnoreNames member. Loading
+              # it must still recover the built-in display name for the default
+              # ignored package instead of losing the name or failing.
+              $legacySettings = [pscustomobject]@{ WingetIgnore = @('228980') }
+              [System.IO.File]::WriteAllText(
+                  $settingsPath,
+                  ($legacySettings | ConvertTo-Json -Depth 4),
+                  [System.Text.UTF8Encoding]::new($false)
+              )
+              $script:WmtSettingsCache = $null
+              $script:WmtSettingsCacheStamp = $null
+              $legacyLoaded = Get-WmtSettings
+              if (-not ($legacyLoaded.WingetIgnoreNames -is [System.Collections.IDictionary]) -or
+                  -not $legacyLoaded.WingetIgnoreNames.Contains("228980") -or
+                  $legacyLoaded.WingetIgnoreNames["228980"] -ne "Steamworks Common Redistributables") {
+                  throw "A legacy settings file without WingetIgnoreNames did not recover the built-in ignored-package name."
+              }
+
+              Write-Host "OK: settings persistence, interval retention, DebugMode persistence, backup recovery, cache invalidation, and legacy ignored-name loading."
           }
           finally {
               try { Remove-Item -LiteralPath $script:SettingsTestDataPath -Recurse -Force -ErrorAction SilentlyContinue } catch {}
@@ -4573,6 +4591,7 @@ jobs:
               'ConvertTo-WmtIgnoredPackageNameMap',
               'New-WmtIgnoredPackageNameEntries',
               'Get-WmtIgnoredPackageListItems',
+              'Remove-WmtIgnoredPackageListItemsById',
               'Invoke-WmtSettingsPatchSave'
           )) {
               $fn = $ast.Find({
@@ -4609,6 +4628,18 @@ jobs:
           $defaultDisplay = @(Get-WmtIgnoredPackageListItems -IgnoredIds @('228980') -Names ([ordered]@{ '228980' = 'Steamworks Common Redistributables' }))
           Assert-True ($defaultDisplay[0].DisplayName -eq 'Steamworks Common Redistributables (228980)') 'the built-in ignored package name is displayed'
 
+          # Exercise the production removal helper against a real WPF ListBox.
+          # The selected ID spelling must not matter when the ignored item was
+          # persisted with different casing.
+          Add-Type -AssemblyName PresentationFramework
+          $ignoredListBox = [System.Windows.Controls.ListBox]::new()
+          [void]$ignoredListBox.Items.Add([pscustomobject]@{ Id = 'pkg.one'; Name = 'Package One'; DisplayName = 'Package One (pkg.one)' })
+          [void]$ignoredListBox.Items.Add([pscustomobject]@{ Id = 'other.id'; Name = 'Other'; DisplayName = 'Other (other.id)' })
+          $removedCount = Remove-WmtIgnoredPackageListItemsById -Items $ignoredListBox.Items -Ids @('PKG.ONE')
+          Assert-True ($removedCount -eq 1) 'the WPF ignored-list removal helper removed the case-variant match'
+          Assert-True ($ignoredListBox.Items.Count -eq 1) 'the WPF ignored-list removal helper retained unrelated entries'
+          Assert-True ([string]$ignoredListBox.Items[0].Id -eq 'other.id') 'the WPF ignored-list removal helper removed the correct entry'
+
           # Exercise the production settings transaction. The ignored ID list
           # and its display-name map must be written atomically, deduplicated,
           # updated, and removed together.
@@ -4620,8 +4651,11 @@ jobs:
               $script:WmtSettingsWriteMutexName = 'Local\Wmt_Ignore_CI_' + [guid]::NewGuid().ToString('N')
               $settingsPath = Join-Path $testRoot 'settings.json'
               $script:IgnoredTestSettings = [pscustomobject]@{
-                  WingetIgnore = @('228980')
-                  WingetIgnoreNames = [pscustomobject]@{ '228980' = 'Steamworks Common Redistributables' }
+                  WingetIgnore = @('228980', 'PKG.ONE', 'pkg.one')
+                  WingetIgnoreNames = [pscustomobject]@{
+                      '228980' = 'Steamworks Common Redistributables'
+                      'stale.id' = 'Stale Package'
+                  }
               }
               [System.IO.File]::WriteAllText(
                   $settingsPath,
@@ -4656,9 +4690,11 @@ jobs:
               Invoke-WmtSettingsPatchSave -Patch @{ Theme = 'dark' } -Name 'unrelated-save' -Message 'test'
               $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
               Assert-True ($saved.Theme -eq 'dark') 'settings saves without map operations still work'
+              Assert-True (@($saved.WingetIgnore).Count -eq 2) 'case-variant duplicate IDs collapse during persistence'
+              Assert-True ($null -eq $saved.WingetIgnoreNames.'stale.id') 'stale ignored-package names are removed during persistence'
 
               Invoke-WmtSettingsPatchSave -Patch @{} -Name 'add-ignore' -Message 'test' `
-                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one', 'pkg.one') }) `
+                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one', 'PKG.ONE') }) `
                   -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = 'Package One' }) })
               $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
               Assert-True (@($saved.WingetIgnore).Count -eq 2) 'ignore list persists IDs without duplicates'
@@ -4673,7 +4709,7 @@ jobs:
 
               Invoke-WmtSettingsPatchSave -Patch @{} -Name 'remove-ignore' -Message 'test' `
                   -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Remove'; Values = @('pkg.one') }) `
-                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Remove'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = '' }) })
+                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Remove'; Values = @([pscustomobject]@{ Key = 'PKG.ONE'; Value = '' }) })
               $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
               Assert-True (@($saved.WingetIgnore).Count -eq 1) 'remove preserves other ignored IDs'
               Assert-True ($null -eq $saved.WingetIgnoreNames.'pkg.one') 'remove clears the persisted name'
