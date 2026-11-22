@@ -2606,19 +2606,101 @@ if ($Enable) { return ($flags -bor 1) }
 return ($flags -band (-bnot 1))
 }
 
-# Parse one line of 'scoop status'. Current Scoop uses the columns
-# "Name Installed Version Latest Version Missing Dependencies Info"; older
-# releases used "Name Version Source". Headers, separators, success messages,
-# and diagnostic lines return $null so they never turn into package rows or
-# inflate the update count. The version-shape check also rejects free-form
-# diagnostics such as "INFO main bucket is stale".
+# Scoop versions are not always strict semantic versions (for example,
+# "nightly" and "2026.11.22" are both valid), but an update column must still
+# look like a version rather than a bucket name or a missing-dependency label.
+function Test-WmtScoopVersionText {
+param([string]$Value)
+$text = ([string]$Value).Trim()
+if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+return [bool](($text -match '\d') -or
+    ($text -match '^(?i:nightly|latest|unknown|continuous)$'))
+}
+
+# Read the fixed-width column starts from Scoop's separator row. Header labels
+# are centered inside their columns, so separator offsets are more reliable
+# than the positions of words such as "Installed" and "Latest".
+function Get-WmtScoopStatusTableColumns {
+param([string]$SeparatorLine)
+if ([string]::IsNullOrWhiteSpace($SeparatorLine)) { return $null }
+$columnRuns = @([regex]::Matches($SeparatorLine, '-{2,}'))
+if ($columnRuns.Count -lt 5) { return $null }
+
+$columns = @{
+    Name      = [int]$columnRuns[0].Index
+    Installed = [int]$columnRuns[1].Index
+    Latest    = [int]$columnRuns[2].Index
+    Missing   = [int]$columnRuns[3].Index
+    Info      = [int]$columnRuns[4].Index
+}
+$lastStart = -1
+foreach ($key in @('Name', 'Installed', 'Latest', 'Missing', 'Info')) {
+    $start = [int]$columns[$key]
+    if ($start -le $lastStart) { return $null }
+    $lastStart = $start
+}
+return $columns
+}
+
+# Parse one row from Scoop's current status table. The Latest Version cell is
+# authoritative: a dependency name in the later Missing Dependencies cell must
+# never be mistaken for an available version.
+function ConvertFrom-WmtScoopCurrentStatusRow {
+param(
+    [string]$Line,
+    $Columns
+)
+if ([string]::IsNullOrWhiteSpace($Line) -or $null -eq $Columns) { return $null }
+$text = ([string]$Line).TrimEnd()
+$tokens = @([regex]::Matches($text, '\S+'))
+if ($tokens.Count -lt 2) { return $null }
+
+# Scoop package directory names do not contain spaces. The first token is the
+# package name and the second is the installed version. A name longer than the
+# table's Name column shifts every later cell to the right, so calculate that
+# shift from the installed-version token.
+$name = [string]$tokens[0].Value
+$installedToken = [int]$tokens[1].Index
+$installedStart = [int]$Columns.Installed
+$shift = $installedToken - $installedStart
+if ($shift -lt 0) { return $null }
+
+$latestStart = [int]$Columns.Latest + $shift
+$missingStart = [int]$Columns.Missing + $shift
+$infoStart = [int]$Columns.Info + $shift
+if ($latestStart -le $installedToken -or $missingStart -le $latestStart -or $infoStart -le $missingStart) {
+    return $null
+}
+
+function Get-WmtScoopStatusCell {
+param([string]$Text, [int]$Start, [int]$End)
+if ($Start -lt 0 -or $Start -ge $Text.Length -or $End -le $Start) { return "" }
+$safeEnd = [Math]::Min($End, $Text.Length)
+return $Text.Substring($Start, $safeEnd - $Start).Trim()
+}
+
+$installed = Get-WmtScoopStatusCell -Text $text -Start ($installedStart + $shift) -End $latestStart
+$latest = Get-WmtScoopStatusCell -Text $text -Start $latestStart -End $missingStart
+$missingDependencies = Get-WmtScoopStatusCell -Text $text -Start $missingStart -End $infoStart
+if (-not (Test-WmtScoopVersionText $installed) -or
+    -not (Test-WmtScoopVersionText $latest) -or
+    -not [string]::IsNullOrWhiteSpace($missingDependencies)) {
+    return $null
+}
+return [PSCustomObject]@{ Name = $name; Version = $installed; Available = $latest }
+}
+
+# Parse one update line. Current Scoop can emit a headerless three-column
+# row, while Scoop releases before v0.2 emitted "name: old -> new" beneath an
+# "Updates are available for:" heading. "Name Version Source" is the output of
+# `scoop list`, not an update, and is deliberately not treated as one.
 function ConvertFrom-WmtScoopStatusLine {
 param(
     [string]$Line,
-    [ValidateSet("Auto", "Current", "Legacy")][string]$Format = "Auto"
+    [ValidateSet("Auto", "Current", "Arrow", "Legacy")][string]$Format = "Auto"
 )
 if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
-$line = $Line.Trim()
+$line = [regex]::Replace(([string]$Line).Trim(), "\x1B\[[0-?]*[ -/]*[@-~]", "")
 if ($line -match "^Name\s+Version\b" -or
     $line -match "^Name\s+Installed\s+Version\b" -or
     $line -match "^----" -or
@@ -2627,55 +2709,146 @@ if ($line -match "^Name\s+Version\b" -or
     $line -match "^(?:WARN|WARNING|ERROR|INFO|NOTICE|HINT|DEBUG|TRACE|FATAL|FAILED|FAILURE)\b") {
     return $null
 }
-if ($line -notmatch '^(\S+)\s+(\S+)\s+(\S+)') { return $null }
-$name = [string]$matches[1]
-$version = [string]$matches[2]
-$available = [string]$matches[3]
-$versionLooksValid = ($version -match '\d') -or
-    ($version -match '^(?i:nightly|latest|unknown|continuous)$')
-$availableLooksValid = ($available -match '\d') -or
-    ($available -match '^(?i:nightly|latest|unknown|continuous)$')
-$sourceLooksValid = ($available -match '^(?i:main|extras|versions|nightly|master)$')
-if ($Format -eq "Current") {
-    if (-not $versionLooksValid -or -not $availableLooksValid) { return $null }
-}
-elseif ($Format -eq "Legacy") {
-    if (-not $versionLooksValid) { return $null }
-}
-else {
-    # Auto mode supports a headerless current row as well as the obsolete
-    # Name/Version/Source table, but not arbitrary three-word diagnostics.
-    if (-not $versionLooksValid -or (-not $availableLooksValid -and -not $sourceLooksValid)) {
-        return $null
+
+$arrowMatch = [regex]::Match($line, '^(?<name>[^:]+):\s+(?<version>\S+)\s+(?:->|=>)\s+(?<available>\S+)\s*$')
+if (($Format -eq "Auto" -or $Format -eq "Arrow" -or $Format -eq "Legacy") -and
+    $arrowMatch.Success -and
+    (Test-WmtScoopVersionText $arrowMatch.Groups['version'].Value) -and
+    (Test-WmtScoopVersionText $arrowMatch.Groups['available'].Value)) {
+    return [PSCustomObject]@{
+        Name      = $arrowMatch.Groups['name'].Value.Trim()
+        Version   = $arrowMatch.Groups['version'].Value.Trim()
+        Available = $arrowMatch.Groups['available'].Value.Trim()
     }
 }
-return [PSCustomObject]@{ Name = $name; Version = $version; Available = $available }
+if ($Format -eq "Current" -or $Format -eq "Auto") {
+    if ($line -notmatch '^(\S+)\s+(\S+)\s+(\S+)\s*$') { return $null }
+    $name = [string]$matches[1]
+    $version = [string]$matches[2]
+    $available = [string]$matches[3]
+    if (-not (Test-WmtScoopVersionText $version) -or -not (Test-WmtScoopVersionText $available)) { return $null }
+    return [PSCustomObject]@{ Name = $name; Version = $version; Available = $available }
+}
+return $null
 }
 
-# Convert complete 'scoop status' output into update rows. Keeping the whole
-# conversion here makes the current Scoop table format testable and ensures
-# headers, success messages, and diagnostics never reach the updates table.
+# Convert complete 'scoop status' output into update rows. The current table
+# is parsed by column so an empty Latest Version cell and a later missing
+# dependency cannot fabricate an update. Legacy arrow rows remain supported.
 function ConvertFrom-WmtScoopStatus {
 param(
     [string]$Output,
     [string[]]$IgnoreList = @()
 )
 if ([string]::IsNullOrWhiteSpace($Output)) { return }
-$format = "Auto"
+$currentColumns = $null
+$expectCurrentSeparator = $false
+$currentTableActive = $false
+$listTableActive = $false
 foreach ($line in ($Output -split "`r?`n")) {
-    $trimmedLine = ([string]$line).Trim()
+    $trimmedLine = [regex]::Replace(([string]$line).Trim(), "\x1B\[[0-?]*[ -/]*[@-~]", "")
     if ($trimmedLine -match "^Name\s+Installed\s+Version\b") {
-        $format = "Current"
+        $currentTableActive = $true
+        $listTableActive = $false
+        $expectCurrentSeparator = $true
+        $currentColumns = $null
         continue
     }
-    if ($trimmedLine -match "^Name\s+Version\b") {
-        $format = "Legacy"
+    if ($trimmedLine -match "^Name\s+Version\s+Source(?:\s|$)") {
+        # `scoop list` reports installed packages and their source buckets. It
+        # is not update output, even when a source happens to look like a
+        # version token.
+        $listTableActive = $true
+        $currentTableActive = $false
+        $currentColumns = $null
         continue
     }
-    $row = ConvertFrom-WmtScoopStatusLine -Line $line -Format $format
-    if (-not $row) { continue }
+    if ($expectCurrentSeparator -and $trimmedLine -match '^-{2,}') {
+        $currentColumns = Get-WmtScoopStatusTableColumns -SeparatorLine $trimmedLine
+        $expectCurrentSeparator = $false
+        continue
+    }
+    if ($currentTableActive) {
+        $row = ConvertFrom-WmtScoopCurrentStatusRow -Line $line -Columns $currentColumns
+        if (-not $row) { continue }
+    }
+    else {
+        if ($listTableActive) { continue }
+        # Headerless current rows are accepted for compatibility, while the
+        # historical arrow rows remain the only supported legacy update form.
+        $row = ConvertFrom-WmtScoopStatusLine -Line $line -Format "Auto"
+        if (-not $row) { continue }
+    }
     if ($IgnoreList -contains $row.Name) { continue }
     [PSCustomObject]@{ Source = "scoop"; Name = $row.Name; Id = $row.Name; Version = $row.Version; Available = $row.Available }
+}
+}
+
+# Provider workers use a typed status object so the aggregate scan can report
+# an incomplete result instead of treating a failed provider as "up to date".
+function New-WmtProviderScanStatus {
+param(
+    [string]$Provider,
+    [bool]$Success,
+    [string]$Message = ""
+)
+[PSCustomObject]@{
+    WmtStateType = "ProviderScanStatus"
+    Provider     = ([string]$Provider).Trim()
+    Success      = [bool]$Success
+    Message      = ([string]$Message).Trim()
+}
+}
+
+# Build the user-visible outcome of a package scan. A provider failure makes
+# the scan incomplete and suppresses automatic installation because the list
+# cannot be trusted as complete.
+function Get-WmtUpdateScanCompletion {
+param(
+    [int]$UpdateCount = 0,
+    $ProviderFailures = $null
+)
+$failedProviders = [System.Collections.Generic.List[string]]::new()
+try {
+    if ($ProviderFailures -is [System.Collections.IDictionary]) {
+        foreach ($provider in @($ProviderFailures.Keys)) {
+            $providerText = ([string]$provider).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($providerText)) { [void]$failedProviders.Add($providerText) }
+        }
+    }
+    elseif ($null -ne $ProviderFailures) {
+        foreach ($provider in @($ProviderFailures)) {
+            $providerText = ([string]$provider).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($providerText)) { [void]$failedProviders.Add($providerText) }
+        }
+    }
+}
+catch {}
+$failedProviders = @($failedProviders | Sort-Object -Unique)
+if ($failedProviders.Count -gt 0) {
+    $providerText = $failedProviders -join ', '
+    $noun = if ($failedProviders.Count -eq 1) { "provider" } else { "providers" }
+    $message = if ($UpdateCount -gt 0) {
+        "Scan incomplete. Found $UpdateCount update(s), but $noun failed: $providerText."
+    }
+    else {
+        "Scan incomplete. $noun failed: $providerText."
+    }
+    return [PSCustomObject]@{
+        IsComplete        = $false
+        StatusText        = "Scan incomplete - provider error"
+        LogMessage        = $message
+        AutoInstallAllowed = $false
+        FailedProviders   = $failedProviders
+    }
+}
+$message = if ($UpdateCount -gt 0) { "Scan Complete. Found $UpdateCount updates." } else { "System is up to date." }
+return [PSCustomObject]@{
+    IsComplete        = $true
+    StatusText        = ""
+    LogMessage        = $message
+    AutoInstallAllowed = $true
+    FailedProviders   = @()
 }
 }
 
@@ -3882,7 +4055,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -53435,6 +53608,7 @@ $script:ScanTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:ScanTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 # We now use a LIST of active scanners instead of just one
 $script:ActiveScans = [System.Collections.ArrayList]::new()
+$script:WmtScanProviderFailures = @{}
 
 function Start-WmtActiveScanWorker {
 param(
@@ -53513,6 +53687,17 @@ $script:ScanTimer.Add_Tick({
                                 catch {}
                             }
                         }
+                        elseif ($item.PSObject.Properties["WmtStateType"] -and
+                            ([string]$item.WmtStateType) -eq "ProviderScanStatus") {
+                            $providerName = ([string]$item.Provider).Trim()
+                            $providerSucceeded = $false
+                            try { $providerSucceeded = [bool]$item.Success } catch {}
+                            if (-not [string]::IsNullOrWhiteSpace($providerName) -and -not $providerSucceeded) {
+                                $providerMessage = ([string]$item.Message).Trim()
+                                if ([string]::IsNullOrWhiteSpace($providerMessage)) { $providerMessage = "Provider scan failed." }
+                                $script:WmtScanProviderFailures[$providerName] = $providerMessage
+                            }
+                        }
                         elseif ($item -is [string] -and $item -match "^STATE:WINDOWS_UPDATE_REBOOT_REQUIRED:(\d+)$") {
                             $script:WmtWindowsUpdateRebootPendingCount = [Math]::Max(
                                 [int]$script:WmtWindowsUpdateRebootPendingCount,
@@ -53537,7 +53722,13 @@ $script:ScanTimer.Add_Tick({
                     }
                 }
                 catch {
-                    Write-GuiLog "Scan Error: $($_.Exception.Message)"
+                    $scanErrorMessage = $_.Exception.Message
+                    Write-GuiLog "Scan Error: $scanErrorMessage"
+                    $failedProvider = ""
+                    try { if ($task.PSObject.Properties["Name"]) { $failedProvider = ([string]$task.Name).Trim().ToLowerInvariant() } } catch {}
+                    if (-not [string]::IsNullOrWhiteSpace($failedProvider) -and $failedProvider -ne "provider scan") {
+                        $script:WmtScanProviderFailures[$failedProvider] = $scanErrorMessage
+                    }
                     try { $task.PowerShell.Dispose() } catch {}
                 }
 
@@ -53560,13 +53751,6 @@ $script:ScanTimer.Add_Tick({
             }
 
             $rebootPendingCount = [Math]::Max(0, [int]$script:WmtWindowsUpdateRebootPendingCount)
-            if ($rebootPendingCount -gt 0) {
-                $lblWingetStatus.Text = "Restart required - $rebootPendingCount Windows update(s) waiting"
-                $lblWingetStatus.Visibility = "Visible"
-            }
-            else {
-                $lblWingetStatus.Visibility = "Hidden"
-            }
             if ($pbWingetProgress) { $pbWingetProgress.Visibility = "Collapsed"; $pbWingetProgress.Value = 0 }
             if ($lblWingetProgress) { $lblWingetProgress.Visibility = "Collapsed"; $lblWingetProgress.Text = "" }
             $btnWingetScan.IsEnabled = $true
@@ -53611,21 +53795,43 @@ $script:ScanTimer.Add_Tick({
             $lstWinget.Items.Refresh()
             $lstWinget.UpdateLayout()
 
-            if ($lstWinget.Items.Count -eq 0) {
+            $scanCompletion = Get-WmtUpdateScanCompletion -UpdateCount $lstWinget.Items.Count -ProviderFailures $script:WmtScanProviderFailures
+            if (-not $scanCompletion.IsComplete) {
+                $lblWingetStatus.Text = $scanCompletion.StatusText
+                $lblWingetStatus.Visibility = "Visible"
+            }
+            elseif ($rebootPendingCount -gt 0) {
+                $lblWingetStatus.Text = "Restart required - $rebootPendingCount Windows update(s) waiting"
+                $lblWingetStatus.Visibility = "Visible"
+            }
+            else {
+                $lblWingetStatus.Visibility = "Hidden"
+            }
+
+            if (-not $scanCompletion.IsComplete) {
+                Write-GuiLog $scanCompletion.LogMessage
+                if ($rebootPendingCount -gt 0) {
+                    Write-GuiLog "Restart required for $rebootPendingCount installed Windows update(s)."
+                }
+            }
+            elseif ($lstWinget.Items.Count -eq 0) {
                 if ($rebootPendingCount -gt 0) {
                     Write-GuiLog "No actionable updates found. Restart Windows to finish $rebootPendingCount installed update(s)."
                 }
                 else {
-                    Write-GuiLog "System is up to date."
+                    Write-GuiLog $scanCompletion.LogMessage
                 }
             }
             else {
-                Write-GuiLog "Scan Complete. Found $($lstWinget.Items.Count) updates."
+                Write-GuiLog $scanCompletion.LogMessage
             }
 
             if ($script:WmtAutoInstallSuppressNextScan) {
                 $script:WmtAutoInstallSuppressNextScan = $false
                 Write-GuiLog "Auto install skipped for this verification scan."
+            }
+            elseif (-not $scanCompletion.AutoInstallAllowed) {
+                Write-GuiLog "Auto install skipped because one or more package providers failed."
             }
             else {
                 Invoke-WmtAutoInstallAvailableUpdates
@@ -53881,6 +54087,7 @@ $btnWingetScan.Add_Click({
 
     # --- Reset scan tracking ---
     $script:ActiveScans.Clear()
+    $script:WmtScanProviderFailures = @{}
     $script:ScanCancelled = $false
     $script:WmtDeferredWingetScan = $null
     $script:WmtDeferredWingetScanPending = $false
@@ -54160,7 +54367,7 @@ $btnWingetScan.Add_Click({
                     $items = New-Object System.Collections.Generic.List[object]
                     if ([string]::IsNullOrWhiteSpace($OutputText)) { return $items.ToArray() }
 
-                    $cleanText = [regex]::Replace($OutputText, "`e\[[0-?]*[ -/]*[@-~]", "")
+                    $cleanText = [regex]::Replace($OutputText, "\x1B\[[0-?]*[ -/]*[@-~]", "")
                     $headers = $null
                     $vertical = [string][char]0x2502
                     $lines = $cleanText -split "`r?`n"
@@ -54644,7 +54851,7 @@ $btnWingetScan.Add_Click({
     if ("scoop" -in $enabled) {
         $ps = New-WmtPooledPowerShell
         [void]$ps.AddScript({
-                param($IgnoreList)
+                param($IgnoreList, [int]$TimeoutMs = 30000)
                 Write-Output "LOG:Scanning Scoop..."
                 $p = $null
                 try {
@@ -54658,9 +54865,10 @@ $btnWingetScan.Add_Click({
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
                     $errTask = $p.StandardError.ReadToEndAsync()
-                    if (-not $p.WaitForExit(30000)) {
+                    if (-not $p.WaitForExit($TimeoutMs)) {
                         try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
                         Write-Output "LOG:Scoop scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "scoop" -Success $false -Message "Scoop scan timed out.")
                         return
                     }
                     $out = $outTask.GetAwaiter().GetResult()
@@ -54671,14 +54879,20 @@ $btnWingetScan.Add_Click({
                     if ($exitCode -ne 0) {
                         $detail = if ([string]::IsNullOrWhiteSpace($err)) { "exit code $exitCode" } else { $err.Trim() }
                         Write-Output "LOG:Scoop check failed: $detail"
+                        Write-Output (New-WmtProviderScanStatus -Provider "scoop" -Success $false -Message $detail)
                         return
                     }
                     ConvertFrom-WmtScoopStatus -Output $out -IgnoreList $IgnoreList
                 }
-                catch { Write-Output "LOG:Scoop check failed." }
+                catch {
+                    $detail = $_.Exception.Message
+                    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "Scoop scan failed." }
+                    Write-Output "LOG:Scoop check failed: $detail"
+                    Write-Output (New-WmtProviderScanStatus -Provider "scoop" -Success $false -Message $detail)
+                }
                 finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+        [void](Start-WmtActiveScanWorker -PowerShell $ps -Name "scoop")
     }
 
     # F. RUBY GEMS WORKER (unchanged)

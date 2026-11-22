@@ -688,7 +688,16 @@ jobs:
               $background -notmatch '\$unknown\[\$button\]') {
               throw 'Optional-feature scan does not recognize pending states defensively.'
           }
-          foreach ($helperName in @('Get-WmtCapabilityStateInfo', 'Get-WmtOptionalFeatureStateInfo', 'ConvertFrom-WmtScoopStatusLine', 'ConvertFrom-WmtScoopStatus')) {
+          foreach ($helperName in @(
+              'Get-WmtCapabilityStateInfo',
+              'Get-WmtOptionalFeatureStateInfo',
+              'Test-WmtScoopVersionText',
+              'Get-WmtScoopStatusTableColumns',
+              'ConvertFrom-WmtScoopCurrentStatusRow',
+              'ConvertFrom-WmtScoopStatusLine',
+              'ConvertFrom-WmtScoopStatus',
+              'New-WmtProviderScanStatus'
+          )) {
               if ($source -notmatch [regex]::Escape('"' + $helperName + '"')) {
                   throw "Shared helper is not registered for pooled workers: $helperName"
               }
@@ -1865,8 +1874,17 @@ jobs:
               if (-not $node) { throw "Missing function: $name" }
               return $node.Extent.Text
           }
-          Invoke-Expression (Find-FunctionText 'ConvertFrom-WmtScoopStatusLine')
-          Invoke-Expression (Find-FunctionText 'ConvertFrom-WmtScoopStatus')
+          foreach ($helperName in @(
+              'Test-WmtScoopVersionText',
+              'Get-WmtScoopStatusTableColumns',
+              'ConvertFrom-WmtScoopCurrentStatusRow',
+              'ConvertFrom-WmtScoopStatusLine',
+              'ConvertFrom-WmtScoopStatus',
+              'New-WmtProviderScanStatus',
+              'Get-WmtUpdateScanCompletion'
+          )) {
+              Invoke-Expression (Find-FunctionText $helperName)
+          }
           $ignored = @(
               '',
               '   ',
@@ -1879,13 +1897,19 @@ jobs:
               'WARNING  Another diagnostic line.',
               'ERROR  Broken manifest.',
               'INFO main bucket is stale',
-              'Bucket main is out of date'
+              'Bucket main is out of date',
+              'Updates are available for:'
           )
           foreach ($line in $ignored) {
               $row = ConvertFrom-WmtScoopStatusLine -Line $line
               if ($row) {
                   throw "A Scoop status line was parsed as a package: '$line'."
               }
+          }
+          $ansiWarning = ([string][char]27) + '[31mWARN  Scoop bucket(s) out of date.' + ([string][char]27) + '[0m'
+          $row = ConvertFrom-WmtScoopStatusLine -Line $ansiWarning
+          if ($row) {
+              throw 'An ANSI-colored Scoop diagnostic was parsed as a package.'
           }
           $row = ConvertFrom-WmtScoopStatusLine -Line '7zip 23.01 24.08'
           if (-not $row -or $row.Name -ne '7zip' -or $row.Version -ne '23.01' -or $row.Available -ne '24.08') {
@@ -1894,6 +1918,14 @@ jobs:
           $row = ConvertFrom-WmtScoopStatusLine -Line '  git 2.46.0 2.47.0  '
           if (-not $row -or $row.Name -ne 'git' -or $row.Version -ne '2.46.0' -or $row.Available -ne '2.47.0') {
               throw 'A trimmed Scoop package row was not parsed correctly.'
+          }
+          $row = ConvertFrom-WmtScoopStatusLine -Line '7zip: 19.00 -> 19.01'
+          if (-not $row -or $row.Name -ne '7zip' -or $row.Version -ne '19.00' -or $row.Available -ne '19.01') {
+              throw 'A legacy Scoop arrow update was not parsed correctly.'
+          }
+          $row = ConvertFrom-WmtScoopStatusLine -Line 'git 2.46.0 main'
+          if ($row) {
+              throw 'A scoop list Name/Version/Source row was mistaken for an update.'
           }
           # Execute the production output-to-row conversion with the current
           # Scoop table shape and its diagnostic/success messages.
@@ -1904,12 +1936,18 @@ jobs:
           ----                -------------- ------------- -------------------- --------------
           7zip                23.01           24.08
           git                 2.46.0          2.47.0
+          broken              1.0                          dep
+          missinglatest       2.0                          python3
           '@
+          $rows = @(ConvertFrom-WmtScoopStatus -Output '7zip 23.01 24.08')
+          if ($rows.Count -ne 1 -or $rows[0].Name -ne '7zip' -or $rows[0].Available -ne '24.08') {
+              throw 'The production Scoop conversion lost a compatible headerless current row.'
+          }
           $rows = @(ConvertFrom-WmtScoopStatus -Output $scoopOutput)
           if ($rows.Count -ne 2 -or $rows[0].Source -ne 'scoop' -or
               $rows[0].Name -ne '7zip' -or $rows[0].Version -ne '23.01' -or
               $rows[0].Available -ne '24.08' -or $rows[1].Name -ne 'git') {
-              throw 'The production Scoop conversion included diagnostics or lost package rows.'
+              throw 'The production Scoop conversion included diagnostics, lost rows, or invented a missing-dependency update.'
           }
           $rows = @(ConvertFrom-WmtScoopStatus -Output $scoopOutput -IgnoreList @('7zip'))
           if ($rows.Count -ne 1 -or $rows[0].Name -ne 'git') {
@@ -1919,17 +1957,43 @@ jobs:
           if ($rows.Count -ne 0) {
               throw 'The production Scoop conversion treated the success message as an update.'
           }
-          # Legacy Scoop releases used Name/Version/Source and could report a
-          # custom bucket. The format-aware converter must retain that row.
+          # Scoop releases before v0.2 emitted update rows as "name: old -> new".
           $legacyOutput = @'
+          Updates are available for:
+              7zip: 19.00 -> 19.01
+              git: 2.46.0 -> 2.47.0
+          '@
+          $rows = @(ConvertFrom-WmtScoopStatus -Output $legacyOutput)
+          if ($rows.Count -ne 2 -or $rows[0].Name -ne '7zip' -or
+              $rows[0].Version -ne '19.00' -or $rows[0].Available -ne '19.01' -or
+              $rows[1].Name -ne 'git') {
+              throw 'The production Scoop conversion lost a legacy arrow update.'
+          }
+          # `scoop list` reports installed packages, not available updates.
+          $installedListOutput = @'
           Name                Version            Source            Updated                 Info
           ----                ------            ------            ------                 ----
           git                 2.46.0             custom            2026-11-20 12:00:00
+          nightly-tool        1.0                nightly           2026-11-20 12:00:00
           '@
-          $rows = @(ConvertFrom-WmtScoopStatus -Output $legacyOutput)
-          if ($rows.Count -ne 1 -or $rows[0].Name -ne 'git' -or
-              $rows[0].Version -ne '2.46.0' -or $rows[0].Available -ne 'custom') {
-              throw 'The production Scoop conversion lost a legacy package row.'
+          $rows = @(ConvertFrom-WmtScoopStatus -Output $installedListOutput)
+          if ($rows.Count -ne 0) {
+              throw 'The production Scoop conversion treated scoop list output as an update.'
+          }
+
+          # A failed provider must produce an incomplete aggregate outcome and
+          # suppress automatic installation instead of reporting success.
+          $complete = Get-WmtUpdateScanCompletion -UpdateCount 0 -ProviderFailures @{}
+          if (-not $complete.IsComplete -or -not $complete.AutoInstallAllowed -or
+              $complete.LogMessage -ne 'System is up to date.') {
+              throw 'A successful package scan did not retain its complete outcome.'
+          }
+          $incomplete = Get-WmtUpdateScanCompletion -UpdateCount 3 -ProviderFailures @{ scoop = 'exit code 7' }
+          if ($incomplete.IsComplete -or $incomplete.AutoInstallAllowed -or
+              $incomplete.LogMessage -notmatch '^Scan incomplete' -or
+              $incomplete.LogMessage -match 'Scan Complete' -or
+              $incomplete.LogMessage -match 'System is up to date') {
+              throw 'A failed package provider did not make the aggregate scan incomplete.'
           }
           # The pooled scan worker must use the shared production converter.
           $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
@@ -1980,7 +2044,9 @@ jobs:
           '@ | Set-Content -LiteralPath (Join-Path $scoopFixtureDir 'scoop.cmd') -Encoding Ascii
               $workerOutput = @(& $scoopWorkerBlock @())
               $workerRows = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
-              if ($workerRows.Count -ne 0 -or
+              $workerStatuses = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($workerRows.Count -ne 0 -or $workerStatuses.Count -ne 1 -or
+                  $workerStatuses[0].Provider -ne 'scoop' -or $workerStatuses[0].Success -or
                   @($workerOutput | Where-Object { [string]$_ -match 'LOG:Scoop check failed: simulated scoop failure' }).Count -ne 1) {
                   throw 'A failed Scoop command was reported as an empty successful update scan.'
               }
@@ -1990,17 +2056,33 @@ jobs:
           '@ | Set-Content -LiteralPath (Join-Path $scoopFixtureDir 'scoop.cmd') -Encoding Ascii
               $workerOutput = @(& $scoopWorkerBlock @())
               $workerRows = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
-              if ($workerRows.Count -ne 0 -or
+              $workerStatuses = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($workerRows.Count -ne 0 -or $workerStatuses.Count -ne 1 -or
+                  $workerStatuses[0].Success -or
                   @($workerOutput | Where-Object { [string]$_ -match 'LOG:Scoop check failed: exit code 9' }).Count -ne 1) {
                   throw 'A Scoop command without stderr did not report its nonzero exit code.'
+              }
+              @'
+          @echo off
+          ping -n 6 127.0.0.1 >nul
+          exit /b 0
+          '@ | Set-Content -LiteralPath (Join-Path $scoopFixtureDir 'scoop.cmd') -Encoding Ascii
+              $workerOutput = @(& $scoopWorkerBlock @() -TimeoutMs 25)
+              $workerRows = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
+              $workerStatuses = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($workerRows.Count -ne 0 -or $workerStatuses.Count -ne 1 -or
+                  $workerStatuses[0].Success -or $workerStatuses[0].Message -notmatch 'timed out' -or
+                  @($workerOutput | Where-Object { [string]$_ -match 'LOG:Scoop scan timed out' }).Count -ne 1) {
+                  throw 'A timed-out Scoop command was not reported as an incomplete provider scan.'
               }
           }
           finally {
               $env:PATH = $oldScoopPath
               Remove-Item -LiteralPath $scoopFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
           }
-          Write-Host 'PASS: current and legacy Scoop output produce only real package update rows.'
-          Write-Host 'PASS: the production Scoop worker surfaces command failures without inventing update rows.'
+          Write-Host 'PASS: current and legacy arrow Scoop output produce only real package update rows.'
+          Write-Host 'PASS: missing dependencies and scoop list rows never fabricate package updates.'
+          Write-Host 'PASS: the production Scoop worker surfaces command failures and timeouts as incomplete scans.'
 
       - name: Smoke test model-ID driver supersedence
         shell: powershell
@@ -5338,8 +5420,12 @@ jobs:
               'ConvertTo-Int',
               'Get-WmtCapabilityStateInfo',
               'Get-WmtOptionalFeatureStateInfo',
+              'Test-WmtScoopVersionText',
+              'Get-WmtScoopStatusTableColumns',
+              'ConvertFrom-WmtScoopCurrentStatusRow',
               'ConvertFrom-WmtScoopStatusLine',
-              'ConvertFrom-WmtScoopStatus'
+              'ConvertFrom-WmtScoopStatus',
+              'New-WmtProviderScanStatus'
           )
           foreach ($helperName in $requiredPoolHelpers) {
               $helperAst = $ast.Find({
@@ -5389,7 +5475,35 @@ jobs:
               # workers, so all of their shared helpers must be registered there.
               $helperPs = [PowerShell]::Create()
               $helperPs.RunspacePool = $pool
-              [void]$helperPs.AddScript('$capability = Get-WmtCapabilityStateInfo -State "InstallPending"; $feature = Get-WmtOptionalFeatureStateInfo -State "EnablePending"; $row = ConvertFrom-WmtScoopStatusLine -Line "WARN  Scoop bucket(s) out of date."; $rows = @(ConvertFrom-WmtScoopStatus -Output "7zip 23.01 24.08"); [pscustomobject]@{ Integer = ConvertTo-Int "42" 0; CapabilityPending = $capability.Pending; CapabilityAction = $capability.Action; FeaturePending = $feature.Pending; FeatureAction = $feature.Action; ScoopRow = [bool]$row; ScoopRows = $rows.Count; ScoopName = $rows[0].Name }')
+              $sharedScanHelperScript = @'
+          $capability = Get-WmtCapabilityStateInfo -State "InstallPending"
+          $feature = Get-WmtOptionalFeatureStateInfo -State "EnablePending"
+          $row = ConvertFrom-WmtScoopStatusLine -Line "WARN  Scoop bucket(s) out of date."
+          $rows = @(ConvertFrom-WmtScoopStatus -Output "7zip 23.01 24.08")
+          $tableOutput = @"
+          Name                Installed Version Latest Version Missing Dependencies Info
+          ----                -------------- ------------- -------------------- --------------
+          7zip                23.01           24.08
+          broken              1.0                          dep
+          "@
+          $tableRows = @(ConvertFrom-WmtScoopStatus -Output $tableOutput)
+          $providerStatus = New-WmtProviderScanStatus -Provider "scoop" -Success $false -Message "exit code 7"
+          [pscustomobject]@{
+              Integer = ConvertTo-Int "42" 0
+              CapabilityPending = $capability.Pending
+              CapabilityAction = $capability.Action
+              FeaturePending = $feature.Pending
+              FeatureAction = $feature.Action
+              ScoopRow = [bool]$row
+              ScoopRows = $rows.Count
+              ScoopName = $rows[0].Name
+              ScoopTableRows = $tableRows.Count
+              ScoopTableName = $tableRows[0].Name
+              ProviderStatusType = $providerStatus.WmtStateType
+              ProviderStatusSuccess = $providerStatus.Success
+          }
+          '@
+              [void]$helperPs.AddScript($sharedScanHelperScript)
               $helperResult = @($helperPs.Invoke())
               if ($helperPs.HadErrors) {
                   $helperErrors = @($helperPs.Streams.Error | ForEach-Object { $_.ToString() }) -join "; "
@@ -5401,10 +5515,14 @@ jobs:
                   $helperResult[0].FeaturePending -ne 'EnablePending' -or
                   $helperResult[0].FeatureAction -ne 'Disable' -or
                   $helperResult[0].ScoopRow -or $helperResult[0].ScoopRows -ne 1 -or
-                  $helperResult[0].ScoopName -ne '7zip') {
+                  $helperResult[0].ScoopName -ne '7zip' -or
+                  $helperResult[0].ScoopTableRows -ne 1 -or
+                  $helperResult[0].ScoopTableName -ne '7zip' -or
+                  $helperResult[0].ProviderStatusType -ne 'ProviderScanStatus' -or
+                  $helperResult[0].ProviderStatusSuccess) {
                   throw "Shared scan helper runspace smoke test returned unexpected output: $($helperResult -join ', ')"
               }
-              Write-Host "OK: shared conversion, servicing-state, and Scoop helpers execute inside the pooled InitialSessionState."
+              Write-Host "OK: shared conversion, servicing-state, Scoop-table, and provider-status helpers execute inside the pooled InitialSessionState."
           }
           finally {
               try { if ($helperPs) { $helperPs.Dispose() } } catch {}
