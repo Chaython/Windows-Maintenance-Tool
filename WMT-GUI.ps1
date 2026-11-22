@@ -3167,6 +3167,44 @@ return [PSCustomObject]@{
 }
 }
 
+function Get-WmtUpdateScanAutoInstallDecision {
+# Decide what the scan-completion path should do after an update scan. Provider
+# failures are relevant only when automatic installation is actually enabled;
+# otherwise they belong solely to the incomplete-scan diagnostic.
+param(
+    $ScanCompletion,
+    [bool]$AutoInstallEnabled = $false,
+    [bool]$SuppressNextScan = $false
+)
+
+if (-not $AutoInstallEnabled) {
+    return [PSCustomObject]@{
+        ShouldInvoke = $false
+        LogMessage   = ""
+    }
+}
+if ($SuppressNextScan) {
+    return [PSCustomObject]@{
+        ShouldInvoke = $false
+        LogMessage   = "Auto install skipped for this verification scan."
+    }
+}
+
+$autoInstallAllowed = $false
+try { $autoInstallAllowed = [bool]$ScanCompletion.AutoInstallAllowed } catch {}
+if ($autoInstallAllowed) {
+    return [PSCustomObject]@{
+        ShouldInvoke = $true
+        LogMessage   = ""
+    }
+}
+
+return [PSCustomObject]@{
+    ShouldInvoke = $false
+    LogMessage   = "Auto install skipped because one or more package providers failed."
+}
+}
+
 # ============================================================================
 # Safe external CLI text capture (OEM-encoding aware for non-English systems)
 # PowerShell 5.1 misinterprets external CLI encoding in WPF contexts, causing
@@ -54250,14 +54288,24 @@ $script:ScanTimer.Add_Tick({
                 Write-GuiLog $scanCompletion.LogMessage
             }
 
-            if ($script:WmtAutoInstallSuppressNextScan) {
-                $script:WmtAutoInstallSuppressNextScan = $false
-                Write-GuiLog "Auto install skipped for this verification scan."
+            # A provider failure only affects auto install when auto install is
+            # enabled. Otherwise the incomplete-scan diagnostic is sufficient,
+            # and an auto-install skip message would be misleading.
+            $autoInstallEnabled = $false
+            try {
+                $autoInstallEnabled = [bool](Test-WmtAnyProviderAutoUpdateEnabled -Settings (Get-WmtSettings))
             }
-            elseif (-not $scanCompletion.AutoInstallAllowed) {
-                Write-GuiLog "Auto install skipped because one or more package providers failed."
+            catch {}
+            $suppressNextAutoInstallScan = [bool]$script:WmtAutoInstallSuppressNextScan
+            $script:WmtAutoInstallSuppressNextScan = $false
+            $autoInstallDecision = Get-WmtUpdateScanAutoInstallDecision `
+                -ScanCompletion $scanCompletion `
+                -AutoInstallEnabled $autoInstallEnabled `
+                -SuppressNextScan $suppressNextAutoInstallScan
+            if (-not [string]::IsNullOrWhiteSpace([string]$autoInstallDecision.LogMessage)) {
+                Write-GuiLog ([string]$autoInstallDecision.LogMessage)
             }
-            else {
+            if ([bool]$autoInstallDecision.ShouldInvoke) {
                 Invoke-WmtAutoInstallAvailableUpdates
             }
         }
@@ -56547,14 +56595,17 @@ $btnWingetUnignore.Add_Click({
 <Grid Margin="16">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <TextBlock Text="Select packages to restore" Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,10"/>
-    <ListBox Name="lbIgnored" Grid.Row="1" SelectionMode="Extended" DisplayMemberPath="DisplayName"/>
+    <ListBox Name="lbIgnored" Grid.Row="1" SelectionMode="Extended" DisplayMemberPath="DisplayName"
+             ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto"/>
     <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
         <Button Name="btnRestore" Content="Un-ignore Selected" MinWidth="142" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
         <Button Name="btnClose" Content="Close" Width="92" IsCancel="True"/>
     </StackPanel>
 </Grid>
 "@
-    $dialog = New-WmtWindowFromXaml -Title "Manage Ignored Updates" -ContentXaml $content -Width 520 -Height 420 -MinWidth 440 -MinHeight 340
+    # Package display names can include long Windows Update titles and GUIDs.
+    # Give the list enough room to show them without truncating the useful part.
+    $dialog = New-WmtWindowFromXaml -Title "Manage Ignored Updates" -ContentXaml $content -Width 1200 -Height 420 -MinWidth 800 -MinHeight 340
     $lb = $dialog.FindName("lbIgnored")
     $btnRestore = $dialog.FindName("btnRestore")
     $btnClose = $dialog.FindName("btnClose")

@@ -1987,7 +1987,18 @@ jobs:
               'ConvertFrom-WmtScoopStatusLine',
               'ConvertFrom-WmtScoopStatus',
               'New-WmtProviderScanStatus',
-              'Get-WmtUpdateScanCompletion'
+              'Test-WmtSettingsMember',
+              'Get-WmtSettingsMember',
+              'Get-WmtProviderCapabilities',
+              'Get-WmtProviderToggleDefaults',
+              'Get-WmtProviderToggles',
+              'Get-WmtProviderToggle',
+              'Get-WmtProviderToggleOverride',
+              'Get-WmtUpdateAutoInstallEnabled',
+              'Get-WmtEffectiveProviderAutoUpdate',
+              'Test-WmtAnyProviderAutoUpdateEnabled',
+              'Get-WmtUpdateScanCompletion',
+              'Get-WmtUpdateScanAutoInstallDecision'
           )) {
               Invoke-Expression (Find-FunctionText $helperName)
           }
@@ -2100,6 +2111,67 @@ jobs:
               $incomplete.LogMessage -match 'Scan Complete' -or
               $incomplete.LogMessage -match 'System is up to date') {
               throw 'A failed package provider did not make the aggregate scan incomplete.'
+          }
+
+          # Exercise the production auto-update setting resolver with the
+          # global switch off. This is the value used by the scan-completion
+          # gate to decide whether an auto-install message is meaningful.
+          $script:ciAutoInstallSettings = [pscustomobject]@{
+              EnabledProviders = @('winget')
+              UpdateAutoInstallEnabled = $false
+              ProviderToggles = [pscustomobject]@{
+                  winget = [pscustomobject]@{ Search = $true; Scan = $true; Logs = $true }
+              }
+              ProviderExecutionOverrides = [pscustomobject]@{}
+          }
+          function Get-WmtSettings { return $script:ciAutoInstallSettings }
+          function Write-GuiLog { param($Message) }
+          if (Test-WmtAnyProviderAutoUpdateEnabled -Settings $script:ciAutoInstallSettings) {
+              throw 'The production resolver enabled auto install while the global switch was off.'
+          }
+          $script:ciAutoInstallSettings.UpdateAutoInstallEnabled = $true
+          if (-not (Test-WmtAnyProviderAutoUpdateEnabled -Settings $script:ciAutoInstallSettings)) {
+              throw 'The production resolver did not enable auto install when the global switch was on.'
+          }
+          $script:ciAutoInstallSettings.UpdateAutoInstallEnabled = $false
+          $script:ciAutoInstallSettings.ProviderExecutionOverrides = [pscustomobject]@{
+              winget = [pscustomobject]@{ AutoUpdate = $true }
+          }
+          if (-not (Test-WmtAnyProviderAutoUpdateEnabled -Settings $script:ciAutoInstallSettings)) {
+              throw 'The production resolver ignored an explicit per-provider auto-update override.'
+          }
+
+          # Provider failures must not produce an auto-install skip diagnostic
+          # when automatic installation is disabled. The incomplete-scan
+          # diagnostic remains visible, but there is nothing to skip.
+          $disabledDecision = Get-WmtUpdateScanAutoInstallDecision `
+              -ScanCompletion $incomplete `
+              -AutoInstallEnabled $false
+          if ($disabledDecision.ShouldInvoke -or
+              -not [string]::IsNullOrWhiteSpace([string]$disabledDecision.LogMessage)) {
+              throw 'A provider failure reported an auto-install skip while auto install was disabled.'
+          }
+          $enabledFailureDecision = Get-WmtUpdateScanAutoInstallDecision `
+              -ScanCompletion $incomplete `
+              -AutoInstallEnabled $true
+          if ($enabledFailureDecision.ShouldInvoke -or
+              $enabledFailureDecision.LogMessage -ne 'Auto install skipped because one or more package providers failed.') {
+              throw 'An enabled auto install did not report the provider failure that blocked it.'
+          }
+          $enabledCompleteDecision = Get-WmtUpdateScanAutoInstallDecision `
+              -ScanCompletion $complete `
+              -AutoInstallEnabled $true
+          if (-not $enabledCompleteDecision.ShouldInvoke -or
+              -not [string]::IsNullOrWhiteSpace([string]$enabledCompleteDecision.LogMessage)) {
+              throw 'A complete scan did not invoke the enabled auto install.'
+          }
+          $verificationDecision = Get-WmtUpdateScanAutoInstallDecision `
+              -ScanCompletion $complete `
+              -AutoInstallEnabled $true `
+              -SuppressNextScan $true
+          if ($verificationDecision.ShouldInvoke -or
+              $verificationDecision.LogMessage -ne 'Auto install skipped for this verification scan.') {
+              throw 'The post-action verification scan did not suppress the enabled auto install.'
           }
           # The pooled scan worker must use the shared production converter.
           $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
@@ -4781,6 +4853,34 @@ jobs:
           )
           if ($parseErrors -and $parseErrors.Count -gt 0) {
               throw "WMT-GUI.ps1 unexpectedly failed AST parsing in ignored-package test."
+          }
+
+          # The Manage Ignored dialog must remain wide enough for long Windows
+          # Update names, and its list must retain horizontal overflow access.
+          $manageDialogCommand = $ast.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.CommandAst] -and
+                  $node.GetCommandName() -eq 'New-WmtWindowFromXaml' -and
+                  $node.Extent.Text -match 'Manage Ignored Updates'
+              }, $true)
+          if (-not $manageDialogCommand) {
+              throw 'The Manage Ignored dialog creation command was not found.'
+          }
+          $manageDialogWidthMatch = [regex]::Match($manageDialogCommand.Extent.Text, '(?i)(?:^|\s)-Width\s+([0-9.]+)')
+          $manageDialogMinWidthMatch = [regex]::Match($manageDialogCommand.Extent.Text, '(?i)(?:^|\s)-MinWidth\s+([0-9.]+)')
+          if (-not $manageDialogWidthMatch.Success -or -not $manageDialogMinWidthMatch.Success) {
+              throw 'The Manage Ignored dialog dimensions could not be verified.'
+          }
+          $manageDialogWidth = [double]$manageDialogWidthMatch.Groups[1].Value
+          $manageDialogMinWidth = [double]$manageDialogMinWidthMatch.Groups[1].Value
+          if ($manageDialogWidth -lt 1000 -or $manageDialogMinWidth -lt 700) {
+              throw "The Manage Ignored dialog is too narrow: width=$manageDialogWidth minWidth=$manageDialogMinWidth."
+          }
+          $manageDialogContextStart = [Math]::Max(0, $manageDialogCommand.Extent.StartOffset - 1600)
+          $manageDialogContextLength = [Math]::Min(1600, $source.Length - $manageDialogContextStart)
+          $manageDialogContext = $source.Substring($manageDialogContextStart, $manageDialogContextLength)
+          if ($manageDialogContext -notmatch 'ScrollViewer\.HorizontalScrollBarVisibility="Auto"') {
+              throw 'The Manage Ignored list does not allow horizontal scrolling for long package names.'
           }
 
           # Load the production compiled accelerator so this regression test
