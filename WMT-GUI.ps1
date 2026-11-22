@@ -9643,6 +9643,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Name,
     [Parameter(Mandatory = $true)][string]$Message,
     [object[]]$ListOperations = @(),
+    [object[]]$MapOperations = @(),
     [scriptblock]$OnComplete,
     [scriptblock]$OnError
 )
@@ -9653,6 +9654,7 @@ if (-not $baseline) { $baseline = Get-WmtSettings }
 $baselineJson = ConvertTo-Json -InputObject $baseline -Depth 8 -Compress
 $patchJson = ConvertTo-Json -InputObject $Patch -Depth 8 -Compress
 $listOperationsJson = ConvertTo-Json -InputObject @($ListOperations) -Depth 8 -Compress
+$mapOperationsJson = ConvertTo-Json -InputObject @($MapOperations) -Depth 8 -Compress
 $mutexName = $script:WmtSettingsWriteMutexName
 $userOnComplete = $OnComplete
 $operationId = $Name
@@ -9716,12 +9718,13 @@ $completed = {
     }
 }.GetNewClosure()
 
-$arguments = [object[]]::new(5)
+$arguments = [object[]]::new(6)
 $arguments[0] = $settingsPath
 $arguments[1] = $baselineJson
 $arguments[2] = $patchJson
 $arguments[3] = $listOperationsJson
 $arguments[4] = $mutexName
+$arguments[5] = $mapOperationsJson
 Write-GuiLog "[$operationId] Save stage: queued settings persistence operation."
 $saveError = {
     param($errorRecord)
@@ -9730,7 +9733,7 @@ $saveError = {
     if ($OnError) { & $OnError $errorRecord }
 }.GetNewClosure()
 Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments -SuppressResultLog -OnComplete $completed -OnError $saveError -Sb {
-    param([string]$Path, [string]$BaselineJson, [string]$PatchJson, [string]$ListOperationsJson, [string]$WriteMutexName)
+    param([string]$Path, [string]$BaselineJson, [string]$PatchJson, [string]$ListOperationsJson, [string]$WriteMutexName, [string]$MapOperationsJson)
 
     $mutex = $null
     $lockTaken = $false
@@ -9785,6 +9788,59 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
                 else { throw "Unsupported settings list operation '$($operation.Action)'." }
             }
             $settings | Add-Member -MemberType NoteProperty -Name ([string]$operation.Property) -Value $list.ToArray() -Force
+        }
+        $mapOperations = @(ConvertFrom-Json -InputObject $MapOperationsJson -ErrorAction Stop)
+        foreach ($operation in $mapOperations) {
+            if (-not $operation -or [string]::IsNullOrWhiteSpace([string]$operation.Property)) { continue }
+            $propertyName = ([string]$operation.Property).Trim()
+            $action = ([string]$operation.Action).Trim().ToLowerInvariant()
+            if ($action -notin @('add', 'remove')) { throw "Unsupported settings map operation '$($operation.Action)'." }
+
+            $map = [ordered]@{}
+            $existing = $settings.PSObject.Properties[$propertyName]
+            if ($existing -and $null -ne $existing.Value) {
+                $rawMap = $existing.Value
+                if ($rawMap -is [System.Collections.IDictionary]) {
+                    foreach ($key in @($rawMap.Keys)) { $map[[string]$key] = $rawMap[$key] }
+                }
+                else {
+                    foreach ($prop in @($rawMap.PSObject.Properties)) { $map[$prop.Name] = $prop.Value }
+                }
+            }
+
+            foreach ($entry in @($operation.Values)) {
+                if ($null -eq $entry) { continue }
+                $key = ""
+                $value = ""
+                try {
+                    if ($entry -is [System.Collections.IDictionary]) {
+                        if ($entry.Contains("Key")) { $key = ([string]$entry["Key"]).Trim() }
+                        if ($entry.Contains("Value")) { $value = ([string]$entry["Value"]).Trim() }
+                    }
+                    else {
+                        if ($entry.PSObject.Properties["Key"]) { $key = ([string]$entry.Key).Trim() }
+                        if ($entry.PSObject.Properties["Value"]) { $value = ([string]$entry.Value).Trim() }
+                    }
+                }
+                catch {}
+                if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+                $actualKey = $null
+                foreach ($existingKey in @($map.Keys)) {
+                    if ([string]::Equals([string]$existingKey, $key, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $actualKey = [string]$existingKey
+                        break
+                    }
+                }
+                if ($action -eq 'add') {
+                    if ($null -eq $actualKey) { $actualKey = $key }
+                    $map[$actualKey] = $value
+                }
+                elseif ($null -ne $actualKey) {
+                    [void]$map.Remove($actualKey)
+                }
+            }
+            $settings | Add-Member -MemberType NoteProperty -Name $propertyName -Value $map -Force
         }
         $json = ConvertTo-Json -InputObject $settings -Depth 8
         $directory = [System.IO.Path]::GetDirectoryName($Path)
@@ -10009,9 +10065,13 @@ function Get-WmtSettingsMapMember {
 # a PSCustomObject. PSCustomObject supports neither ContainsKey() nor index
 # assignment ("Unable to index into an object of type PSObject"), so any member
 # that is read or written by key has to be normalized to a hashtable.
-param($Settings, [Parameter(Mandatory = $true)][string]$Name)
+param(
+    $Settings,
+    [Parameter(Mandatory = $true)][string]$Name,
+    [object]$Default = $null
+)
 $result = [ordered]@{}
-$raw = Get-WmtSettingsMember -Settings $Settings -Name $Name -Default $null
+$raw = Get-WmtSettingsMember -Settings $Settings -Name $Name -Default $Default
 if ($null -eq $raw) { return $result }
 try {
     if ($raw -is [System.Collections.IDictionary]) {
@@ -10024,17 +10084,141 @@ catch {}
 return $result
 }
 
+function ConvertTo-WmtIgnoredPackageNameMap {
+param(
+    $Names,
+    [object[]]$IgnoredIds = @()
+)
+
+$result = [ordered]@{}
+$ignoredIdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ignoredId in @($IgnoredIds)) {
+    $idText = ([string]$ignoredId).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($idText)) { [void]$ignoredIdSet.Add($idText) }
+}
+if ($ignoredIdSet.Count -eq 0 -or $null -eq $Names -or $Names -is [string]) { return $result }
+
+$pairs = [System.Collections.Generic.List[object]]::new()
+try {
+    if ($Names -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Names.Keys)) {
+            [void]$pairs.Add([PSCustomObject]@{ Key = ([string]$key).Trim(); Value = ([string]$Names[$key]).Trim() })
+        }
+    }
+    elseif ($Names -is [System.Collections.IEnumerable]) {
+        foreach ($entry in @($Names)) {
+            if (-not $entry) { continue }
+            $key = ""
+            $value = ""
+            try {
+                if ($entry -is [System.Collections.IDictionary]) {
+                    if ($entry.Contains("Key")) { $key = ([string]$entry["Key"]).Trim() }
+                    if ($entry.Contains("Value")) { $value = ([string]$entry["Value"]).Trim() }
+                }
+                else {
+                    if ($entry.PSObject.Properties["Key"]) { $key = ([string]$entry.Key).Trim() }
+                    if ($entry.PSObject.Properties["Value"]) { $value = ([string]$entry.Value).Trim() }
+                }
+            }
+            catch {}
+            if (-not [string]::IsNullOrWhiteSpace($key)) { [void]$pairs.Add([PSCustomObject]@{ Key = $key; Value = $value }) }
+        }
+    }
+    else {
+        foreach ($prop in @($Names.PSObject.Properties)) {
+            [void]$pairs.Add([PSCustomObject]@{ Key = ([string]$prop.Name).Trim(); Value = ([string]$prop.Value).Trim() })
+        }
+    }
+}
+catch {}
+
+foreach ($pair in $pairs) {
+    $idText = ([string]$pair.Key).Trim()
+    $nameText = ([string]$pair.Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($idText) -or
+        [string]::IsNullOrWhiteSpace($nameText) -or
+        -not $ignoredIdSet.Contains($idText)) { continue }
+
+    $actualKey = $idText
+    foreach ($existingKey in @($result.Keys)) {
+        if ([string]::Equals([string]$existingKey, $idText, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $actualKey = [string]$existingKey
+            break
+        }
+    }
+    $result[$actualKey] = $nameText
+}
+return $result
+}
+
+function New-WmtIgnoredPackageNameEntries {
+param([object[]]$Items = @())
+
+$entries = [System.Collections.Generic.List[object]]::new()
+$entryById = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($item in @($Items)) {
+    if (-not $item) { continue }
+    $idText = ([string]$item.Id).Trim()
+    $nameText = ([string]$item.Name).Trim()
+    if ([string]::IsNullOrWhiteSpace($idText) -or [string]::IsNullOrWhiteSpace($nameText)) { continue }
+
+    if ($entryById.ContainsKey($idText)) {
+        $entryById[$idText].Value = $nameText
+        continue
+    }
+    $entry = [PSCustomObject]@{ Key = $idText; Value = $nameText }
+    [void]$entries.Add($entry)
+    $entryById[$idText] = $entry
+}
+return $entries.ToArray()
+}
+
+function Get-WmtIgnoredPackageListItems {
+param(
+    [object[]]$IgnoredIds = @(),
+    $Names = $null
+)
+
+$nameMap = ConvertTo-WmtIgnoredPackageNameMap -Names $Names -IgnoredIds $IgnoredIds
+$items = [System.Collections.Generic.List[object]]::new()
+$seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ignoredId in @($IgnoredIds)) {
+    $idText = ([string]$ignoredId).Trim()
+    if ([string]::IsNullOrWhiteSpace($idText) -or -not $seenIds.Add($idText)) { continue }
+
+    $nameText = ""
+    foreach ($key in @($nameMap.Keys)) {
+        if ([string]::Equals([string]$key, $idText, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $nameText = ([string]$nameMap[$key]).Trim()
+            break
+        }
+    }
+
+    $displayText = $idText
+    if (-not [string]::IsNullOrWhiteSpace($nameText) -and
+        -not [string]::Equals($nameText, $idText, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $displayText = "$nameText ($idText)"
+    }
+    [void]$items.Add([PSCustomObject]@{
+        Id          = $idText
+        Name        = $nameText
+        DisplayName = $displayText
+    })
+}
+return $items.ToArray()
+}
+
 function Copy-WmtSettings {
 param($Settings)
 if ($null -eq $Settings) { return $null }
 $copy = Copy-WmtSettingsValue -Value $Settings
-# TempCleanup and RegistryScan are persisted as JSON objects and are both read
-# (ContainsKey) and written (index assignment) by key. Normalize them back to
-# hashtables so the Cleaner and Registry Scan dialogs work after a save, not
-# just on a fresh install where the defaults are still hashtables.
+# TempCleanup, RegistryScan, and WingetIgnoreNames are persisted as JSON
+# objects and are read or written by key. Normalize them back to ordered
+# dictionaries so their consumers keep working after a save, not just on a
+# fresh install where the defaults are still hashtables.
 # This is intentionally self-contained: it must not depend on a helper that a
 # caller might not have loaded, or the invariant would be silently skipped.
-foreach ($member in @('TempCleanup', 'RegistryScan')) {
+foreach ($member in @('TempCleanup', 'RegistryScan', 'WingetIgnoreNames')) {
     try {
         if (-not (Test-WmtSettingsMember -Settings $copy -Name $member)) { continue }
         $raw = Get-WmtSettingsMember -Settings $copy -Name $member -Default $null
@@ -10086,11 +10270,15 @@ try {
         else { $windowBounds = $null }
     }
 
+    $ignoredIds = @(Get-WmtSettingsMember -Settings $Settings -Name "WingetIgnore" -Default @("228980"))
+    $ignoredNames = ConvertTo-WmtIgnoredPackageNameMap -Names (Get-WmtSettingsMapMember -Settings $Settings -Name "WingetIgnoreNames" -Default ([ordered]@{ "228980" = "Steamworks Common Redistributables" })) -IgnoredIds $ignoredIds
+
     # Convert Hashtable/OrderedDictionary to a stable explicit schema.
     $saveObj = [PSCustomObject]@{
         TempCleanup                = (Get-WmtSettingsMember -Settings $Settings -Name "TempCleanup" -Default @{})
         RegistryScan               = (Get-WmtSettingsMember -Settings $Settings -Name "RegistryScan" -Default @{})
-        WingetIgnore               = @(Get-WmtSettingsMember -Settings $Settings -Name "WingetIgnore" -Default @("228980"))
+        WingetIgnore               = $ignoredIds
+        WingetIgnoreNames          = $ignoredNames
         WingetIncludeUnknown       = [bool](Get-WmtWingetIncludeUnknown -Settings $Settings)
         HideCrossProviderDuplicates = [bool](Get-WmtSettingsMember -Settings $Settings -Name "HideCrossProviderDuplicates" -Default $false)
         CustomUpdateCommands       = @(Get-WmtCustomUpdateCommands -Settings $Settings)
@@ -10141,7 +10329,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($persistedJson)) { throw "settings.json is empty after the save operation." }
     $persistedSettings = ConvertFrom-Json -InputObject $persistedJson -ErrorAction Stop
     if ($null -eq $persistedSettings) { throw "settings.json could not be read back after the save operation." }
-    foreach ($requiredName in @('TempCleanup','CleanerAutoCleanMinutes','CleanerLocalRefreshMinutes','CleanerRemoteCheckMinutes')) {
+    foreach ($requiredName in @('TempCleanup','CleanerAutoCleanMinutes','CleanerLocalRefreshMinutes','CleanerRemoteCheckMinutes','WingetIgnoreNames')) {
         if (-not $persistedSettings.PSObject.Properties[$requiredName]) {
             throw "settings.json is missing the required '$requiredName' setting after save."
         }
@@ -10182,6 +10370,7 @@ $defaults = @{
     TempCleanup                = [ordered]@{}
     RegistryScan               = [ordered]@{}
     WingetIgnore               = @("228980") # Filter false positive updates for Steamworks Redist
+    WingetIgnoreNames          = [ordered]@{ "228980" = "Steamworks Common Redistributables" }
     WingetIncludeUnknown       = $true
     HideCrossProviderDuplicates = $false
     CustomUpdateCommands       = @()
@@ -10285,6 +10474,21 @@ if ($json) {
             if ($raw) { foreach ($item in $raw) { [void]$clean.Add("$item".Trim()) } }
             $defaults.WingetIgnore = $clean.ToArray()
         }
+        if ($json.PSObject.Properties["WingetIgnoreNames"]) {
+            $rawNames = $json.WingetIgnoreNames
+            if ($rawNames -and -not ($rawNames -is [string])) {
+                try {
+                    if ($rawNames -is [System.Collections.IDictionary]) {
+                        foreach ($key in @($rawNames.Keys)) { $defaults.WingetIgnoreNames[[string]$key] = $rawNames[$key] }
+                    }
+                    else {
+                        foreach ($prop in @($rawNames.PSObject.Properties)) { $defaults.WingetIgnoreNames[$prop.Name] = $prop.Value }
+                    }
+                }
+                catch {}
+            }
+        }
+        $defaults.WingetIgnoreNames = ConvertTo-WmtIgnoredPackageNameMap -Names $defaults.WingetIgnoreNames -IgnoredIds @($defaults.WingetIgnore)
         if ($json.PSObject.Properties["WingetIncludeUnknown"]) { $defaults.WingetIncludeUnknown = ConvertTo-WmtSettingsBoolean $json.WingetIncludeUnknown $true }
         if ($json.PSObject.Properties["HideCrossProviderDuplicates"]) { $defaults.HideCrossProviderDuplicates = ConvertTo-WmtSettingsBoolean $json.HideCrossProviderDuplicates $false }
         if ($json.PSObject.Properties["CustomUpdateCommands"]) {
@@ -55540,16 +55744,21 @@ $btnWingetIgnore.Add_Click({
 
     $msg = "Ignore $($selected.Count) package(s)?`n`nThese updates will be hidden from future scans."
     if ((Show-WmtMessageBox -Message $msg -Title "Ignore Updates" -Button YesNo -Image Question) -eq [System.Windows.MessageBoxResult]::Yes) {
-        $selectedIds = [string[]]@($selected | ForEach-Object { [string]$_.Id } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        $selectedIds = [string[]]@($selected | ForEach-Object { ([string]$_.Id).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        $selectedNameEntries = @(New-WmtIgnoredPackageNameEntries -Items $selected)
         $complete = {
             param($results)
             foreach ($item in @($selected)) {
-                if ($selectedIds -contains [string]$item.Id) { [void]$lstWinget.Items.Remove($item) }
+                if ($selectedIds -contains ([string]$item.Id).Trim()) { [void]$lstWinget.Items.Remove($item) }
             }
             $lstWinget.Items.Refresh()
         }.GetNewClosure()
         $listOperation = @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = $selectedIds })
-        Invoke-WmtSettingsPatchSave -Patch @{} -ListOperations $listOperation -Name ("WingetIgnore_" + [guid]::NewGuid().ToString("N")) -Message "Saving ignored packages..." -OnComplete $complete -OnError {
+        $mapOperations = @()
+        if ($selectedNameEntries.Count -gt 0) {
+            $mapOperations = @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = $selectedNameEntries })
+        }
+        Invoke-WmtSettingsPatchSave -Patch @{} -ListOperations $listOperation -MapOperations $mapOperations -Name ("WingetIgnore_" + [guid]::NewGuid().ToString("N")) -Message "Saving ignored packages..." -OnComplete $complete -OnError {
             param($errorRecord)
             $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
             Show-WmtMessageBox -Message "Could not save ignored packages:`n$message" -Title "Ignore Updates" -Image Error | Out-Null
@@ -55584,10 +55793,25 @@ function Set-WmtWingetUnignoreUiSaveCompleted {
     $state['RefreshNeeded'] = $true
     try {
         $targetList = $state['ListBox']
-        foreach ($item in @($state['SelectedIds'])) {
-            if ($targetList) { [void]$targetList.Items.Remove([string]$item) }
+        $selectedIdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($selectedId in @($state['SelectedIds'])) {
+            $idText = ([string]$selectedId).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($idText)) { [void]$selectedIdSet.Add($idText) }
         }
-        if ($targetList) { try { $targetList.Items.Refresh() } catch {} }
+        if ($targetList) {
+            foreach ($targetItem in @($targetList.Items)) {
+                $targetId = ""
+                try {
+                    if ($targetItem -and $targetItem.PSObject.Properties["Id"]) { $targetId = ([string]$targetItem.Id).Trim() }
+                    else { $targetId = ([string]$targetItem).Trim() }
+                }
+                catch {}
+                if (-not [string]::IsNullOrWhiteSpace($targetId) -and $selectedIdSet.Contains($targetId)) {
+                    [void]$targetList.Items.Remove($targetItem)
+                }
+            }
+            try { $targetList.Items.Refresh() } catch {}
+        }
         $restoreButton = $state['RestoreButton']
         if ($restoreButton -and $targetList) { $restoreButton.IsEnabled = ($targetList.Items.Count -gt 0) }
     }
@@ -55628,7 +55852,7 @@ $btnWingetUnignore.Add_Click({
 <Grid Margin="16">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <TextBlock Text="Select packages to restore" Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,10"/>
-    <ListBox Name="lbIgnored" Grid.Row="1" SelectionMode="Extended"/>
+    <ListBox Name="lbIgnored" Grid.Row="1" SelectionMode="Extended" DisplayMemberPath="DisplayName"/>
     <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
         <Button Name="btnRestore" Content="Un-ignore Selected" MinWidth="142" Background="{DynamicResource Success}" Foreground="{DynamicResource SuccessText}" Margin="0,0,8,0"/>
         <Button Name="btnClose" Content="Close" Width="92" IsCancel="True"/>
@@ -55658,7 +55882,15 @@ $btnWingetUnignore.Add_Click({
             param($s, $e)
             $selected = @($lb.SelectedItems)
             if ($selected.Count -eq 0) { return }
-            $selectedIds = [string[]]@($selected | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+            $selectedIds = [string[]]@($selected | ForEach-Object {
+                    $selectedId = ""
+                    try {
+                        if ($_ -and $_.PSObject.Properties["Id"]) { $selectedId = ([string]$_.Id).Trim() }
+                        else { $selectedId = ([string]$_).Trim() }
+                    }
+                    catch {}
+                    $selectedId
+                } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
             $state = $unignoreUiStateStore[$stateId]
             if (-not $state) { return }
             $state['SelectedIds'] = $selectedIds
@@ -55667,17 +55899,22 @@ $btnWingetUnignore.Add_Click({
             $saved = [scriptblock]::Create("param(`$results)`nSet-WmtWingetUnignoreUiSaveCompleted -StateId '$stateId'")
             $saveFailed = [scriptblock]::Create("param(`$errorRecord)`nShow-WmtWingetUnignoreSaveError -StateId '$stateId' -ErrorRecord `$errorRecord")
             $listOperation = @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Remove'; Values = $selectedIds })
-            Invoke-WmtSettingsPatchSave -Patch @{} -ListOperations $listOperation -Name ("WingetUnignore_" + [guid]::NewGuid().ToString("N")) -Message 'Saving ignored packages...' -OnComplete $saved -OnError $saveFailed
+            $mapOperation = @([pscustomobject]@{
+                    Property = 'WingetIgnoreNames'
+                    Action = 'Remove'
+                    Values = @($selectedIds | ForEach-Object { [pscustomobject]@{ Key = $_; Value = "" } })
+                })
+            Invoke-WmtSettingsPatchSave -Patch @{} -ListOperations $listOperation -MapOperations $mapOperation -Name ("WingetUnignore_" + [guid]::NewGuid().ToString("N")) -Message 'Saving ignored packages...' -OnComplete $saved -OnError $saveFailed
         }.GetNewClosure())
     $btnClose.Add_Click({ $dialog.Close() }.GetNewClosure())
 
     $loaded = {
         param($results)
-        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['IgnoredItems'] } | Select-Object -Last 1)[0]
+        $result = @($results | Where-Object { $_ -and $_.PSObject.Properties['IgnoredIds'] } | Select-Object -Last 1)[0]
         if (-not $result) { return }
         $lb.Items.Clear()
-        $listItems = @($result.IgnoredItems)
-        foreach ($item in $listItems) { [void]$lb.Items.Add([string]$item) }
+        $listItems = @(Get-WmtIgnoredPackageListItems -IgnoredIds @($result.IgnoredIds) -Names $result.IgnoredNames)
+        foreach ($item in $listItems) { [void]$lb.Items.Add($item) }
         $btnRestore.IsEnabled = ($listItems.Count -gt 0)
         if ($listItems.Count -eq 0) {
             Show-WmtMessageBox -Message "No ignored packages found." -Title "Manage Ignored" -Image Information | Out-Null
@@ -55708,11 +55945,26 @@ $btnWingetUnignore.Add_Click({
             }
         }
         $ignored = @('228980')
+        $ignoredNames = [ordered]@{ '228980' = 'Steamworks Common Redistributables' }
         if ($settings -and $settings.PSObject.Properties['WingetIgnore']) {
             $ignored = @($settings.WingetIgnore)
         }
+        if ($settings -and $settings.PSObject.Properties['WingetIgnoreNames']) {
+            $rawNames = $settings.WingetIgnoreNames
+            if ($rawNames -and -not ($rawNames -is [string])) {
+                try {
+                    if ($rawNames -is [System.Collections.IDictionary]) {
+                        foreach ($key in @($rawNames.Keys)) { $ignoredNames[[string]$key] = $rawNames[$key] }
+                    }
+                    else {
+                        foreach ($prop in @($rawNames.PSObject.Properties)) { $ignoredNames[$prop.Name] = $prop.Value }
+                    }
+                }
+                catch {}
+            }
+        }
         $items = @($ignored | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        [pscustomobject]@{ Message = ''; IgnoredItems = $items }
+        [pscustomobject]@{ Message = ''; IgnoredIds = $items; IgnoredNames = $ignoredNames }
     } | Out-Null
     $dialog.ShowDialog() | Out-Null
 

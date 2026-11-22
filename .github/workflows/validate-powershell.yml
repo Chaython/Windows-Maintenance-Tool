@@ -4357,6 +4357,7 @@ jobs:
               "Copy-WmtSettingsValue",
               "Copy-WmtSettings",
               "Get-WmtSettingsMapMember",
+              "ConvertTo-WmtIgnoredPackageNameMap",
               "Save-WmtSettings",
               "Get-WmtSettings",
               "Get-WmtWingetIncludeUnknown",
@@ -4432,6 +4433,12 @@ jobs:
               $script:WmtSettingsCache = $null
               $script:WmtSettingsCacheStamp = $null
               $reloadedMaps = Get-WmtSettings
+              if (-not ($reloadedMaps.WingetIgnoreNames -is [System.Collections.IDictionary])) {
+                  throw "WingetIgnoreNames was not normalized to a hashtable after a save/reload."
+              }
+              if (-not $reloadedMaps.WingetIgnoreNames.Contains("228980")) {
+                  throw "The default ignored-package display name did not survive a save/reload."
+              }
               if (-not ($reloadedMaps.TempCleanup -is [System.Collections.IDictionary])) {
                   throw "TempCleanup was not normalized to a hashtable after a save/reload."
               }
@@ -4541,6 +4548,141 @@ jobs:
           finally {
               try { Remove-Item -LiteralPath $script:SettingsTestDataPath -Recurse -Force -ErrorAction SilentlyContinue } catch {}
           }
+
+
+      - name: Smoke test ignored package names and persistence
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [System.IO.File]::ReadAllText((Resolve-Path ".\WMT-GUI.ps1").Path)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+              $source,
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors -and $parseErrors.Count -gt 0) {
+              throw "WMT-GUI.ps1 unexpectedly failed AST parsing in ignored-package test."
+          }
+
+          foreach ($name in @(
+              'Get-WmtSettingsMember',
+              'Test-WmtSettingsMember',
+              'Get-WmtSettingsMapMember',
+              'ConvertTo-WmtIgnoredPackageNameMap',
+              'New-WmtIgnoredPackageNameEntries',
+              'Get-WmtIgnoredPackageListItems',
+              'Invoke-WmtSettingsPatchSave'
+          )) {
+              $fn = $ast.Find({
+                      param($node)
+                      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $node.Name -eq $name
+                  }, $true)
+              if (-not $fn) { throw "Required ignored-package function '$name' was not found." }
+              Invoke-Expression $fn.Extent.Text
+          }
+
+          function Assert-True {
+              param([bool]$Condition, [string]$Message)
+              if (-not $Condition) { throw "Assertion failed: $Message" }
+          }
+
+          # Duplicate IDs must produce one display row. Known names must be shown
+          # with the ID, while legacy entries without a persisted name must keep
+          # a safe ID-only fallback.
+          $entries = @(New-WmtIgnoredPackageNameEntries -Items @(
+              [pscustomobject]@{ Id = 'pkg.one'; Name = 'Package One' },
+              [pscustomobject]@{ Id = 'PKG.ONE'; Name = 'Package One Updated' },
+              [pscustomobject]@{ Id = 'missing.name'; Name = '' }
+          ))
+          Assert-True ($entries.Count -eq 1) 'duplicate IDs collapse to one name entry'
+          Assert-True ($entries[0].Value -eq 'Package One Updated') 'latest duplicate name wins'
+
+          $display = @(Get-WmtIgnoredPackageListItems -IgnoredIds @('pkg.one', 'pkg.one', 'legacy.id', 'unknown') -Names ([pscustomobject]@{ 'pkg.one' = 'Package One' }))
+          Assert-True ($display.Count -eq 3) 'duplicate and stale IDs are handled'
+          Assert-True ($display[0].DisplayName -eq 'Package One (pkg.one)') 'name and ID are displayed'
+          Assert-True ($display[1].DisplayName -eq 'legacy.id') 'missing name falls back to ID'
+          Assert-True ($display[2].DisplayName -eq 'unknown') 'unknown stale ID falls back to ID'
+
+          $defaultDisplay = @(Get-WmtIgnoredPackageListItems -IgnoredIds @('228980') -Names ([ordered]@{ '228980' = 'Steamworks Common Redistributables' }))
+          Assert-True ($defaultDisplay[0].DisplayName -eq 'Steamworks Common Redistributables (228980)') 'the built-in ignored package name is displayed'
+
+          # Exercise the production settings transaction. The ignored ID list
+          # and its display-name map must be written atomically, deduplicated,
+          # updated, and removed together.
+          $testBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+          $testRoot = Join-Path $testBase ('wmt-ignore-test-' + [guid]::NewGuid().ToString('N'))
+          [void][System.IO.Directory]::CreateDirectory($testRoot)
+          try {
+              $script:IgnoredTestDataPath = $testRoot
+              $script:WmtSettingsWriteMutexName = 'Local\Wmt_Ignore_CI_' + [guid]::NewGuid().ToString('N')
+              $settingsPath = Join-Path $testRoot 'settings.json'
+              $script:IgnoredTestSettings = [pscustomobject]@{
+                  WingetIgnore = @('228980')
+                  WingetIgnoreNames = [pscustomobject]@{ '228980' = 'Steamworks Common Redistributables' }
+              }
+              [System.IO.File]::WriteAllText(
+                  $settingsPath,
+                  ($script:IgnoredTestSettings | ConvertTo-Json -Depth 6),
+                  [System.Text.UTF8Encoding]::new($false)
+              )
+
+              function Get-DataPath { return $script:IgnoredTestDataPath }
+              function Get-WmtSettings { return $script:IgnoredTestSettings }
+              function Write-GuiLog { param([string]$Message) }
+              function Set-WmtSettingsCacheFromPersistedState { param($Settings, [string]$SettingsStamp) }
+              function Invoke-WmtUiBackgroundCommand {
+                  param(
+                      [string]$Name,
+                      [string]$Msg,
+                      [object[]]$ArgumentList = @(),
+                      [switch]$SuppressResultLog,
+                      [scriptblock]$OnComplete,
+                      [scriptblock]$OnError,
+                      [scriptblock]$Sb
+                  )
+                  try {
+                      $result = & $Sb @ArgumentList
+                      if ($OnComplete) { & $OnComplete @($result) }
+                  }
+                  catch {
+                      if ($OnError) { & $OnError $_ }
+                      else { throw }
+                  }
+              }
+
+              Invoke-WmtSettingsPatchSave -Patch @{ Theme = 'dark' } -Name 'unrelated-save' -Message 'test'
+              $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+              Assert-True ($saved.Theme -eq 'dark') 'settings saves without map operations still work'
+
+              Invoke-WmtSettingsPatchSave -Patch @{} -Name 'add-ignore' -Message 'test' `
+                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one', 'pkg.one') }) `
+                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = 'Package One' }) })
+              $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+              Assert-True (@($saved.WingetIgnore).Count -eq 2) 'ignore list persists IDs without duplicates'
+              Assert-True ($saved.WingetIgnoreNames.'pkg.one' -eq 'Package One') 'ignore name persists'
+
+              Invoke-WmtSettingsPatchSave -Patch @{} -Name 'update-ignore' -Message 'test' `
+                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one') }) `
+                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = 'Package One Updated' }) })
+              $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+              Assert-True (@($saved.WingetIgnore).Count -eq 2) 'duplicate add does not duplicate ignore list'
+              Assert-True ($saved.WingetIgnoreNames.'pkg.one' -eq 'Package One Updated') 'duplicate add updates name'
+
+              Invoke-WmtSettingsPatchSave -Patch @{} -Name 'remove-ignore' -Message 'test' `
+                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Remove'; Values = @('pkg.one') }) `
+                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Remove'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = '' }) })
+              $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+              Assert-True (@($saved.WingetIgnore).Count -eq 1) 'remove preserves other ignored IDs'
+              Assert-True ($null -eq $saved.WingetIgnoreNames.'pkg.one') 'remove clears the persisted name'
+          }
+          finally {
+              try { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+          Write-Host "OK: ignored package names, legacy fallbacks, and atomic persistence."
 
 
       - name: Smoke test centralized background-operation manager
