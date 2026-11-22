@@ -1084,7 +1084,8 @@ jobs:
               @{ State = 'UninstallPending'; Known = $true; Enabled = $false; Pending = 'UninstallPending'; Action = 'Install' },
               @{ State = 'Superseded'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
               @{ State = 'PartiallyInstalled'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
-              @{ State = 'SomethingNew'; Known = $false; Enabled = $false; Pending = ''; Action = '' }
+              @{ State = 'SomethingNew'; Known = $false; Enabled = $false; Pending = ''; Action = '' },
+              @{ State = ' Installed '; Known = $true; Enabled = $true; Pending = ''; Action = 'Remove' }
           )
           foreach ($case in $capabilityExpectations) {
               $info = Get-WmtCapabilityStateInfo -State $case.State
@@ -1105,7 +1106,8 @@ jobs:
               @{ State = 'Disabled with Payload Removed'; Known = $true; Enabled = $false; Pending = ''; Action = 'Enable' },
               @{ State = 'Superseded'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
               @{ State = 'PartiallyInstalled'; Known = $true; Enabled = $false; Pending = ''; Action = '' },
-              @{ State = 'SomethingNew'; Known = $false; Enabled = $false; Pending = ''; Action = '' }
+              @{ State = 'SomethingNew'; Known = $false; Enabled = $false; Pending = ''; Action = '' },
+              @{ State = ' enabled '; Known = $true; Enabled = $true; Pending = ''; Action = 'Disable' }
           )
           foreach ($case in $featureExpectations) {
               $info = Get-WmtOptionalFeatureStateInfo -State $case.State
@@ -1254,6 +1256,9 @@ jobs:
           function Get-WindowsCapability {
               [CmdletBinding()]
               param([switch]$Online, [string]$Name)
+              if ($null -ne $script:MockAllCapabilities) {
+                  return @($script:MockAllCapabilities)
+              }
               @([pscustomobject]@{ Name = $script:MockCapabilityName; State = $script:MockCapabilityState })
           }
           $featureMap = @{
@@ -1310,6 +1315,19 @@ jobs:
               $result.Unavailable.ContainsKey('btnFeatXPS')) {
               throw 'Capability fallback did not replace an unknown feature state cleanly.'
           }
+          # A capability from a provider that is not in the feature map must
+          # never create a synthetic empty-button state.
+          $script:MockAllCapabilities = @(
+              [pscustomobject]@{ Name = 'XPS.Viewer~~~~0.0.1.0'; State = 'Installed' },
+              [pscustomobject]@{ Name = 'OpenSSH.Client~~~~0.0.1.0'; State = 'Installed' }
+          )
+          $result = & $scanBlock $featureMap
+          if (-not $result -or $result.States.Count -ne 2 -or
+              $result.States.ContainsKey('') -or
+              $result.Providers.ContainsKey('')) {
+              throw 'An unmapped capability was classified into a synthetic feature state.'
+          }
+          $script:MockAllCapabilities = $null
           $script:MockIncludeXpsAsFeature = $false
           $script:MockFeatureState = 'Superseded'
           $script:MockCapabilityState = 'Installed'
@@ -1378,6 +1396,7 @@ jobs:
           $script:MockFeatureState = 'Enabled'
           $script:MockCapabilityState = 'InstallPending'
           $script:MockScanResult = @(& $scanBlock $featureMap)
+          $script:OptionalFeaturesCheckStarted = $true
           $fakeScanPs = [pscustomobject]@{}
           $fakeScanPs | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value {
               param($Invocation)
@@ -1395,6 +1414,7 @@ jobs:
           $script:OptionalFeatureUnknownCache = @{}
           & $onTick
           if (-not $script:OptionalFeaturesReady -or
+              $script:OptionalFeaturesCheckStarted -or
               $script:OptionalFeaturePendingCache['btnFeatXPS'] -ne 'InstallPending' -or
               $script:OptionalFeatureStateCache['btnFeatXPS'] -ne $true) {
               throw 'The completion callback did not publish the pending capability state.'
@@ -1433,6 +1453,10 @@ jobs:
                  Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $false }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{ 'btnFeatXPS' = 'InstallPending' }; Unknown = @{} } },
               @{ Label = 'unknown state overlaps a verified state'; Expected = 'contradictory unrecognized-state data';
                  Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{}; Unknown = @{ 'btnFeatXPS' = 'Unknown state' } } },
+              @{ Label = 'null provider'; Expected = 'invalid feature provider';
+                 Result = @{ States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $false }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = $null }; Unavailable = @{}; Pending = @{}; Unknown = @{} } },
+              @{ Label = 'string state'; Expected = 'invalid feature state';
+                 Result = @{ States = @{ 'btnFeatHyperV' = 'false'; 'btnFeatXPS' = $false }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }; 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }; Unavailable = @{}; Pending = @{}; Unknown = @{} } },
               @{ Label = 'incomplete classification'; Expected = 'features were classified';
                  Result = @{ States = @{ 'btnFeatHyperV' = $true }; Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' } }; Unavailable = @{}; Pending = @{}; Unknown = @{} } }
           )
@@ -1505,6 +1529,238 @@ jobs:
               throw 'Quick Find did not render the DisablePending outcome.'
           }
           Write-Host 'PASS: pending states reach the UI cache and render restart-aware labels.'
+
+      - name: Smoke test optional-feature retry and timeout lifecycle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors.Message -join '; ') }
+          function Find-FunctionText([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node.Extent.Text
+          }
+          function Find-FunctionAst([string]$name) {
+              $node = $ast.Find({
+                  param($n)
+                  $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+              }, $true)
+              if (-not $node) { throw "Missing function: $name" }
+              return $node
+          }
+          Invoke-Expression (Find-FunctionText 'Test-WmtOptionalFeatureScanResult')
+          Invoke-Expression (Find-FunctionText 'Merge-WmtOptionalFeatureScanResult')
+
+          # Extract the production completion and timeout callbacks rather
+          # than duplicating their state transitions in the test.
+          $scanAst = Find-FunctionAst 'Start-OptionalFeaturesBackgroundCheck'
+          $registerCall = $scanAst.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.CommandAst] -and
+                  $node.GetCommandName() -eq 'Register-WmtUiPollOperation'
+          }, $true)
+          if (-not $registerCall) { throw 'Optional-feature poll registration was not found.' }
+          $onTickIndex = -1
+          $registerElements = @($registerCall.CommandElements)
+          for ($i = 0; $i -lt $registerElements.Count; $i++) {
+              if ($registerElements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                  $registerElements[$i].ParameterName -eq 'OnTick') {
+                  $onTickIndex = $i + 1
+                  break
+              }
+          }
+          if ($onTickIndex -le 0 -or $onTickIndex -ge $registerElements.Count) {
+              throw 'Optional-feature completion callback was not found.'
+          }
+          $onTickText = $registerElements[$onTickIndex].Extent.Text
+          $onTick = [scriptblock]::Create($onTickText.Substring(1, $onTickText.Length - 2))
+          $timeoutTick = $scanAst.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                  $node.Member.Value -eq 'Add_Tick' -and
+                  $node.Extent.Text -match 'Optional-feature detection timed out'
+          }, $true)
+          if (-not $timeoutTick -or $timeoutTick.Arguments.Count -ne 1) {
+              throw 'Optional-feature timeout callback was not found.'
+          }
+          $timeoutText = $timeoutTick.Arguments[0].Extent.Text
+          $timeoutCallback = [scriptblock]::Create($timeoutText.Substring(1, $timeoutText.Length - 2))
+
+          $script:MockLogs = @()
+          $script:MockErrors = @()
+          $script:MockStopCalls = @()
+          $script:MockRetryStartCount = 0
+          function Write-GuiLog { param([string]$Message) $script:MockLogs += $Message }
+          function Show-TweakStatesLoadError { param([string]$Message) $script:MockErrors += $Message }
+          function Sync-WmtOptionalFeatureButtons { }
+          function Sync-WmtTweakOverlayHide { }
+          function Sync-WmtQuickFindStateAvailability { }
+          function Unregister-WmtUiPollOperation { param([string]$Name) }
+          function Stop-WmtPowerShellInvocationAsync {
+              param($PowerShell, $Invocation, [string]$Name)
+              $script:MockStopCalls += $Name
+          }
+          function Start-WmtPowerShellCleanupDetached {
+              param($PowerShell, $Invocation, [string]$Name)
+              $script:MockStopCalls += $Name
+          }
+
+          # A worker-pool startup failure must clear the running flag, remain
+          # fail-closed, and leave the scan retryable with an actionable error.
+          Invoke-Expression (Find-FunctionText 'Start-OptionalFeaturesBackgroundCheck')
+          function New-WmtPooledPowerShell { param([string]$PoolKind) throw 'simulated worker creation failure' }
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $false
+          $script:FeaturesPoolRetryTimer = $null
+          Start-OptionalFeaturesBackgroundCheck
+          if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              -not (@($script:MockErrors) -match 'Could not start optional-feature background worker')) {
+              throw 'Optional-feature worker startup failure did not remain fail-closed and retryable.'
+          }
+
+          # The retry handler must preserve the last verified state, provider,
+          # and pending marker while discarding stale unavailable/unknown data.
+          Invoke-Expression (Find-FunctionText 'Show-TweakStatesLoadError')
+          $script:MockRetryHandler = $null
+          $retryButton = [pscustomobject]@{ Visibility = 'Collapsed' }
+          $retryButton | Add-Member -MemberType ScriptMethod -Name Add_Click -Value {
+              param($Handler)
+              $script:MockRetryHandler = $Handler
+          }
+          function Get-Ctrl {
+              param([string]$Name)
+              if ($Name -eq 'btnTweakOverlayRetry') { return $retryButton }
+              return $null
+          }
+          function Set-TweakStatesLoadingOverlay { param([bool]$Visible, [string]$ErrorMessage = '') }
+          function Start-OptionalFeaturesBackgroundCheck { $script:MockRetryStartCount++ }
+          $script:TweakOverlayRetryWired = $false
+          $script:TweakStatesReady = $true
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $true
+          $script:WmtTweakLoadError = ''
+          $script:OptionalFeatureStateCache = @{ 'btnFeatXPS' = $false }
+          $script:OptionalFeatureProviderCache = @{
+              'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' }
+          }
+          $script:OptionalFeaturePendingCache = @{ 'btnFeatXPS' = 'DisablePending' }
+          $script:OptionalFeatureUnavailableCache = @{ 'btnFeatXPS' = 'stale unavailable reason' }
+          $script:OptionalFeatureUnknownCache = @{ 'btnFeatXPS' = 'stale unknown reason' }
+          $script:FeaturesCheckTimeout = $null
+          $script:FeaturesCheckPS = [pscustomobject]@{ OldWorker = $true }
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $false }
+          Show-TweakStatesLoadError -Message 'simulated optional-feature failure'
+          if (-not ($script:MockRetryHandler -is [scriptblock])) {
+              throw 'The optional-feature error did not wire the retry handler.'
+          }
+          & $script:MockRetryHandler
+          if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              $script:MockRetryStartCount -ne 1 -or
+              $script:OptionalFeatureStateCache['btnFeatXPS'] -ne $false -or
+              $script:OptionalFeatureProviderCache['btnFeatXPS'].Name -ne 'XPS.Viewer~~~~0.0.1.0' -or
+              $script:OptionalFeaturePendingCache['btnFeatXPS'] -ne 'DisablePending' -or
+              $script:OptionalFeatureUnavailableCache.ContainsKey('btnFeatXPS') -or
+              $script:OptionalFeatureUnknownCache.ContainsKey('btnFeatXPS') -or
+              -not (@($script:MockStopCalls) -match 'Optional features retry')) {
+              throw 'The optional-feature retry did not preserve the last verified snapshot safely.'
+          }
+
+          # A later unfamiliar state must fall back to the snapshot retained by
+          # the retry and publish a warning without becoming a false/true state.
+          $script:OptionalFeaturesMap = @{
+              'Microsoft-Hyper-V-All' = 'btnFeatHyperV'
+              'XpsViewer' = 'btnFeatXPS'
+          }
+          $script:MockRawResult = @(@{
+              States = @{ 'btnFeatHyperV' = $true }
+              Providers = @{ 'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' } }
+              Unavailable = @{}
+              Pending = @{}
+              Unknown = @{ 'btnFeatXPS' = "Unrecognized capability state 'FutureState' for XpsViewer" }
+          })
+          $fakeScanPs = [pscustomobject]@{}
+          $fakeScanPs | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value {
+              param($Invocation)
+              $result = @($script:MockRawResult)
+              Write-Output -NoEnumerate $result
+          }
+          $fakeScanPs | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+          $script:FeaturesCheckPS = $fakeScanPs
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $true }
+          $script:FeaturesCheckTimeout = $null
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $true
+          & $onTick
+          if (-not $script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              $script:OptionalFeatureStateCache['btnFeatXPS'] -ne $false -or
+              $script:OptionalFeatureProviderCache['btnFeatXPS'].Name -ne 'XPS.Viewer~~~~0.0.1.0' -or
+              $script:OptionalFeaturePendingCache['btnFeatXPS'] -ne 'DisablePending' -or
+              -not $script:OptionalFeatureUnknownCache.ContainsKey('btnFeatXPS') -or
+              -not (@($script:MockLogs) -match 'last verified state retained')) {
+              throw 'An unknown state after retry did not retain and warn about the last verified snapshot.'
+          }
+
+          # A malformed completion result must fail closed and clear the
+          # running flag so the user can retry.
+          function Show-TweakStatesLoadError { param([string]$Message) $script:MockErrors += $Message }
+          $script:MockErrors = @()
+          $script:MockRawResult = @(@{
+              States = @{ 'btnFeatHyperV' = $true; 'btnFeatXPS' = $false }
+              Providers = @{
+                  'btnFeatHyperV' = @{ Type = 'Feature'; Name = 'Microsoft-Hyper-V-All' }
+                  'btnFeatXPS' = $null
+              }
+              Unavailable = @{}
+              Pending = @{}
+              Unknown = @{}
+          })
+          $script:FeaturesCheckPS = $fakeScanPs
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $true }
+          $script:FeaturesCheckTimeout = $null
+          $script:OptionalFeaturesReady = $true
+          $script:OptionalFeaturesCheckStarted = $true
+          & $onTick
+          if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              -not (@($script:MockErrors) -match 'Optional-feature verification failed')) {
+              throw 'A malformed optional-feature completion did not fail closed and become retryable.'
+          }
+
+          # A timeout must clear every cached feature classification and remain
+          # fail-closed while stopping the outstanding worker.
+          $script:MockErrors = @()
+          $script:MockStopCalls = @()
+          $fakeTimeout = [pscustomobject]@{}
+          $fakeTimeout | Add-Member -MemberType ScriptMethod -Name Stop -Value { }
+          $script:FeaturesCheckTimeout = $fakeTimeout
+          $script:FeaturesCheckPS = $fakeScanPs
+          $script:FeaturesCheckAsync = [pscustomobject]@{ IsCompleted = $false }
+          $script:OptionalFeaturesReady = $false
+          $script:OptionalFeaturesCheckStarted = $true
+          $script:OptionalFeatureStateCache = @{ 'btnFeatXPS' = $true }
+          $script:OptionalFeatureUnavailableCache = @{ 'btnFeatXPS' = 'unavailable' }
+          $script:OptionalFeatureProviderCache = @{ 'btnFeatXPS' = @{ Type = 'Capability'; Name = 'XPS.Viewer~~~~0.0.1.0' } }
+          $script:OptionalFeaturePendingCache = @{ 'btnFeatXPS' = 'InstallPending' }
+          $script:OptionalFeatureUnknownCache = @{ 'btnFeatXPS' = 'unknown' }
+          & $timeoutCallback
+          if ($script:OptionalFeaturesReady -or $script:OptionalFeaturesCheckStarted -or
+              $script:OptionalFeatureStateCache.Count -ne 0 -or
+              $script:OptionalFeatureUnavailableCache.Count -ne 0 -or
+              $script:OptionalFeatureProviderCache.Count -ne 0 -or
+              $script:OptionalFeaturePendingCache.Count -ne 0 -or
+              $script:OptionalFeatureUnknownCache.Count -ne 0 -or
+              -not (@($script:MockErrors) -match 'detection timed out') -or
+              -not (@($script:MockStopCalls) -match 'timeout')) {
+              throw 'The optional-feature timeout did not fail closed and clear its cached state.'
+          }
+          Write-Host 'PASS: worker startup failure remains fail-closed and retryable.'
+          Write-Host 'PASS: retry preserves the last verified snapshot for a later unknown state.'
+          Write-Host 'PASS: malformed completion fails closed and timeout clears all cached states.'
 
       - name: Smoke test High Contrast flag bit updates
         shell: powershell
@@ -1621,7 +1877,9 @@ jobs:
               'Everything is ok!',
               "WARN  Scoop bucket(s) out of date. Run 'scoop update' to get the latest changes.",
               'WARNING  Another diagnostic line.',
-              'ERROR  Broken manifest.'
+              'ERROR  Broken manifest.',
+              'INFO main bucket is stale',
+              'Bucket main is out of date'
           )
           foreach ($line in $ignored) {
               $row = ConvertFrom-WmtScoopStatusLine -Line $line
@@ -1641,6 +1899,7 @@ jobs:
           # Scoop table shape and its diagnostic/success messages.
           $scoopOutput = @'
           WARN  Scoop bucket(s) out of date. Run 'scoop update' to get the latest changes.
+          INFO main bucket is stale
           Name                Installed Version Latest Version Missing Dependencies Info
           ----                -------------- ------------- -------------------- --------------
           7zip                23.01           24.08
@@ -1660,6 +1919,18 @@ jobs:
           if ($rows.Count -ne 0) {
               throw 'The production Scoop conversion treated the success message as an update.'
           }
+          # Legacy Scoop releases used Name/Version/Source and could report a
+          # custom bucket. The format-aware converter must retain that row.
+          $legacyOutput = @'
+          Name                Version            Source            Updated                 Info
+          ----                ------            ------            ------                 ----
+          git                 2.46.0             custom            2026-11-20 12:00:00
+          '@
+          $rows = @(ConvertFrom-WmtScoopStatus -Output $legacyOutput)
+          if ($rows.Count -ne 1 -or $rows[0].Name -ne 'git' -or
+              $rows[0].Version -ne '2.46.0' -or $rows[0].Available -ne 'custom') {
+              throw 'The production Scoop conversion lost a legacy package row.'
+          }
           # The pooled scan worker must use the shared production converter.
           $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
           $scoopEnd = $source.IndexOf('# F. RUBY GEMS WORKER', $scoopStart)
@@ -1670,7 +1941,66 @@ jobs:
           if ($scoopWorker -notmatch 'ConvertFrom-WmtScoopStatus\b') {
               throw 'The Scoop update scan must use the shared status converter.'
           }
+          # Execute the production worker against a deterministic scoop.cmd.
+          # A nonzero command must be a failed scan, not an empty update list.
+          $scoopAddScript = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                  $node.Member.Value -eq 'AddScript' -and
+                  $node.Extent.Text -match 'Scanning Scoop'
+          }, $true)
+          if (-not $scoopAddScript -or $scoopAddScript.Arguments.Count -ne 1) {
+              throw 'Could not extract the production Scoop worker.'
+          }
+          $scoopWorkerText = $scoopAddScript.Arguments[0].Extent.Text
+          $scoopWorkerBlock = [scriptblock]::Create($scoopWorkerText.Substring(1, $scoopWorkerText.Length - 2))
+          $scoopFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-scoop-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($scoopFixtureDir)
+          $oldScoopPath = $env:PATH
+          try {
+              @'
+          @echo off
+          echo WARN  Scoop bucket(s) out of date.
+          echo Name                Installed Version Latest Version Missing Dependencies Info
+          echo ----                -------------- ------------- -------------------- --------------
+          echo 7zip                23.01           24.08
+          exit /b 0
+          '@ | Set-Content -LiteralPath (Join-Path $scoopFixtureDir 'scoop.cmd') -Encoding Ascii
+              $env:PATH = $scoopFixtureDir + ';' + $oldScoopPath
+              $workerOutput = @(& $scoopWorkerBlock @())
+              $workerRows = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
+              if ($workerRows.Count -ne 1 -or $workerRows[0].Name -ne '7zip' -or
+                  @($workerOutput | Where-Object { [string]$_ -match '^LOG:Scanning Scoop' }).Count -ne 1) {
+                  throw 'The production Scoop worker did not return the expected package row.'
+              }
+              @'
+          @echo off
+          echo simulated scoop failure 1>&2
+          exit /b 7
+          '@ | Set-Content -LiteralPath (Join-Path $scoopFixtureDir 'scoop.cmd') -Encoding Ascii
+              $workerOutput = @(& $scoopWorkerBlock @())
+              $workerRows = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
+              if ($workerRows.Count -ne 0 -or
+                  @($workerOutput | Where-Object { [string]$_ -match 'LOG:Scoop check failed: simulated scoop failure' }).Count -ne 1) {
+                  throw 'A failed Scoop command was reported as an empty successful update scan.'
+              }
+              @'
+          @echo off
+          exit /b 9
+          '@ | Set-Content -LiteralPath (Join-Path $scoopFixtureDir 'scoop.cmd') -Encoding Ascii
+              $workerOutput = @(& $scoopWorkerBlock @())
+              $workerRows = @($workerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
+              if ($workerRows.Count -ne 0 -or
+                  @($workerOutput | Where-Object { [string]$_ -match 'LOG:Scoop check failed: exit code 9' }).Count -ne 1) {
+                  throw 'A Scoop command without stderr did not report its nonzero exit code.'
+              }
+          }
+          finally {
+              $env:PATH = $oldScoopPath
+              Remove-Item -LiteralPath $scoopFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
           Write-Host 'PASS: current and legacy Scoop output produce only real package update rows.'
+          Write-Host 'PASS: the production Scoop worker surfaces command failures without inventing update rows.'
 
       - name: Smoke test model-ID driver supersedence
         shell: powershell

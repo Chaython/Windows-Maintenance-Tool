@@ -2560,7 +2560,8 @@ catch { return $Default }
 # one unfamiliar state can never break the Tweaks page or block a toggle.
 function Get-WmtCapabilityStateInfo {
 param([string]$State)
-switch ($State) {
+$normalizedState = ([string]$State).Trim()
+switch ($normalizedState) {
     "Installed" { return @{ Known = $true; Enabled = $true; Pending = ""; Action = "Remove"; Reason = "" } }
     "NotPresent" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Install"; Reason = "" } }
     "Staged" { return @{ Known = $true; Enabled = $false; Pending = ""; Action = "Install"; Reason = "" } }
@@ -2579,7 +2580,8 @@ switch ($State) {
 # states expose the eventual outcome and the action that reverses it.
 function Get-WmtOptionalFeatureStateInfo {
 param([string]$State)
-switch ($State) {
+$normalizedState = ([string]$State).Trim()
+switch ($normalizedState) {
     "Enabled" { return @{ Known = $true; Enabled = $true; Pending = ""; Action = "Disable"; Reason = "" } }
     "EnablePending" { return @{ Known = $true; Enabled = $true; Pending = "EnablePending"; Action = "Disable"; Reason = "" } }
     "Enable Pending" { return @{ Known = $true; Enabled = $true; Pending = "EnablePending"; Action = "Disable"; Reason = "" } }
@@ -2607,24 +2609,47 @@ return ($flags -band (-bnot 1))
 # Parse one line of 'scoop status'. Current Scoop uses the columns
 # "Name Installed Version Latest Version Missing Dependencies Info"; older
 # releases used "Name Version Source". Headers, separators, success messages,
-# and WARN/WARNING/ERROR diagnostics return $null so they never turn into
-# package rows or inflate the update count.
+# and diagnostic lines return $null so they never turn into package rows or
+# inflate the update count. The version-shape check also rejects free-form
+# diagnostics such as "INFO main bucket is stale".
 function ConvertFrom-WmtScoopStatusLine {
-param([string]$Line)
+param(
+    [string]$Line,
+    [ValidateSet("Auto", "Current", "Legacy")][string]$Format = "Auto"
+)
 if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
 $line = $Line.Trim()
-if ($line -match "^Name\s+Version(?:\s+Source)?$" -or
+if ($line -match "^Name\s+Version\b" -or
     $line -match "^Name\s+Installed\s+Version\b" -or
     $line -match "^----" -or
     $line -match "^Everything is ok!$" -or
     $line -match "Scoop is up to date" -or
-    $line -match "^(?:WARN|WARNING|ERROR)\b") {
+    $line -match "^(?:WARN|WARNING|ERROR|INFO|NOTICE|HINT|DEBUG|TRACE|FATAL|FAILED|FAILURE)\b") {
     return $null
 }
-if ($line -match '^(\S+)\s+(\S+)\s+(\S+)') {
-    return [PSCustomObject]@{ Name = $matches[1]; Version = $matches[2]; Available = $matches[3] }
+if ($line -notmatch '^(\S+)\s+(\S+)\s+(\S+)') { return $null }
+$name = [string]$matches[1]
+$version = [string]$matches[2]
+$available = [string]$matches[3]
+$versionLooksValid = ($version -match '\d') -or
+    ($version -match '^(?i:nightly|latest|unknown|continuous)$')
+$availableLooksValid = ($available -match '\d') -or
+    ($available -match '^(?i:nightly|latest|unknown|continuous)$')
+$sourceLooksValid = ($available -match '^(?i:main|extras|versions|nightly|master)$')
+if ($Format -eq "Current") {
+    if (-not $versionLooksValid -or -not $availableLooksValid) { return $null }
 }
-return $null
+elseif ($Format -eq "Legacy") {
+    if (-not $versionLooksValid) { return $null }
+}
+else {
+    # Auto mode supports a headerless current row as well as the obsolete
+    # Name/Version/Source table, but not arbitrary three-word diagnostics.
+    if (-not $versionLooksValid -or (-not $availableLooksValid -and -not $sourceLooksValid)) {
+        return $null
+    }
+}
+return [PSCustomObject]@{ Name = $name; Version = $version; Available = $available }
 }
 
 # Convert complete 'scoop status' output into update rows. Keeping the whole
@@ -2636,8 +2661,18 @@ param(
     [string[]]$IgnoreList = @()
 )
 if ([string]::IsNullOrWhiteSpace($Output)) { return }
+$format = "Auto"
 foreach ($line in ($Output -split "`r?`n")) {
-    $row = ConvertFrom-WmtScoopStatusLine -Line $line
+    $trimmedLine = ([string]$line).Trim()
+    if ($trimmedLine -match "^Name\s+Installed\s+Version\b") {
+        $format = "Current"
+        continue
+    }
+    if ($trimmedLine -match "^Name\s+Version\b") {
+        $format = "Legacy"
+        continue
+    }
+    $row = ConvertFrom-WmtScoopStatusLine -Line $line -Format $format
     if (-not $row) { continue }
     if ($IgnoreList -contains $row.Name) { continue }
     [PSCustomObject]@{ Source = "scoop"; Name = $row.Name; Id = $row.Name; Version = $row.Version; Available = $row.Available }
@@ -54329,23 +54364,43 @@ $btnWingetScan.Add_Click({
         [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
 
-    # E. SCOOP WORKER (unchanged)
+    # E. SCOOP WORKER
     if ("scoop" -in $enabled) {
         $ps = New-WmtPooledPowerShell
         [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Scoop..."
+                $p = $null
                 try {
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c scoop status")
-                    $pInfo.RedirectStandardOutput = $true; $pInfo.UseShellExecute = $false; $pInfo.CreateNoWindow = $true
+                    $pInfo.RedirectStandardOutput = $true
+                    $pInfo.RedirectStandardError = $true
+                    $pInfo.UseShellExecute = $false
+                    $pInfo.CreateNoWindow = $true
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+                    $pInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if (-not $p.WaitForExit(30000)) { try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }; Write-Output "LOG:Scoop scan timed out."; return }
+                    $errTask = $p.StandardError.ReadToEndAsync()
+                    if (-not $p.WaitForExit(30000)) {
+                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
+                        Write-Output "LOG:Scoop scan timed out."
+                        return
+                    }
                     $out = $outTask.GetAwaiter().GetResult()
+                    $err = ""
+                    try { $err = $errTask.GetAwaiter().GetResult() } catch {}
+                    $exitCode = 0
+                    try { $exitCode = [int]$p.ExitCode } catch {}
+                    if ($exitCode -ne 0) {
+                        $detail = if ([string]::IsNullOrWhiteSpace($err)) { "exit code $exitCode" } else { $err.Trim() }
+                        Write-Output "LOG:Scoop check failed: $detail"
+                        return
+                    }
                     ConvertFrom-WmtScoopStatus -Output $out -IgnoreList $IgnoreList
                 }
                 catch { Write-Output "LOG:Scoop check failed." }
+                finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
         [void](Start-WmtActiveScanWorker -PowerShell $ps)
     }
@@ -72438,13 +72493,14 @@ try {
                     }
                 }
                 $script:OptionalFeaturesCheckStarted = $false
-                $script:OptionalFeatureStateCache = @{}
-                Sync-WmtOptionalFeatureButtons
+                # Keep the last verified state/provider/pending snapshot as the
+                # fallback for an unfamiliar servicing state. A successful new
+                # scan replaces these maps, while a failed scan remains
+                # fail-closed because OptionalFeaturesReady stays false.
                 $script:OptionalFeaturesReady = $false
                 $script:OptionalFeatureUnavailableCache = @{}
-                $script:OptionalFeatureProviderCache = @{}
-                $script:OptionalFeaturePendingCache = @{}
                 $script:OptionalFeatureUnknownCache = @{}
+                Sync-WmtOptionalFeatureButtons
                 Start-OptionalFeaturesBackgroundCheck
             }
             Sync-WmtQuickFindStateAvailability
@@ -73040,16 +73096,28 @@ foreach ($button in $Result.States.Keys) {
     if ($button -notin $ValidButtons -or $Result.Providers.ContainsKey($button) -eq $false) {
         throw "Scan returned an unrecognized or providerless feature."
     }
+    if ($Result.States[$button] -isnot [bool]) {
+        throw "Scan returned an invalid feature state."
+    }
+    $provider = $Result.Providers[$button]
+    if ($provider -isnot [System.Collections.IDictionary] -or
+        -not $provider.Contains('Type') -or -not $provider.Contains('Name') -or
+        [string]$provider['Type'] -notin @("Feature", "Capability") -or
+        [string]::IsNullOrWhiteSpace([string]$provider['Name'])) {
+        throw "Scan returned an invalid feature provider."
+    }
 }
 foreach ($button in $Result.Unavailable.Keys) {
     if ($button -notin $ValidButtons -or $Result.States.ContainsKey($button) -or
-        $Result.Unknown.ContainsKey($button)) {
+        $Result.Unknown.ContainsKey($button) -or
+        [string]::IsNullOrWhiteSpace([string]$Result.Unavailable[$button])) {
         throw "Scan returned contradictory or unknown feature data."
     }
 }
 foreach ($button in $Result.Unknown.Keys) {
     if ($button -notin $ValidButtons -or $Result.States.ContainsKey($button) -or
-        $Result.Unavailable.ContainsKey($button)) {
+        $Result.Unavailable.ContainsKey($button) -or
+        [string]::IsNullOrWhiteSpace([string]$Result.Unknown[$button])) {
         throw "Scan returned contradictory unrecognized-state data."
     }
 }
@@ -73236,7 +73304,9 @@ catch {
         "QuickAssist" = "App.Support.QuickAssist~~~~"
         "XpsViewer" = "XPS.Viewer~~~~"
     }
-    $needCapabilities = @($capabilityPrefixes.Keys | Where-Object { -not $states.ContainsKey([string]$map[$_]) })
+    $needCapabilities = @($capabilityPrefixes.Keys | Where-Object {
+        $map.ContainsKey($_) -and -not $states.ContainsKey([string]$map[$_])
+    })
     if ($needCapabilities.Count -gt 0) {
         if (-not (Get-Command Get-WindowsCapability -ErrorAction SilentlyContinue)) {
             throw "Cannot enumerate Windows capabilities for $($needCapabilities -join ', ')."
@@ -73326,6 +73396,7 @@ Register-WmtUiPollOperation -Name "OptionalFeaturesCheck" -IntervalMs 1000 -Test
             $script:OptionalFeaturePendingCache = $resolved.Pending
             $script:OptionalFeatureUnknownCache = $resolved.Unknown
             $script:OptionalFeaturesReady = $true
+            $script:OptionalFeaturesCheckStarted = $false
             try {
                 Write-GuiLog "[Optional Features] Verified $($result.States.Count) current states; $($resolved.Unavailable.Count) not available; $($result.Unknown.Count) unrecognized."
                 foreach ($button in $result.Unknown.Keys) {
