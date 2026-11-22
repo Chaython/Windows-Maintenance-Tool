@@ -215,6 +215,321 @@ namespace WmtTaskbarWindowAppId {
 '@
 }
 
+# --- IGNORED UPDATE NAME ACCELERATOR ---
+# The ignored-update list is read on every settings load, written on every
+# ignore/un-ignore action, and rendered again in the Manage Ignored dialog.
+# The PowerShell-only implementation compared every entry against the whole
+# name map, so the work grew quadratically and the UI stalled for a moment
+# once a user had ignored a few hundred updates. This compiled helper keeps
+# the exact same behavior (case-insensitive IDs, stable ordering, "Name (ID)"
+# display text) while doing the lookups through hash tables.
+if (-not ([System.Management.Automation.PSTypeName]'WmtIgnoredNames.Accelerator').Type) {
+try {
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Globalization;
+using System.Management.Automation;
+using System.Reflection;
+
+namespace WmtIgnoredNames
+{
+    public sealed class NameEntry
+    {
+        public string Key { get; set; }
+        public string Value { get; set; }
+    }
+
+    public sealed class IgnoredItem
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string DisplayName { get; set; }
+        public override string ToString() { return DisplayName ?? string.Empty; }
+    }
+
+    public static class Accelerator
+    {
+        private static readonly StringComparer Comparer = StringComparer.OrdinalIgnoreCase;
+        private static readonly string[] NameCandidates = { "Name", "Title", "DisplayName", "PackageName", "ProductName" };
+
+        /// <summary>Trim, drop blanks, and collapse case-insensitive duplicates while keeping the original order.</summary>
+        public static string[] NormalizeIds(object ids)
+        {
+            List<string> result = new List<string>();
+            HashSet<string> seen = new HashSet<string>(Comparer);
+            if (ids is string)
+            {
+                string single = ToText(ids);
+                if (single.Length > 0) result.Add(single);
+                return result.ToArray();
+            }
+            IEnumerable sequence = ids as IEnumerable;
+            if (sequence == null) return result.ToArray();
+            foreach (object raw in sequence)
+            {
+                string text = ToText(raw);
+                if (text.Length == 0) continue;
+                if (seen.Add(text)) result.Add(text);
+            }
+            return result.ToArray();
+        }
+
+        /// <summary>Build the ID -> display-name map for the ignored IDs only.</summary>
+        public static OrderedDictionary BuildNameMap(object ids, object names)
+        {
+            OrderedDictionary map = new OrderedDictionary(Comparer);
+            HashSet<string> wanted = new HashSet<string>(Comparer);
+            foreach (string id in NormalizeIds(ids)) wanted.Add(id);
+            if (wanted.Count == 0) return map;
+
+            foreach (KeyValuePair<string, string> pair in EnumerateMapPairs(names))
+            {
+                string key = pair.Key == null ? string.Empty : pair.Key.Trim();
+                if (key.Length == 0) continue;
+                string value = pair.Value == null ? string.Empty : pair.Value.Trim();
+                if (value.Length == 0) continue;
+                if (!wanted.Contains(key)) continue;
+                map[key] = value;
+            }
+            return map;
+        }
+
+        /// <summary>Build ID/name entries for provider rows selected in the update list.</summary>
+        public static NameEntry[] BuildNameEntries(object items)
+        {
+            OrderedDictionary entries = new OrderedDictionary(Comparer);
+            IEnumerable sequence = items as IEnumerable;
+            if (sequence == null) return new NameEntry[0];
+
+            foreach (object item in sequence)
+            {
+                if (item == null) continue;
+                string id = ToText(GetMemberValue(item, "Id"));
+                if (id.Length == 0) continue;
+
+                string name = string.Empty;
+                foreach (string candidate in NameCandidates)
+                {
+                    name = ToText(GetMemberValue(item, candidate));
+                    if (name.Length > 0) break;
+                }
+                // A provider row without a human-readable label is retained in
+                // the ID list but is not written to the name map. Manage
+                // Ignored renders that legacy/unknown entry as its raw ID.
+                if (name.Length == 0) continue;
+
+                if (entries.Contains(id))
+                {
+                    NameEntry existing = entries[id] as NameEntry;
+                    if (existing != null) existing.Value = name;
+                    continue;
+                }
+                entries[id] = new NameEntry { Key = id, Value = name };
+            }
+
+            List<NameEntry> result = new List<NameEntry>();
+            foreach (object value in entries.Values) result.Add((NameEntry)value);
+            return result.ToArray();
+        }
+
+        /// <summary>Build the Manage Ignored rows (ID, name, and "Name (ID)" display text).</summary>
+        public static IgnoredItem[] BuildListItems(object ids, object names)
+        {
+            OrderedDictionary map = BuildNameMap(ids, names);
+            List<IgnoredItem> items = new List<IgnoredItem>();
+            HashSet<string> seen = new HashSet<string>(Comparer);
+            foreach (string id in NormalizeIds(ids))
+            {
+                if (!seen.Add(id)) continue;
+                string name = map.Contains(id) ? ToText(map[id]) : string.Empty;
+                string display = id;
+                if (name.Length > 0 && !string.Equals(name, id, StringComparison.OrdinalIgnoreCase))
+                {
+                    display = name + " (" + id + ")";
+                }
+                items.Add(new IgnoredItem { Id = id, Name = name, DisplayName = display });
+            }
+            return items.ToArray();
+        }
+
+        /// <summary>Copy a persisted name map without rebuilding it entry by entry in PowerShell.</summary>
+        public static OrderedDictionary CopyMap(object source)
+        {
+            OrderedDictionary map = new OrderedDictionary(Comparer);
+            foreach (KeyValuePair<string, string> pair in EnumerateMapPairs(source))
+            {
+                string key = pair.Key == null ? string.Empty : pair.Key.Trim();
+                if (key.Length == 0) continue;
+                map[key] = pair.Value;
+            }
+            return map;
+        }
+
+        /// <summary>Merge two persisted ID/name maps, matching IDs case-insensitively.</summary>
+        public static OrderedDictionary MergeMaps(object existing, object additions)
+        {
+            OrderedDictionary map = CopyMap(existing);
+            foreach (KeyValuePair<string, string> pair in EnumerateMapPairs(additions))
+            {
+                string key = pair.Key == null ? string.Empty : pair.Key.Trim();
+                if (key.Length == 0) continue;
+                map[key] = pair.Value == null ? string.Empty : pair.Value.Trim();
+            }
+            return map;
+        }
+
+        /// <summary>Merge (or remove) name entries in a persisted map, matching IDs case-insensitively.</summary>
+        public static OrderedDictionary MergeNames(object existing, object entries, bool remove)
+        {
+            OrderedDictionary map = CopyMap(existing);
+            foreach (KeyValuePair<string, string> pair in EnumerateEntryPairs(entries))
+            {
+                string key = pair.Key == null ? string.Empty : pair.Key.Trim();
+                if (key.Length == 0) continue;
+                if (remove)
+                {
+                    map.Remove(key);
+                    continue;
+                }
+                map[key] = pair.Value == null ? string.Empty : pair.Value.Trim();
+            }
+            return map;
+        }
+
+        /// <summary>Drop name entries that no longer belong to an ignored ID.</summary>
+        public static OrderedDictionary PruneNames(object names, object ids)
+        {
+            OrderedDictionary map = CopyMap(names);
+            HashSet<string> wanted = new HashSet<string>(Comparer);
+            foreach (string id in NormalizeIds(ids)) wanted.Add(id);
+
+            List<string> stale = new List<string>();
+            foreach (object key in map.Keys)
+            {
+                if (!wanted.Contains(ToText(key))) stale.Add(Convert.ToString(key, CultureInfo.InvariantCulture));
+            }
+            foreach (string key in stale) map.Remove(key);
+            return map;
+        }
+
+        private static IEnumerable<KeyValuePair<string, string>> EnumerateMapPairs(object source)
+        {
+            List<KeyValuePair<string, string>> pairs = new List<KeyValuePair<string, string>>();
+            if (source == null || source is string) return pairs;
+
+            IDictionary dictionary = source as IDictionary;
+            if (dictionary != null)
+            {
+                foreach (DictionaryEntry entry in dictionary)
+                {
+                    pairs.Add(new KeyValuePair<string, string>(ToText(entry.Key), ToText(entry.Value)));
+                }
+                return pairs;
+            }
+
+            // ConvertFrom-Json returns PSCustomObject for every JSON object.
+            // PSObject exposes those adapted properties directly; reflection
+            // alone cannot see them.
+            try
+            {
+                PSObject powerShellObject = PSObject.AsPSObject(source);
+                foreach (PSPropertyInfo member in powerShellObject.Properties)
+                {
+                    string name = ToText(member.Name);
+                    if (name.Length == 0) continue;
+                    object value = null;
+                    try { value = member.Value; } catch {}
+                    pairs.Add(new KeyValuePair<string, string>(name, ToText(value)));
+                }
+                return pairs;
+            }
+            catch {}
+
+            return pairs;
+        }
+
+        private static IEnumerable<KeyValuePair<string, string>> EnumerateEntryPairs(object source)
+        {
+            List<KeyValuePair<string, string>> pairs = new List<KeyValuePair<string, string>>();
+            if (source == null) return pairs;
+
+            IDictionary dictionary = source as IDictionary;
+            if (dictionary != null)
+            {
+                foreach (DictionaryEntry entry in dictionary)
+                {
+                    pairs.Add(new KeyValuePair<string, string>(ToText(entry.Key), ToText(entry.Value)));
+                }
+                return pairs;
+            }
+
+            IEnumerable sequence = source as IEnumerable;
+            if (sequence == null) return pairs;
+            foreach (object entry in sequence)
+            {
+                if (entry == null) continue;
+                string key = ToText(GetMemberValue(entry, "Key"));
+                if (key.Length == 0) continue;
+                pairs.Add(new KeyValuePair<string, string>(key, ToText(GetMemberValue(entry, "Value"))));
+            }
+            return pairs;
+        }
+
+        private static object GetMemberValue(object target, string memberName)
+        {
+            if (target == null) return null;
+            try
+            {
+                PropertyInfo property = target.GetType().GetProperty(memberName);
+                if (property != null && property.CanRead && property.GetIndexParameters().Length == 0)
+                {
+                    return property.GetValue(target, null);
+                }
+            }
+            catch {}
+            try
+            {
+                PSObject powerShellObject = PSObject.AsPSObject(target);
+                PSPropertyInfo member = powerShellObject.Properties[memberName];
+                if (member != null)
+                {
+                    try { return member.Value; } catch {}
+                }
+            }
+            catch {}
+            return null;
+        }
+
+        private static string ToText(object value)
+        {
+            if (value == null) return string.Empty;
+            string text = value as string;
+            if (text != null) return text.Trim();
+            try
+            {
+                IFormattable formattable = value as IFormattable;
+                if (formattable != null)
+                {
+                    string formatted = formattable.ToString(null, CultureInfo.InvariantCulture);
+                    return formatted == null ? string.Empty : formatted.Trim();
+                }
+                string plain = value.ToString();
+                return plain == null ? string.Empty : plain.Trim();
+            }
+            catch { return string.Empty; }
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+catch {
+try { Write-Verbose "Ignored-update name accelerator unavailable: $($_.Exception.Message)" } catch {}
+}
+}
+
 $startupProc = $null
 try {
 $startupProc = [System.Diagnostics.Process]::GetCurrentProcess()
@@ -9824,10 +10139,9 @@ param(
 $settingsPath = Join-Path (Get-DataPath) "settings.json"
 $baseline = $script:WmtSettingsCache
 if (-not $baseline) { $baseline = Get-WmtSettings }
-$baselineJson = ConvertTo-Json -InputObject $baseline -Depth 8 -Compress
-$patchJson = ConvertTo-Json -InputObject $Patch -Depth 8 -Compress
-$listOperationsJson = ConvertTo-Json -InputObject @($ListOperations) -Depth 8 -Compress
-$mapOperationsJson = ConvertTo-Json -InputObject @($MapOperations) -Depth 8 -Compress
+# The payload is handed to the worker as live objects. Serializing the whole
+# settings file to JSON on the UI thread was the part of an ignore action
+# that made the window stutter, so the conversion happens in the worker now.
 $mutexName = $script:WmtSettingsWriteMutexName
 $userOnComplete = $OnComplete
 $operationId = $Name
@@ -9893,11 +10207,11 @@ $completed = {
 
 $arguments = [object[]]::new(6)
 $arguments[0] = $settingsPath
-$arguments[1] = $baselineJson
-$arguments[2] = $patchJson
-$arguments[3] = $listOperationsJson
+$arguments[1] = $baseline
+$arguments[2] = $Patch
+$arguments[3] = @($ListOperations)
 $arguments[4] = $mutexName
-$arguments[5] = $mapOperationsJson
+$arguments[5] = @($MapOperations)
 Write-GuiLog "[$operationId] Save stage: queued settings persistence operation."
 $saveError = {
     param($errorRecord)
@@ -9906,7 +10220,7 @@ $saveError = {
     if ($OnError) { & $OnError $errorRecord }
 }.GetNewClosure()
 Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments -SuppressResultLog -OnComplete $completed -OnError $saveError -Sb {
-    param([string]$Path, [string]$BaselineJson, [string]$PatchJson, [string]$ListOperationsJson, [string]$WriteMutexName, [string]$MapOperationsJson)
+    param([string]$Path, $Baseline, $Patch, $ListOperations, [string]$WriteMutexName, $MapOperations)
 
     $mutex = $null
     $lockTaken = $false
@@ -9917,7 +10231,10 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
         catch [System.Threading.AbandonedMutexException] { $lockTaken = $true }
         if (-not $lockTaken) { throw "Timed out waiting for the settings file lock." }
 
-        $baselineSettings = ConvertFrom-Json -InputObject $BaselineJson -ErrorAction Stop
+        # The caller hands over live objects so the UI thread does not have to
+        # serialize the whole settings file. The worker takes its own copy
+        # before it starts changing anything.
+        $baselineSettings = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $Baseline -Depth 8) -ErrorAction Stop
         if ($null -eq $baselineSettings) { throw "Could not load the current settings defaults." }
         $settings = if ([System.IO.File]::Exists($Path)) {
             $raw = [System.IO.File]::ReadAllText($Path)
@@ -9934,11 +10251,11 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
                 $settings | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value -Force
             }
         }
-        $patch = ConvertFrom-Json -InputObject $PatchJson -ErrorAction Stop
+        $patch = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $Patch -Depth 8) -ErrorAction Stop
         foreach ($property in @($patch.PSObject.Properties)) {
             $settings | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value -Force
         }
-        $listOperations = @(ConvertFrom-Json -InputObject $ListOperationsJson -ErrorAction Stop)
+        $listOperations = @($ListOperations)
         foreach ($operation in $listOperations) {
             if (-not $operation -or [string]::IsNullOrWhiteSpace([string]$operation.Property)) { continue }
             # Package IDs are matched case-insensitively by the providers. Use
@@ -9971,55 +10288,59 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
             }
             $settings | Add-Member -MemberType NoteProperty -Name ([string]$operation.Property) -Value $list.ToArray() -Force
         }
-        $mapOperations = @(ConvertFrom-Json -InputObject $MapOperationsJson -ErrorAction Stop)
+        $mapOperations = @($MapOperations)
+        $ignoredNamesAcceleratorAvailable = $false
+        try {
+            $ignoredNamesAcceleratorAvailable = [bool]([System.Management.Automation.PSTypeName]'WmtIgnoredNames.Accelerator').Type
+        }
+        catch {}
         foreach ($operation in $mapOperations) {
             if (-not $operation -or [string]::IsNullOrWhiteSpace([string]$operation.Property)) { continue }
             $propertyName = ([string]$operation.Property).Trim()
             $action = ([string]$operation.Action).Trim().ToLowerInvariant()
             if ($action -notin @('add', 'remove')) { throw "Unsupported settings map operation '$($operation.Action)'." }
 
-            $map = [ordered]@{}
+            # A case-insensitive ordered dictionary keeps the merge linear:
+            # every lookup is a hash hit instead of a scan through the map.
             $existing = $settings.PSObject.Properties[$propertyName]
-            if ($existing -and $null -ne $existing.Value) {
-                $rawMap = $existing.Value
-                if ($rawMap -is [System.Collections.IDictionary]) {
-                    foreach ($key in @($rawMap.Keys)) { $map[[string]$key] = $rawMap[$key] }
-                }
-                else {
-                    foreach ($prop in @($rawMap.PSObject.Properties)) { $map[$prop.Name] = $prop.Value }
-                }
+            $existingValue = if ($existing) { $existing.Value } else { $null }
+            if ($ignoredNamesAcceleratorAvailable) {
+                $map = [WmtIgnoredNames.Accelerator]::MergeNames(
+                    $existingValue,
+                    @($operation.Values),
+                    ($action -eq 'remove')
+                )
             }
-
-            foreach ($entry in @($operation.Values)) {
-                if ($null -eq $entry) { continue }
-                $key = ""
-                $value = ""
-                try {
-                    if ($entry -is [System.Collections.IDictionary]) {
-                        if ($entry.Contains("Key")) { $key = ([string]$entry["Key"]).Trim() }
-                        if ($entry.Contains("Value")) { $value = ([string]$entry["Value"]).Trim() }
+            else {
+                $map = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+                if ($null -ne $existingValue) {
+                    if ($existingValue -is [System.Collections.IDictionary]) {
+                        foreach ($key in @($existingValue.Keys)) { $map[[string]$key] = $existingValue[$key] }
                     }
                     else {
-                        if ($entry.PSObject.Properties["Key"]) { $key = ([string]$entry.Key).Trim() }
-                        if ($entry.PSObject.Properties["Value"]) { $value = ([string]$entry.Value).Trim() }
+                        foreach ($prop in @($existingValue.PSObject.Properties)) { $map[$prop.Name] = $prop.Value }
                     }
                 }
-                catch {}
-                if ([string]::IsNullOrWhiteSpace($key)) { continue }
 
-                $actualKey = $null
-                foreach ($existingKey in @($map.Keys)) {
-                    if ([string]::Equals([string]$existingKey, $key, [System.StringComparison]::OrdinalIgnoreCase)) {
-                        $actualKey = [string]$existingKey
-                        break
+                foreach ($entry in @($operation.Values)) {
+                    if ($null -eq $entry) { continue }
+                    $key = ""
+                    $value = ""
+                    try {
+                        if ($entry -is [System.Collections.IDictionary]) {
+                            if ($entry.Contains("Key")) { $key = ([string]$entry["Key"]).Trim() }
+                            if ($entry.Contains("Value")) { $value = ([string]$entry["Value"]).Trim() }
+                        }
+                        else {
+                            if ($entry.PSObject.Properties["Key"]) { $key = ([string]$entry.Key).Trim() }
+                            if ($entry.PSObject.Properties["Value"]) { $value = ([string]$entry.Value).Trim() }
+                        }
                     }
-                }
-                if ($action -eq 'add') {
-                    if ($null -eq $actualKey) { $actualKey = $key }
-                    $map[$actualKey] = $value
-                }
-                elseif ($null -ne $actualKey) {
-                    [void]$map.Remove($actualKey)
+                    catch {}
+                    if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+                    if ($action -eq 'add') { $map[$key] = $value }
+                    else { [void]$map.Remove($key) }
                 }
             }
             $settings | Add-Member -MemberType NoteProperty -Name $propertyName -Value $map -Force
@@ -10031,28 +10352,35 @@ Invoke-WmtUiBackgroundCommand -Name $Name -Msg $Message -ArgumentList $arguments
         $ignoreNamesProperty = $settings.PSObject.Properties['WingetIgnoreNames']
         $ignoreListProperty = $settings.PSObject.Properties['WingetIgnore']
         if ($ignoreNamesProperty -and $ignoreListProperty) {
-            $finalIgnoredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $normalizedIgnoredIds = [System.Collections.Generic.List[string]]::new()
-            foreach ($ignoredId in @($ignoreListProperty.Value)) {
-                $idText = ([string]$ignoredId).Trim()
-                if ([string]::IsNullOrWhiteSpace($idText)) { continue }
-                if ($finalIgnoredIds.Add($idText)) { [void]$normalizedIgnoredIds.Add($idText) }
+            if ($ignoredNamesAcceleratorAvailable) {
+                $normalizedIgnoredIds = [WmtIgnoredNames.Accelerator]::NormalizeIds(@($ignoreListProperty.Value))
+                $prunedNames = [WmtIgnoredNames.Accelerator]::PruneNames($ignoreNamesProperty.Value, $normalizedIgnoredIds)
             }
-            $settings | Add-Member -MemberType NoteProperty -Name 'WingetIgnore' -Value $normalizedIgnoredIds.ToArray() -Force
-            $prunedNames = [ordered]@{}
-            $rawNames = $ignoreNamesProperty.Value
-            if ($rawNames -is [System.Collections.IDictionary]) {
-                foreach ($key in @($rawNames.Keys)) {
-                    $idText = ([string]$key).Trim()
-                    if ($finalIgnoredIds.Contains($idText)) { $prunedNames[[string]$key] = $rawNames[$key] }
+            else {
+                $finalIgnoredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                $normalizedIgnoredIds = [System.Collections.Generic.List[string]]::new()
+                foreach ($ignoredId in @($ignoreListProperty.Value)) {
+                    $idText = ([string]$ignoredId).Trim()
+                    if ([string]::IsNullOrWhiteSpace($idText)) { continue }
+                    if ($finalIgnoredIds.Add($idText)) { [void]$normalizedIgnoredIds.Add($idText) }
+                }
+                $normalizedIgnoredIds = $normalizedIgnoredIds.ToArray()
+                $prunedNames = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+                $rawNames = $ignoreNamesProperty.Value
+                if ($rawNames -is [System.Collections.IDictionary]) {
+                    foreach ($key in @($rawNames.Keys)) {
+                        $idText = ([string]$key).Trim()
+                        if ($finalIgnoredIds.Contains($idText)) { $prunedNames[[string]$key] = $rawNames[$key] }
+                    }
+                }
+                elseif ($rawNames -and -not ($rawNames -is [string])) {
+                    foreach ($prop in @($rawNames.PSObject.Properties)) {
+                        $idText = ([string]$prop.Name).Trim()
+                        if ($finalIgnoredIds.Contains($idText)) { $prunedNames[$prop.Name] = $prop.Value }
+                    }
                 }
             }
-            elseif ($rawNames -and -not ($rawNames -is [string])) {
-                foreach ($prop in @($rawNames.PSObject.Properties)) {
-                    $idText = ([string]$prop.Name).Trim()
-                    if ($finalIgnoredIds.Contains($idText)) { $prunedNames[$prop.Name] = $prop.Value }
-                }
-            }
+            $settings | Add-Member -MemberType NoteProperty -Name 'WingetIgnore' -Value $normalizedIgnoredIds -Force
             $settings | Add-Member -MemberType NoteProperty -Name 'WingetIgnoreNames' -Value $prunedNames -Force
         }
         $json = ConvertTo-Json -InputObject $settings -Depth 8
@@ -10248,7 +10576,11 @@ if ($Value -is [System.Collections.IDictionary]) {
     # the keys on every save.
     $copy = [ordered]@{}
     foreach ($key in @($Value.Keys)) {
-        $copy[$key] = Copy-WmtSettingsValue -Value $Value[$key]
+        $item = $Value[$key]
+        # Strings and value types are immutable, so they can be shared with the
+        # copy instead of walking every entry through another function call.
+        if ($null -eq $item -or $item -is [string] -or $item.GetType().IsValueType) { $copy[$key] = $item; continue }
+        $copy[$key] = Copy-WmtSettingsValue -Value $item
     }
     return $copy
 }
@@ -10286,6 +10618,14 @@ param(
 $result = [ordered]@{}
 $raw = Get-WmtSettingsMember -Settings $Settings -Name $Name -Default $Default
 if ($null -eq $raw) { return $result }
+if ($Name -eq 'WingetIgnoreNames') {
+    try {
+        if (([System.Management.Automation.PSTypeName]'WmtIgnoredNames.Accelerator').Type) {
+            return [WmtIgnoredNames.Accelerator]::CopyMap($raw)
+        }
+    }
+    catch {}
+}
 try {
     if ($raw -is [System.Collections.IDictionary]) {
         foreach ($key in @($raw.Keys)) { $result[$key] = $raw[$key] }
@@ -10297,22 +10637,21 @@ catch {}
 return $result
 }
 
-function ConvertTo-WmtIgnoredPackageNameMap {
-param(
-    $Names,
-    [object[]]$IgnoredIds = @()
-)
-
-$result = [ordered]@{}
-$ignoredIdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($ignoredId in @($IgnoredIds)) {
-    $idText = ([string]$ignoredId).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($idText)) { [void]$ignoredIdSet.Add($idText) }
+function Test-WmtIgnoredNamesAccelerator {
+# The compiled helper keeps the ignored-name bookkeeping linear. It is
+# optional so a locked-down host that refuses Add-Type still gets a working
+# (pure PowerShell) implementation.
+try { return [bool]([System.Management.Automation.PSTypeName]'WmtIgnoredNames.Accelerator').Type }
+catch { return $false }
 }
-if ($ignoredIdSet.Count -eq 0 -or $null -eq $Names -or $Names -is [string]) { return $result }
+
+function Get-WmtIgnoredPackageNamePairs {
+# Normalizes any supported name-map shape into Key/Value pairs.
+param($Names)
 
 $pairs = [System.Collections.Generic.List[object]]::new()
 try {
+    if ($null -eq $Names -or $Names -is [string]) { return $pairs.ToArray() }
     if ($Names -is [System.Collections.IDictionary]) {
         foreach ($key in @($Names.Keys)) {
             [void]$pairs.Add([PSCustomObject]@{ Key = ([string]$key).Trim(); Value = ([string]$Names[$key]).Trim() })
@@ -10344,36 +10683,92 @@ try {
     }
 }
 catch {}
+return $pairs.ToArray()
+}
 
-foreach ($pair in $pairs) {
+function ConvertTo-WmtIgnoredPackageNameMap {
+param(
+    $Names,
+    [object[]]$IgnoredIds = @()
+)
+
+if (Test-WmtIgnoredNamesAccelerator) {
+    try { return [WmtIgnoredNames.Accelerator]::BuildNameMap($IgnoredIds, $Names) }
+    catch {}
+}
+
+# PowerShell fallback. The lookup is a hash set, so the cost stays linear in
+# the number of ignored entries.
+$result = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+$ignoredIdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ignoredId in @($IgnoredIds)) {
+    $idText = ([string]$ignoredId).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($idText)) { [void]$ignoredIdSet.Add($idText) }
+}
+if ($ignoredIdSet.Count -eq 0 -or $null -eq $Names -or $Names -is [string]) { return $result }
+
+foreach ($pair in @(Get-WmtIgnoredPackageNamePairs -Names $Names)) {
     $idText = ([string]$pair.Key).Trim()
     $nameText = ([string]$pair.Value).Trim()
     if ([string]::IsNullOrWhiteSpace($idText) -or
         [string]::IsNullOrWhiteSpace($nameText) -or
         -not $ignoredIdSet.Contains($idText)) { continue }
-
-    $actualKey = $idText
-    foreach ($existingKey in @($result.Keys)) {
-        if ([string]::Equals([string]$existingKey, $idText, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $actualKey = [string]$existingKey
-            break
-        }
-    }
-    $result[$actualKey] = $nameText
+    $result[$idText] = $nameText
 }
 return $result
 }
 
+function Copy-WmtIgnoredPackageNameMap {
+# Copies a persisted name map. The values are plain strings, so a shallow
+# copy is safe and avoids walking every entry in PowerShell.
+param($Names)
+
+if (Test-WmtIgnoredNamesAccelerator) {
+    try { return [WmtIgnoredNames.Accelerator]::CopyMap($Names) }
+    catch {}
+}
+
+$copy = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($pair in @(Get-WmtIgnoredPackageNamePairs -Names $Names)) {
+    if ([string]::IsNullOrWhiteSpace([string]$pair.Key)) { continue }
+    $copy[[string]$pair.Key] = [string]$pair.Value
+}
+return $copy
+}
+
 function New-WmtIgnoredPackageNameEntries {
+# Every provider row must end up in the name map, otherwise Manage Ignored can
+# only show the raw ID. Providers publish their label as Name; the other
+# members are fallbacks for rows that use a different property.
 param([object[]]$Items = @())
+
+if (Test-WmtIgnoredNamesAccelerator) {
+    try { return [WmtIgnoredNames.Accelerator]::BuildNameEntries($Items) }
+    catch {}
+}
 
 $entries = [System.Collections.Generic.List[object]]::new()
 $entryById = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($item in @($Items)) {
     if (-not $item) { continue }
-    $idText = ([string]$item.Id).Trim()
-    $nameText = ([string]$item.Name).Trim()
-    if ([string]::IsNullOrWhiteSpace($idText) -or [string]::IsNullOrWhiteSpace($nameText)) { continue }
+    $idText = ""
+    try { if ($item.PSObject.Properties["Id"]) { $idText = ([string]$item.Id).Trim() } } catch {}
+    if ([string]::IsNullOrWhiteSpace($idText)) { continue }
+
+    $nameText = ""
+    foreach ($member in @('Name', 'Title', 'DisplayName', 'PackageName', 'ProductName')) {
+        try {
+            if (-not $item.PSObject.Properties[$member]) { continue }
+            $candidate = ([string]$item.$member).Trim()
+            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            $nameText = $candidate
+            break
+        }
+        catch {}
+    }
+    # A row without any label remains in the ID list, but it is not written
+    # to the name map. Manage Ignored renders that entry as its raw ID.
+    if ([string]::IsNullOrWhiteSpace($nameText)) { continue }
 
     if ($entryById.ContainsKey($idText)) {
         $entryById[$idText].Value = $nameText
@@ -10392,6 +10787,13 @@ param(
     $Names = $null
 )
 
+if (Test-WmtIgnoredNamesAccelerator) {
+    try { return [WmtIgnoredNames.Accelerator]::BuildListItems($IgnoredIds, $Names) }
+    catch {}
+}
+
+# PowerShell fallback. The name lookup uses the map's own hash index, so the
+# cost stays linear in the number of ignored entries.
 $nameMap = ConvertTo-WmtIgnoredPackageNameMap -Names $Names -IgnoredIds $IgnoredIds
 $items = [System.Collections.Generic.List[object]]::new()
 $seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -10400,12 +10802,10 @@ foreach ($ignoredId in @($IgnoredIds)) {
     if ([string]::IsNullOrWhiteSpace($idText) -or -not $seenIds.Add($idText)) { continue }
 
     $nameText = ""
-    foreach ($key in @($nameMap.Keys)) {
-        if ([string]::Equals([string]$key, $idText, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $nameText = ([string]$nameMap[$key]).Trim()
-            break
-        }
+    try {
+        if ($nameMap.Contains($idText)) { $nameText = ([string]$nameMap[$idText]).Trim() }
     }
+    catch {}
 
     $displayText = $idText
     if (-not [string]::IsNullOrWhiteSpace($nameText) -and
@@ -10453,27 +10853,51 @@ foreach ($item in @($Items)) {
 return $removed
 }
 
+function Copy-WmtSettingsMember {
+# Copies one settings member. The ignored-name map holds one label per
+# ignored update and is read on every settings access, so it is copied with
+# the compiled helper instead of one PowerShell call per entry.
+param([string]$Name, $Value)
+
+if ($Name -eq 'WingetIgnoreNames') { return (Copy-WmtIgnoredPackageNameMap -Names $Value) }
+return (Copy-WmtSettingsValue -Value $Value)
+}
+
 function Copy-WmtSettings {
 param($Settings)
 if ($null -eq $Settings) { return $null }
-$copy = Copy-WmtSettingsValue -Value $Settings
+
+$isDictionary = $Settings -is [System.Collections.IDictionary]
+$isCustomObject = (-not $isDictionary) -and ($Settings -is [System.Management.Automation.PSCustomObject])
+if (-not $isDictionary -and -not $isCustomObject) { return (Copy-WmtSettingsValue -Value $Settings) }
+
+$members = [ordered]@{}
+if ($isDictionary) {
+    foreach ($key in @($Settings.Keys)) {
+        $members[[string]$key] = Copy-WmtSettingsMember -Name ([string]$key) -Value $Settings[$key]
+    }
+}
+else {
+    foreach ($prop in @($Settings.PSObject.Properties)) {
+        $members[$prop.Name] = Copy-WmtSettingsMember -Name $prop.Name -Value $prop.Value
+    }
+}
+
+$copy = if ($isCustomObject) { [PSCustomObject]$members } else { $members }
 # TempCleanup, RegistryScan, and WingetIgnoreNames are persisted as JSON
 # objects and are read or written by key. Normalize them back to ordered
 # dictionaries so their consumers keep working after a save, not just on a
-# fresh install where the defaults are still hashtables.
-# This is intentionally self-contained: it must not depend on a helper that a
-# caller might not have loaded, or the invariant would be silently skipped.
+# fresh install where the defaults are still hashtables. A member that is
+# already a dictionary is left alone: rebuilding it would copy every entry a
+# second time, and the ignored-name map can hold hundreds of entries.
 foreach ($member in @('TempCleanup', 'RegistryScan', 'WingetIgnoreNames')) {
     try {
         if (-not (Test-WmtSettingsMember -Settings $copy -Name $member)) { continue }
         $raw = Get-WmtSettingsMember -Settings $copy -Name $member -Default $null
         if ($null -eq $raw) { continue }
+        if ($raw -is [System.Collections.IDictionary]) { continue }
         $normalized = [ordered]@{}
-        if ($raw -is [System.Collections.IDictionary]) {
-            foreach ($key in @($raw.Keys)) { $normalized[$key] = $raw[$key] }
-        } else {
-            foreach ($prop in @($raw.PSObject.Properties)) { $normalized[$prop.Name] = $prop.Value }
-        }
+        foreach ($prop in @($raw.PSObject.Properties)) { $normalized[$prop.Name] = $prop.Value }
         if ($copy -is [System.Collections.IDictionary]) { $copy[$member] = $normalized }
         else { $copy.$member = $normalized }
     }
@@ -56223,15 +56647,25 @@ $btnWingetUnignore.Add_Click({
         if ($settings -and $settings.PSObject.Properties['WingetIgnoreNames']) {
             $rawNames = $settings.WingetIgnoreNames
             if ($rawNames -and -not ($rawNames -is [string])) {
+                $mergedWithAccelerator = $false
                 try {
-                    if ($rawNames -is [System.Collections.IDictionary]) {
-                        foreach ($key in @($rawNames.Keys)) { $ignoredNames[[string]$key] = $rawNames[$key] }
-                    }
-                    else {
-                        foreach ($prop in @($rawNames.PSObject.Properties)) { $ignoredNames[$prop.Name] = $prop.Value }
+                    if (([System.Management.Automation.PSTypeName]'WmtIgnoredNames.Accelerator').Type) {
+                        $ignoredNames = [WmtIgnoredNames.Accelerator]::MergeMaps($ignoredNames, $rawNames)
+                        $mergedWithAccelerator = $true
                     }
                 }
                 catch {}
+                if (-not $mergedWithAccelerator) {
+                    try {
+                        if ($rawNames -is [System.Collections.IDictionary]) {
+                            foreach ($key in @($rawNames.Keys)) { $ignoredNames[[string]$key] = $rawNames[$key] }
+                        }
+                        else {
+                            foreach ($prop in @($rawNames.PSObject.Properties)) { $ignoredNames[$prop.Name] = $prop.Value }
+                        }
+                    }
+                    catch {}
+                }
             }
         }
         $items = @($ignored | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

@@ -4534,6 +4534,13 @@ jobs:
               throw "WMT-GUI.ps1 unexpectedly failed AST parsing in settings smoke test."
           }
 
+          $acceleratorStart = $source.IndexOf('# --- IGNORED UPDATE NAME ACCELERATOR ---', [System.StringComparison]::Ordinal)
+          $acceleratorEnd = $source.IndexOf('$startupProc = $null', $acceleratorStart, [System.StringComparison]::Ordinal)
+          if ($acceleratorStart -lt 0 -or $acceleratorEnd -le $acceleratorStart) {
+              throw "The ignored-update name accelerator block was not found."
+          }
+          Invoke-Expression $source.Substring($acceleratorStart, $acceleratorEnd - $acceleratorStart)
+
           $needed = @(
               "Get-WmtSettingsFileStamp",
               "Test-WmtSettingsMember",
@@ -4543,7 +4550,11 @@ jobs:
               "Move-WmtCorruptSettingsFile",
               "Write-WmtSettingsFileAtomic",
               "Copy-WmtSettingsValue",
+              "Copy-WmtSettingsMember",
               "Copy-WmtSettings",
+              "Test-WmtIgnoredNamesAccelerator",
+              "Get-WmtIgnoredPackageNamePairs",
+              "Copy-WmtIgnoredPackageNameMap",
               "Get-WmtSettingsMapMember",
               "ConvertTo-WmtIgnoredPackageNameMap",
               "Save-WmtSettings",
@@ -4772,11 +4783,48 @@ jobs:
               throw "WMT-GUI.ps1 unexpectedly failed AST parsing in ignored-package test."
           }
 
+          # Load the production compiled accelerator so this regression test
+          # exercises the same fast path used by the GUI, including JSON maps
+          # represented as PSCustomObject values.
+          $acceleratorStart = $source.IndexOf('# --- IGNORED UPDATE NAME ACCELERATOR ---', [System.StringComparison]::Ordinal)
+          $acceleratorEnd = $source.IndexOf('$startupProc = $null', $acceleratorStart, [System.StringComparison]::Ordinal)
+          if ($acceleratorStart -lt 0 -or $acceleratorEnd -le $acceleratorStart) {
+              throw "The ignored-update name accelerator block was not found."
+          }
+          Invoke-Expression $source.Substring($acceleratorStart, $acceleratorEnd - $acceleratorStart)
+          if (-not ([System.Management.Automation.PSTypeName]'WmtIgnoredNames.Accelerator').Type) {
+              throw "The ignored-update name accelerator did not compile."
+          }
+
+          # Exercise the production Manage Ignored loader itself, not only its
+          # list-rendering helper.
+          $loaderCallStart = $source.IndexOf('Invoke-WmtUiBackgroundCommand -Name ("WingetIgnoredLoad_"', [System.StringComparison]::Ordinal)
+          if ($loaderCallStart -lt 0) { throw "The Manage Ignored loader call was not found." }
+          $loaderScriptStart = $source.IndexOf('-Sb {', $loaderCallStart, [System.StringComparison]::Ordinal)
+          $loaderBlockStart = $source.IndexOf('{', $loaderScriptStart + 4, [System.StringComparison]::Ordinal)
+          if ($loaderScriptStart -lt 0 -or $loaderBlockStart -lt 0) {
+              throw "The Manage Ignored loader script block was not found."
+          }
+          $loaderDepth = 0
+          $loaderBlockEnd = -1
+          for ($loaderIndex = $loaderBlockStart; $loaderIndex -lt $source.Length; $loaderIndex++) {
+              if ($source[$loaderIndex] -eq '{') { $loaderDepth++ }
+              elseif ($source[$loaderIndex] -eq '}') {
+                  $loaderDepth--
+                  if ($loaderDepth -eq 0) { $loaderBlockEnd = $loaderIndex; break }
+              }
+          }
+          if ($loaderBlockEnd -lt 0) { throw "The Manage Ignored loader script block was not complete." }
+          $manageIgnoredLoader = [scriptblock]::Create($source.Substring($loaderBlockStart + 1, $loaderBlockEnd - $loaderBlockStart - 1))
+
           foreach ($name in @(
               'Get-WmtSettingsMember',
               'Test-WmtSettingsMember',
               'Get-WmtSettingsMapMember',
+              'Test-WmtIgnoredNamesAccelerator',
+              'Get-WmtIgnoredPackageNamePairs',
               'ConvertTo-WmtIgnoredPackageNameMap',
+              'Copy-WmtIgnoredPackageNameMap',
               'New-WmtIgnoredPackageNameEntries',
               'Get-WmtIgnoredPackageListItems',
               'Remove-WmtIgnoredPackageListItemsById',
@@ -4796,6 +4844,37 @@ jobs:
               if (-not $Condition) { throw "Assertion failed: $Message" }
           }
 
+          # Every update provider publishes a human-readable Name alongside
+          # its ID. Exercise the complete provider-row contract here so a
+          # provider-specific row shape cannot silently regress to ID-only.
+          $providerRows = @(
+              [pscustomobject]@{ Source = 'winget'; Name = '7-Zip 24.09'; Id = '7zip.7zip' }
+              [pscustomobject]@{ Source = 'msstore'; Name = 'Microsoft PowerToys'; Id = '9NBLGGH4NNS1' }
+              [pscustomobject]@{ Source = 'windowsupdate'; Name = '2026-11 Cumulative Update for Windows 11 (KB5031234)'; Id = '11111111-2222-3333-4444-555555555555|1' }
+              [pscustomobject]@{ Source = 'pip'; Name = 'requests'; Id = 'requests' }
+              [pscustomobject]@{ Source = 'npm'; Name = 'typescript'; Id = 'typescript' }
+              [pscustomobject]@{ Source = 'npm (global)'; Name = 'pnpm'; Id = 'pnpm-global' }
+              [pscustomobject]@{ Source = 'pnpm'; Name = 'vite'; Id = 'vite' }
+              [pscustomobject]@{ Source = 'pnpm (global)'; Name = 'typescript'; Id = 'typescript-global' }
+              [pscustomobject]@{ Source = 'dotnet'; Name = 'dotnet-ef'; Id = 'dotnet-ef' }
+              [pscustomobject]@{ Source = 'psmodule'; Name = 'PSReadLine'; Id = 'PSReadLine' }
+              [pscustomobject]@{ Source = 'composer'; Name = 'monolog/monolog'; Id = 'monolog/monolog' }
+              [pscustomobject]@{ Source = 'chocolatey'; Name = 'git'; Id = 'chocolatey-git' }
+              [pscustomobject]@{ Source = 'scoop'; Name = 'git'; Id = 'git' }
+              [pscustomobject]@{ Source = 'gem'; Name = 'rails'; Id = 'rails' }
+              [pscustomobject]@{ Source = 'cargo'; Name = 'ripgrep'; Id = 'ripgrep' }
+              [pscustomobject]@{ Source = 'legendary'; Name = 'Hades'; Id = 'Hades' }
+              [pscustomobject]@{ Source = 'gogdl'; Name = 'Baldur''s Gate 3'; Id = '1207658929' }
+              [pscustomobject]@{ Source = 'steam'; Name = 'Hades'; Id = '1145360' }
+          )
+          $providerEntries = @(New-WmtIgnoredPackageNameEntries -Items $providerRows)
+          Assert-True ($providerEntries.Count -eq $providerRows.Count) 'every update provider row registers an ignored-list name'
+          $providerNameById = @{}
+          foreach ($providerEntry in $providerEntries) { $providerNameById[[string]$providerEntry.Key] = [string]$providerEntry.Value }
+          Assert-True ($providerNameById['11111111-2222-3333-4444-555555555555|1'] -eq '2026-11 Cumulative Update for Windows 11 (KB5031234)') 'the Windows Update name is registered with its revision-qualified ID'
+          Assert-True ($providerNameById['7zip.7zip'] -eq '7-Zip 24.09') 'the Winget name is registered with its package ID'
+          Assert-True ($providerNameById['Hades'] -eq 'Hades') 'a provider ID that differs from its display name is registered correctly'
+
           # Duplicate IDs must produce one display row. Known names must be shown
           # with the ID, while legacy entries without a persisted name must keep
           # a safe ID-only fallback.
@@ -4804,7 +4883,7 @@ jobs:
               [pscustomobject]@{ Id = 'PKG.ONE'; Name = 'Package One Updated' },
               [pscustomobject]@{ Id = 'missing.name'; Name = '' }
           ))
-          Assert-True ($entries.Count -eq 1) 'duplicate IDs collapse to one name entry'
+          Assert-True ($entries.Count -eq 1) 'duplicate IDs collapse to one name entry and nameless rows are skipped'
           Assert-True ($entries[0].Value -eq 'Package One Updated') 'latest duplicate name wins'
 
           $display = @(Get-WmtIgnoredPackageListItems -IgnoredIds @('pkg.one', 'pkg.one', 'legacy.id', 'unknown') -Names ([pscustomobject]@{ 'pkg.one' = 'Package One' }))
@@ -4813,8 +4892,30 @@ jobs:
           Assert-True ($display[1].DisplayName -eq 'legacy.id') 'missing name falls back to ID'
           Assert-True ($display[2].DisplayName -eq 'unknown') 'unknown stale ID falls back to ID'
 
+          $wuDisplay = @(Get-WmtIgnoredPackageListItems -IgnoredIds @('11111111-2222-3333-4444-555555555555|1') -Names ([pscustomobject]@{ '11111111-2222-3333-4444-555555555555|1' = '2026-11 Cumulative Update for Windows 11 (KB5031234)' }))
+          Assert-True ($wuDisplay.Count -eq 1) 'the Windows Update ignored entry is displayed'
+          Assert-True ($wuDisplay[0].DisplayName -eq '2026-11 Cumulative Update for Windows 11 (KB5031234) (11111111-2222-3333-4444-555555555555|1)') 'the Windows Update name and revision-qualified ID are displayed'
+
           $defaultDisplay = @(Get-WmtIgnoredPackageListItems -IgnoredIds @('228980') -Names ([ordered]@{ '228980' = 'Steamworks Common Redistributables' }))
           Assert-True ($defaultDisplay[0].DisplayName -eq 'Steamworks Common Redistributables (228980)') 'the built-in ignored package name is displayed'
+
+          # Guard the hot path against a return to quadratic key scans. This
+          # uses the same PSCustomObject shape produced by ConvertFrom-Json.
+          $perfIds = [string[]]::new(5000)
+          $perfNameMap = [ordered]@{}
+          for ($perfIndex = 0; $perfIndex -lt $perfIds.Length; $perfIndex++) {
+              $perfId = '11111111-2222-3333-4444-{0:D12}|1' -f $perfIndex
+              $perfIds[$perfIndex] = $perfId
+              $perfNameMap[$perfId] = "Windows Update $perfIndex"
+          }
+          $perfJsonNames = [pscustomobject]$perfNameMap
+          $perfTimer = [System.Diagnostics.Stopwatch]::StartNew()
+          $perfMap = ConvertTo-WmtIgnoredPackageNameMap -Names $perfJsonNames -IgnoredIds $perfIds
+          $perfItems = @(Get-WmtIgnoredPackageListItems -IgnoredIds $perfIds -Names $perfJsonNames)
+          $perfTimer.Stop()
+          Assert-True ($perfMap.Count -eq $perfIds.Length) 'the large ignored-name map is complete'
+          Assert-True ($perfItems.Count -eq $perfIds.Length) 'the large ignored-list rendering is complete'
+          Assert-True ($perfTimer.ElapsedMilliseconds -lt 2000) 'ignored-name map and list rendering remain responsive at 5000 entries'
 
           # Exercise the production removal helper against a real WPF ListBox.
           # The selected ID spelling must not matter when the ignored item was
@@ -4881,32 +4982,47 @@ jobs:
               Assert-True (@($saved.WingetIgnore).Count -eq 2) 'case-variant duplicate IDs collapse during persistence'
               Assert-True ($null -eq $saved.WingetIgnoreNames.'stale.id') 'stale ignored-package names are removed during persistence'
 
+              $wuId = '11111111-2222-3333-4444-555555555555|1'
+              $wuName = '2026-11 Cumulative Update for Windows 11 (KB5031234)'
               Invoke-WmtSettingsPatchSave -Patch @{} -Name 'add-ignore' -Message 'test' `
-                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one', 'PKG.ONE') }) `
-                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = 'Package One' }) })
+                  -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one', 'PKG.ONE', $wuId) }) `
+                  -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = @(
+                      [pscustomobject]@{ Key = 'pkg.one'; Value = 'Package One' },
+                      [pscustomobject]@{ Key = $wuId; Value = $wuName }
+                  ) })
               $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
-              Assert-True (@($saved.WingetIgnore).Count -eq 2) 'ignore list persists IDs without duplicates'
+              Assert-True (@($saved.WingetIgnore).Count -eq 3) 'ignore list persists IDs without duplicates'
               Assert-True ($saved.WingetIgnoreNames.'pkg.one' -eq 'Package One') 'ignore name persists'
+              Assert-True (@($saved.WingetIgnore) -contains $wuId) 'the revision-qualified Windows Update ID persists'
+              Assert-True ($saved.WingetIgnoreNames.$wuId -eq $wuName) 'the Windows Update name persists with its ID'
+
+              $loadedIgnored = & $manageIgnoredLoader $settingsPath
+              Assert-True (@($loadedIgnored.IgnoredIds) -contains $wuId) 'Manage Ignored loads the revision-qualified Windows Update ID'
+              Assert-True ($loadedIgnored.IgnoredNames.Contains($wuId)) 'Manage Ignored loads the Windows Update name map entry'
+              $loadedWuRows = @(Get-WmtIgnoredPackageListItems -IgnoredIds @($loadedIgnored.IgnoredIds) -Names $loadedIgnored.IgnoredNames | Where-Object { [string]$_.Id -eq $wuId })
+              Assert-True ($loadedWuRows.Count -eq 1) 'Manage Ignored renders one Windows Update entry'
+              Assert-True ($loadedWuRows[0].DisplayName -eq "$wuName ($wuId)") 'Manage Ignored renders the Windows Update name with its ID'
 
               Invoke-WmtSettingsPatchSave -Patch @{} -Name 'update-ignore' -Message 'test' `
                   -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Add'; Values = @('pkg.one') }) `
                   -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Add'; Values = @([pscustomobject]@{ Key = 'pkg.one'; Value = 'Package One Updated' }) })
               $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
-              Assert-True (@($saved.WingetIgnore).Count -eq 2) 'duplicate add does not duplicate ignore list'
+              Assert-True (@($saved.WingetIgnore).Count -eq 3) 'duplicate add does not duplicate ignore list'
               Assert-True ($saved.WingetIgnoreNames.'pkg.one' -eq 'Package One Updated') 'duplicate add updates name'
 
               Invoke-WmtSettingsPatchSave -Patch @{} -Name 'remove-ignore' -Message 'test' `
                   -ListOperations @([pscustomobject]@{ Property = 'WingetIgnore'; Action = 'Remove'; Values = @('pkg.one') }) `
                   -MapOperations @([pscustomobject]@{ Property = 'WingetIgnoreNames'; Action = 'Remove'; Values = @([pscustomobject]@{ Key = 'PKG.ONE'; Value = '' }) })
               $saved = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
-              Assert-True (@($saved.WingetIgnore).Count -eq 1) 'remove preserves other ignored IDs'
+              Assert-True (@($saved.WingetIgnore).Count -eq 2) 'remove preserves other ignored IDs'
               Assert-True ($null -eq $saved.WingetIgnoreNames.'pkg.one') 'remove clears the persisted name'
+              Assert-True ($saved.WingetIgnoreNames.$wuId -eq $wuName) 'removing another package preserves the Windows Update name'
           }
           finally {
               try { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
           }
 
-          Write-Host "OK: ignored package names, legacy fallbacks, and atomic persistence."
+          Write-Host "OK: provider ignored names, Windows Update round-trip, legacy fallbacks, responsiveness, and atomic persistence."
 
 
       - name: Smoke test centralized background-operation manager
