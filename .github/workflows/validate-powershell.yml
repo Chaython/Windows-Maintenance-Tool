@@ -1988,6 +1988,8 @@ jobs:
               'ConvertFrom-WmtScoopStatus',
               'New-WmtProviderScanStatus',
               'ConvertFrom-WmtPnpmOutdatedJson',
+              'Start-WmtProviderProcess',
+              'Complete-WmtProviderProcess',
               'Test-WmtSettingsMember',
               'Get-WmtSettingsMember',
               'Get-WmtProviderCapabilities',
@@ -5570,7 +5572,9 @@ jobs:
               'ConvertFrom-WmtScoopStatusLine',
               'ConvertFrom-WmtScoopStatus',
               'New-WmtProviderScanStatus',
-              'ConvertFrom-WmtPnpmOutdatedJson'
+              'ConvertFrom-WmtPnpmOutdatedJson',
+              'Start-WmtProviderProcess',
+              'Complete-WmtProviderProcess'
           )
           foreach ($helperName in $requiredPoolHelpers) {
               $helperAst = $ast.Find({
