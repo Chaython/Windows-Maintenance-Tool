@@ -391,6 +391,207 @@ jobs:
 
           Write-Host 'PASS: Steam ownership seeding is opt-in and recovers top-level JSON arrays.'
 
+      - name: Test concurrent provider process helpers
+        shell: powershell
+        run: |
+          # Provider checks that need independent queries (npm/pnpm local and
+          # global, per-tool .NET searches) must start them before waiting, and
+          # must enforce a per-command timeout without blocking the WPF thread.
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = (Get-Location).Path
+          $sourcePath = Join-Path $repoRoot 'WMT-GUI.ps1'
+          $source = [System.IO.File]::ReadAllText($sourcePath)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors -and $parseErrors.Count -gt 0) {
+              throw ('Parse failed: ' + (($parseErrors | ForEach-Object { $_.Message }) -join '; '))
+          }
+
+          function Get-WmtFunctionSource([string]$Name) {
+              $functionAst = $ast.FindAll({
+                      param($node)
+                      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+                  }, $true) | Select-Object -First 1
+              if (-not $functionAst) { throw "Missing function $Name" }
+              return $functionAst.Extent.Text
+          }
+
+          function Get-WmtWorkerBlock([string]$Marker) {
+              $blocks = @($ast.FindAll({
+                          param($node)
+                          $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
+                      }, $true))
+              $matchedBlocks = @($blocks | Where-Object { $_.Extent.Text.Contains($Marker) } | Sort-Object { $_.Extent.Text.Length })
+              if ($matchedBlocks.Count -eq 0) { throw "Worker block for '$Marker' was not found." }
+              $text = $matchedBlocks[0].Extent.Text.Trim()
+              if ($text.StartsWith('{') -and $text.EndsWith('}')) { $text = $text.Substring(1, $text.Length - 2) }
+              return [scriptblock]::Create($text)
+          }
+
+          function Assert-True([bool]$Condition, [string]$Message) {
+              if (-not $Condition) { throw $Message }
+          }
+
+          Invoke-Expression (Get-WmtFunctionSource 'Start-WmtProviderProcess')
+          Invoke-Expression (Get-WmtFunctionSource 'Complete-WmtProviderProcess')
+          Invoke-Expression (Get-WmtFunctionSource 'New-WmtProviderScanStatus')
+
+          $first = $null
+          $second = $null
+          try {
+              $first = Start-WmtProviderProcess -FileName 'cmd.exe' -Arguments '/c ping -n 3 127.0.0.1 >nul' -CaptureError
+              $second = Start-WmtProviderProcess -FileName 'cmd.exe' -Arguments '/c ping -n 3 127.0.0.1 >nul' -CaptureError
+              Start-Sleep -Milliseconds 250
+              Assert-True (-not $first.Process.HasExited) 'The first concurrent helper process finished before the overlap check.'
+              Assert-True (-not $second.Process.HasExited) 'The second concurrent helper process finished before the overlap check.'
+              $firstResult = Complete-WmtProviderProcess -Entry $first -TimeoutMs 15000
+              $secondResult = Complete-WmtProviderProcess -Entry $second -TimeoutMs 15000
+              Assert-True (-not $firstResult.TimedOut -and -not $secondResult.TimedOut) 'A concurrent helper process timed out unexpectedly.'
+              Assert-True ($firstResult.ExitCode -eq 0 -and $secondResult.ExitCode -eq 0) 'A concurrent helper process returned a non-zero exit code.'
+          }
+          finally {
+              if ($first -and $first.Process) { try { $first.Process.Dispose() } catch {} }
+              if ($second -and $second.Process) { try { $second.Process.Dispose() } catch {} }
+          }
+
+          $echoEntry = $null
+          try {
+              $echoEntry = Start-WmtProviderProcess -FileName 'cmd.exe' -Arguments '/c echo wmt-provider-output' -CaptureError
+              $echoResult = Complete-WmtProviderProcess -Entry $echoEntry -TimeoutMs 5000
+              Assert-True (-not $echoResult.TimedOut) 'The output-capture helper timed out.'
+              Assert-True ($echoResult.Out -match 'wmt-provider-output') 'The helper did not capture stdout.'
+          }
+          finally {
+              if ($echoEntry -and $echoEntry.Process) { try { $echoEntry.Process.Dispose() } catch {} }
+          }
+
+          $slow = $null
+          try {
+              $slow = Start-WmtProviderProcess -FileName 'cmd.exe' -Arguments '/c ping -n 10 127.0.0.1 >nul'
+              $slowResult = Complete-WmtProviderProcess -Entry $slow -TimeoutMs 250 -KillTree
+              Assert-True ($slowResult.TimedOut) 'The helper did not report a timed-out process.'
+              Assert-True ($slowResult.ExitCode -eq 124) 'The helper did not use exit code 124 for a timeout.'
+              Assert-True ($slow.Process.HasExited) 'The helper left a timed-out process running.'
+          }
+          finally {
+              if ($slow -and $slow.Process) { try { $slow.Process.Dispose() } catch {} }
+          }
+
+          # npm and pnpm workers must launch both independent queries before waiting.
+          $npmStart = $source.IndexOf('# C. NPM WORKER')
+          $npmEnd = $source.IndexOf('# D. CHOCOLATEY WORKER')
+          Assert-True ($npmStart -ge 0 -and $npmEnd -gt $npmStart) 'Could not locate the npm worker block.'
+          $npmBlock = $source.Substring($npmStart, $npmEnd - $npmStart)
+          $npmLocalStart = $npmBlock.IndexOf('$localEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c npm outdated --json 2>nul"')
+          $npmGlobalStart = $npmBlock.IndexOf('$globalEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c npm outdated -g --json 2>nul"')
+          $npmLocalComplete = $npmBlock.IndexOf('$localResult = Complete-WmtProviderProcess -Entry $localEntry -TimeoutMs 30000')
+          $npmGlobalComplete = $npmBlock.IndexOf('$globalResult = Complete-WmtProviderProcess -Entry $globalEntry -TimeoutMs 30000')
+          Assert-True ($npmLocalStart -ge 0) 'The npm worker does not start its local check.'
+          Assert-True ($npmGlobalStart -gt $npmLocalStart) 'The npm worker does not start its global check before waiting.'
+          Assert-True ($npmLocalComplete -gt $npmGlobalStart) 'The npm worker waits for the local check before starting the global check.'
+          Assert-True ($npmGlobalComplete -gt $npmLocalComplete) 'The npm worker does not complete both checks.'
+
+          $pnpmStart = $source.IndexOf('# H. PNPM WORKER')
+          $pnpmEnd = $source.IndexOf('# I. LEGENDARY / EPIC GAMES WORKER')
+          Assert-True ($pnpmStart -ge 0 -and $pnpmEnd -gt $pnpmStart) 'Could not locate the pnpm worker block.'
+          $pnpmBlock = $source.Substring($pnpmStart, $pnpmEnd - $pnpmStart)
+          $pnpmLocalStart = $pnpmBlock.IndexOf('$localEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c pnpm outdated --format json 2>nul"')
+          $pnpmGlobalStart = $pnpmBlock.IndexOf('$globalEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c pnpm outdated -g --format json 2>nul"')
+          $pnpmLocalComplete = $pnpmBlock.IndexOf('$localResult = Complete-WmtProviderProcess -Entry $localEntry -TimeoutMs 35000')
+          $pnpmGlobalComplete = $pnpmBlock.IndexOf('$globalResult = Complete-WmtProviderProcess -Entry $globalEntry -TimeoutMs 15000')
+          Assert-True ($pnpmLocalStart -ge 0) 'The pnpm worker does not start its local check.'
+          Assert-True ($pnpmGlobalStart -gt $pnpmLocalStart) 'The pnpm worker does not start its global check before waiting.'
+          Assert-True ($pnpmLocalComplete -gt $pnpmGlobalStart) 'The pnpm worker waits for the local check before starting the global check.'
+          Assert-True ($pnpmGlobalComplete -gt $pnpmLocalComplete) 'The pnpm worker does not complete both checks.'
+
+          $dotnetStart = $source.IndexOf('# H. .NET GLOBAL TOOLS WORKER')
+          $dotnetEnd = $source.IndexOf('# I. POWERSHELL MODULES WORKER')
+          Assert-True ($dotnetStart -ge 0 -and $dotnetEnd -gt $dotnetStart) 'Could not locate the .NET worker block.'
+          $dotnetBlock = $source.Substring($dotnetStart, $dotnetEnd - $dotnetStart)
+          Assert-True ($dotnetBlock -match '\$searchLimit = 4') 'The .NET worker does not bound concurrent searches.'
+          Assert-True ($dotnetBlock -match 'Start-WmtProviderProcess -FileName "dotnet"') 'The .NET worker does not start searches through the shared helper.'
+          Assert-True ($dotnetBlock -match 'Complete-WmtProviderProcess -Entry \$searchEntry') 'The .NET worker does not complete searches through the shared helper.'
+
+          # The deferred winget registration and preflight must precede provider workers.
+          $deferredIndex = $source.IndexOf('$script:WmtDeferredWingetScanPending = $true')
+          $pipWorkerIndex = $source.IndexOf('# B. PIP WORKER')
+          $oldDeferredIndex = $source.IndexOf('# --- Winget joins the running scan once its source refresh has finished ---')
+          Assert-True ($deferredIndex -ge 0) 'The deferred winget registration is missing.'
+          Assert-True ($pipWorkerIndex -gt $deferredIndex) 'The deferred winget registration no longer precedes the provider workers.'
+          Assert-True ($oldDeferredIndex -lt 0) 'The old late deferred-winget block still exists.'
+
+          # Run the real .NET worker against a fake dotnet.exe to verify bounded
+          # concurrency and installed-tool row ordering. Four concurrent 1s
+          # searches finish in roughly two seconds; a serial worker takes 8s+.
+          $fakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('wmt-fake-dotnet-' + [Guid]::NewGuid().ToString('N'))
+          [void][System.IO.Directory]::CreateDirectory($fakeRoot)
+          $oldPath = $env:PATH
+          try {
+              $fakeSourcePath = Join-Path $fakeRoot 'FakeDotnet.cs'
+              $fakeExePath = Join-Path $fakeRoot 'dotnet.exe'
+              $fakeSourceLines = @(
+                  'using System;',
+                  'using System.Threading;',
+                  '',
+                  'class FakeDotnet',
+                  '{',
+                  '    static int Main(string[] args)',
+                  '    {',
+                  '        string joined = string.Join(" ", args);',
+                  '        if (joined.StartsWith("tool list --global", StringComparison.OrdinalIgnoreCase))',
+                  '        {',
+                  '            Console.WriteLine("Package Id      Version      Commands");',
+                  '            Console.WriteLine("--------------------------------------");',
+                  '            for (int i = 1; i <= 8; i++)',
+                  '            {',
+                  '                Console.WriteLine("fake.tool" + i + "      1.0.0        fake" + i);',
+                  '            }',
+                  '            return 0;',
+                  '        }',
+                  '        if (joined.StartsWith("tool search", StringComparison.OrdinalIgnoreCase))',
+                  '        {',
+                  '            Thread.Sleep(1000);',
+                  '            string id = args.Length > 2 ? args[2].Trim(new char[] { (char)34 }) : "fake.tool";',
+                  '            Console.WriteLine("Package ID      Version");',
+                  '            Console.WriteLine("--------------------------------------");',
+                  '            Console.WriteLine(id + "      2.0.0");',
+                  '            return 0;',
+                  '        }',
+                  '        return 0;',
+                  '    }',
+                  '}'
+              )
+              [System.IO.File]::WriteAllText($fakeSourcePath, ($fakeSourceLines -join "`r`n"), [System.Text.UTF8Encoding]::new($false))
+              $cscPath = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+              Assert-True (Test-Path -LiteralPath $cscPath -PathType Leaf) 'The .NET Framework C# compiler was not found.'
+              & $cscPath '/nologo' "/out:$fakeExePath" $fakeSourcePath
+              Assert-True ($LASTEXITCODE -eq 0) 'The fake dotnet compiler failed.'
+
+              $env:PATH = $fakeRoot + ';' + $oldPath
+              $dotnetWorker = Get-WmtWorkerBlock 'Scanning .NET global tools...'
+              $watch = [Diagnostics.Stopwatch]::StartNew()
+              $dotnetOutput = @(& $dotnetWorker @())
+              $watch.Stop()
+              $dotnetRows = @($dotnetOutput | Where-Object {
+                      $_ -is [pscustomobject] -and $_.PSObject.Properties['Source'] -and [string]$_.Source -eq 'dotnet'
+                  })
+              Assert-True ($dotnetRows.Count -eq 8) "Expected eight bounded .NET search rows, got $($dotnetRows.Count)."
+              Assert-True ($watch.Elapsed.TotalSeconds -lt 7) 'The .NET worker did not search tools concurrently.'
+              for ($i = 1; $i -le 8; $i++) {
+                  Assert-True ([string]$dotnetRows[$i - 1].Name -eq "fake.tool$i") "The .NET worker changed installed-tool row order at ${i}."
+                  Assert-True ([string]$dotnetRows[$i - 1].Available -eq '2.0.0') "The .NET worker lost the latest version for fake.tool$i."
+              }
+              $dotnetFailureLogs = @($dotnetOutput | Where-Object { $_ -is [string] -and $_ -match 'timed out|exited with code|failed' })
+              Assert-True ($dotnetFailureLogs.Count -eq 0) ('The .NET worker reported failures: ' + ($dotnetFailureLogs -join '; '))
+          }
+          finally {
+              $env:PATH = $oldPath
+              try { Remove-Item -LiteralPath $fakeRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+          Write-Host 'PASS: concurrent provider helpers, parallel npm/pnpm startup, bounded .NET searches, and early deferred winget setup.'
+
       - name: Test shared WPF controls
         shell: powershell -NoProfile -STA -ExecutionPolicy Bypass -File {0}
         run: |

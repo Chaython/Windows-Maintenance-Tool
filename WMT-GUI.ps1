@@ -5226,6 +5226,102 @@ return $seed
 }
 
 # ============================================================================
+# Concurrent provider process helpers
+# Providers that need independent queries (local/global, per-tool searches)
+# start every process before waiting. A slow command therefore does not add
+# its timeout to its sibling's budget, and timeout/kill-tree handling stays
+# consistent without blocking the WPF dispatcher.
+# ============================================================================
+function Start-WmtProviderProcess {
+param(
+    [Parameter(Mandatory = $true)][string]$FileName,
+    [string]$Arguments = "",
+    [switch]$CaptureError
+)
+
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $FileName
+$psi.Arguments = $Arguments
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$psi.RedirectStandardOutput = $true
+$psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+if ($CaptureError) {
+    $psi.RedirectStandardError = $true
+    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+}
+
+$process = [System.Diagnostics.Process]::Start($psi)
+return [pscustomobject]@{
+    Process    = $process
+    OutputTask = $process.StandardOutput.ReadToEndAsync()
+    ErrorTask  = if ($CaptureError) { $process.StandardError.ReadToEndAsync() } else { $null }
+    StartedAt  = [System.Diagnostics.Stopwatch]::StartNew()
+}
+}
+
+function Complete-WmtProviderProcess {
+param(
+    [Parameter(Mandatory = $true)]$Entry,
+    [int]$TimeoutMs = 30000,
+    [switch]$KillTree
+)
+
+$process = $Entry.Process
+if (-not $process) { throw "Provider process entry has no process handle." }
+
+# The timeout budget starts when the process was launched. Completing a
+# sibling first must not give this process a fresh budget.
+$remainingMs = [Math]::Max(0, $TimeoutMs - [int]$Entry.StartedAt.ElapsedMilliseconds)
+$timedOut = -not $process.WaitForExit($remainingMs)
+if ($timedOut) {
+    $killed = $false
+    if ($KillTree) {
+        try {
+            $killInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $killInfo.FileName = "$env:SystemRoot\System32\taskkill.exe"
+            $killInfo.Arguments = "/PID $($process.Id) /T /F"
+            $killInfo.UseShellExecute = $false
+            $killInfo.CreateNoWindow = $true
+            $killInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+            $killProcess = [System.Diagnostics.Process]::Start($killInfo)
+            if ($killProcess) {
+                [void]$killProcess.WaitForExit(5000)
+                try { $killProcess.Dispose() } catch {}
+                $killed = $true
+            }
+        }
+        catch {}
+    }
+    if (-not $killed) { try { $process.Kill() } catch {} }
+    try { [void]$process.WaitForExit(2000) } catch {}
+}
+
+$out = ""
+$err = ""
+try {
+    if ($Entry.OutputTask.Wait(5000)) { $out = [string]$Entry.OutputTask.GetAwaiter().GetResult() }
+}
+catch {}
+try {
+    if ($Entry.ErrorTask -and $Entry.ErrorTask.Wait(5000)) { $err = [string]$Entry.ErrorTask.GetAwaiter().GetResult() }
+}
+catch {}
+$exitCode = 124
+if (-not $timedOut) {
+    try { $exitCode = [int]$process.ExitCode } catch { $exitCode = 1 }
+}
+
+return [pscustomobject]@{
+    TimedOut = [bool]$timedOut
+    ExitCode = $exitCode
+    Out      = $out
+    Err      = $err
+}
+}
+
+# ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
 # page status queries cannot be starved by package scans or library refreshes.
@@ -5279,7 +5375,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson", "New-WmtSteamOwnershipSeed")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson", "New-WmtSteamOwnershipSeed", "Start-WmtProviderProcess", "Complete-WmtProviderProcess")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -56912,6 +57008,17 @@ $btnWingetScan.Add_Click({
     }
     if (-not $deferWingetScan) { & $startWingetScan $enabled $ignoreList $includeUnknown }
 
+    # Register the deferred winget scan and start its source refresh before the
+    # other provider workers. The refresh uses one shared worker slot, but it
+    # lets winget join as soon as the refresh finishes instead of waiting behind
+    # every provider that was queued ahead of it.
+    if ($deferWingetScan) {
+        $script:WmtDeferredWingetScanPending = $true
+        $script:WmtDeferredWingetScan = @{ ScriptBlock = $startWingetScan; Enabled = $enabled; IgnoreList = $ignoreList; IncludeUnknown = $includeUnknown }
+        if ($script:WingetScanSourcePreflightInProgress) { Write-GuiLog "Winget scan will start when the source refresh finishes." }
+        else { Start-WingetScanSourcePreflight -Sources $wingetSourcesToPrep }
+    }
+
     if ("msstore" -in $enabled) {
         [void](Start-WmtProviderScanWorker -ProviderName "msstore" -WorkerFactory {
             $ps = New-WmtPooledPowerShell
@@ -57386,15 +57493,22 @@ $btnWingetScan.Add_Click({
             [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Npm..."
+                $localEntry = $null
+                $globalEntry = $null
                 try {
-                    # Local packages
-                    $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c npm outdated --json 2>nul")
-                    $pInfo.RedirectStandardOutput = $true; $pInfo.UseShellExecute = $false; $pInfo.CreateNoWindow = $true
-                    $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                    $p = [System.Diagnostics.Process]::Start($pInfo)
-                    $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if ($p.WaitForExit(30000)) {
-                        $json = $outTask.GetAwaiter().GetResult().Trim()
+                    # Local and global checks are independent read-only queries.
+                    # Start both before waiting so the global query cannot add its
+                    # timeout to the local query's budget.
+                    $localEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c npm outdated --json 2>nul"
+                    $globalEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c npm outdated -g --json 2>nul"
+
+                    $localResult = Complete-WmtProviderProcess -Entry $localEntry -TimeoutMs 30000 -KillTree
+                    if ($localResult.TimedOut) {
+                        Write-Output "LOG:Npm local scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan timed out.")
+                    }
+                    else {
+                        $json = ([string]$localResult.Out).Trim()
                         # npm exits with code 1 when outdated packages are found.
                         # Parse valid JSON first and treat that documented exit
                         # code as a successful provider scan.
@@ -57405,9 +57519,9 @@ $btnWingetScan.Add_Click({
                                 $o = $pkgs.$k
                                 [PSCustomObject]@{Source = "npm"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
                             }
-                            if ($p.ExitCode -notin @(0, 1)) {
-                                Write-Output "LOG:Npm local scan exited with code $($p.ExitCode)."
-                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan exited with code $($p.ExitCode).")
+                            if ($localResult.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Npm local scan exited with code $($localResult.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan exited with code $($localResult.ExitCode).")
                             }
                         }
                         else {
@@ -57415,20 +57529,14 @@ $btnWingetScan.Add_Click({
                             Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan returned invalid JSON.")
                         }
                     }
-                    else {
-                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
-                        Write-Output "LOG:Npm local scan timed out."
-                        Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan timed out.")
-                    }
 
-                    # Global packages
-                    $pInfoG = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c npm outdated -g --json 2>nul")
-                    $pInfoG.RedirectStandardOutput = $true; $pInfoG.UseShellExecute = $false; $pInfoG.CreateNoWindow = $true
-                    $pInfoG.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                    $pg = [System.Diagnostics.Process]::Start($pInfoG)
-                    $outTaskG = $pg.StandardOutput.ReadToEndAsync()
-                    if ($pg.WaitForExit(30000)) {
-                        $jsonG = $outTaskG.GetAwaiter().GetResult().Trim()
+                    $globalResult = Complete-WmtProviderProcess -Entry $globalEntry -TimeoutMs 30000 -KillTree
+                    if ($globalResult.TimedOut) {
+                        Write-Output "LOG:Npm global scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan timed out.")
+                    }
+                    else {
+                        $jsonG = ([string]$globalResult.Out).Trim()
                         if ($jsonG -and $jsonG.StartsWith("{")) {
                             $pkgsG = $jsonG | ConvertFrom-Json
                             foreach ($k in $pkgsG.PSObject.Properties.Name) {
@@ -57436,9 +57544,9 @@ $btnWingetScan.Add_Click({
                                 $o = $pkgsG.$k
                                 [PSCustomObject]@{Source = "npm (global)"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
                             }
-                            if ($pg.ExitCode -notin @(0, 1)) {
-                                Write-Output "LOG:Npm global scan exited with code $($pg.ExitCode)."
-                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan exited with code $($pg.ExitCode).")
+                            if ($globalResult.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Npm global scan exited with code $($globalResult.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan exited with code $($globalResult.ExitCode).")
                             }
                         }
                         else {
@@ -57446,15 +57554,14 @@ $btnWingetScan.Add_Click({
                             Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan returned invalid JSON.")
                         }
                     }
-                    else {
-                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $pg.Id /T /F 2>$null | Out-Null } catch { try { $pg.Kill() } catch {} }
-                        Write-Output "LOG:Npm global scan timed out."
-                        Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan timed out.")
-                    }
                 }
                 catch {
                     Write-Output "LOG:Npm check failed: $($_.Exception.Message)"
                     Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message $_.Exception.Message)
+                }
+                finally {
+                    if ($localEntry -and $localEntry.Process) { try { $localEntry.Process.Dispose() } catch {} }
+                    if ($globalEntry -and $globalEntry.Process) { try { $globalEntry.Process.Dispose() } catch {} }
                 }
             }).AddArgument($ignoreList)
             $ps
@@ -57734,10 +57841,54 @@ $btnWingetScan.Add_Click({
                         return
                     }
 
+                    # Search every tool's latest version concurrently. A serial
+                    # per-tool 12s timeout can exceed the scan deadline on a
+                    # machine with many global tools; keep at most four searches
+                    # in flight and emit rows in installed-tool order.
+                    $searchLimit = 4
+                    $searchTimeoutMs = 12000
+                    $searchQueue = New-Object System.Collections.Queue
+                    foreach ($tool in $installed) { $searchQueue.Enqueue($tool) }
+                    $runningSearches = New-Object System.Collections.ArrayList
+                    $searchResults = @{}
+                    try {
+                        while ($searchQueue.Count -gt 0 -or $runningSearches.Count -gt 0) {
+                            while ($runningSearches.Count -lt $searchLimit -and $searchQueue.Count -gt 0) {
+                                $queuedTool = $searchQueue.Dequeue()
+                                $entry = Start-WmtProviderProcess -FileName "dotnet" -Arguments "tool search `"$([string]$queuedTool.Id)`" --take 5"
+                                [void]$runningSearches.Add([pscustomobject]@{ Tool = $queuedTool; Entry = $entry })
+                            }
+
+                            $completedSearch = $false
+                            for ($searchIndex = $runningSearches.Count - 1; $searchIndex -ge 0; $searchIndex--) {
+                                $searchItem = $runningSearches[$searchIndex]
+                                $searchEntry = $searchItem.Entry
+                                $searchElapsedMs = [int]$searchEntry.StartedAt.ElapsedMilliseconds
+                                $searchDone = $false
+                                try { $searchDone = [bool]$searchEntry.Process.HasExited } catch { $searchDone = $true }
+                                if (-not $searchDone -and $searchElapsedMs -lt $searchTimeoutMs) { continue }
+
+                                $searchResults[[string]$searchItem.Tool.Id] = Complete-WmtProviderProcess -Entry $searchEntry -TimeoutMs $searchTimeoutMs -KillTree
+                                try { $searchEntry.Process.Dispose() } catch {}
+                                $runningSearches.RemoveAt($searchIndex)
+                                $completedSearch = $true
+                            }
+
+                            if (-not $completedSearch) { Start-Sleep -Milliseconds 100 }
+                        }
+                    }
+                    finally {
+                        foreach ($searchItem in @($runningSearches)) {
+                            try { [void](Complete-WmtProviderProcess -Entry $searchItem.Entry -TimeoutMs 0 -KillTree) } catch {}
+                            try { $searchItem.Entry.Process.Dispose() } catch {}
+                        }
+                    }
+
                     foreach ($tool in $installed) {
                         $pkgId = [string]$tool.Id
                         $currentVersion = [string]$tool.Version
-                        $searchResult = Invoke-DotnetToolCommand -Arguments "tool search `"$pkgId`" --take 5" -TimeoutMs 12000
+                        $searchResult = $searchResults[$pkgId]
+                        if (-not $searchResult) { continue }
                         if ($searchResult.TimedOut) {
                             Write-Output "LOG:.NET search timed out for $pkgId."
                             Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search timed out for $pkgId.")
@@ -57749,7 +57900,7 @@ $btnWingetScan.Add_Click({
                             continue
                         }
                         $latestVersion = ""
-                        foreach ($line in ($searchResult.Out -split "`r?`n")) {
+                        foreach ($line in ([string]$searchResult.Out -split "`r?`n")) {
                             $trimmed = ([string]$line).Trim()
                             if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
                             if ($trimmed -match "(?i)^Package\s+ID\s+Version") { continue }
@@ -57950,15 +58101,21 @@ $btnWingetScan.Add_Click({
             [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Pnpm..."
+                $localEntry = $null
+                $globalEntry = $null
                 try {
-                    # Local packages
-                    $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c pnpm outdated --format json 2>nul")
-                    $pInfo.RedirectStandardOutput = $true; $pInfo.UseShellExecute = $false; $pInfo.CreateNoWindow = $true
-                    $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                    $p = [System.Diagnostics.Process]::Start($pInfo)
-                    $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if ($p.WaitForExit(35000)) {
-                        $json = $outTask.GetAwaiter().GetResult().Trim()
+                    # Both checks are independent. Start them together while
+                    # keeping each command's own timeout budget.
+                    $localEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c pnpm outdated --format json 2>nul"
+                    $globalEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c pnpm outdated -g --format json 2>nul"
+
+                    $localResult = Complete-WmtProviderProcess -Entry $localEntry -TimeoutMs 35000 -KillTree
+                    if ($localResult.TimedOut) {
+                        Write-Output "LOG:Pnpm local scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan timed out.")
+                    }
+                    else {
+                        $json = ([string]$localResult.Out).Trim()
                         # pnpm uses exit code 1 to report that outdated packages
                         # exist. Current pnpm releases return an object keyed by
                         # package name (and "{}" when there are no updates), while
@@ -57973,25 +58130,20 @@ $btnWingetScan.Add_Click({
                             foreach ($pkg in @($parsed.Rows)) {
                                 [PSCustomObject]@{Source = "pnpm"; Name = $pkg.Name; Id = $pkg.Id; Version = $pkg.Version; Available = $pkg.Available }
                             }
-                            if ($p.ExitCode -notin @(0, 1)) {
-                                Write-Output "LOG:Pnpm local scan exited with code $($p.ExitCode)."
-                                Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan exited with code $($p.ExitCode).")
+                            if ($localResult.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Pnpm local scan exited with code $($localResult.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan exited with code $($localResult.ExitCode).")
                             }
                         }
                     }
-                    else {
-                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
-                        Write-Output "LOG:Pnpm local scan timed out."
-                        Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan timed out.")
+
+                    $globalResult = Complete-WmtProviderProcess -Entry $globalEntry -TimeoutMs 15000 -KillTree
+                    if ($globalResult.TimedOut) {
+                        Write-Output "LOG:Pnpm global scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan timed out.")
                     }
-                    # Global packages
-                    $pInfoG = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c pnpm outdated -g --format json 2>nul")
-                    $pInfoG.RedirectStandardOutput = $true; $pInfoG.UseShellExecute = $false; $pInfoG.CreateNoWindow = $true
-                    $pInfoG.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
-                    $pg = [System.Diagnostics.Process]::Start($pInfoG)
-                    $outTaskG = $pg.StandardOutput.ReadToEndAsync()
-                    if ($pg.WaitForExit(15000)) {
-                        $jsonG = $outTaskG.GetAwaiter().GetResult().Trim()
+                    else {
+                        $jsonG = ([string]$globalResult.Out).Trim()
                         $parsedG = ConvertFrom-WmtPnpmOutdatedJson -Output $jsonG -IgnoreList $IgnoreList -Source "pnpm (global)"
                         if (-not $parsedG.Valid) {
                             Write-Output "LOG:Pnpm global scan returned invalid JSON."
@@ -58001,21 +58153,20 @@ $btnWingetScan.Add_Click({
                             foreach ($pkg in @($parsedG.Rows)) {
                                 [PSCustomObject]@{Source = "pnpm (global)"; Name = $pkg.Name; Id = $pkg.Id; Version = $pkg.Version; Available = $pkg.Available }
                             }
-                            if ($pg.ExitCode -notin @(0, 1)) {
-                                Write-Output "LOG:Pnpm global scan exited with code $($pg.ExitCode)."
-                                Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan exited with code $($pg.ExitCode).")
+                            if ($globalResult.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Pnpm global scan exited with code $($globalResult.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan exited with code $($globalResult.ExitCode).")
                             }
                         }
-                    }
-                    else {
-                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $pg.Id /T /F 2>$null | Out-Null } catch { try { $pg.Kill() } catch {} }
-                        Write-Output "LOG:Pnpm global scan timed out."
-                        Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan timed out.")
                     }
                 }
                 catch {
                     Write-Output "LOG:Pnpm check failed: $($_.Exception.Message)"
                     Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message $_.Exception.Message)
+                }
+                finally {
+                    if ($localEntry -and $localEntry.Process) { try { $localEntry.Process.Dispose() } catch {} }
+                    if ($globalEntry -and $globalEntry.Process) { try { $globalEntry.Process.Dispose() } catch {} }
                 }
             }).AddArgument($ignoreList)
             $ps
@@ -58763,14 +58914,6 @@ $btnWingetScan.Add_Click({
             }).AddArgument($ignoreList)
             $ps
         })
-    }
-
-    # --- Winget joins the running scan once its source refresh has finished ---
-    if ($deferWingetScan) {
-        $script:WmtDeferredWingetScanPending = $true
-        $script:WmtDeferredWingetScan = @{ ScriptBlock = $startWingetScan; Enabled = $enabled; IgnoreList = $ignoreList; IncludeUnknown = $includeUnknown }
-        if ($script:WingetScanSourcePreflightInProgress) { Write-GuiLog "Winget scan will start when the source refresh finishes." }
-        else { Start-WingetScanSourcePreflight -Sources $wingetSourcesToPrep }
     }
 
     # --- Start the result collection timer (already defined earlier in script) ---
