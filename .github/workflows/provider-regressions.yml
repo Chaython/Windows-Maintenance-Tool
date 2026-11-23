@@ -81,6 +81,7 @@ jobs:
                   'Write-WmtProviderStatusCache',
                   'Set-WmtProviderStatusCacheEntry',
                   'Get-WmtProviderAvailability',
+                  'Select-WmtProviderAvailabilityFallback',
                   'Select-WmtScannableProviderKeys',
                   'Get-WmtProviderDisplayName',
                   'Get-WmtProviderDefinitions',
@@ -181,6 +182,22 @@ jobs:
               $cachedAvailability = Get-WmtProviderAvailability -ProviderDefinitions $providerDefinitions -MaxAgeMinutes 60
               Assert-True ($cachedAvailability.FromCache) 'A fresh persisted provider cache was not reused.'
 
+              # A stale snapshot is reused only when PATH is unchanged. This is the
+              # probe-failure fallback that keeps a scan from starting every provider.
+              $staleSnapshot = [PSCustomObject]@{
+                  Providers  = @{ winget = $true; scoop = $false }
+                  CheckedUtc = [DateTime]::UtcNow.AddHours(-3)
+                  PathStamp  = 'fixture-path-stamp'
+                  FromCache  = $true
+                  IsFresh    = $false
+              }
+              $fallbackSnapshot = Select-WmtProviderAvailabilityFallback -Snapshot $staleSnapshot -PathStamp 'fixture-path-stamp'
+              Assert-True ($null -ne $fallbackSnapshot) 'A stale snapshot with an unchanged PATH was rejected.'
+              Assert-True (-not [bool]$fallbackSnapshot.Providers['scoop']) 'The stale snapshot lost a known-missing provider.'
+              Assert-True ($null -eq (Select-WmtProviderAvailabilityFallback -Snapshot $staleSnapshot -PathStamp 'different-path-stamp')) 'A stale snapshot with a changed PATH was reused.'
+              Assert-True ($null -eq (Select-WmtProviderAvailabilityFallback -Snapshot $null -PathStamp 'fixture-path-stamp')) 'A missing snapshot produced a fallback.'
+              Assert-True ($null -eq (Select-WmtProviderAvailabilityFallback -Snapshot ([PSCustomObject]@{ Providers = @{}; PathStamp = 'fixture-path-stamp' }) -PathStamp 'fixture-path-stamp')) 'An empty snapshot produced a fallback.'
+
               # A PATH change is an explicit invalidation signal even while the cache TTL
               # is still fresh. Installing a provider must be visible to the next scan.
               $env:PATH = (Join-Path $script:ProviderDetectionDataPath 'empty') + ';' + $env:PATH
@@ -279,6 +296,9 @@ jobs:
               Assert-True ($source -match '\$providerDetectionPs\.AddScript\(\$sharedProviderProbeScript\.ToString\(\)\)') 'The Provider panel background probe does not use the shared probe.'
               Assert-True ($source -match '\$detector\.AddScript\(\$state\.ProbeScript\.ToString\(\)\)') 'The post-install provider probe does not use the shared probe.'
               Assert-True ($source -match '(?s)\$testProviderInstalled\s*=\s*\{.*?& \$sharedProviderProbeScript') 'The provider action installed-state check does not use the shared probe.'
+              Assert-True ($source -match 'Add-Type -TypeDefinition \$ProviderDetectorSource') 'The scan-preparation worker does not warm the compiled provider detector.'
+              Assert-True ($source -match '\$preparationArguments\[10\]\s*=\s*\[string\]\$script:WmtProviderDetectorSource') 'The update scan does not pass the detector source to scan preparation.'
+              Assert-True ($source -match '\$preparationArguments\[11\]\s*=\s*\$scanProviderFallback') 'The update scan does not pass a stale snapshot fallback to scan preparation.'
 
               # Scan completion must resolve display names even when no label map is
               # supplied, so a scan never reports raw keys such as "scoop, gem".

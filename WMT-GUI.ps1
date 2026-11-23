@@ -3777,6 +3777,24 @@ return [PSCustomObject]@{
 }
 }
 
+# A stale snapshot is still a safe probe fallback while PATH is unchanged: the
+# compiled detector's answer only goes stale when a tool appears or disappears
+# without touching PATH. Reusing it avoids starting every enabled provider when
+# the background probe cannot run, while a PATH change still forces a full scan.
+function Select-WmtProviderAvailabilityFallback {
+param(
+    $Snapshot = $null,
+    [string]$PathStamp = ""
+)
+if ([string]::IsNullOrWhiteSpace($PathStamp) -or -not $Snapshot) { return $null }
+try {
+    if (-not $Snapshot.Providers -or $Snapshot.Providers.Count -eq 0) { return $null }
+    if ([string]$Snapshot.PathStamp -ne [string]$PathStamp) { return $null }
+    return $Snapshot
+}
+catch { return $null }
+}
+
 function Select-WmtScannableProviderKeys {
 param(
     [string[]]$EnabledProviders = @(),
@@ -5288,8 +5306,16 @@ if ($timedOut) {
             $killProcess = [System.Diagnostics.Process]::Start($killInfo)
             if ($killProcess) {
                 [void]$killProcess.WaitForExit(5000)
+                $killExitCode = -1
+                try { $killExitCode = [int]$killProcess.ExitCode } catch {}
                 try { $killProcess.Dispose() } catch {}
-                $killed = $true
+                # taskkill returns 128 when the target already exited. Treat
+                # that as success; any other non-zero code means the tree may
+                # still be running, so fall through to Process.Kill().
+                $killed = ($killExitCode -eq 0 -or $killExitCode -eq 128)
+                if (-not $killed) {
+                    try { if ($process.HasExited) { $killed = $true } } catch {}
+                }
             }
         }
         catch {}
@@ -56578,18 +56604,142 @@ $btnWingetScan.Add_Click({
         $steamOwnershipJson = if ($hideCrossProviderDuplicates -and $script:WmtSteamLibraryCache -and -not (Test-Path -LiteralPath $steamCacheFile -PathType Leaf)) {
             ConvertTo-Json -InputObject @($script:WmtSteamLibraryCache) -Depth 4 -Compress
         } else { "" }
-        $preparationArguments = [object[]]::new(4)
+        # The installed-state probe belongs in this background preparation step.
+        # Running it from the click handler would compile the detector and walk
+        # PATH on the WPF dispatcher. A fresh persisted snapshot skips the probe.
+        $scanProviderDefinitions = @(Get-WmtProviderDefinitions)
+        $scanProviderPathText = Get-WmtProviderPathText
+        $scanProviderPathStamp = Get-WmtProviderPathStamp -PathText $scanProviderPathText
+        $scanProviderProbeScriptText = $script:WmtProviderProbeScript.ToString()
+        $scanProviderAliasProbeCommands = [string[]]@($script:WmtProviderAliasProbeCommands)
+        $scanProviderCacheFresh = $false
+        $scanProviderFallback = $null
+        try {
+            $scanProviderCacheSnapshot = Get-WmtProviderAvailability `
+                -ProviderDefinitions $scanProviderDefinitions `
+                -CacheOnly `
+                -MaxAgeMinutes 60
+            $scanProviderCacheFresh = [bool]($scanProviderCacheSnapshot -and $scanProviderCacheSnapshot.IsFresh)
+        }
+        catch {}
+        if (-not $scanProviderCacheFresh) {
+            # The probe still runs first. This snapshot is only a fallback when
+            # the probe cannot produce a result, so a failed probe does not turn
+            # into a scan of every enabled provider.
+            $scanProviderFallback = Select-WmtProviderAvailabilityFallback `
+                -Snapshot $scanProviderCacheSnapshot `
+                -PathStamp $scanProviderPathStamp
+        }
+        $preparationArguments = [object[]]::new(12)
         $preparationArguments[0] = $scanSettingsJson
         $preparationArguments[1] = $steamCacheFile
         $preparationArguments[2] = $steamOwnershipJson
         $preparationArguments[3] = $hideCrossProviderDuplicates
+        $preparationArguments[4] = $scanProviderDefinitions
+        $preparationArguments[5] = $scanProviderProbeScriptText
+        $preparationArguments[6] = $scanProviderAliasProbeCommands
+        $preparationArguments[7] = $scanProviderPathText
+        $preparationArguments[8] = $scanProviderPathStamp
+        $preparationArguments[9] = $scanProviderCacheFresh
+        $preparationArguments[10] = [string]$script:WmtProviderDetectorSource
+        $preparationArguments[11] = $scanProviderFallback
         Invoke-WmtUiBackgroundCommand -Name "WingetScanPreparation" -Msg "Preparing update scan..." -ArgumentList $preparationArguments -Sb {
-            param([string]$SettingsJson, [string]$SteamCacheFile, [string]$SteamOwnershipJson, [bool]$HideCrossProviderDuplicates)
+            param(
+                [string]$SettingsJson,
+                [string]$SteamCacheFile,
+                [string]$SteamOwnershipJson,
+                [bool]$HideCrossProviderDuplicates,
+                [object[]]$ProviderDefinitions,
+                [string]$ProviderProbeScript,
+                [string[]]$AliasProbeCommands,
+                [string]$ProviderPathText,
+                [string]$ProviderPathStamp,
+                [bool]$SkipProbe,
+                [string]$ProviderDetectorSource,
+                $ProviderFallback
+            )
             $settings = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
             $steamSeed = New-WmtSteamOwnershipSeed `
                 -SteamCacheFile $SteamCacheFile `
                 -SteamOwnershipJson $SteamOwnershipJson `
                 -Enabled $HideCrossProviderDuplicates
+
+            $providerAvailability = $null
+            $providerAvailabilityMessage = ''
+            if (-not $SkipProbe) {
+                # Compile the detector here so the probe takes the fast compiled
+                # path even when no earlier provider action warmed the AppDomain.
+                # The type is AppDomain-wide, so later workers skip this block.
+                if (-not ('Wmt.Providers.Detector' -as [type]) -and
+                    -not [string]::IsNullOrWhiteSpace($ProviderDetectorSource)) {
+                    try {
+                        Add-Type -TypeDefinition $ProviderDetectorSource -Language CSharp -ErrorAction Stop
+                    }
+                    catch {
+                        # A concurrent runspace may have compiled it first, or
+                        # compilation is unavailable. The probe falls back to
+                        # Get-Command/Test-Path in either case.
+                    }
+                }
+                try {
+                    $probeScript = [scriptblock]::Create([string]$ProviderProbeScript)
+                    $probeResults = @(& $probeScript `
+                            -Providers @($ProviderDefinitions) `
+                            -AliasProbeCommands @($AliasProbeCommands) `
+                            -PathText ([string]$ProviderPathText))
+                    $providers = @{}
+                    foreach ($probeResult in @($probeResults)) {
+                        if (-not $probeResult) { continue }
+                        $probeKey = ([string]$probeResult.Key).Trim().ToLowerInvariant()
+                        if ([string]::IsNullOrWhiteSpace($probeKey)) { continue }
+                        $providers[$probeKey] = [bool]$probeResult.Installed
+                    }
+                    if ($providers.Count -gt 0) {
+                        $providerAvailability = [PSCustomObject]@{
+                            Providers  = $providers
+                            CheckedUtc = [DateTime]::UtcNow
+                            PathStamp  = [string]$ProviderPathStamp
+                            FromCache  = $false
+                            IsFresh    = $true
+                        }
+                    }
+                    else {
+                        $providerAvailabilityMessage = '[Providers] Installed-state probe returned no results; this scan starts every enabled provider.'
+                    }
+                }
+                catch {
+                    $providerAvailabilityMessage = "[Providers] Installed-state probe failed; this scan starts every enabled provider: $($_.Exception.Message)"
+                }
+            }
+
+            if (-not $SkipProbe -and -not $providerAvailability -and $ProviderFallback) {
+                try {
+                    if ($ProviderFallback.Providers -and
+                        $ProviderFallback.Providers.Count -gt 0 -and
+                        [string]$ProviderFallback.PathStamp -eq [string]$ProviderPathStamp) {
+                        $fallbackCheckedText = ''
+                        try {
+                            $fallbackCheckedUtc = [DateTime]$ProviderFallback.CheckedUtc
+                            if ($fallbackCheckedUtc -ne [DateTime]::MinValue) {
+                                $fallbackCheckedText = $fallbackCheckedUtc.ToLocalTime().ToString('g')
+                            }
+                        }
+                        catch {}
+                        $fallbackWhenText = if ($fallbackCheckedText) { " from $fallbackCheckedText" } else { '' }
+                        $providerAvailability = [PSCustomObject]@{
+                            Providers       = $ProviderFallback.Providers
+                            CheckedUtc      = [DateTime]$ProviderFallback.CheckedUtc
+                            PathStamp       = [string]$ProviderFallback.PathStamp
+                            FromCache       = $true
+                            IsFresh         = $false
+                            IsStaleFallback = $true
+                        }
+                        $providerAvailabilityMessage = "[Providers] Installed-state probe was unavailable; reusing the previous provider snapshot$fallbackWhenText because PATH is unchanged."
+                    }
+                }
+                catch {}
+            }
+
             [pscustomobject]@{
                 Message = ''
                 ScanSettings = $settings
@@ -56597,6 +56747,8 @@ $btnWingetScan.Add_Click({
                 SteamInstalledNameKeys = $steamSeed.SteamInstalledNameKeys
                 SeededSteamOwners = $steamSeed.SeededSteamOwners
                 SteamOwnershipEnabled = [bool]$steamSeed.Enabled
+                ProviderAvailability = $providerAvailability
+                ProviderAvailabilityMessage = $providerAvailabilityMessage
             }
         } -OnComplete {
             # NOTE: this callback and -OnError below are deliberately plain scriptblocks, NOT .GetNewClosure().
@@ -56617,6 +56769,20 @@ $btnWingetScan.Add_Click({
                 return
             }
             $script:WmtWingetScanSteamCacheAttempted = $false
+            if ($prepared.ProviderAvailabilityMessage) {
+                Write-GuiLog ([string]$prepared.ProviderAvailabilityMessage)
+            }
+            if ($prepared.ProviderAvailability) {
+                # Persist the background probe so later scans (and Provider
+                # Settings) reuse it instead of probing again.
+                try {
+                    [void](Write-WmtProviderStatusCache `
+                        -Providers $prepared.ProviderAvailability.Providers `
+                        -PathStamp ([string]$prepared.ProviderAvailability.PathStamp) `
+                        -CheckedUtc ([DateTime]$prepared.ProviderAvailability.CheckedUtc))
+                }
+                catch {}
+            }
             $script:WmtWingetScanPreparedState = $prepared
             $script:WmtWingetScanPreparationPending = $false
             $btnWingetScan.IsEnabled = $true
@@ -56741,34 +56907,78 @@ $btnWingetScan.Add_Click({
     }
     $enabled = $scanEnabled
 
-    # First-run installed-state scan. A provider that is not installed is
-    # skipped instead of starting a worker that can only report "not found".
-    # The result is cached for later scans and shared with Provider Settings.
+    # Installed-state filter. The probe ran in the scan-preparation worker, so
+    # the WPF dispatcher never compiles the detector or walks PATH. Fall back to
+    # a fresh persisted snapshot; if neither is available, start every enabled
+    # provider rather than blocking the click with a synchronous probe.
     $script:WmtScanUnavailableProviders = @()
     try {
         # Build the provider definitions from the shared table. The Provider
         # Settings dialog's local $providerDefinitions is not in scope here.
         $scanProviderDefinitions = @(Get-WmtProviderDefinitions)
-        $providerAvailability = Get-WmtProviderAvailability `
-            -ProviderDefinitions $scanProviderDefinitions `
-            -MaxAgeMinutes 60
-        $providerSelection = Select-WmtScannableProviderKeys `
-            -EnabledProviders $enabled `
-            -Availability $providerAvailability
-        $enabled = @($providerSelection.Runnable)
-        $script:WmtScanUnavailableProviders = @($providerSelection.Unavailable)
+        $providerAvailability = $null
+        try {
+            if ($scanPrepared.PSObject.Properties['ProviderAvailability']) {
+                $providerAvailability = $scanPrepared.ProviderAvailability
+            }
+        }
+        catch {}
 
-        if ($providerAvailability.FromCache) {
-            Write-GuiLog "Provider installed-state cache used (checked $($providerAvailability.CheckedUtc.ToLocalTime().ToString('g')))."
+        if (-not $providerAvailability) {
+            try {
+                $cachedAvailability = Get-WmtProviderAvailability `
+                    -ProviderDefinitions $scanProviderDefinitions `
+                    -CacheOnly `
+                    -MaxAgeMinutes 60
+                if ($cachedAvailability -and $cachedAvailability.IsFresh) {
+                    $providerAvailability = $cachedAvailability
+                }
+            }
+            catch {}
+        }
+
+        if ($providerAvailability) {
+            $providerSelection = Select-WmtScannableProviderKeys `
+                -EnabledProviders $enabled `
+                -Availability $providerAvailability
+            $enabled = @($providerSelection.Runnable)
+            $script:WmtScanUnavailableProviders = @($providerSelection.Unavailable)
+
+            if ($providerAvailability.FromCache) {
+                $cacheKind = 'fresh'
+                try {
+                    if ($providerAvailability.PSObject.Properties['IsStaleFallback'] -and [bool]$providerAvailability.IsStaleFallback) {
+                        $cacheKind = 'stale fallback'
+                    }
+                }
+                catch {}
+                $cacheCheckedText = ''
+                try {
+                    $cacheCheckedUtc = [DateTime]$providerAvailability.CheckedUtc
+                    if ($cacheCheckedUtc -ne [DateTime]::MinValue) {
+                        $cacheCheckedText = $cacheCheckedUtc.ToLocalTime().ToString('g')
+                    }
+                }
+                catch {}
+                if ($cacheCheckedText) {
+                    Write-GuiLog "Provider installed-state cache used ($cacheKind, checked $cacheCheckedText)."
+                }
+                else {
+                    Write-GuiLog "Provider installed-state cache used ($cacheKind)."
+                }
+            }
+            else {
+                Write-GuiLog "Provider installed-state scan completed."
+            }
+            if ($script:WmtScanUnavailableProviders.Count -gt 0) {
+                $notDetectedNames = @($script:WmtScanUnavailableProviders | ForEach-Object {
+                        Get-WmtProviderDisplayName -ProviderKey $_
+                    })
+                Write-GuiLog "Not detected (skipped): $($notDetectedNames -join ', ')."
+            }
         }
         else {
-            Write-GuiLog "Provider installed-state scan completed."
-        }
-        if ($script:WmtScanUnavailableProviders.Count -gt 0) {
-            $notDetectedNames = @($script:WmtScanUnavailableProviders | ForEach-Object {
-                    Get-WmtProviderDisplayName -ProviderKey $_
-                })
-            Write-GuiLog "Not detected (skipped): $($notDetectedNames -join ', ')."
+            Write-GuiLog "[Providers] Installed-state snapshot is stale or unavailable; scanning every enabled provider."
         }
     }
     catch {
@@ -57560,8 +57770,19 @@ $btnWingetScan.Add_Click({
                     Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message $_.Exception.Message)
                 }
                 finally {
-                    if ($localEntry -and $localEntry.Process) { try { $localEntry.Process.Dispose() } catch {} }
-                    if ($globalEntry -and $globalEntry.Process) { try { $globalEntry.Process.Dispose() } catch {} }
+                    # Disposing a Process does not stop it. If a failure skipped
+                    # one of the Complete calls, kill the still-running query
+                    # before releasing its handle.
+                    foreach ($pendingEntry in @($localEntry, $globalEntry)) {
+                        if (-not $pendingEntry -or -not $pendingEntry.Process) { continue }
+                        try {
+                            if (-not $pendingEntry.Process.HasExited) {
+                                [void](Complete-WmtProviderProcess -Entry $pendingEntry -TimeoutMs 0 -KillTree)
+                            }
+                        }
+                        catch {}
+                        try { $pendingEntry.Process.Dispose() } catch {}
+                    }
                 }
             }).AddArgument($ignoreList)
             $ps
@@ -57851,27 +58072,54 @@ $btnWingetScan.Add_Click({
                     foreach ($tool in $installed) { $searchQueue.Enqueue($tool) }
                     $runningSearches = New-Object System.Collections.ArrayList
                     $searchResults = @{}
+                    $searchErrors = @{}
                     try {
                         while ($searchQueue.Count -gt 0 -or $runningSearches.Count -gt 0) {
                             while ($runningSearches.Count -lt $searchLimit -and $searchQueue.Count -gt 0) {
                                 $queuedTool = $searchQueue.Dequeue()
-                                $entry = Start-WmtProviderProcess -FileName "dotnet" -Arguments "tool search `"$([string]$queuedTool.Id)`" --take 5"
-                                [void]$runningSearches.Add([pscustomobject]@{ Tool = $queuedTool; Entry = $entry })
+                                $queuedToolId = [string]$queuedTool.Id
+                                try {
+                                    $entry = Start-WmtProviderProcess -FileName "dotnet" -Arguments "tool search `"$queuedToolId`" --take 5"
+                                    [void]$runningSearches.Add([pscustomobject]@{ Tool = $queuedTool; Entry = $entry })
+                                }
+                                catch {
+                                    # One tool that cannot start must not discard the results
+                                    # of searches that already completed.
+                                    $searchErrors[$queuedToolId] = $_.Exception.Message
+                                    Write-Output "LOG:.NET search could not start for $queuedToolId`: $($_.Exception.Message)"
+                                    Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search could not start for $queuedToolId.")
+                                }
                             }
 
                             $completedSearch = $false
                             for ($searchIndex = $runningSearches.Count - 1; $searchIndex -ge 0; $searchIndex--) {
                                 $searchItem = $runningSearches[$searchIndex]
                                 $searchEntry = $searchItem.Entry
+                                $searchItemId = [string]$searchItem.Tool.Id
                                 $searchElapsedMs = [int]$searchEntry.StartedAt.ElapsedMilliseconds
                                 $searchDone = $false
                                 try { $searchDone = [bool]$searchEntry.Process.HasExited } catch { $searchDone = $true }
                                 if (-not $searchDone -and $searchElapsedMs -lt $searchTimeoutMs) { continue }
 
-                                $searchResults[[string]$searchItem.Tool.Id] = Complete-WmtProviderProcess -Entry $searchEntry -TimeoutMs $searchTimeoutMs -KillTree
-                                try { $searchEntry.Process.Dispose() } catch {}
-                                $runningSearches.RemoveAt($searchIndex)
-                                $completedSearch = $true
+                                try {
+                                    $searchResults[$searchItemId] = Complete-WmtProviderProcess -Entry $searchEntry -TimeoutMs $searchTimeoutMs -KillTree
+                                }
+                                catch {
+                                    $searchErrors[$searchItemId] = $_.Exception.Message
+                                    Write-Output "LOG:.NET search failed for $searchItemId`: $($_.Exception.Message)"
+                                    Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search failed for $searchItemId.")
+                                }
+                                finally {
+                                    try {
+                                        if (-not $searchEntry.Process.HasExited) {
+                                            [void](Complete-WmtProviderProcess -Entry $searchEntry -TimeoutMs 0 -KillTree)
+                                        }
+                                    }
+                                    catch {}
+                                    try { $searchEntry.Process.Dispose() } catch {}
+                                    $runningSearches.RemoveAt($searchIndex)
+                                    $completedSearch = $true
+                                }
                             }
 
                             if (-not $completedSearch) { Start-Sleep -Milliseconds 100 }
@@ -57888,7 +58136,13 @@ $btnWingetScan.Add_Click({
                         $pkgId = [string]$tool.Id
                         $currentVersion = [string]$tool.Version
                         $searchResult = $searchResults[$pkgId]
-                        if (-not $searchResult) { continue }
+                        if (-not $searchResult) {
+                            if (-not $searchErrors.ContainsKey($pkgId)) {
+                                Write-Output "LOG:.NET search produced no result for $pkgId."
+                                Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search produced no result for $pkgId.")
+                            }
+                            continue
+                        }
                         if ($searchResult.TimedOut) {
                             Write-Output "LOG:.NET search timed out for $pkgId."
                             Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search timed out for $pkgId.")
@@ -58165,8 +58419,19 @@ $btnWingetScan.Add_Click({
                     Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message $_.Exception.Message)
                 }
                 finally {
-                    if ($localEntry -and $localEntry.Process) { try { $localEntry.Process.Dispose() } catch {} }
-                    if ($globalEntry -and $globalEntry.Process) { try { $globalEntry.Process.Dispose() } catch {} }
+                    # Disposing a Process does not stop it. If a failure skipped
+                    # one of the Complete calls, kill the still-running query
+                    # before releasing its handle.
+                    foreach ($pendingEntry in @($localEntry, $globalEntry)) {
+                        if (-not $pendingEntry -or -not $pendingEntry.Process) { continue }
+                        try {
+                            if (-not $pendingEntry.Process.HasExited) {
+                                [void](Complete-WmtProviderProcess -Entry $pendingEntry -TimeoutMs 0 -KillTree)
+                            }
+                        }
+                        catch {}
+                        try { $pendingEntry.Process.Dispose() } catch {}
+                    }
                 }
             }).AddArgument($ignoreList)
             $ps
