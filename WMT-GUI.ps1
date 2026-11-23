@@ -3115,6 +3115,92 @@ param(
 }
 }
 
+function ConvertFrom-WmtPnpmOutdatedJson {
+param(
+    [string]$Output,
+    [object[]]$IgnoreList = @(),
+    [string]$Source = "pnpm"
+)
+
+$result = [PSCustomObject]@{
+    Valid = $false
+    Rows  = @()
+}
+$text = ([string]$Output).Trim()
+if ([string]::IsNullOrWhiteSpace($text)) { return $result }
+
+try {
+    # Assign the converter result before wrapping it in an array. Windows
+    # PowerShell 5.1 otherwise nests a one-element JSON array inside the
+    # array subexpression and mistakes the package properties for top-level
+    # object keys.
+    $parsedValue = $text | ConvertFrom-Json -ErrorAction Stop
+    $parsedItems = @($parsedValue)
+}
+catch {
+    return $result
+}
+if ($parsedItems.Count -eq 0) {
+    if ($text.StartsWith("[")) {
+        $result.Valid = $true
+        return $result
+    }
+    return $result
+}
+if ($null -eq $parsedItems[0]) { return $result }
+
+$rows = [System.Collections.Generic.List[object]]::new()
+$entries = [System.Collections.Generic.List[object]]::new()
+if ($text.StartsWith("[")) {
+    foreach ($item in $parsedItems) {
+        [void]$entries.Add([PSCustomObject]@{ Value = $item; NameHint = "" })
+    }
+}
+else {
+    foreach ($property in @($parsedItems[0].PSObject.Properties)) {
+        [void]$entries.Add([PSCustomobject]@{ Value = $property.Value; NameHint = [string]$property.Name })
+    }
+}
+
+foreach ($entry in $entries) {
+    $package = $entry.Value
+    if ($null -eq $package) { continue }
+    $name = ""
+    try { if ($package.PSObject.Properties["name"]) { $name = ([string]$package.name).Trim() } } catch {}
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = ([string]$entry.NameHint).Trim() }
+    if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+    $currentVersion = ""
+    $latestVersion = ""
+    try {
+        if ($package.PSObject.Properties["current"]) { $currentVersion = [string]$package.current }
+        elseif ($package.PSObject.Properties["version"]) { $currentVersion = [string]$package.version }
+        elseif ($package.PSObject.Properties["installed"]) { $currentVersion = [string]$package.installed }
+    }
+    catch {}
+    try {
+        if ($package.PSObject.Properties["latest"]) { $latestVersion = [string]$package.latest }
+        elseif ($package.PSObject.Properties["available"]) { $latestVersion = [string]$package.available }
+        elseif ($package.PSObject.Properties["wanted"]) { $latestVersion = [string]$package.wanted }
+    }
+    catch {}
+    if ([string]::IsNullOrWhiteSpace($currentVersion) -and [string]::IsNullOrWhiteSpace($latestVersion)) { continue }
+    if ($IgnoreList -contains $name) { continue }
+
+    [void]$rows.Add([PSCustomObject]@{
+        Source    = ([string]$Source).Trim()
+        Name      = $name
+        Id        = $name
+        Version   = $currentVersion
+        Available = $latestVersion
+    })
+}
+
+$result.Valid = $true
+$result.Rows = @($rows.ToArray())
+return $result
+}
+
 # Canonical provider keys are used at every scan, policy, row, and action
 # boundary. Keep this helper near the other provider primitives so settings
 # normalization and background workers can all resolve aliases consistently.
@@ -4439,7 +4525,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -11462,6 +11548,48 @@ else {
 Save-WmtSettings -Settings $settings
 }
 
+function Get-WmtCustomCommandSourceKey {
+param(
+    [string]$Source,
+    [string]$Command
+)
+
+# Custom commands are scoped to the operational source, not only to the
+# provider. npm/pnpm local and global installs use different commands, so
+# preserve that scope while still canonicalizing ordinary provider aliases.
+$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
+switch ($sourceKey) {
+    "npm (global)" { return "npm (global)" }
+    "npm-global" { return "npm (global)" }
+    "pnpm (global)" { return "pnpm (global)" }
+    "pnpm-global" { return "pnpm (global)" }
+    default {
+        $canonicalKey = Get-WmtCanonicalProviderKey -ProviderOrSource $sourceKey
+        # bb6dc22 temporarily canonicalized legacy npm/pnpm global command
+        # entries to the local provider key. Recover that persisted form by
+        # recognizing an explicit global flag in the command itself. New
+        # entries continue to persist the operational global source.
+        if ($canonicalKey -in @("npm", "pnpm") -and
+            $Command -match '(?i)(?:^|\s)(?:npm|pnpm)(?:\.cmd|\.exe)?(?=\s)' -and
+            $Command -match '(?i)(?:^|\s)(?:-g|--global)(?=\s|$)') {
+            return "$canonicalKey (global)"
+        }
+        return $canonicalKey
+    }
+}
+}
+
+function Get-WmtCustomCommandEntrySourceKey {
+param($Entry)
+
+if ($null -eq $Entry) { return "" }
+$source = ""
+$command = ""
+try { $source = [string]$Entry.Source } catch {}
+try { $command = [string]$Entry.Command } catch {}
+return (Get-WmtCustomCommandSourceKey -Source $source -Command $command)
+}
+
 function Get-WmtCustomUpdateCommands {
 param($Settings)
 if (-not $Settings) { $Settings = Get-WmtSettings }
@@ -11475,13 +11603,13 @@ return @()
 
 function Get-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id, $Settings)
-$sourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource $Source
+$sourceKey = Get-WmtCustomCommandSourceKey -Source $Source
 $idKey = ([string]$Id).Trim().ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($sourceKey) -or [string]::IsNullOrWhiteSpace($idKey)) { return "" }
 
 foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $Settings)) {
     if (-not $entry) { continue }
-    $entrySourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry.Source)
+    $entrySourceKey = Get-WmtCustomCommandEntrySourceKey -Entry $entry
     if ($entrySourceKey -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) {
         return ([string]$entry.Command).Trim()
     }
@@ -11491,7 +11619,7 @@ return ""
 
 function Set-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id, [string]$Name, [string]$Command)
-$sourceValue = Get-WmtCanonicalProviderKey -ProviderOrSource $Source
+$sourceValue = Get-WmtCustomCommandSourceKey -Source $Source
 $idValue = ([string]$Id).Trim()
 $commandValue = ([string]$Command).Trim()
 if ([string]::IsNullOrWhiteSpace($sourceValue) -or [string]::IsNullOrWhiteSpace($idValue)) { throw "A package source and ID are required." }
@@ -11501,7 +11629,7 @@ $settings = Get-WmtSettings
 $updated = New-Object System.Collections.Generic.List[object]
 foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $settings)) {
     if (-not $entry) { continue }
-    $entrySourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry.Source)
+    $entrySourceKey = Get-WmtCustomCommandEntrySourceKey -Entry $entry
     if ($entrySourceKey -eq $sourceValue -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idValue.ToLowerInvariant()) { continue }
     [void]$updated.Add($entry)
 }
@@ -11513,7 +11641,7 @@ Save-WmtSettings -Settings $settings
 
 function Remove-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id)
-$sourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource $Source
+$sourceKey = Get-WmtCustomCommandSourceKey -Source $Source
 $idKey = ([string]$Id).Trim().ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($sourceKey) -or [string]::IsNullOrWhiteSpace($idKey)) { return }
 
@@ -11521,7 +11649,7 @@ $settings = Get-WmtSettings
 $updated = New-Object System.Collections.Generic.List[object]
 foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $settings)) {
     if (-not $entry) { continue }
-    $entrySourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry.Source)
+    $entrySourceKey = Get-WmtCustomCommandEntrySourceKey -Entry $entry
     if ($entrySourceKey -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) { continue }
     [void]$updated.Add($entry)
 }
@@ -49380,7 +49508,12 @@ exit /b %WMT_EXIT%
                 if ($act -eq "Install") { $cmd = "pnpm add -g `"$id`"" }
                 if ($act -eq "Update") { $cmd = "pnpm update -g `"$id`"" }
                 if ($act -eq "Uninstall") { $cmd = "pnpm remove -g `"$id`"" }
-                if ($act -eq "Repair") { $cmd = "pnpm rebuild `"$id`"" }
+                # pnpm rebuild is project-scoped and does not support global
+                # packages. `pnpm add -g` would replace the package's whole
+                # isolated install group and remove sibling global tools. A
+                # global update re-resolves the selected package while keeping
+                # that group and its unrelated packages intact.
+                if ($act -eq "Repair") { $cmd = "pnpm update -g `"$id`"" }
                 $userCmd = $cmd
             }
             # --- CHOCOLATEY ---
@@ -51427,6 +51560,120 @@ function Update-WmtProviderPathEnvironment {
     catch {}
 }
 
+function New-WmtProviderSettingsUiState {
+param(
+    [Parameter(Mandatory = $true)]$Dialog,
+    $SaveButton,
+    [Parameter(Mandatory = $true)][string]$StateId
+)
+
+# Use a PSCustomObject so asynchronous callbacks retain the same mutable
+# state object after the modal ShowDialog scope starts unwinding. Hashtable
+# dot-property assignment in a nested GetNewClosure can otherwise fail after
+# Window.Close() resumes the outer modal scope.
+return [PSCustomObject]@{
+    StateId           = $StateId
+    Dialog            = $Dialog
+    SaveButton        = $SaveButton
+    SavePending       = $false
+    SettingsPersisted = $false
+    CloseRequested    = $false
+    DialogClosed      = $false
+    CloseError        = ""
+    CloseAttemptCount = 0
+    Generation        = [long]0
+    OperationId       = ""
+}
+}
+
+function Get-WmtProviderSettingsRegisteredState {
+param(
+    [Parameter(Mandatory = $true)]$Registry,
+    [Parameter(Mandatory = $true)][string]$StateId
+)
+
+if ($Registry -is [System.Collections.IDictionary]) {
+    if (-not $Registry.Contains($StateId)) { return $null }
+    return $Registry[$StateId]
+}
+try {
+    $property = $Registry.PSObject.Properties[$StateId]
+    if ($property) { return $property.Value }
+}
+catch {}
+return $null
+}
+
+function Test-WmtProviderSettingsOperationCurrent {
+param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)][long]$Generation,
+    [Parameter(Mandatory = $true)][string]$StateId,
+    [Parameter(Mandatory = $true)]$Registry
+)
+
+if ($null -eq $State) { return $false }
+$stateGeneration = $null
+if ($State -is [System.Collections.IDictionary]) {
+    if ($State.Contains("Generation")) { $stateGeneration = $State["Generation"] }
+}
+else {
+    try {
+        if ($State.PSObject.Properties["Generation"]) { $stateGeneration = $State.Generation }
+    }
+    catch {}
+}
+if ($null -eq $stateGeneration) { return $false }
+try {
+    if ([long]$stateGeneration -ne $Generation) { return $false }
+}
+catch { return $false }
+
+$registeredState = Get-WmtProviderSettingsRegisteredState -Registry $Registry -StateId $StateId
+if ($null -eq $registeredState) { return $false }
+return [object]::ReferenceEquals($registeredState, $State)
+}
+
+function Register-WmtProviderSettingsDialogLifecycle {
+param(
+    [Parameter(Mandatory = $true)]$Dialog,
+    [Parameter(Mandatory = $true)][string]$StateId,
+    [Parameter(Mandatory = $true)]$Registry
+)
+
+$state = Get-WmtProviderSettingsRegisteredState -Registry $Registry -StateId $StateId
+if ($null -eq $state) { throw "Provider settings dialog state is not registered." }
+if (-not [object]::ReferenceEquals($state.Dialog, $Dialog)) {
+    throw "Provider settings dialog reference does not match the registered dialog."
+}
+
+# Record the Closed lifecycle signal on the exact registered state object.
+# The callback resolves the state through the registry instead of relying on
+# a mutable outer-scope variable.
+$Dialog.Add_Closed({
+    $closedState = Get-WmtProviderSettingsRegisteredState -Registry $Registry -StateId $StateId
+    if ($null -ne $closedState) { $closedState.DialogClosed = $true }
+}.GetNewClosure())
+
+# Do not let a user close the modal while persistence is still in flight.
+# Otherwise a later persistence failure would lose the only window on which
+# the user can retry. A close explicitly requested by the verified save path
+# is allowed through by CloseRequested.
+$Dialog.Add_Closing({
+    param($sender, $eventArgs)
+    $closingState = Get-WmtProviderSettingsRegisteredState -Registry $Registry -StateId $StateId
+    if ($null -ne $closingState -and
+        [bool]$closingState.SavePending -and
+        -not [bool]$closingState.CloseRequested) {
+        $eventArgs.Cancel = $true
+        try {
+            Write-GuiLog "[$StateId] Provider Settings cannot close while its settings are still saving."
+        }
+        catch {}
+    }
+}.GetNewClosure())
+}
+
 function Close-WmtProviderSettingsDialog {
 param(
     [Parameter(Mandatory = $true)]$Dialog,
@@ -51441,17 +51688,20 @@ $hasClosedState = $false
 $hasDialogState = $false
 $alreadyClosed = $false
 $stateDialog = $null
+$stateId = ""
 if ($State -is [System.Collections.IDictionary]) {
     $hasClosedState = $State.Contains("DialogClosed")
     if ($hasClosedState) { $alreadyClosed = [bool]$State["DialogClosed"] }
     $hasDialogState = $State.Contains("Dialog")
     if ($hasDialogState) { $stateDialog = $State["Dialog"] }
+    if ($State.Contains("StateId")) { $stateId = [string]$State["StateId"] }
 }
 else {
     $hasClosedState = [bool]$State.PSObject.Properties["DialogClosed"]
     if ($hasClosedState) { $alreadyClosed = [bool]$State.DialogClosed }
     $hasDialogState = [bool]$State.PSObject.Properties["Dialog"]
     if ($hasDialogState) { $stateDialog = $State.Dialog }
+    if ($State.PSObject.Properties["StateId"]) { $stateId = [string]$State.StateId }
 }
 
 if (-not $hasClosedState) {
@@ -51464,11 +51714,29 @@ if (-not [object]::ReferenceEquals($stateDialog, $Dialog)) {
     throw "Provider settings dialog reference does not match the registered dialog."
 }
 
+# Mark the close as intentional before calling Close(). The lifecycle
+# handler uses this flag to distinguish a verified Save & Close request from
+# an attempt to close the modal while persistence is still pending.
+if ($State -is [System.Collections.IDictionary]) {
+    $State["CloseRequested"] = $true
+    if ($State.Contains("CloseAttemptCount")) {
+        $State["CloseAttemptCount"] = [long]$State["CloseAttemptCount"] + 1
+    }
+}
+else {
+    if ($State.PSObject.Properties["CloseRequested"]) { $State.CloseRequested = $true }
+    if ($State.PSObject.Properties["CloseAttemptCount"]) {
+        $State.CloseAttemptCount = [long]$State.CloseAttemptCount + 1
+    }
+}
+
+$closeCallIssued = $false
 try {
     if (-not $alreadyClosed) {
         # Close the exact captured window even if a transient Hide made
         # IsVisible false. Hiding a modal WPF window does not end ShowDialog().
         $Dialog.Close()
+        $closeCallIssued = $true
     }
 }
 catch {
@@ -51482,17 +51750,25 @@ if ($stillVisible) {
     throw "Provider settings dialog remained visible after Close() was called."
 }
 
+$closedEventObserved = $false
 if ($State -is [System.Collections.IDictionary]) {
-    $alreadyClosed = [bool]$State["DialogClosed"]
+    $closedEventObserved = [bool]$State["DialogClosed"]
 }
 else {
-    $alreadyClosed = [bool]$State.DialogClosed
+    $closedEventObserved = [bool]$State.DialogClosed
 }
-if (-not $alreadyClosed) {
+if (-not $closedEventObserved) {
     throw "Provider settings dialog did not report its Closed event."
 }
 
-return $true
+return [PSCustomObject]@{
+    StateId            = $stateId
+    AlreadyClosed      = $alreadyClosed
+    CloseRequested     = $closeCallIssued
+    ClosedEventObserved = $closedEventObserved
+    IsVisible          = $stillVisible
+    VerifiedClosed     = $true
+}
 }
 
 function Get-WmtProviderEnabledIntent {
@@ -51764,17 +52040,15 @@ foreach ($staleStateId in @($providerSettingsUiStates.Keys)) {
     [void]$providerSettingsUiStates.Remove($staleStateId)
 }
 $providerSettingsStateId = [guid]::NewGuid().ToString("N")
-$providerSettingsState = @{
-    Dialog            = $win
-    SaveButton        = $win.FindName("btnSave")
-    SavePending       = $false
-    SettingsPersisted = $false
-    CloseRequested    = $false
-    DialogClosed      = $false
-    CloseError        = ""
-}
+$providerSettingsState = New-WmtProviderSettingsUiState `
+    -Dialog $win `
+    -SaveButton ($win.FindName("btnSave")) `
+    -StateId $providerSettingsStateId
 $providerSettingsUiStates[$providerSettingsStateId] = $providerSettingsState
-$win.Add_Closed({ $providerSettingsState.DialogClosed = $true }.GetNewClosure())
+Register-WmtProviderSettingsDialogLifecycle `
+    -Dialog $win `
+    -StateId $providerSettingsStateId `
+    -Registry $providerSettingsUiStates
 
 function Get-WinCtrl($name) { $win.FindName($name) }
 
@@ -53483,22 +53757,49 @@ foreach ($provider in $providerDefinitions) {
 # Save Event
 $providerSettingsSaveButton = Get-WinCtrl "btnSave"
 $providerSettingsSaveButton.Add_Click({
-        if ($providerSettingsState.SavePending) { return }
-        if ($providerSettingsState.SettingsPersisted) {
-            if ($providerSettingsState.CloseRequested) { return }
-            $providerSettingsState.CloseRequested = $true
+    # Explicitly materialize every object needed by the nested completion
+    # closures. GetNewClosure does not reliably carry a parent closure's
+    # read-only outer variables into a second nested closure under Windows
+    # PowerShell 5.1.
+    $providerSettingsRegistry = $providerSettingsUiStates
+    $providerSettingsStateKey = $providerSettingsStateId
+    $providerSettingsDialog = $win
+    $providerSettingsButton = $providerSettingsSaveButton
+    # Re-materialize the original names inside this closure as well. The
+    # nested completion closures can then capture these assigned values.
+    $providerSettingsUiStates = $providerSettingsRegistry
+    $providerSettingsStateId = $providerSettingsStateKey
+    $providerSettingsSaveButton = $providerSettingsButton
+    $win = $providerSettingsDialog
+    try {
+        $currentState = Get-WmtProviderSettingsRegisteredState -Registry $providerSettingsRegistry -StateId $providerSettingsStateKey
+        if ($null -eq $currentState -or -not [object]::ReferenceEquals($currentState, $providerSettingsState)) {
+            Write-GuiLog "[$providerSettingsStateKey] Ignored a stale Provider Settings save request."
+            return
+        }
+        if ($currentState.SavePending) { return }
+        if ($currentState.SettingsPersisted) {
+            if ($currentState.CloseRequested) { return }
+            $currentState.CloseRequested = $true
             try {
-                [void](Close-WmtProviderSettingsDialog -Dialog $providerSettingsState.Dialog -State $providerSettingsState)
-                $providerSettingsState.DialogClosed = $true
+                $closeResult = Close-WmtProviderSettingsDialog -Dialog $currentState.Dialog -State $currentState
+                $currentState.DialogClosed = $true
                 [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
+                if ($closeResult.AlreadyClosed) {
+                    Write-GuiLog "[$providerSettingsStateId] Provider settings dialog was already closed before the retry completed."
+                }
+                else {
+                    Write-GuiLog "[$providerSettingsStateId] Provider settings dialog closed and verified."
+                }
             }
             catch {
-                $providerSettingsState.CloseRequested = $false
-                $providerSettingsState.CloseError = $_.Exception.Message
-                Write-GuiLog "[$providerSettingsStateId] Provider settings were saved, but the Provider Settings window could not be closed: $($providerSettingsState.CloseError)"
+                $currentState.CloseRequested = $false
+                $currentState.CloseError = $_.Exception.Message
+                Write-GuiLog "[$providerSettingsStateId] Provider settings were saved, but the Provider Settings window could not be closed: $($currentState.CloseError)"
                 try {
                     Show-WmtMessageBox `
-                        -Message "Provider settings were saved, but the Provider Settings window could not be closed:`n$($providerSettingsState.CloseError)" `
+                        -Owner $win `
+                        -Message "Provider settings were saved, but the Provider Settings window could not be closed:`n$($currentState.CloseError)" `
                         -Title "Provider Settings" `
                         -Image Warning | Out-Null
                 }
@@ -53506,7 +53807,14 @@ $providerSettingsSaveButton.Add_Click({
             }
             return
         }
-        $providerSettingsState.SavePending = $true
+
+        $currentState.Generation = [long]$currentState.Generation + 1
+        $providerSettingsGeneration = [long]$currentState.Generation
+        $providerSettingsOperationId = "ProviderSettings_" + [guid]::NewGuid().ToString("N")
+        $currentState.OperationId = $providerSettingsOperationId
+        $currentState.SavePending = $true
+        $currentState.SettingsPersisted = $false
+        $currentState.CloseRequested = $false
         if ($providerSettingsSaveButton) {
             $providerSettingsSaveButton.IsEnabled = $false
             $providerSettingsSaveButton.Content = "Saving..."
@@ -53557,11 +53865,11 @@ $providerSettingsSaveButton.Add_Click({
         $executionOverridesToSave = [ordered]@{}
         foreach ($provider in $providerDefinitions) {
             $key = [string]$provider.Key
-            $chkSearch = & $getWinCtrl "chk${key}Search"
-            $chkScan = & $getWinCtrl "chk${key}Scan"
-            $chkLogs = & $getWinCtrl "chk${key}Logs"
-            $chkHeadless = & $getWinCtrl "chk${key}Headless"
-            $chkAuto = & $getWinCtrl "chk${key}AutoUpdate"
+            $chkSearch = $win.FindName("chk${key}Search")
+            $chkScan = $win.FindName("chk${key}Scan")
+            $chkLogs = $win.FindName("chk${key}Logs")
+            $chkHeadless = $win.FindName("chk${key}Headless")
+            $chkAuto = $win.FindName("chk${key}AutoUpdate")
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $key
             $togglesToSave[$key] = [ordered]@{
                 Search = if ($defaults.Search -and $chkSearch) { [bool]$chkSearch.IsChecked } else { $false }
@@ -53660,7 +53968,6 @@ $providerSettingsSaveButton.Add_Click({
         # and controls used by the completion path; do not resolve them later
         # through mutable outer-scope variables.
         $providerSettingsDispatcher = $win.Dispatcher
-        $providerSettingsOperationId = "ProviderSettings_" + [guid]::NewGuid().ToString("N")
         $providerSettingsAutoScanEnabled = -not (Get-WmtUpdateScansDisabled -Settings $settingsPatch)
         $providerSettingsRunInTray = Get-WmtRunInTrayOnClose -Settings $settingsPatch
         $settingsSaved = {
@@ -53670,6 +53977,16 @@ $providerSettingsSaveButton.Add_Click({
             try {
                 if ($providerSettingsDispatcher -and -not $providerSettingsDispatcher.CheckAccess()) {
                     throw "Provider settings completion was not delivered on the WPF dispatcher."
+                }
+
+                $completedState = Get-WmtProviderSettingsRegisteredState -Registry $providerSettingsUiStates -StateId $providerSettingsStateId
+                if (-not (Test-WmtProviderSettingsOperationCurrent `
+                        -State $completedState `
+                        -Generation $providerSettingsGeneration `
+                        -StateId $providerSettingsStateId `
+                        -Registry $providerSettingsUiStates)) {
+                    Write-GuiLog "[$providerSettingsOperationId] Ignored a stale Provider Settings completion."
+                    return
                 }
 
                 Write-GuiLog "[$providerSettingsOperationId] Provider completion stage: validating save result."
@@ -53691,32 +54008,38 @@ $providerSettingsSaveButton.Add_Click({
                 # Closing and optional refreshes are independent post-save work.
                 $stage = 'CloseDialog'
                 try {
-                    $providerSettingsState.SettingsPersisted = $true
-                    $providerSettingsState.CloseRequested = $true
+                    $completedState.SettingsPersisted = $true
+                    $completedState.CloseRequested = $true
                     Write-GuiLog "[$providerSettingsOperationId] Provider completion stage: closing dialog."
-                    [void](Close-WmtProviderSettingsDialog -Dialog $providerSettingsState.Dialog -State $providerSettingsState)
-                    $providerSettingsState.DialogClosed = $true
-                    Write-GuiLog "[$providerSettingsOperationId] Provider settings dialog closed."
+                    $closeResult = Close-WmtProviderSettingsDialog -Dialog $completedState.Dialog -State $completedState
+                    $completedState.DialogClosed = $true
+                    if ($closeResult.AlreadyClosed) {
+                        Write-GuiLog "[$providerSettingsOperationId] Provider settings dialog was already closed before completion."
+                    }
+                    else {
+                        Write-GuiLog "[$providerSettingsOperationId] Provider settings dialog closed and verified."
+                    }
                 }
                 catch {
-                    $providerSettingsState.CloseError = $_.Exception.Message
-                    $providerSettingsState.CloseRequested = $false
+                    $completedState.CloseError = $_.Exception.Message
+                    $completedState.CloseRequested = $false
                     if ($providerSettingsSaveButton) {
                         $providerSettingsSaveButton.IsEnabled = $true
                         $providerSettingsSaveButton.Content = "Retry Close"
                     }
-                    Write-GuiLog "[$providerSettingsOperationId] Settings saved successfully; dialog close failed: $($providerSettingsState.CloseError)"
+                    Write-GuiLog "[$providerSettingsOperationId] Settings saved successfully; dialog close failed: $($completedState.CloseError)"
                     try {
                         Show-WmtMessageBox `
-                            -Message "Provider settings were saved, but the Provider Settings window could not be closed:`n$($providerSettingsState.CloseError)" `
+                            -Owner $win `
+                            -Message "Provider settings were saved, but the Provider Settings window could not be closed:`n$($completedState.CloseError)" `
                             -Title "Provider Settings" `
                             -Image Warning | Out-Null
                     }
                     catch {}
                 }
                 finally {
-                    $providerSettingsState.SavePending = $false
-                    if ($providerSettingsState.DialogClosed) {
+                    $completedState.SavePending = $false
+                    if ($completedState.DialogClosed) {
                         [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
                     }
                 }
@@ -53752,13 +54075,23 @@ $providerSettingsSaveButton.Add_Click({
         }.GetNewClosure()
         Invoke-WmtSettingsPatchSave -Patch $settingsPatch -Name $providerSettingsOperationId -Message 'Saving provider settings...' -OnComplete $settingsSaved -OnError {
             param($errorRecord)
-            $providerSettingsState.SavePending = $false
-            $providerSettingsState.SettingsPersisted = $false
-            $providerSettingsState.CloseRequested = $false
-            # If the user closed the modal while persistence was pending, the
-            # failed save can no longer retry in that window. Do not retain the
-            # closed window and its closures in the script-level registry.
-            if ($providerSettingsState.DialogClosed) {
+            $failedState = Get-WmtProviderSettingsRegisteredState -Registry $providerSettingsUiStates -StateId $providerSettingsStateId
+            if (-not (Test-WmtProviderSettingsOperationCurrent `
+                    -State $failedState `
+                    -Generation $providerSettingsGeneration `
+                    -StateId $providerSettingsStateId `
+                    -Registry $providerSettingsUiStates)) {
+                Write-GuiLog "[$providerSettingsOperationId] Ignored a stale Provider Settings save failure."
+                return
+            }
+            $failedState.SavePending = $false
+            $failedState.SettingsPersisted = $false
+            $failedState.CloseRequested = $false
+            # A user close is cancelled while persistence is pending, so the
+            # exact dialog normally remains available for a retry. If another
+            # path closed it anyway, do not retain the closed window and its
+            # closures in the script-level registry.
+            if ($failedState.DialogClosed) {
                 [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
             }
             if ($providerSettingsSaveButton) {
@@ -53766,12 +54099,39 @@ $providerSettingsSaveButton.Add_Click({
                 $providerSettingsSaveButton.Content = "Save & Close"
             }
             $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
-            Show-WmtMessageBox -Owner $win -Message "Could not save provider settings:`n$message" -Title "Provider Settings" -Image Error | Out-Null
+            $messageOwner = if ($failedState.DialogClosed) { $null } else { $win }
+            Show-WmtMessageBox -Owner $messageOwner -Message "Could not save provider settings:`n$message" -Title "Provider Settings" -Image Error | Out-Null
         }.GetNewClosure()
-    })
+    }
+    catch {
+        # A synchronous failure while reading controls, building the patch, or
+        # queueing persistence must restore the exact dialog instead of
+        # leaving it permanently stuck on "Saving...".
+        $message = $_.Exception.Message
+        $failedState = Get-WmtProviderSettingsRegisteredState -Registry $providerSettingsUiStates -StateId $providerSettingsStateId
+        if ($null -ne $failedState) {
+            $failedState.SavePending = $false
+            $failedState.SettingsPersisted = $false
+            $failedState.CloseRequested = $false
+            if ($failedState.DialogClosed) {
+                [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
+            }
+        }
+        if ($providerSettingsSaveButton) {
+            $providerSettingsSaveButton.IsEnabled = $true
+            $providerSettingsSaveButton.Content = "Save & Close"
+        }
+        Write-GuiLog "[$providerSettingsStateId] Provider settings save failed before completion: $message"
+        try {
+            Show-WmtMessageBox -Owner $win -Message "Could not save provider settings:`n$message" -Title "Provider Settings" -Image Error | Out-Null
+        }
+        catch {}
+    }
+}.GetNewClosure())
 
 $win.ShowDialog() | Out-Null
-if (-not $providerSettingsState.SavePending) {
+$remainingProviderSettingsState = Get-WmtProviderSettingsRegisteredState -Registry $providerSettingsUiStates -StateId $providerSettingsStateId
+if ($null -eq $remainingProviderSettingsState -or -not $remainingProviderSettingsState.SavePending) {
     [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
 }
 if ($providerDetectionTimer) { $providerDetectionTimer.Stop() }
@@ -56559,21 +56919,23 @@ $btnWingetScan.Add_Click({
                     if ($p.WaitForExit(35000)) {
                         $json = $outTask.GetAwaiter().GetResult().Trim()
                         # pnpm uses exit code 1 to report that outdated packages
-                        # exist. Valid JSON is authoritative in that case.
-                        if ($json -and $json.StartsWith("[")) {
-                            $pkgs = $json | ConvertFrom-Json
-                            foreach ($pkg in $pkgs) {
-                                if ($IgnoreList -contains $pkg.name) { continue }
-                                [PSCustomObject]@{Source = "pnpm"; Name = $pkg.name; Id = $pkg.name; Version = $pkg.current; Available = $pkg.latest }
+                        # exist. Current pnpm releases return an object keyed by
+                        # package name (and "{}" when there are no updates), while
+                        # older releases returned an array. Valid JSON is
+                        # authoritative in either shape.
+                        $parsed = ConvertFrom-WmtPnpmOutdatedJson -Output $json -IgnoreList $IgnoreList -Source "pnpm"
+                        if (-not $parsed.Valid) {
+                            Write-Output "LOG:Pnpm local scan returned invalid JSON."
+                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan returned invalid JSON.")
+                        }
+                        else {
+                            foreach ($pkg in @($parsed.Rows)) {
+                                [PSCustomObject]@{Source = "pnpm"; Name = $pkg.Name; Id = $pkg.Id; Version = $pkg.Version; Available = $pkg.Available }
                             }
                             if ($p.ExitCode -notin @(0, 1)) {
                                 Write-Output "LOG:Pnpm local scan exited with code $($p.ExitCode)."
                                 Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan exited with code $($p.ExitCode).")
                             }
-                        }
-                        else {
-                            Write-Output "LOG:Pnpm local scan returned invalid JSON."
-                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan returned invalid JSON.")
                         }
                     }
                     else {
@@ -56589,20 +56951,19 @@ $btnWingetScan.Add_Click({
                     $outTaskG = $pg.StandardOutput.ReadToEndAsync()
                     if ($pg.WaitForExit(15000)) {
                         $jsonG = $outTaskG.GetAwaiter().GetResult().Trim()
-                        if ($jsonG -and $jsonG.StartsWith("[")) {
-                            $pkgsG = $jsonG | ConvertFrom-Json
-                            foreach ($pkg in $pkgsG) {
-                                if ($IgnoreList -contains $pkg.name) { continue }
-                                [PSCustomObject]@{Source = "pnpm (global)"; Name = $pkg.name; Id = $pkg.name; Version = $pkg.current; Available = $pkg.latest }
+                        $parsedG = ConvertFrom-WmtPnpmOutdatedJson -Output $jsonG -IgnoreList $IgnoreList -Source "pnpm (global)"
+                        if (-not $parsedG.Valid) {
+                            Write-Output "LOG:Pnpm global scan returned invalid JSON."
+                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan returned invalid JSON.")
+                        }
+                        else {
+                            foreach ($pkg in @($parsedG.Rows)) {
+                                [PSCustomObject]@{Source = "pnpm (global)"; Name = $pkg.Name; Id = $pkg.Id; Version = $pkg.Version; Available = $pkg.Available }
                             }
                             if ($pg.ExitCode -notin @(0, 1)) {
                                 Write-Output "LOG:Pnpm global scan exited with code $($pg.ExitCode)."
                                 Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan exited with code $($pg.ExitCode).")
                             }
-                        }
-                        else {
-                            Write-Output "LOG:Pnpm global scan returned invalid JSON."
-                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan returned invalid JSON.")
                         }
                     }
                     else {

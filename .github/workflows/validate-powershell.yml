@@ -1987,6 +1987,7 @@ jobs:
               'ConvertFrom-WmtScoopStatusLine',
               'ConvertFrom-WmtScoopStatus',
               'New-WmtProviderScanStatus',
+              'ConvertFrom-WmtPnpmOutdatedJson',
               'Test-WmtSettingsMember',
               'Get-WmtSettingsMember',
               'Get-WmtProviderCapabilities',
@@ -2362,9 +2363,109 @@ jobs:
               $env:PATH = $oldScoopPath
               Remove-Item -LiteralPath $scoopFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
           }
+
+          # pnpm 10+ returns object-shaped JSON keyed by package name and uses
+          # "{}" for a successful scan with no updates. Older releases returned
+          # an array. Both shapes are valid, including a one-element array on
+          # Windows PowerShell 5.1 where ConvertFrom-Json unrolls the pipeline.
+          $emptyPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output '{}'
+          if (-not $emptyPnpm.Valid -or @($emptyPnpm.Rows).Count -ne 0) {
+              throw 'The production pnpm converter rejected an empty object result.'
+          }
+          $objectPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output '{"object-tool":{"current":"1.0.0","latest":"2.0.0"}}'
+          if (-not $objectPnpm.Valid -or @($objectPnpm.Rows).Count -ne 1 -or
+              [string]$objectPnpm.Rows[0].Name -ne 'object-tool' -or
+              [string]$objectPnpm.Rows[0].Version -ne '1.0.0' -or
+              [string]$objectPnpm.Rows[0].Available -ne '2.0.0') {
+              throw 'The production pnpm converter rejected current object-shaped JSON.'
+          }
+          $arrayPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output '[{"name":"array-tool","current":"3.0.0","latest":"4.0.0"}]'
+          if (-not $arrayPnpm.Valid -or @($arrayPnpm.Rows).Count -ne 1 -or
+              [string]$arrayPnpm.Rows[0].Name -ne 'array-tool' -or
+              [string]$arrayPnpm.Rows[0].Version -ne '3.0.0' -or
+              [string]$arrayPnpm.Rows[0].Available -ne '4.0.0') {
+              throw 'The production pnpm converter rejected a legacy one-element JSON array.'
+          }
+          $invalidPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output 'not-json'
+          if ($invalidPnpm.Valid) {
+              throw 'The production pnpm converter accepted invalid JSON.'
+          }
+
+          # Execute the production pnpm worker against a deterministic
+          # pnpm.cmd. Object-shaped local/global rows must survive, and exit
+          # code 1 remains authoritative when the JSON itself is valid.
+          $pnpmAddScript = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                  $node.Member.Value -eq 'AddScript' -and
+                  $node.Extent.Text -match 'Scanning Pnpm'
+          }, $true)
+          if (-not $pnpmAddScript -or $pnpmAddScript.Arguments.Count -ne 1) {
+              throw 'Could not extract the production pnpm worker.'
+          }
+          $pnpmWorkerText = $pnpmAddScript.Arguments[0].Extent.Text
+          $pnpmWorkerBlock = [scriptblock]::Create($pnpmWorkerText.Substring(1, $pnpmWorkerText.Length - 2))
+          $pnpmFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-pnpm-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($pnpmFixtureDir)
+          $oldPnpmPath = $env:PATH
+          try {
+              @'
+          @echo off
+          if "%~2"=="-g" (
+            echo {"global-tool":{"current":"3.0.0","latest":"4.0.0"}}
+          ) else (
+            echo {"local-tool":{"current":"1.0.0","latest":"2.0.0"}}
+          )
+          exit /b 0
+          '@ | Set-Content -LiteralPath (Join-Path $pnpmFixtureDir 'pnpm.cmd') -Encoding Ascii
+              $env:PATH = $pnpmFixtureDir + ';' + $oldPnpmPath
+              $pnpmWorkerOutput = @(& $pnpmWorkerBlock @())
+              $pnpmWorkerRows = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'pnpm*' })
+              $pnpmWorkerStatuses = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($pnpmWorkerRows.Count -ne 2 -or
+                  @($pnpmWorkerRows | Where-Object { [string]$_.Name -eq 'local-tool' -and [string]$_.Source -eq 'pnpm' }).Count -ne 1 -or
+                  @($pnpmWorkerRows | Where-Object { [string]$_.Name -eq 'global-tool' -and [string]$_.Source -eq 'pnpm (global)' }).Count -ne 1 -or
+                  $pnpmWorkerStatuses.Count -ne 0) {
+                  throw 'The production pnpm worker rejected current object-shaped local/global JSON.'
+              }
+
+              @'
+          @echo off
+          echo {}
+          exit /b 0
+          '@ | Set-Content -LiteralPath (Join-Path $pnpmFixtureDir 'pnpm.cmd') -Encoding Ascii
+              $pnpmWorkerOutput = @(& $pnpmWorkerBlock @())
+              $pnpmWorkerRows = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'pnpm*' })
+              $pnpmWorkerStatuses = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($pnpmWorkerRows.Count -ne 0 -or $pnpmWorkerStatuses.Count -ne 0) {
+                  throw 'The production pnpm worker rejected the valid empty-object result.'
+              }
+
+              @'
+          @echo off
+          if "%~2"=="-g" (
+            echo {"global-tool":{"current":"3.0.0","latest":"4.0.0"}}
+          ) else (
+            echo {"local-tool":{"current":"1.0.0","latest":"2.0.0"}}
+          )
+          exit /b 1
+          '@ | Set-Content -LiteralPath (Join-Path $pnpmFixtureDir 'pnpm.cmd') -Encoding Ascii
+              $pnpmWorkerOutput = @(& $pnpmWorkerBlock @())
+              $pnpmWorkerRows = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'pnpm*' })
+              $pnpmWorkerStatuses = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($pnpmWorkerRows.Count -ne 2 -or $pnpmWorkerStatuses.Count -ne 0) {
+                  throw 'The production pnpm worker treated valid JSON with exit code 1 as a provider failure.'
+              }
+          }
+          finally {
+              $env:PATH = $oldPnpmPath
+              Remove-Item -LiteralPath $pnpmFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           Write-Host 'PASS: current and legacy arrow Scoop output produce only real package update rows.'
           Write-Host 'PASS: missing dependencies and scoop list rows never fabricate package updates.'
           Write-Host 'PASS: the production Scoop worker surfaces command failures and timeouts as incomplete scans.'
+          Write-Host 'PASS: current object-shaped and legacy array-shaped pnpm JSON produce package rows without false failures.'
 
       - name: Smoke test provider isolation and action recovery
         shell: powershell
@@ -2384,6 +2485,12 @@ jobs:
 
           foreach ($name in @(
               'Get-WmtCanonicalProviderKey',
+              'Get-WmtCustomCommandSourceKey',
+              'Get-WmtCustomCommandEntrySourceKey',
+              'Get-WmtCustomUpdateCommands',
+              'Get-WmtCustomUpdateCommand',
+              'Set-WmtCustomUpdateCommand',
+              'Remove-WmtCustomUpdateCommand',
               'New-WmtProviderScanStatus',
               'Set-WmtProviderScanFailure',
               'Start-WmtActiveScanWorker',
@@ -2398,6 +2505,10 @@ jobs:
               'Receive-WmtUpdateActionProviderWorker',
               'Complete-WmtUpdateActionFinalization',
               'Get-WmtProviderEnabledIntent',
+              'New-WmtProviderSettingsUiState',
+              'Get-WmtProviderSettingsRegisteredState',
+              'Test-WmtProviderSettingsOperationCurrent',
+              'Register-WmtProviderSettingsDialogLifecycle',
               'Close-WmtProviderSettingsDialog'
           )) {
               $fn = $ast.Find({
@@ -2544,6 +2655,59 @@ jobs:
           if (-not $pnpmGlobalRow -or [string]$pnpmGlobalRow.Source -ne 'pnpm (global)' -or
               [string]$pnpmGlobalRow.WmtProviderKey -ne 'pnpm') {
               throw 'Canonical provider identity overwrote the operational pnpm global source.'
+          }
+
+          # Custom update commands are scoped by the operational source. A
+          # local npm command must not overwrite or resolve to the global npm
+          # command for the same package ID; pnpm global/local must remain
+          # separate in the same way.
+          $script:ciCustomSettings = [pscustomobject]@{ CustomUpdateCommands = @() }
+          function Get-WmtSettings { return $script:ciCustomSettings }
+          function Save-WmtSettings { param($Settings) $script:ciCustomSettings = $Settings }
+          Set-WmtCustomUpdateCommand -Source 'npm' -Id 'shared-tool' -Name 'Shared Tool' -Command 'npm update shared-tool'
+          Set-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'shared-tool' -Name 'Shared Tool' -Command 'npm update -g shared-tool'
+          Set-WmtCustomUpdateCommand -Source 'pnpm' -Id 'shared-tool' -Name 'Shared Tool' -Command 'pnpm update shared-tool'
+          Set-WmtCustomUpdateCommand -Source 'pnpm (global)' -Id 'shared-tool' -Name 'Shared Tool' -Command 'pnpm update -g shared-tool'
+          $customCommands = @(Get-WmtCustomUpdateCommands -Settings $script:ciCustomSettings)
+          if ($customCommands.Count -ne 4) {
+              throw 'Custom update commands collapsed npm/pnpm local and global scopes.'
+          }
+          if ((Get-WmtCustomUpdateCommand -Source 'npm' -Id 'shared-tool' -Settings $script:ciCustomSettings) -ne 'npm update shared-tool' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'shared-tool' -Settings $script:ciCustomSettings) -ne 'npm update -g shared-tool' -or
+              (Get-WmtCustomUpdateCommand -Source 'pnpm' -Id 'shared-tool' -Settings $script:ciCustomSettings) -ne 'pnpm update shared-tool' -or
+              (Get-WmtCustomUpdateCommand -Source 'pnpm (global)' -Id 'shared-tool' -Settings $script:ciCustomSettings) -ne 'pnpm update -g shared-tool') {
+              throw 'Custom update command lookup crossed npm/pnpm local and global scopes.'
+          }
+          Remove-WmtCustomUpdateCommand -Source 'npm' -Id 'shared-tool'
+          if ((Get-WmtCustomUpdateCommand -Source 'npm' -Id 'shared-tool' -Settings $script:ciCustomSettings) -ne '' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'shared-tool' -Settings $script:ciCustomSettings) -ne 'npm update -g shared-tool') {
+              throw 'Removing a local npm custom command also removed the global npm command.'
+          }
+          if ((Get-WmtCustomCommandSourceKey -Source 'npm-global') -ne 'npm (global)' -or
+              (Get-WmtCustomCommandSourceKey -Source 'pnpm-global') -ne 'pnpm (global)') {
+              throw 'Custom command source aliases did not preserve npm/pnpm global scope.'
+          }
+
+          # bb6dc22 persisted npm/pnpm global commands with the canonical local
+          # provider source. Recover that legacy form from the explicit global
+          # flag so it still resolves and can be removed only in global scope.
+          $script:ciCustomSettings = [pscustomobject]@{
+              CustomUpdateCommands = @(
+                  [pscustomobject]@{ Source = 'npm'; Id = 'legacy-tool'; Name = 'Legacy Tool'; Command = 'npm update -g legacy-tool' }
+                  [pscustomobject]@{ Source = 'npm'; Id = 'legacy-local'; Name = 'Legacy Local'; Command = 'npm update legacy-local' }
+                  [pscustomobject]@{ Source = 'pnpm'; Id = 'legacy-tool'; Name = 'Legacy Tool'; Command = 'pnpm update -g legacy-tool' }
+              )
+          }
+          if ((Get-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'legacy-tool' -Settings $script:ciCustomSettings) -ne 'npm update -g legacy-tool' -or
+              (Get-WmtCustomUpdateCommand -Source 'pnpm (global)' -Id 'legacy-tool' -Settings $script:ciCustomSettings) -ne 'pnpm update -g legacy-tool' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm' -Id 'legacy-tool' -Settings $script:ciCustomSettings) -ne '') {
+              throw 'Legacy npm/pnpm global custom commands were not migrated to global scope.'
+          }
+          Remove-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'legacy-tool'
+          if ((Get-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'legacy-tool' -Settings $script:ciCustomSettings) -ne '' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm' -Id 'legacy-local' -Settings $script:ciCustomSettings) -ne 'npm update legacy-local' -or
+              (Get-WmtCustomUpdateCommand -Source 'pnpm (global)' -Id 'legacy-tool' -Settings $script:ciCustomSettings) -ne 'pnpm update -g legacy-tool') {
+              throw 'Removing a legacy global custom command changed another npm/pnpm scope.'
           }
 
           # Typed provider failures are canonicalized by the production collector.
@@ -2866,6 +3030,67 @@ jobs:
               throw 'The production action worker did not emit its provider-start lifecycle signal.'
           }
 
+          # A global pnpm repair must stay in the global package scope.
+          # `pnpm rebuild` is project-scoped and cannot repair a global
+          # installation. `pnpm add -g` would replace the package's whole
+          # isolated group and remove sibling global tools, so the production
+          # command must use the group-preserving global update path.
+          $pnpmGlobalRepairItem = [pscustomobject]@{
+              Source = 'pnpm (global)'
+              Name = 'Global Pnpm Tool'
+              Id = 'global-tool'
+              Version = '1.0'
+              Available = '2.0'
+              WmtActionIndex = 4
+              ProviderLogFilesEnabled = $false
+              ProviderHeadlessEnabled = $false
+          }
+          $pnpmRepairQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+          $pnpmRepairArgs = @{
+              Items = [object[]]@($pnpmGlobalRepairItem)
+              TotalItems = 4
+              ProviderKey = 'pnpm'
+              ActionName = 'Repair'
+              CmdTemplate = ''
+              TempPath = $env:TEMP
+              PackageInstallLogRoot = $env:TEMP
+              WingetIncludeUnknown = $false
+              SilentUpdateInstallEnabled = $false
+              PythonExePath = 'python.exe'
+              LegendaryExePath = ''
+              GogdlExePath = ''
+              GogdlAuthConfigPath = ''
+          }
+          $pnpmRepairFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-pnpm-repair-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($pnpmRepairFixtureDir)
+          $pnpmRepairArgsFile = Join-Path $pnpmRepairFixtureDir 'pnpm-args.txt'
+          $oldPnpmRepairPath = $env:PATH
+          $oldPnpmRepairArgsFile = $env:WMT_CI_PNPM_ARGS_FILE
+          try {
+              @'
+          @echo off
+          echo %*>%WMT_CI_PNPM_ARGS_FILE%
+          exit /b 0
+          '@ | Set-Content -LiteralPath (Join-Path $pnpmRepairFixtureDir 'pnpm.cmd') -Encoding Ascii
+              $env:WMT_CI_PNPM_ARGS_FILE = $pnpmRepairArgsFile
+              $env:PATH = $pnpmRepairFixtureDir + ';' + $oldPnpmRepairPath
+              & $workerBlock $pnpmRepairArgs $pnpmRepairQueue | Out-Null
+              $recordedPnpmArgs = if (Test-Path -LiteralPath $pnpmRepairArgsFile) {
+                  (Get-Content -LiteralPath $pnpmRepairArgsFile -Raw).Trim()
+              }
+              else { '' }
+              if ($recordedPnpmArgs -ne 'update -g global-tool' -or
+                  $recordedPnpmArgs -match 'rebuild|add -g' -or
+                  @($pnpmRepairQueue.ToArray() | Where-Object { [string]$_ -eq 'RESULT:4:SUCCESS:Global Pnpm Tool' }).Count -ne 1) {
+                  throw 'A global pnpm repair did not use the group-preserving global update command.'
+              }
+          }
+          finally {
+              $env:PATH = $oldPnpmRepairPath
+              $env:WMT_CI_PNPM_ARGS_FILE = $oldPnpmRepairArgsFile
+              Remove-Item -LiteralPath $pnpmRepairFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           # Missing providers remain enabled by explicit user intent. They fail
           # independently during scans until the user disables or installs them.
           $enabledIntent = @(Get-WmtProviderEnabledIntent `
@@ -2894,6 +3119,10 @@ jobs:
           # Provider-dialog close verification uses the exact registered window
           # and its Closed lifecycle signal; a hidden but still-open modal window
           # is not considered closed.
+          if ($source -notmatch '\$providerSettingsUiStates\s*=\s*\$providerSettingsRegistry' -or
+              $source -notmatch '\$providerSettingsStateId\s*=\s*\$providerSettingsStateKey') {
+              throw 'The Provider Settings completion closures do not explicitly materialize their registry and state ID.'
+          }
           $dialogState = @{ Dialog = $null; DialogClosed = $false }
           $dialog = [pscustomobject]@{ IsVisible = $true; CloseCalls = 0 }
           $dialogState.Dialog = $dialog
@@ -2902,8 +3131,10 @@ jobs:
                   $this.IsVisible = $false
                   $dialogState.DialogClosed = $true
               }).GetNewClosure()
-          [void](Close-WmtProviderSettingsDialog -Dialog $dialog -State $dialogState)
-          if (-not $dialogState.DialogClosed -or $dialog.CloseCalls -ne 1) {
+          $closeResult = Close-WmtProviderSettingsDialog -Dialog $dialog -State $dialogState
+          if (-not $dialogState.DialogClosed -or $dialog.CloseCalls -ne 1 -or
+              -not $closeResult.VerifiedClosed -or $closeResult.AlreadyClosed -or
+              -not $closeResult.CloseRequested -or -not $closeResult.ClosedEventObserved) {
               throw 'The Provider settings dialog did not close through its exact registered reference.'
           }
 
@@ -2956,11 +3187,42 @@ jobs:
               throw 'Provider settings close accepted a dialog without a registered reference.'
           }
 
+          # The per-dialog generation and exact registry identity reject stale
+          # asynchronous completions without allowing them to mutate a newer
+          # Provider Settings window.
+          $generationState = New-WmtProviderSettingsUiState `
+              -Dialog ([pscustomobject]@{ IsVisible = $true }) `
+              -SaveButton $null `
+              -StateId 'ci-generation-state'
+          $generationRegistry = @{ 'ci-generation-state' = $generationState }
+          $generationState.Generation = 2
+          if (-not (Test-WmtProviderSettingsOperationCurrent `
+                    -State $generationState `
+                    -Generation 2 `
+                    -StateId 'ci-generation-state' `
+                    -Registry $generationRegistry) -or
+              (Test-WmtProviderSettingsOperationCurrent `
+                    -State $generationState `
+                    -Generation 1 `
+                    -StateId 'ci-generation-state' `
+                    -Registry $generationRegistry)) {
+              throw 'Provider settings operation generation validation accepted a stale completion.'
+          }
+          $generationRegistry['ci-generation-state'] = [pscustomobject]@{ Generation = 2 }
+          if (Test-WmtProviderSettingsOperationCurrent `
+                    -State $generationState `
+                    -Generation 2 `
+                    -StateId 'ci-generation-state' `
+                    -Registry $generationRegistry) {
+              throw 'Provider settings operation validation accepted a replacement state object.'
+          }
+
           # If persistence fails after the modal was closed, its registry entry
           # must not retain the closed window and its closures.
           $errorCallbackCandidates = @($ast.FindAll({
                   param($node)
                   $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+                      $node.Extent.Text -match 'param\(\$errorRecord\)' -and
                       $node.Extent.Text -match 'Could not save provider settings'
               }, $true) | Sort-Object { $_.Extent.Text.Length })
           if (-not $errorCallbackCandidates -or $errorCallbackCandidates.Count -eq 0) {
@@ -2972,7 +3234,9 @@ jobs:
               SettingsPersisted = $false
               CloseRequested = $false
               DialogClosed = $true
+              Generation = 1
           }
+          $providerSettingsGeneration = 1
           $providerSettingsUiStates = @{ $providerSettingsStateId = $providerSettingsState }
           $providerSettingsSaveButton = $null
           function Show-WmtMessageBox { param($Message, $Title, $Image, $Owner) }
@@ -3603,6 +3867,9 @@ jobs:
           $repoRoot = (Get-Location).Path
           $SourcePath = Join-Path $repoRoot 'WMT-GUI.ps1'
           Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+              throw 'The Provider Settings WPF regressions require Windows PowerShell 5.1.'
+          }
           if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Run with powershell.exe -STA.' }
           $tokens = $null
           $parseErrors = $null
@@ -4921,6 +5188,109 @@ jobs:
               $d.Close()
               Assert ($p.State -eq 'Cancelled' -and $b.IsEnabled) 'Closing the owner left a running worker.'
               Assert (-not (Test-WmtUiPollOperation 'UiCommand:ComponentOwnerClose')) 'Owner closure retained the monitor.'
+          }
+          Test-Case 'Provider settings lifecycle cancels a manual close while saving' {
+              $d=[Windows.Window]::new()
+              $stateId='wpf-provider-pending'
+              $state=New-WmtProviderSettingsUiState -Dialog $d -SaveButton $null -StateId $stateId
+              $registry=@{ $stateId=$state }
+              Register-WmtProviderSettingsDialogLifecycle -Dialog $d -StateId $stateId -Registry $registry
+              try {
+                  $state.SavePending=$true
+                  $d.Show()
+                  $d.Close()
+                  Assert ($d.IsVisible -and -not $state.DialogClosed) 'A pending Provider Settings save allowed the modal to close.'
+                  $state.SavePending=$false
+                  $d.Close()
+                  Assert ($state.DialogClosed -and -not $d.IsVisible) 'Provider Settings did not close after the pending save ended.'
+              }
+              finally {
+                  if ($d.IsVisible) { $d.Close() }
+              }
+          }
+          Test-Case 'Provider settings close verifies a real hidden WPF window' {
+              $d=[Windows.Window]::new()
+              $stateId='wpf-provider-hidden'
+              $state=New-WmtProviderSettingsUiState -Dialog $d -SaveButton $null -StateId $stateId
+              $registry=@{ $stateId=$state }
+              Register-WmtProviderSettingsDialogLifecycle -Dialog $d -StateId $stateId -Registry $registry
+              try {
+                  $d.Show()
+                  $d.Hide()
+                  $result=Close-WmtProviderSettingsDialog -Dialog $d -State $state
+                  Assert ($result.VerifiedClosed -and $result.CloseRequested -and $result.ClosedEventObserved) 'The hidden Provider Settings window was not closed and verified.'
+                  Assert (-not $d.IsVisible -and $state.DialogClosed) 'The hidden Provider Settings window retained visible/open state.'
+              }
+              finally {
+                  if ($d.IsVisible) { $d.Close() }
+              }
+          }
+          Test-Case 'Provider settings close ends a real ShowDialog modal' {
+              $d=[Windows.Window]::new()
+              $stateId='wpf-provider-modal'
+              $state=New-WmtProviderSettingsUiState -Dialog $d -SaveButton $null -StateId $stateId
+              $registry=@{ $stateId=$state }
+              Register-WmtProviderSettingsDialogLifecycle -Dialog $d -StateId $stateId -Registry $registry
+              $timer=[Windows.Threading.DispatcherTimer]::new()
+              $timer.Interval=[TimeSpan]::FromMilliseconds(100)
+              $holder=@{ Result=$null; Error=$null }
+              $timer.Add_Tick({
+                  $timer.Stop()
+                  try { $holder.Result=Close-WmtProviderSettingsDialog -Dialog $d -State $state }
+                  catch {
+                      $holder.Error=$_.Exception.Message
+                      try { $d.Close() } catch {}
+                  }
+              }.GetNewClosure())
+              $timer.Start()
+              $d.ShowDialog() | Out-Null
+              Assert (-not $holder.Error -and $holder.Result -and $holder.Result.VerifiedClosed) "ShowDialog did not close through the verified Provider Settings path: $($holder.Error)"
+              Assert ($state.DialogClosed -and -not $d.IsVisible) 'The real Provider Settings modal did not reach its Closed state.'
+          }
+          Test-Case 'Provider settings close cannot target a replacement window' {
+              $original=[Windows.Window]::new()
+              $replacement=[Windows.Window]::new()
+              $stateId='wpf-provider-original'
+              $state=New-WmtProviderSettingsUiState -Dialog $original -SaveButton $null -StateId $stateId
+              $registry=@{ $stateId=$state }
+              Register-WmtProviderSettingsDialogLifecycle -Dialog $original -StateId $stateId -Registry $registry
+              try {
+                  $original.Show()
+                  $replacement.Show()
+                  $rejected=$false
+                  try { [void](Close-WmtProviderSettingsDialog -Dialog $replacement -State $state) }
+                  catch { $rejected=$_.Exception.Message -match 'does not match' }
+                  Assert ($rejected -and $replacement.IsVisible -and -not $state.DialogClosed) 'A stale close request affected the replacement Provider Settings window.'
+              }
+              finally {
+                  if ($original.IsVisible) { $original.Close() }
+                  if ($replacement.IsVisible) { $replacement.Close() }
+              }
+          }
+          Test-Case 'Nested provider completion closure retains its registry and generation' {
+              $stateId='wpf-provider-nested'
+              $state=New-WmtProviderSettingsUiState -Dialog ([Windows.Window]::new()) -SaveButton $null -StateId $stateId
+              $state.Generation=1
+              $registry=@{ $stateId=$state }
+              $generation=1
+              $outer={
+                  $providerSettingsRegistry=$registry
+                  $providerSettingsStateKey=$stateId
+                  $providerSettingsGenerationValue=$generation
+                  # Match the production closure's explicit materialization of
+                  # values needed by a second nested GetNewClosure block.
+                  $providerSettingsUiStates=$providerSettingsRegistry
+                  $providerSettingsStateId=$providerSettingsStateKey
+                  $providerSettingsGeneration=$providerSettingsGenerationValue
+                  $inner={
+                      $current=Get-WmtProviderSettingsRegisteredState -Registry $providerSettingsUiStates -StateId $providerSettingsStateId
+                      if (-not (Test-WmtProviderSettingsOperationCurrent -State $current -Generation $providerSettingsGeneration -StateId $providerSettingsStateId -Registry $providerSettingsUiStates)) {
+                          throw 'The nested Provider Settings completion lost its registry or generation.'
+                      }
+                  }.GetNewClosure()
+                  & $inner
+              }.GetNewClosure()
+              & $outer
           }
           # Cancellation finalizes workers asynchronously. Let the real stop collectors
           # release their PowerShell instances before stopping the shared dispatcher timer.
@@ -6510,7 +6880,8 @@ jobs:
               'ConvertFrom-WmtScoopCurrentStatusRow',
               'ConvertFrom-WmtScoopStatusLine',
               'ConvertFrom-WmtScoopStatus',
-              'New-WmtProviderScanStatus'
+              'New-WmtProviderScanStatus',
+              'ConvertFrom-WmtPnpmOutdatedJson'
           )
           foreach ($helperName in $requiredPoolHelpers) {
               $helperAst = $ast.Find({
@@ -6573,6 +6944,7 @@ jobs:
           "@
           $tableRows = @(ConvertFrom-WmtScoopStatus -Output $tableOutput)
           $providerStatus = New-WmtProviderScanStatus -Provider "scoop" -Success $false -Message "exit code 7"
+          $pnpmParsed = ConvertFrom-WmtPnpmOutdatedJson -Output '{"pooled-tool":{"current":"1.0.0","latest":"2.0.0"}}'
           [pscustomobject]@{
               Integer = ConvertTo-Int "42" 0
               CapabilityPending = $capability.Pending
@@ -6586,6 +6958,9 @@ jobs:
               ScoopTableName = $tableRows[0].Name
               ProviderStatusType = $providerStatus.WmtStateType
               ProviderStatusSuccess = $providerStatus.Success
+              PnpmValid = $pnpmParsed.Valid
+              PnpmRows = @($pnpmParsed.Rows).Count
+              PnpmName = $pnpmParsed.Rows[0].Name
           }
           '@
               [void]$helperPs.AddScript($sharedScanHelperScript)
@@ -6604,10 +6979,13 @@ jobs:
                   $helperResult[0].ScoopTableRows -ne 1 -or
                   $helperResult[0].ScoopTableName -ne '7zip' -or
                   $helperResult[0].ProviderStatusType -ne 'ProviderScanStatus' -or
-                  $helperResult[0].ProviderStatusSuccess) {
+                  $helperResult[0].ProviderStatusSuccess -or
+                  -not $helperResult[0].PnpmValid -or
+                  $helperResult[0].PnpmRows -ne 1 -or
+                  $helperResult[0].PnpmName -ne 'pooled-tool') {
                   throw "Shared scan helper runspace smoke test returned unexpected output: $($helperResult -join ', ')"
               }
-              Write-Host "OK: shared conversion, servicing-state, Scoop-table, and provider-status helpers execute inside the pooled InitialSessionState."
+              Write-Host "OK: shared conversion, servicing-state, Scoop-table, pnpm-JSON, and provider-status helpers execute inside the pooled InitialSessionState."
           }
           finally {
               try { if ($helperPs) { $helperPs.Dispose() } } catch {}
