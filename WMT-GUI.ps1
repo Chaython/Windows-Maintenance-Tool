@@ -5160,6 +5160,71 @@ catch {}
 return $map
 }
 
+# Builds the optional Steam ownership seed used to hide unknown-version winget
+# rows that are actually owned by an installed Steam game. Windows PowerShell
+# 5.1 writes a top-level JSON array from ConvertFrom-Json as one object, so
+# "@($text | ConvertFrom-Json)" yields a single nested array instead of the
+# rows. Parse into a variable first, then normalize it. Defined before the
+# runspace pools so every pooled worker can register it.
+function New-WmtSteamOwnershipSeed {
+param(
+    [string]$SteamCacheFile = "",
+    [string]$SteamOwnershipJson = "",
+    [bool]$Enabled = $false,
+    [int]$MaxAgeHours = 24
+)
+
+$seed = [pscustomobject]@{
+    Enabled                = [bool]$Enabled
+    ProviderOwnershipIndex = @{ Name = @{}; Id = @{}; Path = @{} }
+    SteamInstalledNameKeys = @{}
+    SeededSteamOwners      = 0
+}
+if (-not $Enabled) { return $seed }
+
+$steamOwnership = @()
+if (-not [string]::IsNullOrWhiteSpace($SteamCacheFile) -and (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf)) {
+    try {
+        $cacheInfo = Get-Item -LiteralPath $SteamCacheFile -ErrorAction Stop
+        if (((Get-Date) - $cacheInfo.LastWriteTime).TotalHours -lt $MaxAgeHours) {
+            $parsedOwnership = [System.IO.File]::ReadAllText($SteamCacheFile) | ConvertFrom-Json -ErrorAction Stop
+            $steamOwnership = @($parsedOwnership)
+        }
+    }
+    catch {}
+}
+if ($steamOwnership.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($SteamOwnershipJson)) {
+    try {
+        $parsedOwnership = ConvertFrom-Json -InputObject $SteamOwnershipJson -ErrorAction Stop
+        $steamOwnership = @($parsedOwnership)
+    }
+    catch {}
+}
+
+$nameOwners = @{}
+$installedNameKeys = @{}
+$ownerIds = @{}
+$seededOwners = 0
+foreach ($owned in @($steamOwnership)) {
+    if (-not $owned) { continue }
+    if ($owned.PSObject.Properties["IsInstalled"] -and -not [bool]$owned.IsInstalled) { continue }
+    $ownedName = if ($owned.PSObject.Properties["Title"]) { ([string]$owned.Title).Trim() } elseif ($owned.PSObject.Properties["Name"]) { ([string]$owned.Name).Trim() } else { "" }
+    if ([string]::IsNullOrWhiteSpace($ownedName)) { continue }
+    $ownedId = if ($owned.PSObject.Properties["Id"]) { ([string]$owned.Id).Trim() } else { "" }
+    $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+    if ([string]::IsNullOrWhiteSpace($nameKey)) { continue }
+    $nameOwners[$nameKey] = [PSCustomObject]@{ Provider = "steam"; Id = $ownedId; Path = ""; Name = $ownedName }
+    $installedNameKeys[$nameKey] = $ownedId
+    if (-not [string]::IsNullOrWhiteSpace($ownedId)) { $ownerIds["steam|$($ownedId.ToLowerInvariant())"] = $true }
+    $seededOwners++
+}
+
+$seed.ProviderOwnershipIndex = @{ Name = $nameOwners; Id = $ownerIds; Path = @{} }
+$seed.SteamInstalledNameKeys = $installedNameKeys
+$seed.SeededSteamOwners = $seededOwners
+return $seed
+}
+
 # ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
@@ -5214,7 +5279,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson", "New-WmtSteamOwnershipSeed")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -56314,6 +56379,19 @@ else {
     Write-GuiLog $scanCompletion.LogMessage
 }
 
+# Report the aggregate wall time for this scan. Provider checks run in parallel,
+# so this is the critical path (the slowest provider or the global deadline), not
+# the sum of every provider command.
+try {
+    if ($script:ScanStartTime) {
+        $scanElapsedSeconds = ((Get-Date) - [datetime]$script:ScanStartTime).TotalSeconds
+        if ($scanElapsedSeconds -gt 0) {
+            Write-GuiLog ("Provider scan finished in {0:N1}s." -f $scanElapsedSeconds)
+        }
+    }
+}
+catch {}
+
 # Provider failures are isolated. When auto install is enabled, eligible rows
 # from successful providers remain actionable; failed providers are filtered by
 # the dispatcher. Disabled auto install remains completely silent.
@@ -56366,87 +56444,63 @@ $btnWingetScan.Add_Click({
         $scanSettings = $script:WmtSettingsCache
         if (-not $scanSettings) { $scanSettings = Get-WmtSettings }
         $scanSettingsJson = ConvertTo-Json -InputObject $scanSettings -Depth 8 -Compress
+        $hideCrossProviderDuplicates = $false
+        try { $hideCrossProviderDuplicates = [bool](Get-WmtSettingsMember -Settings $scanSettings -Name "HideCrossProviderDuplicates" -Default $false) } catch {}
         $steamCacheFile = Join-Path (Get-DataPath) "steam_library.json"
-        $hasSteamCache = [bool]$script:WmtSteamLibraryCache
-        if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
-            $hasSteamCache = $false
-            try {
-                $cacheInfo = Get-Item -LiteralPath $steamCacheFile -ErrorAction Stop
-                $cacheAgeHours = ((Get-Date) - $cacheInfo.LastWriteTime).TotalHours
-                if ($cacheAgeHours -lt 24) {
-                    $cachedSteamOwnership = @([System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
-                    $hasSteamCache = ($cachedSteamOwnership.Count -gt 0)
+        # Steam ownership data is only used to hide cross-provider duplicates.
+        # Do not read, refresh, or report on it while that option is disabled.
+        if ($hideCrossProviderDuplicates) {
+            $hasSteamCache = [bool]$script:WmtSteamLibraryCache
+            if (Test-Path -LiteralPath $steamCacheFile -PathType Leaf) {
+                $hasSteamCache = $false
+                try {
+                    $cacheInfo = Get-Item -LiteralPath $steamCacheFile -ErrorAction Stop
+                    $cacheAgeHours = ((Get-Date) - $cacheInfo.LastWriteTime).TotalHours
+                    if ($cacheAgeHours -lt 24) {
+                        $cachedSteamOwnership = [System.IO.File]::ReadAllText($steamCacheFile) | ConvertFrom-Json -ErrorAction Stop
+                        $hasSteamCache = (@($cachedSteamOwnership).Count -gt 0)
+                    }
+                }
+                catch {
+                    Write-GuiLog "[Winget] Steam ownership cache is unreadable; requesting a refresh: $($_.Exception.Message)"
                 }
             }
-            catch {
-                Write-GuiLog "[Winget] Steam ownership cache is unreadable; requesting a refresh: $($_.Exception.Message)"
+            if ($hasSteamCache) { $script:WmtWingetScanSteamCacheAttempted = $false }
+            elseif (-not $script:WmtWingetScanSteamCacheAttempted) {
+                $previousLibraryBuild = $script:WmtLibraryCacheAsyncResult
+                try { Start-WmtLibraryCacheBuilder -SteamOnly }
+                catch { Write-GuiLog "Could not start Steam ownership cache build: $($_.Exception.Message)" }
+                # The cache is only a seed for cross-provider duplicate filtering, and the Steam scanner reports
+                # installed games itself, so nothing waits for the build: it finishes in the background and
+                # the next scan picks it up.
+                if ($script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult -ne $previousLibraryBuild) {
+                    $script:WmtWingetScanSteamCacheAttempted = $true
+                    Write-GuiLog "[Winget] Building the Steam ownership cache in the background; this scan does not wait for it."
+                }
             }
         }
-        if ($hasSteamCache) { $script:WmtWingetScanSteamCacheAttempted = $false }
-        elseif (-not $script:WmtWingetScanSteamCacheAttempted) {
-            $previousLibraryBuild = $script:WmtLibraryCacheAsyncResult
-            try { Start-WmtLibraryCacheBuilder -SteamOnly }
-            catch { Write-GuiLog "Could not start Steam ownership cache build: $($_.Exception.Message)" }
-            # The cache is only a seed for cross-provider duplicate filtering, and the Steam scanner reports
-            # installed games itself, so nothing waits for the build: it finishes in the background and
-            # the next scan picks it up.
-            if ($script:WmtLibraryCacheAsyncResult -and $script:WmtLibraryCacheAsyncResult -ne $previousLibraryBuild) {
-                $script:WmtWingetScanSteamCacheAttempted = $true
-                Write-GuiLog "[Winget] Building the Steam ownership cache in the background; this scan does not wait for it."
-            }
-        }
-        $steamOwnershipJson = if ($script:WmtSteamLibraryCache -and -not (Test-Path -LiteralPath $steamCacheFile -PathType Leaf)) {
+        $steamOwnershipJson = if ($hideCrossProviderDuplicates -and $script:WmtSteamLibraryCache -and -not (Test-Path -LiteralPath $steamCacheFile -PathType Leaf)) {
             ConvertTo-Json -InputObject @($script:WmtSteamLibraryCache) -Depth 4 -Compress
         } else { "" }
-        $preparationArguments = [object[]]::new(3)
+        $preparationArguments = [object[]]::new(4)
         $preparationArguments[0] = $scanSettingsJson
         $preparationArguments[1] = $steamCacheFile
         $preparationArguments[2] = $steamOwnershipJson
+        $preparationArguments[3] = $hideCrossProviderDuplicates
         Invoke-WmtUiBackgroundCommand -Name "WingetScanPreparation" -Msg "Preparing update scan..." -ArgumentList $preparationArguments -Sb {
-            param([string]$SettingsJson, [string]$SteamCacheFile, [string]$SteamOwnershipJson)
+            param([string]$SettingsJson, [string]$SteamCacheFile, [string]$SteamOwnershipJson, [bool]$HideCrossProviderDuplicates)
             $settings = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
-            $steamOwnership = @()
-            if (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf) {
-                try {
-                    $cacheInfo = Get-Item -LiteralPath $SteamCacheFile -ErrorAction Stop
-                    if (((Get-Date) - $cacheInfo.LastWriteTime).TotalHours -lt 24) {
-                        $steamOwnership = @([System.IO.File]::ReadAllText($SteamCacheFile) | ConvertFrom-Json -ErrorAction Stop)
-                    }
-                }
-                catch {}
-            }
-            if ($steamOwnership.Count -eq 0 -and
-                -not (Test-Path -LiteralPath $SteamCacheFile -PathType Leaf) -and
-                -not [string]::IsNullOrWhiteSpace($SteamOwnershipJson)) {
-                try { $steamOwnership = @(ConvertFrom-Json -InputObject $SteamOwnershipJson -ErrorAction Stop) } catch {}
-            }
-            if ($steamOwnership.Count -eq 0) {
-                $steamOwnership = @()
-            }
-
-            $nameOwners = @{}
-            $installedNameKeys = @{}
-            $ownerIds = @{}
-            $seededOwners = 0
-            foreach ($owned in @($steamOwnership)) {
-                if (-not $owned) { continue }
-                if ($owned.PSObject.Properties["IsInstalled"] -and -not [bool]$owned.IsInstalled) { continue }
-                $ownedName = if ($owned.PSObject.Properties["Title"]) { ([string]$owned.Title).Trim() } elseif ($owned.PSObject.Properties["Name"]) { ([string]$owned.Name).Trim() } else { "" }
-                if ([string]::IsNullOrWhiteSpace($ownedName)) { continue }
-                $ownedId = if ($owned.PSObject.Properties["Id"]) { ([string]$owned.Id).Trim() } else { "" }
-                $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
-                if ([string]::IsNullOrWhiteSpace($nameKey)) { continue }
-                $nameOwners[$nameKey] = [PSCustomObject]@{ Provider="steam"; Id=$ownedId; Path=""; Name=$ownedName }
-                $installedNameKeys[$nameKey] = $ownedId
-                if (-not [string]::IsNullOrWhiteSpace($ownedId)) { $ownerIds["steam|$($ownedId.ToLowerInvariant())"] = $true }
-                $seededOwners++
-            }
+            $steamSeed = New-WmtSteamOwnershipSeed `
+                -SteamCacheFile $SteamCacheFile `
+                -SteamOwnershipJson $SteamOwnershipJson `
+                -Enabled $HideCrossProviderDuplicates
             [pscustomobject]@{
                 Message = ''
                 ScanSettings = $settings
-                ProviderOwnershipIndex = @{ Name=$nameOwners; Id=$ownerIds; Path=@{} }
-                SteamInstalledNameKeys = $installedNameKeys
-                SeededSteamOwners = $seededOwners
+                ProviderOwnershipIndex = $steamSeed.ProviderOwnershipIndex
+                SteamInstalledNameKeys = $steamSeed.SteamInstalledNameKeys
+                SeededSteamOwners = $steamSeed.SeededSteamOwners
+                SteamOwnershipEnabled = [bool]$steamSeed.Enabled
             }
         } -OnComplete {
             # NOTE: this callback and -OnError below are deliberately plain scriptblocks, NOT .GetNewClosure().
@@ -56645,11 +56699,15 @@ $btnWingetScan.Add_Click({
     $script:ScanStartTime = Get-Date
     $script:WmtSteamInstalledNameKeys = $scanPrepared.SteamInstalledNameKeys
     $script:WmtProviderOwnershipIndex = $scanPrepared.ProviderOwnershipIndex
-    if ([int]$scanPrepared.SeededSteamOwners -gt 0) {
-        Write-GuiLog "[Winget] Seeded $($scanPrepared.SeededSteamOwners) installed Steam ownership record(s) for cross-provider duplicate filtering."
-    }
-    else {
-        Write-GuiLog "[Winget] No installed Steam ownership records were discovered; cross-provider unknown-version suppression cannot match Steam games."
+    # Steam ownership seeding only runs for cross-provider duplicate hiding.
+    # Keep the scan log silent when that option is disabled.
+    if ([bool]$scanPrepared.SteamOwnershipEnabled) {
+        if ([int]$scanPrepared.SeededSteamOwners -gt 0) {
+            Write-GuiLog "[Winget] Seeded $($scanPrepared.SeededSteamOwners) installed Steam ownership record(s) for cross-provider duplicate filtering."
+        }
+        else {
+            Write-GuiLog "[Winget] No installed Steam ownership records were discovered; cross-provider unknown-version suppression cannot match Steam games."
+        }
     }
 
     # --- Global Timeout Timer (120 seconds) ---

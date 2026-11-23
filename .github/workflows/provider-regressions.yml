@@ -294,6 +294,103 @@ jobs:
               $script:WmtProviderAvailabilityCachePath = $null
           }
 
+      - name: Test Steam ownership duplicate-filter seeding
+        shell: powershell
+        run: |
+          # Regression for the Steam ownership seed used by cross-provider
+          # duplicate hiding. The seed must do nothing when the setting is off,
+          # and must recover installed rows from a top-level JSON array on
+          # Windows PowerShell 5.1 (where ConvertFrom-Json writes the array as
+          # one object, so "@($text | ConvertFrom-Json)" returns a single item).
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = (Get-Location).Path
+          $sourcePath = Join-Path $repoRoot 'WMT-GUI.ps1'
+          $source = [System.IO.File]::ReadAllText($sourcePath)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+              $source,
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors -and $parseErrors.Count -gt 0) {
+              throw ($parseErrors.Message -join '; ')
+          }
+
+          function Assert-True([bool]$Condition, [string]$Message) {
+              if (-not $Condition) { throw $Message }
+          }
+
+          $seedFunction = $ast.Find({
+                  param($candidate)
+                  $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $candidate.Name -eq 'New-WmtSteamOwnershipSeed'
+              }, $true)
+          if (-not $seedFunction) { throw 'The Steam ownership seed builder is missing.' }
+          Invoke-Expression $seedFunction.Extent.Text
+
+          $initialStateFunction = $ast.Find({
+                  param($candidate)
+                  $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $candidate.Name -eq 'New-WmtRunspaceInitialState'
+              }, $true)
+          Assert-True ($initialStateFunction -and $initialStateFunction.Extent.Text -match 'New-WmtSteamOwnershipSeed') 'The Steam ownership seed builder is not registered for pooled runspaces.'
+
+          # The scan log must be guarded by the prepared ownership-enabled flag,
+          # so a normal scan with duplicate hiding off writes no Steam ownership
+          # messages at all.
+          $logCommand = $ast.Find({
+                  param($candidate)
+                  $candidate -is [System.Management.Automation.Language.CommandAst] -and
+                  $candidate.Extent.Text -match 'No installed Steam ownership records'
+              }, $true)
+          Assert-True ($null -ne $logCommand) 'The Steam ownership diagnostics log statement is missing.'
+          $logGuards = @($ast.FindAll({
+                          param($candidate)
+                          $candidate -is [System.Management.Automation.Language.IfStatementAst] -and
+                          $candidate.Extent.StartOffset -le $logCommand.Extent.StartOffset -and
+                          $candidate.Extent.EndOffset -ge $logCommand.Extent.EndOffset
+                      }, $true))
+          Assert-True (@($logGuards | Where-Object { $_.Clauses[0].Item1.Extent.Text -match 'SteamOwnershipEnabled' }).Count -gt 0) 'The Steam ownership diagnostics log is not gated by the duplicate-hiding setting.'
+          Assert-True ($source -match '-Enabled \$HideCrossProviderDuplicates') 'Scan preparation does not pass the duplicate-hiding setting to the ownership seed.'
+          Assert-True ($source -match '\$preparationArguments\s*=\s*\[object\[\]\]::new\(4\)') 'Scan preparation does not carry the duplicate-hiding setting.'
+          Assert-True ($source -match 'if \(\$hideCrossProviderDuplicates\) \{') 'Steam ownership cache work is not gated by the duplicate-hiding setting.'
+
+          $fixtureRows = @(
+              [pscustomobject]@{ Title = 'Counter-Strike 2'; Id = '730'; IsInstalled = $true }
+              [pscustomobject]@{ Title = 'Not Installed Game'; Id = '999'; IsInstalled = $false }
+              [pscustomobject]@{ Title = 'Team Fortress 2'; Id = '440'; IsInstalled = $true }
+          )
+          $fixtureJson = ConvertTo-Json -InputObject $fixtureRows -Depth 4
+          $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('wmt-steam-ownership-' + [Guid]::NewGuid().ToString('N'))
+          [void][System.IO.Directory]::CreateDirectory($fixtureRoot)
+          $fixtureFile = Join-Path $fixtureRoot 'steam_library.json'
+          [System.IO.File]::WriteAllText($fixtureFile, $fixtureJson, [System.Text.UTF8Encoding]::new($false))
+          try {
+              $disabled = New-WmtSteamOwnershipSeed -SteamCacheFile $fixtureFile -SteamOwnershipJson $fixtureJson -Enabled $false
+              Assert-True (-not [bool]$disabled.Enabled) 'The disabled seed reported itself as enabled.'
+              Assert-True ([int]$disabled.SeededSteamOwners -eq 0) 'The disabled seed read Steam ownership rows.'
+              Assert-True ($disabled.ProviderOwnershipIndex.Name.Count -eq 0) 'The disabled seed returned name owners.'
+              Assert-True ($disabled.ProviderOwnershipIndex.Id.Count -eq 0) 'The disabled seed returned id owners.'
+              Assert-True ($disabled.SteamInstalledNameKeys.Count -eq 0) 'The disabled seed returned installed name keys.'
+
+              $enabled = New-WmtSteamOwnershipSeed -SteamCacheFile $fixtureFile -Enabled $true
+              Assert-True ([bool]$enabled.Enabled) 'The enabled seed did not report itself as enabled.'
+              Assert-True ([int]$enabled.SeededSteamOwners -eq 2) "Expected two installed Steam owners, got $($enabled.SeededSteamOwners)."
+              Assert-True ($enabled.ProviderOwnershipIndex.Name.Count -eq 2) 'The enabled seed did not index both installed rows.'
+              Assert-True ($enabled.ProviderOwnershipIndex.Id.ContainsKey('steam|730')) 'The enabled seed did not index Counter-Strike 2 by Steam id.'
+              Assert-True ($enabled.ProviderOwnershipIndex.Name['counterstrike2'].Id -eq '730') 'The enabled seed did not preserve the Counter-Strike 2 id.'
+              Assert-True (-not $enabled.ProviderOwnershipIndex.Name.ContainsKey('notinstalledgame')) 'The enabled seed indexed an uninstalled row.'
+
+              $fromJson = New-WmtSteamOwnershipSeed -SteamOwnershipJson $fixtureJson -Enabled $true
+              Assert-True ([int]$fromJson.SeededSteamOwners -eq 2) "Expected two installed Steam owners from JSON, got $($fromJson.SeededSteamOwners)."
+          }
+          finally {
+              try { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+          Write-Host 'PASS: Steam ownership seeding is opt-in and recovers top-level JSON arrays.'
+
       - name: Test shared WPF controls
         shell: powershell -NoProfile -STA -ExecutionPolicy Bypass -File {0}
         run: |
