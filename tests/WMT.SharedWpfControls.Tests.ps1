@@ -23,6 +23,19 @@ $paletteAssignment = $ast.Find({ param($n)
     $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:ThemePalettes'
 }, $true)
 Invoke-Expression $paletteAssignment.Extent.Text
+# Provider completion runs the same installed-state probe as the panel and the
+# update scan. Load the probe assignments the extracted callback references.
+foreach ($probeAssignmentName in @(
+        '$script:WmtProviderAliasProbeCommands',
+        '$script:WmtProviderProbeScript'
+    )) {
+    $probeAssignment = $ast.Find({ param($n)
+        $n -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq $probeAssignmentName
+    }, $true)
+    if (-not $probeAssignment) { throw "Missing provider probe assignment: $probeAssignmentName" }
+    Invoke-Expression $probeAssignment.Extent.Text
+}
 $script:CurrentTheme = 'dark'
 $script:WmtThemedElements = [Collections.ArrayList]::new()
 $script:WmtUiBackgroundCommands = @{}
@@ -1109,6 +1122,8 @@ Test-Case 'Provider completion captures state and releases its monitor after ver
             ProviderKey = 'ProviderTest'
             # Get-Command is available in an isolated Windows PowerShell runspace.
             ProviderInfo = [pscustomobject]@{ Key = 'ProviderTest'; Commands = [string[]]@('Get-Command') }
+            ProbeScript = $script:WmtProviderProbeScript
+            ProbeAliasCommands = $script:WmtProviderAliasProbeCommands
             StatusCache = $statusCache
             ExitObserved = $false; CompletionLogged = $false
             RefreshCompleted = $false; TempRemoved = $false

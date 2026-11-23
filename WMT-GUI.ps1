@@ -3246,13 +3246,615 @@ switch ($sourceKey) {
 }
 }
 
+# Installed-state detection runs once per cache window and is shared by the
+# Provider Settings window and the update scanner. The compiled path scan keeps
+# a first run from paying Get-Command and Test-Path costs for every missing
+# provider, and the persistent cache lets later scans skip tools that are known
+# to be absent instead of starting workers that can only fail.
+$script:WmtProviderDetectorSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Microsoft.Win32;
+
+namespace Wmt.Providers
+{
+    public static class Detector
+    {
+        public static bool TestCommand(string command, string pathValue)
+        {
+            if (String.IsNullOrWhiteSpace(command)) { return false; }
+            string name = command.Trim().Trim('"');
+            if (name.Length == 0) { return false; }
+            if (name.IndexOf('\\') >= 0 || name.IndexOf('/') >= 0)
+            {
+                try { return File.Exists(name); }
+                catch { return false; }
+            }
+
+            List<string> extensions = new List<string>();
+            extensions.Add(String.Empty);
+            string pathExt = Environment.GetEnvironmentVariable("PATHEXT");
+            if (String.IsNullOrWhiteSpace(pathExt)) { pathExt = ".COM;.EXE;.BAT;.CMD"; }
+            foreach (string rawExtension in pathExt.Split(';'))
+            {
+                string extension = rawExtension.Trim();
+                if (extension.Length > 0 && !ContainsIgnoreCase(extensions, extension))
+                {
+                    extensions.Add(extension);
+                }
+            }
+
+            List<string> directories = new List<string>();
+            try { directories.Add(Environment.CurrentDirectory); }
+            catch { }
+            if (!String.IsNullOrWhiteSpace(pathValue))
+            {
+                foreach (string rawDirectory in pathValue.Split(';'))
+                {
+                    string directory = rawDirectory.Trim().Trim('"');
+                    if (directory.Length > 0)
+                    {
+                        try { directories.Add(Environment.ExpandEnvironmentVariables(directory)); }
+                        catch { directories.Add(directory); }
+                    }
+                }
+            }
+
+            foreach (string directory in directories)
+            {
+                foreach (string extension in extensions)
+                {
+                    try
+                    {
+                        if (File.Exists(Path.Combine(directory, name + extension))) { return true; }
+                    }
+                    catch { }
+                }
+            }
+            return false;
+        }
+
+        public static bool TestRegistryPath(string path)
+        {
+            if (String.IsNullOrWhiteSpace(path)) { return false; }
+            string text = path.Trim();
+            RegistryHive hive;
+            string subKey;
+            if (text.StartsWith("HKCU:\\", StringComparison.OrdinalIgnoreCase))
+            {
+                hive = RegistryHive.CurrentUser;
+                subKey = text.Substring(6);
+            }
+            else if (text.StartsWith("HKEY_CURRENT_USER\\", StringComparison.OrdinalIgnoreCase))
+            {
+                hive = RegistryHive.CurrentUser;
+                subKey = text.Substring(18);
+            }
+            else if (text.StartsWith("HKLM:\\", StringComparison.OrdinalIgnoreCase))
+            {
+                hive = RegistryHive.LocalMachine;
+                subKey = text.Substring(6);
+            }
+            else if (text.StartsWith("HKEY_LOCAL_MACHINE\\", StringComparison.OrdinalIgnoreCase))
+            {
+                hive = RegistryHive.LocalMachine;
+                subKey = text.Substring(19);
+            }
+            else
+            {
+                try { return File.Exists(text) || Directory.Exists(text); }
+                catch { return false; }
+            }
+
+            if (String.IsNullOrWhiteSpace(subKey)) { return false; }
+            try
+            {
+                using (RegistryKey baseKey = RegistryKey.OpenBaseKey(hive, RegistryView.Default))
+                using (RegistryKey key = baseKey.OpenSubKey(subKey, false))
+                {
+                    return key != null;
+                }
+            }
+            catch { return false; }
+        }
+
+        public static bool TestLocalPath(string path)
+        {
+            if (String.IsNullOrWhiteSpace(path)) { return false; }
+            try { return File.Exists(path.Trim()); }
+            catch { return false; }
+        }
+
+        public static bool DetectProvider(string commandNames, string registryPaths, string localPaths, string pathValue)
+        {
+            foreach (string command in SplitLines(commandNames))
+            {
+                if (TestCommand(command, pathValue)) { return true; }
+            }
+            foreach (string registryPath in SplitLines(registryPaths))
+            {
+                if (TestRegistryPath(registryPath)) { return true; }
+            }
+            foreach (string localPath in SplitLines(localPaths))
+            {
+                if (TestLocalPath(localPath)) { return true; }
+            }
+            return false;
+        }
+
+        private static bool ContainsIgnoreCase(List<string> values, string value)
+        {
+            foreach (string item in values)
+            {
+                if (String.Equals(item, value, StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
+
+        private static IEnumerable<string> SplitLines(string value)
+        {
+            if (String.IsNullOrWhiteSpace(value)) { yield break; }
+            foreach (string raw in value.Split('\n'))
+            {
+                string item = raw.Trim();
+                if (item.Length > 0) { yield return item; }
+            }
+        }
+    }
+}
+'@
+
+$script:WmtProviderDetectorReady = $false
+$script:WmtProviderAvailabilityCache = $null
+$script:WmtProviderAvailabilityCachePath = $null
+
+# Only commands that can be Windows app execution aliases need a Get-Command
+# probe after the compiled PATH check. Scanning every missing command name with
+# Get-Command costs more than a second on a cold first run and finds nothing
+# that the file-based check did not already cover.
+$script:WmtProviderAliasProbeCommands = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]@("winget", "store"),
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+
+# One installed-state probe shared by the Provider panel, the update scan, and
+# post-install verification. It depends only on .NET, Get-Command, and
+# Test-Path, so the exact same script text can run inside a background
+# runspace. Callers pass the merged PATH so every context makes the same
+# decision.
+$script:WmtProviderProbeScript = {
+    param($Providers, $AliasProbeCommands, $PathText)
+
+    $detectorType = "Wmt.Providers.Detector" -as [type]
+    $effectivePath = [string]$PathText
+    if ([string]::IsNullOrWhiteSpace($effectivePath)) { $effectivePath = [string]$env:Path }
+    $originalPath = [string]$env:Path
+    $pathChanged = $false
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($effectivePath) -and $effectivePath -ne $originalPath) {
+            try { $env:Path = $effectivePath; $pathChanged = $true } catch {}
+        }
+
+        foreach ($provider in @($Providers)) {
+            if (-not $provider) { continue }
+
+            $commandNames = @()
+            if ($provider.PSObject.Properties["Commands"]) {
+                $commandNames = @($provider.Commands |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                        ForEach-Object { ([string]$_).Trim() })
+            }
+            $registryPaths = @()
+            if ($provider.PSObject.Properties["RegistryPaths"]) {
+                $registryPaths = @($provider.RegistryPaths |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                        ForEach-Object { ([string]$_).Trim() })
+            }
+            $localPaths = @()
+            if ($provider.PSObject.Properties["LocalPaths"]) {
+                $localPaths = @($provider.LocalPaths |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                        ForEach-Object { ([string]$_).Trim() })
+            }
+
+            $installed = $false
+            $compiledCheckRan = $false
+            if ($detectorType) {
+                try {
+                    $installed = [bool]([Wmt.Providers.Detector]::DetectProvider(
+                            ($commandNames -join "`n"),
+                            ($registryPaths -join "`n"),
+                            ($localPaths -join "`n"),
+                            $effectivePath
+                        ))
+                    $compiledCheckRan = $true
+                }
+                catch { $installed = $false }
+            }
+
+            if (-not $installed -and -not $compiledCheckRan) {
+                foreach ($registryPath in $registryPaths) {
+                    if (Test-Path -LiteralPath $registryPath) { $installed = $true; break }
+                }
+                if (-not $installed) {
+                    foreach ($localPath in $localPaths) {
+                        if (Test-Path -LiteralPath $localPath -PathType Leaf) { $installed = $true; break }
+                    }
+                }
+            }
+
+            if (-not $installed) {
+                foreach ($commandName in $commandNames) {
+                    if (-not $compiledCheckRan -or
+                        ($AliasProbeCommands -and ($AliasProbeCommands -contains $commandName))) {
+                        if (Get-Command $commandName -ErrorAction SilentlyContinue) {
+                            $installed = $true
+                            break
+                        }
+                    }
+                }
+            }
+
+            [PSCustomObject]@{ Key = [string]$provider.Key; Installed = [bool]$installed }
+        }
+    }
+    finally {
+        if ($pathChanged) {
+            try { $env:Path = $originalPath } catch {}
+        }
+    }
+}
+
+function Initialize-WmtProviderDetector {
+if ($script:WmtProviderDetectorReady) { return $true }
+if ('Wmt.Providers.Detector' -as [type]) {
+    $script:WmtProviderDetectorReady = $true
+    return $true
+}
+try {
+    Add-Type -TypeDefinition $script:WmtProviderDetectorSource -Language CSharp -ErrorAction Stop
+    $script:WmtProviderDetectorReady = $true
+    return $true
+}
+catch {
+    # Another runspace can win the compilation race. Re-check the AppDomain
+    # before falling back to the slower PowerShell-only path.
+    if ('Wmt.Providers.Detector' -as [type]) {
+        $script:WmtProviderDetectorReady = $true
+        return $true
+    }
+    try { Write-GuiLog "[Providers] .NET provider detector could not be compiled; using the PowerShell fallback: $($_.Exception.Message)" } catch {}
+    return $false
+}
+}
+
+function Get-WmtProviderPathText {
+$parts = New-Object System.Collections.Generic.List[string]
+$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($pathValue in @(
+        [Environment]::GetEnvironmentVariable("Path", "Machine"),
+        [Environment]::GetEnvironmentVariable("Path", "User"),
+        [Environment]::GetEnvironmentVariable("Path", "Process"))) {
+    foreach ($part in @(([string]$pathValue) -split ";")) {
+        $trimmed = $part.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $seen.Add($trimmed)) {
+            [void]$parts.Add($trimmed)
+        }
+    }
+}
+return ($parts -join ";")
+}
+
+function Get-WmtProviderPathStamp {
+param([string]$PathText)
+try {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$PathText)) }
+    finally { $sha.Dispose() }
+    return (([System.BitConverter]::ToString($hash)) -replace '-', '').ToLowerInvariant()
+}
+catch { return [string]$PathText }
+}
+
+function Get-WmtProviderStatusCachePath {
+if ([string]::IsNullOrWhiteSpace($script:WmtProviderAvailabilityCachePath)) {
+    $script:WmtProviderAvailabilityCachePath = Join-Path (Get-DataPath) "provider-status.json"
+}
+return $script:WmtProviderAvailabilityCachePath
+}
+
+function Read-WmtProviderStatusCache {
+param([switch]$Refresh)
+if (-not $Refresh -and $script:WmtProviderAvailabilityCache) {
+    return $script:WmtProviderAvailabilityCache
+}
+$path = Get-WmtProviderStatusCachePath
+try {
+    if (-not [System.IO.File]::Exists($path)) { return $null }
+    $json = [System.IO.File]::ReadAllText($path)
+    if ([string]::IsNullOrWhiteSpace($json)) { return $null }
+    $data = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+    if ($null -eq $data -or [int]$data.Version -ne 1) { return $null }
+    if (-not $data.PSObject.Properties["Providers"] -or $null -eq $data.Providers) { return $null }
+
+    $providers = @{}
+    foreach ($property in @($data.Providers.PSObject.Properties)) {
+        $key = ([string]$property.Name).Trim().ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            $providers[$key] = [bool]$property.Value
+        }
+    }
+    if ($providers.Count -eq 0) { return $null }
+
+    $checkedUtc = [DateTime]::MinValue
+    try {
+        $checkedUtc = [DateTime]::Parse(
+            [string]$data.CheckedUtc,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        ).ToUniversalTime()
+    }
+    catch {}
+
+    $result = [PSCustomObject]@{
+        Version    = 1
+        CheckedUtc = $checkedUtc
+        PathStamp  = [string]$data.PathStamp
+        Providers  = $providers
+    }
+    $script:WmtProviderAvailabilityCache = $result
+    return $result
+}
+catch { return $null }
+}
+
+function Write-WmtProviderStatusCache {
+param(
+    [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Providers,
+    [string]$PathStamp = "",
+    [datetime]$CheckedUtc = [DateTime]::UtcNow
+)
+
+$ordered = [ordered]@{}
+foreach ($key in @($Providers.Keys | Sort-Object)) {
+    $normalizedKey = ([string]$key).Trim().ToLowerInvariant()
+    if (-not [string]::IsNullOrWhiteSpace($normalizedKey)) {
+        $ordered[$normalizedKey] = [bool]$Providers[$key]
+    }
+}
+if ($ordered.Count -eq 0) { return $false }
+
+$payload = [ordered]@{
+    Version    = 1
+    CheckedUtc = $CheckedUtc.ToUniversalTime().ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
+    PathStamp  = [string]$PathStamp
+    Providers  = $ordered
+}
+# Keep the in-memory snapshot even when the data directory is read-only. A
+# failed disk write must not force every later scan to probe providers again.
+$cacheCopy = @{}
+foreach ($key in $ordered.Keys) {
+    $cacheCopy[[string]$key] = [bool]$ordered[$key]
+}
+$script:WmtProviderAvailabilityCache = [PSCustomObject]@{
+    Version    = 1
+    CheckedUtc = $CheckedUtc.ToUniversalTime()
+    PathStamp  = [string]$PathStamp
+    Providers  = $cacheCopy
+}
+
+$tempPath = $null
+try {
+    $path = Get-WmtProviderStatusCachePath
+    $tempPath = "$path.$PID.tmp"
+    $json = $payload | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tempPath -Destination $path -Force -ErrorAction Stop
+    $tempPath = $null
+    return $true
+}
+catch {
+    try { Write-GuiLog "[Providers] Could not save the installed-state cache: $($_.Exception.Message)" } catch {}
+    return $false
+}
+finally {
+    if ($tempPath -and [System.IO.File]::Exists($tempPath)) {
+        try { [System.IO.File]::Delete($tempPath) } catch {}
+    }
+}
+}
+
+function Set-WmtProviderStatusCacheEntry {
+param(
+    [Parameter(Mandatory = $true)][string]$ProviderKey,
+    [bool]$Installed,
+    [string]$PathText = ""
+)
+
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
+if ([string]::IsNullOrWhiteSpace($key)) { return $false }
+try {
+    $providers = @{}
+    $cache = Read-WmtProviderStatusCache
+    if ($cache -and $cache.Providers) {
+        foreach ($cacheKey in @($cache.Providers.Keys)) {
+            $providers[[string]$cacheKey] = [bool]$cache.Providers[$cacheKey]
+        }
+    }
+    $providers[$key] = [bool]$Installed
+    if ([string]::IsNullOrWhiteSpace($PathText)) { $PathText = Get-WmtProviderPathText }
+    return (Write-WmtProviderStatusCache `
+        -Providers $providers `
+        -PathStamp (Get-WmtProviderPathStamp -PathText $PathText))
+}
+catch { return $false }
+}
+
+function Get-WmtProviderAvailability {
+param(
+    [Parameter(Mandatory = $true)][object[]]$ProviderDefinitions,
+    [switch]$CacheOnly,
+    [switch]$Force,
+    [int]$MaxAgeMinutes = 60
+)
+
+$pathText = Get-WmtProviderPathText
+$pathStamp = Get-WmtProviderPathStamp -PathText $pathText
+$cache = Read-WmtProviderStatusCache
+$now = [DateTime]::UtcNow
+$cacheFresh = $false
+if ($cache -and $cache.Providers -and $cache.Providers.Count -gt 0 -and
+    $cache.PathStamp -eq $pathStamp -and
+    $cache.CheckedUtc -ne [DateTime]::MinValue) {
+    $cacheFresh = ((($now - $cache.CheckedUtc).TotalMinutes) -le $MaxAgeMinutes)
+    if ($cacheFresh) {
+        # A partial cache from an older WMT must be completed rather than
+        # treated as fresh, otherwise a newly added provider never runs.
+        foreach ($provider in @($ProviderDefinitions)) {
+            if (-not $provider) { continue }
+            $key = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider.Key)
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            if (-not $cache.Providers.ContainsKey($key)) {
+                $cacheFresh = $false
+                break
+            }
+        }
+    }
+}
+
+if ($CacheOnly) {
+    if ($cache -and $cache.Providers -and $cache.Providers.Count -gt 0) {
+        return [PSCustomObject]@{
+            Providers  = $cache.Providers
+            CheckedUtc = $cache.CheckedUtc
+            PathStamp  = $cache.PathStamp
+            FromCache  = $true
+            IsFresh    = $cacheFresh
+        }
+    }
+    return $null
+}
+
+if (-not $Force -and $cacheFresh) {
+    return [PSCustomObject]@{
+        Providers  = $cache.Providers
+        CheckedUtc = $cache.CheckedUtc
+        PathStamp  = $pathStamp
+        FromCache  = $true
+        IsFresh    = $true
+    }
+}
+
+$providers = @{}
+$aliasProbeCommands = $script:WmtProviderAliasProbeCommands
+# Warm the compiled detector before probing. The probe transparently falls
+# back to Get-Command/Test-Path if the type cannot be compiled.
+[void](Initialize-WmtProviderDetector)
+$probeResults = @(& $script:WmtProviderProbeScript `
+        -Providers @($ProviderDefinitions) `
+        -AliasProbeCommands $aliasProbeCommands `
+        -PathText $pathText)
+foreach ($probeResult in $probeResults) {
+    if (-not $probeResult) { continue }
+    $key = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$probeResult.Key)
+    if ([string]::IsNullOrWhiteSpace($key)) { continue }
+    $providers[$key] = [bool]$probeResult.Installed
+}
+
+$checkedUtc = [DateTime]::UtcNow
+[void](Write-WmtProviderStatusCache -Providers $providers -PathStamp $pathStamp -CheckedUtc $checkedUtc)
+$detectedCount = @($providers.Values | Where-Object { [bool]$_ }).Count
+$missingCount = @($providers.Values | Where-Object { -not [bool]$_ }).Count
+try { Write-GuiLog "[Providers] Installed-state scan completed: $detectedCount detected, $missingCount not detected." } catch {}
+
+return [PSCustomObject]@{
+    Providers  = $providers
+    CheckedUtc = $checkedUtc
+    PathStamp  = $pathStamp
+    FromCache  = $false
+    IsFresh    = $true
+}
+}
+
+function Select-WmtScannableProviderKeys {
+param(
+    [string[]]$EnabledProviders = @(),
+    $Availability = $null
+)
+
+$runnable = [System.Collections.Generic.List[string]]::new()
+$unavailable = [System.Collections.Generic.List[string]]::new()
+$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($provider in @($EnabledProviders)) {
+    $key = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider)
+    if ([string]::IsNullOrWhiteSpace($key) -or -not $seen.Add($key)) { continue }
+
+    $known = $false
+    $installed = $false
+    try {
+        if ($Availability -and $Availability.Providers -is [System.Collections.IDictionary]) {
+            if ($Availability.Providers.Contains($key)) {
+                $known = $true
+                $installed = [bool]$Availability.Providers[$key]
+            }
+        }
+        elseif ($Availability -and $Availability.Providers) {
+            $property = $Availability.Providers.PSObject.Properties[$key]
+            if ($property) {
+                $known = $true
+                $installed = [bool]$property.Value
+            }
+        }
+    }
+    catch {}
+
+    if ($known -and -not $installed) {
+        [void]$unavailable.Add($key)
+    }
+    else {
+        [void]$runnable.Add($key)
+    }
+}
+
+return [PSCustomObject]@{
+    Runnable    = @($runnable.ToArray())
+    Unavailable = @($unavailable.ToArray())
+}
+}
+
+function Get-WmtProviderDisplayName {
+param([string]$ProviderKey)
+switch (Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey) {
+    "winget" { return "Winget" }
+    "msstore" { return "Store CLI" }
+    "windowsupdate" { return "Windows Update" }
+    "pip" { return "Python (Pip)" }
+    "npm" { return "Node (Npm)" }
+    "pnpm" { return "pnpm" }
+    "chocolatey" { return "Chocolatey" }
+    "scoop" { return "Scoop" }
+    "gem" { return "Ruby (Gem)" }
+    "cargo" { return "Rust (Cargo)" }
+    "dotnet" { return ".NET Tools" }
+    "psmodule" { return "PS Modules" }
+    "composer" { return "Composer" }
+    "steam" { return "Steam Games" }
+    "legendary" { return "Legendary" }
+    "gogdl" { return "GOGDL" }
+    default { return ([string]$ProviderKey).Trim() }
+}
+}
+
 # Build the user-visible outcome of a package scan. Providers are independent:
 # a failed provider is reported on its own, but it does not invalidate updates
 # discovered by providers that completed successfully.
 function Get-WmtUpdateScanCompletion {
 param(
     [int]$UpdateCount = 0,
-    $ProviderFailures = $null
+    $ProviderFailures = $null,
+    $UnavailableProviders = $null,
+    $ProviderLabels = $null
 )
 $failedProviders = [System.Collections.Generic.List[string]]::new()
 try {
@@ -3271,32 +3873,103 @@ try {
 }
 catch {}
 $failedProviders = @($failedProviders | Sort-Object -Unique)
-if ($failedProviders.Count -gt 0) {
-    $providerText = $failedProviders -join ', '
-    $noun = if ($failedProviders.Count -eq 1) { "provider" } else { "providers" }
-    $message = if ($UpdateCount -gt 0) {
-        "Scan complete. Found $UpdateCount update(s). $noun failed independently: $providerText."
+
+# Providers that were never installed are not failures. They are reported once
+# as a compact "not detected" list so a first run does not emit one error per
+# absent package manager.
+$notDetectedProviders = [System.Collections.Generic.List[string]]::new()
+try {
+    if ($UnavailableProviders -is [System.Collections.IDictionary]) {
+        foreach ($provider in @($UnavailableProviders.Keys)) {
+            $providerText = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider)
+            if (-not [string]::IsNullOrWhiteSpace($providerText)) { [void]$notDetectedProviders.Add($providerText) }
+        }
+    }
+    elseif ($null -ne $UnavailableProviders) {
+        foreach ($provider in @($UnavailableProviders)) {
+            $providerText = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider)
+            if (-not [string]::IsNullOrWhiteSpace($providerText)) { [void]$notDetectedProviders.Add($providerText) }
+        }
+    }
+}
+catch {}
+$notDetectedProviders = @($notDetectedProviders | Select-Object -Unique)
+
+$resolveProviderLabel = {
+    param([string]$ProviderKey)
+    try {
+        if ($ProviderLabels -is [System.Collections.IDictionary] -and $ProviderLabels.Contains($ProviderKey)) {
+            $label = ([string]$ProviderLabels[$ProviderKey]).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($label)) { return $label }
+        }
+        elseif ($ProviderLabels -and $ProviderLabels.PSObject.Properties[$ProviderKey]) {
+            $label = ([string]$ProviderLabels.$ProviderKey).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($label)) { return $label }
+        }
+    }
+    catch {}
+    return (Get-WmtProviderDisplayName -ProviderKey $ProviderKey)
+}
+
+$hasProviderFailures = $failedProviders.Count -gt 0
+$hasUnavailableProviders = $notDetectedProviders.Count -gt 0
+if ($hasProviderFailures -or $hasUnavailableProviders) {
+    $messageParts = [System.Collections.Generic.List[string]]::new()
+    if ($UpdateCount -gt 0) {
+        [void]$messageParts.Add("Scan complete. Found $UpdateCount update(s).")
+    }
+    elseif ($hasProviderFailures) {
+        [void]$messageParts.Add("Scan complete. No updates were found by providers that completed.")
     }
     else {
-        "Scan complete. No updates were found by providers that completed. $noun failed independently: $providerText."
+        [void]$messageParts.Add("Scan complete.")
     }
+
+    if ($hasProviderFailures) {
+        $providerText = $failedProviders -join ', '
+        $noun = if ($failedProviders.Count -eq 1) { "provider" } else { "providers" }
+        [void]$messageParts.Add("$noun failed independently: $providerText.")
+    }
+
+    $notDetectedLabels = @()
+    if ($hasUnavailableProviders) {
+        $notDetectedLabels = @($notDetectedProviders | ForEach-Object { & $resolveProviderLabel $_ } | Select-Object -Unique)
+        $notDetectedText = $notDetectedLabels -join ', '
+        $notDetectedVerb = if ($notDetectedLabels.Count -eq 1) { "is" } else { "are" }
+        [void]$messageParts.Add("$notDetectedText $notDetectedVerb not detected. Install these tools to include them in scans.")
+    }
+
+    $statusText = if ($hasUnavailableProviders -and $hasProviderFailures) {
+        "Scan complete - provider errors; not detected: $($notDetectedLabels -join ', ')"
+    }
+    elseif ($hasUnavailableProviders) {
+        "Scan complete - not detected: $($notDetectedLabels -join ', ')"
+    }
+    else {
+        "Scan complete - provider errors"
+    }
+
     return [PSCustomObject]@{
-        IsComplete         = $true
-        HasProviderFailures = $true
-        StatusText         = "Scan complete - provider errors"
-        LogMessage         = $message
-        AutoInstallAllowed = $true
-        FailedProviders    = $failedProviders
+        IsComplete              = $true
+        HasProviderFailures     = $hasProviderFailures
+        HasUnavailableProviders = $hasUnavailableProviders
+        StatusText              = $statusText
+        LogMessage              = ($messageParts -join ' ')
+        AutoInstallAllowed      = $true
+        FailedProviders         = $failedProviders
+        UnavailableProviders    = $notDetectedProviders
     }
 }
 $message = if ($UpdateCount -gt 0) { "Scan complete. Found $UpdateCount updates." } else { "System is up to date." }
 return [PSCustomObject]@{
-    IsComplete         = $true
-    HasProviderFailures = $false
-    StatusText         = ""
-    LogMessage         = $message
-    AutoInstallAllowed = $true
-    FailedProviders    = @()
+    IsComplete              = $true
+    HasProviderFailures     = $false
+    HasUnavailableProviders = $false
+    StatusText              = ""
+    LogMessage              = $message
+    AutoInstallAllowed      = $true
+    FailedProviders         = @()
+    UnavailableProviders    = @()
 }
 }
 
@@ -39552,7 +40225,15 @@ if ($targetCtrl) { $script:WmtTabTargetByButton[$btnName] = $targetCtrl }
 
 # --- INITIALIZE ALL CONTROLS ---
 $btnManageProviders = Get-Ctrl "btnManageProviders"
-$btnManageProviders.Add_Click({ Show-ProviderManager })
+$btnManageProviders.Add_Click({
+    try {
+        Show-ProviderManager
+    }
+    catch {
+        Write-GuiLog "[Providers] Provider Settings failed to open: $($_.Exception.Message)"
+        try { Write-GuiLog ("[Providers] " + $_.ScriptStackTrace) } catch {}
+    }
+})
 $btnWingetScan = Get-Ctrl "btnWingetScan"
 $btnWingetUpdateSel = Get-Ctrl "btnWingetUpdateSel"
 $btnWingetUpdateAll = Get-Ctrl "btnWingetUpdateAll"
@@ -52056,21 +52737,11 @@ foreach ($provider in @($ProviderDefinitions)) {
 return $enabled.ToArray()
 }
 
-function Show-ProviderManager {
-# 1. Load Current Settings
-$settings = Get-WmtSettings
-if (-not $settings.EnabledProviders) {
-    $settings | Add-Member -MemberType NoteProperty -Name "EnabledProviders" -Value @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl") -Force
-}
-$enabled = @($settings.EnabledProviders | ForEach-Object {
-        Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$_)
-    } | Select-Object -Unique)
-$providerToggles = Get-WmtProviderToggles -Settings $settings
-$providerCapabilities = Get-WmtProviderCapabilities
-
-# 2. Provider definitions are needed BEFORE building the XAML so we can
-# generate per-provider rows that include the Search/Scan/Headless/AutoUpdate toggles.
-$providerDefinitions = @(
+# Single provider definition table shared by Provider Settings and the update
+# scanner. The scanner must not depend on $providerDefinitions from the
+# Provider Settings dialog scope; that variable does not exist during a scan.
+function Get-WmtProviderDefinitions {
+return @(
     [PSCustomObject]@{ Key = "winget"; DisplayName = "Winget"; Commands = [string[]]@("winget"); Label = "lblProviderWingetStatus"; Button = "btnProviderWingetAction"; LockedOn = $true; ToolTip = "Windows Package Manager" },
     [PSCustomObject]@{ Key = "msstore"; DisplayName = "Store CLI"; Commands = [string[]]@("store"); Label = "lblProviderMsStoreStatus"; Button = "btnProviderMsStoreAction"; LockedOn = $false; ToolTip = "Microsoft Store Apps via store.exe" },
     [PSCustomObject]@{ Key = "windowsupdate"; DisplayName = "Windows Update"; Commands = [string[]]@("powershell"); Label = "lblWindowsUpdateStatus"; Button = "btnProviderWindowsUpdateAction"; LockedOn = $false; ToolTip = "Windows Update Agent. Scans both regular and optional Windows updates, including drivers when offered." },
@@ -52088,6 +52759,28 @@ $providerDefinitions = @(
     [PSCustomObject]@{ Key = "legendary"; DisplayName = "Legendary"; Commands = [string[]]@("legendary", "legendary.exe"); LocalPaths = [string[]]@(Get-WmtLegendaryExePath); Label = "lblLegendaryStatus"; Button = "btnProviderLegendaryAction"; LockedOn = $false; ToolTip = "Legendary CLI for Epic Games Store game updates." },
     [PSCustomObject]@{ Key = "gogdl"; DisplayName = "GOGDL"; Commands = [string[]]@("gogdl", "gogdl.exe", "gogdl_windows_x86_64.exe"); LocalPaths = [string[]]@(Get-WmtGogdlExePath); Label = "lblGogdlStatus"; Button = "btnProviderGogdlAction"; LockedOn = $false; ToolTip = "GOGDL updates installed GOG games through Heroic's gogdl downloader." }
 )
+}
+
+function Show-ProviderManager {
+# 1. Load Current Settings
+$settings = Get-WmtSettings
+if (-not $settings.EnabledProviders) {
+    $settings | Add-Member -MemberType NoteProperty -Name "EnabledProviders" -Value @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl") -Force
+}
+$enabled = @($settings.EnabledProviders | ForEach-Object {
+        Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$_)
+    } | Select-Object -Unique)
+$providerToggles = Get-WmtProviderToggles -Settings $settings
+$providerCapabilities = Get-WmtProviderCapabilities
+
+# 2. Provider definitions are needed BEFORE building the XAML so we can
+# generate per-provider rows that include the Search/Scan/Headless/AutoUpdate toggles.
+$providerDefinitions = @(Get-WmtProviderDefinitions)
+# GetNewClosure() creates a module scope that cannot reliably resolve
+# $script: variables on Windows PowerShell 5.1. Capture the shared probe and
+# alias list as locals so every closure below uses the exact same detector.
+$sharedProviderProbeScript = $script:WmtProviderProbeScript
+$sharedProviderAliasProbeCommands = $script:WmtProviderAliasProbeCommands
 
 function Format-WmtProviderRowXaml {
     param($Provider)
@@ -52313,6 +53006,41 @@ if (-not $script:WmtProviderActionMonitors) { $script:WmtProviderActionMonitors 
 $providerActionMonitors = $script:WmtProviderActionMonitors
 if (-not $script:WmtProviderActionLastStatus) { $script:WmtProviderActionLastStatus = @{} }
 $providerActionStatusCache = $script:WmtProviderActionLastStatus
+
+# Render the persisted installed-state snapshot immediately. A fresh snapshot
+# avoids a redundant detection pass when the window opens; a stale or missing
+# one is refreshed by the single background detector below.
+$providerStatusCacheSnapshot = $null
+$providerStatusCacheFresh = $false
+try {
+    $providerStatusCacheSnapshot = Get-WmtProviderAvailability `
+        -ProviderDefinitions $providerDefinitions `
+        -CacheOnly `
+        -MaxAgeMinutes 60
+    if ($providerStatusCacheSnapshot) {
+        $providerStatusCacheFresh = [bool]$providerStatusCacheSnapshot.IsFresh
+        # A partial cache (for example, one written by an older WMT that knew
+        # fewer providers) cannot leave any row stuck on "Checking...".
+        foreach ($providerDefinition in @($providerDefinitions)) {
+            if (-not $providerStatusCacheSnapshot.Providers.ContainsKey([string]$providerDefinition.Key)) {
+                $providerStatusCacheFresh = $false
+                break
+            }
+        }
+        foreach ($cacheKey in @($providerStatusCacheSnapshot.Providers.Keys)) {
+            $isRunning = @($providerActionMonitors.Values | Where-Object { $_.ProviderKey -eq $cacheKey }).Count -gt 0
+            if (-not $isRunning -and
+                ($providerStatusCacheFresh -or -not $providerActionStatusCache.ContainsKey($cacheKey))) {
+                $providerActionStatusCache[$cacheKey] = [PSCustomObject]@{
+                    Installed  = [bool]$providerStatusCacheSnapshot.Providers[$cacheKey]
+                    CheckedUtc = $providerStatusCacheSnapshot.CheckedUtc
+                    ExitCode   = $null
+                }
+            }
+        }
+    }
+}
+catch {}
 
 
 function Get-WmtProviderActionScript {
@@ -53176,30 +53904,25 @@ exit `$exitCode
 }
 
 $getWinCtrl = { param($name) $win.FindName($name) }.GetNewClosure()
-$updateProviderPathEnvironment = ${function:Update-WmtProviderPathEnvironment}.GetNewClosure()
 $getProviderActionScript = ${function:Get-WmtProviderActionScript}.GetNewClosure()
 $testProviderInstalled = {
     param($Provider)
 
     if (-not $Provider) { return $false }
-    & $updateProviderPathEnvironment
-    foreach ($cmd in @($Provider.Commands)) {
-        if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
-        if (Get-Command $cmd -ErrorAction SilentlyContinue) { return $true }
+    try {
+        $probeResult = @(& $sharedProviderProbeScript `
+                -Providers @($Provider) `
+                -AliasProbeCommands $sharedProviderAliasProbeCommands `
+                -PathText (Get-WmtProviderPathText)) |
+            Select-Object -Last 1
+        if (-not $probeResult) { return $false }
+        return [bool]$probeResult.Installed
     }
-    if ($Provider.PSObject.Properties["RegistryPaths"]) {
-        foreach ($registryPath in @($Provider.RegistryPaths)) {
-            if ([string]::IsNullOrWhiteSpace($registryPath)) { continue }
-            if (Test-Path -LiteralPath $registryPath) { return $true }
-        }
+    catch {
+        # A probe failure is not proof of presence. Choose the Install action,
+        # which is safe for a missing provider.
+        return $false
     }
-    if ($Provider.PSObject.Properties["LocalPaths"]) {
-        foreach ($localPath in @($Provider.LocalPaths)) {
-            if ([string]::IsNullOrWhiteSpace($localPath)) { continue }
-            if (Test-Path -LiteralPath $localPath -PathType Leaf) { return $true }
-        }
-    }
-    return $false
 }.GetNewClosure()
 $updateProviderStatuses = {
     param([switch]$UseCache)
@@ -53257,7 +53980,7 @@ $updateProviderStatuses = {
         }
         else {
             if ($labelCtrl) {
-                $labelCtrl.Text = "Not Found"
+                $labelCtrl.Text = "Not detected"
                 Set-WmtThemedBrush -Object $labelCtrl -Property ([System.Windows.Controls.TextBlock]::ForegroundProperty) -ColorOrKey "Warning"
             }
             if ($buttonCtrl) {
@@ -53343,6 +54066,8 @@ $startProviderAction = {
         UpdateStatuses = $updateProviderStatuses
         ProviderInfo   = $provider
         TestInstalled  = $testProviderInstalled
+        ProbeScript    = $sharedProviderProbeScript
+        ProbeAliasCommands = $sharedProviderAliasProbeCommands
         StatusCache    = $providerActionStatusCache
         ExitObserved   = $false
         ExitCode       = 1
@@ -53391,30 +54116,13 @@ $startProviderAction = {
                 # The status cache is independent of the old dialog's WPF controls.
                 if (-not $state.DetectionPs) {
                     # Background runspace keeps Get-Command, registry and disk checks off WPF.
+                    # This is the same shared probe the panel and the scan use.
                     $detector = [PowerShell]::Create()
-                    $detectScript = @'
-param($providerInfo)
-$env:Path = (@([Environment]::GetEnvironmentVariable('Path','Machine'),
-               [Environment]::GetEnvironmentVariable('Path','User'),
-               [Environment]::GetEnvironmentVariable('Path','Process')) -join ';')
-foreach ($commandName in @($providerInfo.Commands)) {
-    if (-not [string]::IsNullOrWhiteSpace($commandName) -and
-        (Get-Command $commandName -ErrorAction SilentlyContinue)) { return $true }
-}
-foreach ($propertyName in @('RegistryPaths','LocalPaths')) {
-    if (-not $providerInfo.PSObject.Properties[$propertyName]) { continue }
-    foreach ($itemPath in @($providerInfo.$propertyName)) {
-        if ([string]::IsNullOrWhiteSpace($itemPath)) { continue }
-        if ($propertyName -eq 'LocalPaths') {
-            if (Test-Path -LiteralPath $itemPath -PathType Leaf) { return $true }
-        }
-        elseif (Test-Path -LiteralPath $itemPath) { return $true }
-    }
-}
-return $false
-'@
                     try {
-                        [void]$detector.AddScript($detectScript).AddArgument($state.ProviderInfo)
+                        $detectionCommand = $detector.AddScript($state.ProbeScript.ToString())
+                        [void]$detectionCommand.AddArgument(@($state.ProviderInfo))
+                        [void]$detectionCommand.AddArgument([string[]]@($state.ProbeAliasCommands))
+                        [void]$detectionCommand.AddArgument([string](Get-WmtProviderPathText))
                         $state.DetectionInvocation = $detector.BeginInvoke()
                         $state.DetectionPs = $detector
                         $state.DetectionStartedUtc = [DateTime]::UtcNow
@@ -53456,7 +54164,9 @@ return $false
                 $detectionFailed = $false
                 $installed = $false
                 try {
-                    $installed = [bool](@($state.DetectionPs.EndInvoke($state.DetectionInvocation)) | Select-Object -Last 1)
+                    $detectionResult = @($state.DetectionPs.EndInvoke($state.DetectionInvocation)) | Select-Object -Last 1
+                    if (-not $detectionResult) { throw "The installed-state probe returned no result." }
+                    $installed = [bool]$detectionResult.Installed
                 }
                 catch {
                     $detectionFailed = $true
@@ -53473,6 +54183,12 @@ return $false
                         CheckedUtc = [DateTime]::UtcNow
                         ExitCode = $state.ExitCode
                     }
+                    try {
+                        [void](Set-WmtProviderStatusCacheEntry `
+                            -ProviderKey $state.ProviderKey `
+                            -Installed $installed)
+                    }
+                    catch {}
                 }
                 # Failure is not proof of absence. Retain the existing cache/status
                 # and avoid writing a fresh "not installed" result on an exception.
@@ -53845,58 +54561,32 @@ if ($chkUpdateAutoInstall) {
 
 # Probe all providers in one worker so PATH is rebuilt once and slow command,
 # registry, or filesystem lookups never delay the modal window from appearing.
-$providerDetectionPs = [PowerShell]::Create()
+# A fresh persisted snapshot already rendered every row, so skip the probe.
+$providerDetectionPs = $null
+$providerDetectionPathText = $null
+if (-not $providerStatusCacheFresh) {
+    # Warm the compiled detector before the background probe. The child
+    # runspace shares this AppDomain, so compiling once here keeps a cold
+    # Provider Settings open from paying Get-Command costs for every row.
+    try { [void](Initialize-WmtProviderDetector) } catch {}
+    $providerDetectionPathText = Get-WmtProviderPathText
+    $providerDetectionPs = [PowerShell]::Create()
+}
 $providerDetectionInvocation = $null
 $providerDetectionStartedUtc = [DateTime]::UtcNow
-$providerDetectionScript = @'
-param($providers)
-$machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
-$userPath = [Environment]::GetEnvironmentVariable('Path','User')
-$processPath = [Environment]::GetEnvironmentVariable('Path','Process')
-$pathParts = New-Object System.Collections.Generic.List[string]
-$seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($pathValue in @($machinePath, $userPath, $processPath)) {
-    foreach ($part in @(([string]$pathValue) -split ';')) {
-        $trimmed = $part.Trim()
-        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $seenPaths.Add($trimmed)) {
-            [void]$pathParts.Add($trimmed)
-        }
+if ($providerDetectionPs) {
+    try {
+        $providerDetectionCommand = $providerDetectionPs.AddScript($sharedProviderProbeScript.ToString())
+        [void]$providerDetectionCommand.AddArgument(@($providerDefinitions))
+        [void]$providerDetectionCommand.AddArgument([string[]]@($sharedProviderAliasProbeCommands))
+        [void]$providerDetectionCommand.AddArgument([string]$providerDetectionPathText)
+        $providerDetectionInvocation = $providerDetectionPs.BeginInvoke()
     }
-}
-$env:Path = $pathParts -join ';'
-foreach ($provider in $providers) {
-    $installed = $false
-    foreach ($commandName in @($provider.Commands)) {
-        if (-not [string]::IsNullOrWhiteSpace($commandName) -and
-            (Get-Command $commandName -ErrorAction SilentlyContinue)) {
-            $installed = $true
-            break
-        }
+    catch {
+        try { $providerDetectionPs.Dispose() } catch {}
+        $providerDetectionPs = $null
+        Write-GuiLog "[Providers] Could not start background installed-state detection: $($_.Exception.Message)"
     }
-    if (-not $installed) {
-        foreach ($propertyName in @('RegistryPaths','LocalPaths')) {
-            if (-not $provider.PSObject.Properties[$propertyName]) { continue }
-            foreach ($itemPath in @($provider.$propertyName)) {
-                if ([string]::IsNullOrWhiteSpace($itemPath)) { continue }
-                if ($propertyName -eq 'LocalPaths') {
-                    if (Test-Path -LiteralPath $itemPath -PathType Leaf) { $installed = $true; break }
-                }
-                elseif (Test-Path -LiteralPath $itemPath) { $installed = $true; break }
-            }
-            if ($installed) { break }
-        }
-    }
-    [PSCustomObject]@{ Key = [string]$provider.Key; Installed = [bool]$installed }
-}
-'@
-try {
-    [void]$providerDetectionPs.AddScript($providerDetectionScript).AddArgument(@($providerDefinitions))
-    $providerDetectionInvocation = $providerDetectionPs.BeginInvoke()
-}
-catch {
-    try { $providerDetectionPs.Dispose() } catch {}
-    $providerDetectionPs = $null
-    Write-GuiLog "[Providers] Could not start background installed-state detection: $($_.Exception.Message)"
 }
 
 $providerDetectionTimer = [System.Windows.Threading.DispatcherTimer]::new()
@@ -53949,6 +54639,21 @@ $providerDetectionTimer.Add_Tick({
             ExitCode = if ($oldStatus) { $oldStatus.ExitCode } else { $null }
         }
     }
+    try {
+        $detectedCache = @{}
+        foreach ($cacheProvider in @($providerDefinitions)) {
+            $cacheProviderKey = [string]$cacheProvider.Key
+            if ($providerActionStatusCache.ContainsKey($cacheProviderKey)) {
+                $detectedCache[$cacheProviderKey] = [bool]$providerActionStatusCache[$cacheProviderKey].Installed
+            }
+        }
+        if ($detectedCache.Count -gt 0) {
+            [void](Write-WmtProviderStatusCache `
+                -Providers $detectedCache `
+                -PathStamp (Get-WmtProviderPathStamp -PathText (Get-WmtProviderPathText)))
+        }
+    }
+    catch {}
     & $updateProviderStatuses -UseCache
     foreach ($provider in $providerDefinitions) {
         & $updateProviderToggleState -ProviderKey ([string]$provider.Key)
@@ -55289,6 +55994,7 @@ $script:ScanTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 # We now use a LIST of active scanners instead of just one
 $script:ActiveScans = [System.Collections.ArrayList]::new()
 $script:WmtScanProviderFailures = @{}
+$script:WmtScanUnavailableProviders = @()
 
 function Set-WmtProviderScanFailure {
 param(
@@ -55568,13 +56274,17 @@ if ($providerOwnedWingetRowsSuppressed -gt 0) {
 $lstWinget.Items.Refresh()
 $lstWinget.UpdateLayout()
 
-$scanCompletion = Get-WmtUpdateScanCompletion -UpdateCount $lstWinget.Items.Count -ProviderFailures $script:WmtScanProviderFailures
+$scanCompletion = Get-WmtUpdateScanCompletion `
+    -UpdateCount $lstWinget.Items.Count `
+    -ProviderFailures $script:WmtScanProviderFailures `
+    -UnavailableProviders $script:WmtScanUnavailableProviders
 $hasProviderFailures = @($scanCompletion.FailedProviders).Count -gt 0
+$hasUnavailableProviders = @($scanCompletion.UnavailableProviders).Count -gt 0
 if (-not $scanCompletion.IsComplete) {
     $lblWingetStatus.Text = $scanCompletion.StatusText
     $lblWingetStatus.Visibility = "Visible"
 }
-elseif ($hasProviderFailures) {
+elseif ($hasProviderFailures -or $hasUnavailableProviders) {
     $lblWingetStatus.Text = $scanCompletion.StatusText
     $lblWingetStatus.Visibility = "Visible"
 }
@@ -55586,7 +56296,7 @@ else {
     $lblWingetStatus.Visibility = "Hidden"
 }
 
-if ($hasProviderFailures -or -not $scanCompletion.IsComplete) {
+if ($hasProviderFailures -or $hasUnavailableProviders -or -not $scanCompletion.IsComplete) {
     Write-GuiLog $scanCompletion.LogMessage
     if ($rebootPendingCount -gt 0) {
         Write-GuiLog "Restart required for $rebootPendingCount installed Windows update(s)."
@@ -55880,6 +56590,40 @@ $btnWingetScan.Add_Click({
         if ($scanOn) { $scanEnabled += $prov }
     }
     $enabled = $scanEnabled
+
+    # First-run installed-state scan. A provider that is not installed is
+    # skipped instead of starting a worker that can only report "not found".
+    # The result is cached for later scans and shared with Provider Settings.
+    $script:WmtScanUnavailableProviders = @()
+    try {
+        # Build the provider definitions from the shared table. The Provider
+        # Settings dialog's local $providerDefinitions is not in scope here.
+        $scanProviderDefinitions = @(Get-WmtProviderDefinitions)
+        $providerAvailability = Get-WmtProviderAvailability `
+            -ProviderDefinitions $scanProviderDefinitions `
+            -MaxAgeMinutes 60
+        $providerSelection = Select-WmtScannableProviderKeys `
+            -EnabledProviders $enabled `
+            -Availability $providerAvailability
+        $enabled = @($providerSelection.Runnable)
+        $script:WmtScanUnavailableProviders = @($providerSelection.Unavailable)
+
+        if ($providerAvailability.FromCache) {
+            Write-GuiLog "Provider installed-state cache used (checked $($providerAvailability.CheckedUtc.ToLocalTime().ToString('g')))."
+        }
+        else {
+            Write-GuiLog "Provider installed-state scan completed."
+        }
+        if ($script:WmtScanUnavailableProviders.Count -gt 0) {
+            $notDetectedNames = @($script:WmtScanUnavailableProviders | ForEach-Object {
+                    Get-WmtProviderDisplayName -ProviderKey $_
+                })
+            Write-GuiLog "Not detected (skipped): $($notDetectedNames -join ', ')."
+        }
+    }
+    catch {
+        Write-GuiLog "[Providers] Installed-state scan failed; attempting every enabled provider: $($_.Exception.Message)"
+    }
 
     Write-GuiLog "Scan-enabled providers: $($enabled -join ', ')"
     Write-GuiLog "Winget include unknown: $includeUnknown"

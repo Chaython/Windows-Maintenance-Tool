@@ -3826,6 +3826,16 @@ jobs:
               Write-Host ('PASS: ' + $spec.Function + ' full-width dialog layout.')
           }
 
+      - name: Smoke test provider installed-state detection and summary
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testPath = Join-Path (Get-Location).Path 'tests\WMT.ProviderDetection.Tests.ps1'
+          if (-not (Test-Path -LiteralPath $testPath -PathType Leaf)) {
+              throw 'The provider installed-state regression test is missing.'
+          }
+          & $testPath
+
       - name: Smoke test process timeouts and output capture
         shell: powershell
         run: |
