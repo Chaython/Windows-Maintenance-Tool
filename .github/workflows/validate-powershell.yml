@@ -2386,6 +2386,24 @@ jobs:
               [string]$arrayPnpm.Rows[0].Available -ne '4.0.0') {
               throw 'The production pnpm converter rejected a legacy one-element JSON array.'
           }
+          # pnpm disambiguates duplicate report entries by appending the
+          # current version and dependency type to the JSON key. The manager
+          # must act on the real package name, not the collision key, or the
+          # generated selector becomes invalid ("foo@1.0.0 (dev)").
+          $collisionPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output '{"collision-tool@1.0.0 (dev)":{"current":"1.0.0","latest":"2.0.0"},"@scope/collision-tool@3.0.0 (peer)":{"current":"3.0.0","latest":"4.0.0"}}'
+          if (-not $collisionPnpm.Valid -or @($collisionPnpm.Rows).Count -ne 2 -or
+              [string]$collisionPnpm.Rows[0].Name -ne 'collision-tool' -or
+              [string]$collisionPnpm.Rows[0].Id -ne 'collision-tool' -or
+              [string]$collisionPnpm.Rows[0].Version -ne '1.0.0' -or
+              [string]$collisionPnpm.Rows[0].Available -ne '2.0.0' -or
+              [string]$collisionPnpm.Rows[1].Name -ne '@scope/collision-tool' -or
+              [string]$collisionPnpm.Rows[1].Id -ne '@scope/collision-tool') {
+              throw 'The production pnpm converter did not recover package names from collision keys.'
+          }
+          $ignoredCollisionPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output '{"collision-tool@1.0.0 (dev)":{"current":"1.0.0","latest":"2.0.0"}}' -IgnoreList @('collision-tool')
+          if (-not $ignoredCollisionPnpm.Valid -or @($ignoredCollisionPnpm.Rows).Count -ne 0) {
+              throw 'The production pnpm converter ignored the collision key instead of the recovered package name.'
+          }
           $invalidPnpm = ConvertFrom-WmtPnpmOutdatedJson -Output 'not-json'
           if ($invalidPnpm.Valid) {
               throw 'The production pnpm converter accepted invalid JSON.'
@@ -2487,6 +2505,7 @@ jobs:
               'Get-WmtCanonicalProviderKey',
               'Get-WmtCustomCommandSourceKey',
               'Get-WmtCustomCommandEntrySourceKey',
+              'Get-WmtCustomCommandManagerEntries',
               'Get-WmtCustomUpdateCommands',
               'Get-WmtCustomUpdateCommand',
               'Set-WmtCustomUpdateCommand',
@@ -2708,6 +2727,51 @@ jobs:
               (Get-WmtCustomUpdateCommand -Source 'npm' -Id 'legacy-local' -Settings $script:ciCustomSettings) -ne 'npm update legacy-local' -or
               (Get-WmtCustomUpdateCommand -Source 'pnpm (global)' -Id 'legacy-tool' -Settings $script:ciCustomSettings) -ne 'pnpm update -g legacy-tool') {
               throw 'Removing a legacy global custom command changed another npm/pnpm scope.'
+          }
+
+          # The custom-command manager must edit and remove legacy global
+          # entries through their effective global scope. bb6dc22 persisted
+          # those rows with the local provider source, so using the raw Source
+          # would create a duplicate local entry or remove nothing.
+          $script:ciCustomSettings = [pscustomobject]@{
+              CustomUpdateCommands = @(
+                  [pscustomobject]@{ Source = 'npm'; Id = 'manager-global'; Name = 'Manager Global'; Command = 'npm update -g manager-global' }
+                  [pscustomobject]@{ Source = 'npm'; Id = 'manager-local'; Name = 'Manager Local'; Command = 'npm update manager-local' }
+                  [pscustomobject]@{ Source = 'pnpm'; Id = 'manager-pnpm-global'; Name = 'Manager Pnpm Global'; Command = 'pnpm update -g manager-pnpm-global' }
+              )
+          }
+          $managerRows = @(Get-WmtCustomCommandManagerEntries -Settings $script:ciCustomSettings)
+          $managerGlobal = @($managerRows | Where-Object { $_.Id -eq 'manager-global' })[0]
+          $managerLocal = @($managerRows | Where-Object { $_.Id -eq 'manager-local' })[0]
+          $managerPnpmGlobal = @($managerRows | Where-Object { $_.Id -eq 'manager-pnpm-global' })[0]
+          if (-not $managerGlobal -or $managerGlobal.Source -ne 'npm (global)' -or
+              -not $managerPnpmGlobal -or $managerPnpmGlobal.Source -ne 'pnpm (global)' -or
+              -not $managerLocal -or $managerLocal.Source -ne 'npm') {
+              throw 'The custom-command manager did not normalize legacy global entries.'
+          }
+          # Edit through the row scope exactly as the manager dialog does.
+          Set-WmtCustomUpdateCommand -Source $managerGlobal.Source -Id $managerGlobal.Id -Name $managerGlobal.Name -Command 'npm update -g manager-global --latest'
+          $afterManagerEdit = @(Get-WmtCustomUpdateCommands -Settings $script:ciCustomSettings)
+          if ($afterManagerEdit.Count -ne 3 -or
+              (Get-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'manager-global' -Settings $script:ciCustomSettings) -ne 'npm update -g manager-global --latest' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm' -Id 'manager-global' -Settings $script:ciCustomSettings) -ne '' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm' -Id 'manager-local' -Settings $script:ciCustomSettings) -ne 'npm update manager-local') {
+              throw 'Editing a legacy global entry through the manager duplicated or moved it.'
+          }
+          Remove-WmtCustomUpdateCommand -Source $managerPnpmGlobal.Source -Id $managerPnpmGlobal.Id
+          if ((Get-WmtCustomUpdateCommand -Source 'pnpm (global)' -Id 'manager-pnpm-global' -Settings $script:ciCustomSettings) -ne '' -or
+              @(Get-WmtCustomUpdateCommands -Settings $script:ciCustomSettings).Count -ne 2) {
+              throw 'Removing a legacy pnpm global entry through the manager left it or removed another scope.'
+          }
+          # Editing a local entry must remain local; scope is explicit, not
+          # inferred from the custom command text at write time.
+          Set-WmtCustomUpdateCommand -Source 'npm' -Id 'manager-local' -Name 'Manager Local' -Command 'npm update manager-local --latest'
+          if ((Get-WmtCustomUpdateCommand -Source 'npm' -Id 'manager-local' -Settings $script:ciCustomSettings) -ne 'npm update manager-local --latest' -or
+              (Get-WmtCustomUpdateCommand -Source 'npm (global)' -Id 'manager-local' -Settings $script:ciCustomSettings) -ne '') {
+              throw 'Editing a local custom command moved it out of its operational scope.'
+          }
+          if ($source -notmatch '\$entries\s*=\s*@\(Get-WmtCustomCommandManagerEntries\s*\|\s*Sort-Object') {
+              throw 'The custom-command manager still loads raw persisted sources instead of effective scopes.'
           }
 
           # Typed provider failures are canonicalized by the production collector.
@@ -3030,17 +3094,18 @@ jobs:
               throw 'The production action worker did not emit its provider-start lifecycle signal.'
           }
 
-          # A global pnpm repair must stay in the global package scope.
-          # `pnpm rebuild` is project-scoped and cannot repair a global
-          # installation. `pnpm add -g` would replace the package's whole
-          # isolated group and remove sibling global tools, so the production
-          # command must use the group-preserving global update path.
+          # A global pnpm repair must force-reinstall the package's complete
+          # isolated global group. `pnpm rebuild` is project-scoped, while a
+          # selective `pnpm add -g` can replace the group and remove sibling
+          # tools. Execute the production worker against a real group-shaped
+          # fixture; the fake pnpm restores package files and global shims only
+          # when the complete group is re-added at its installed versions.
           $pnpmGlobalRepairItem = [pscustomobject]@{
               Source = 'pnpm (global)'
               Name = 'Global Pnpm Tool'
               Id = 'global-tool'
-              Version = '1.0'
-              Available = '2.0'
+              Version = '1.0.0'
+              Available = '2.0.0'
               WmtActionIndex = 4
               ProviderLogFilesEnabled = $false
               ProviderHeadlessEnabled = $false
@@ -3062,32 +3127,104 @@ jobs:
               GogdlAuthConfigPath = ''
           }
           $pnpmRepairFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-pnpm-repair-' + [Guid]::NewGuid().ToString('N'))
-          [void][IO.Directory]::CreateDirectory($pnpmRepairFixtureDir)
-          $pnpmRepairArgsFile = Join-Path $pnpmRepairFixtureDir 'pnpm-args.txt'
+          $pnpmRepairGroupDir = Join-Path $pnpmRepairFixtureDir 'global\v11\fixture-group'
+          $pnpmRepairTargetDir = Join-Path $pnpmRepairGroupDir 'node_modules\global-tool'
+          $pnpmRepairSiblingDir = Join-Path $pnpmRepairGroupDir 'node_modules\sibling-tool'
+          $pnpmRepairBinDir = Join-Path $pnpmRepairFixtureDir 'bin'
+          [void][IO.Directory]::CreateDirectory($pnpmRepairTargetDir)
+          [void][IO.Directory]::CreateDirectory($pnpmRepairSiblingDir)
+          [void][IO.Directory]::CreateDirectory($pnpmRepairBinDir)
           $oldPnpmRepairPath = $env:PATH
-          $oldPnpmRepairArgsFile = $env:WMT_CI_PNPM_ARGS_FILE
           try {
+              [ordered]@{
+                  dependencies = [ordered]@{ 'global-tool' = '^1.0.0'; 'sibling-tool' = '^2.0.0' }
+              } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $pnpmRepairGroupDir 'package.json') -Encoding UTF8
+              [ordered]@{
+                  name = 'global-tool'
+                  version = '1.0.0'
+                  bin = [ordered]@{ 'global-tool' = 'cli.js' }
+              } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $pnpmRepairTargetDir 'package.json') -Encoding UTF8
+              Set-Content -LiteralPath (Join-Path $pnpmRepairTargetDir 'cli.js') -Value 'DAMAGED' -NoNewline
+              [ordered]@{
+                  name = 'sibling-tool'
+                  version = '2.0.0'
+                  bin = [ordered]@{ 'sibling-tool' = 'cli.js' }
+              } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $pnpmRepairSiblingDir 'package.json') -Encoding UTF8
+              Set-Content -LiteralPath (Join-Path $pnpmRepairSiblingDir 'cli.js') -Value 'SIBLING' -NoNewline
+              # The global shims are missing until the group is reinstalled.
               @'
+          $ErrorActionPreference = 'Stop'
+          $root = $PSScriptRoot
+          $group = Join-Path $root 'global\v11\fixture-group'
+          $bin = Join-Path $root 'bin'
+          $argsText = ($args | ForEach-Object { [string]$_ }) -join ' '
+          switch -Regex ($argsText) {
+              '^list -g --json --long$' {
+                  $dependencies = [ordered]@{}
+                  foreach ($name in @('global-tool', 'sibling-tool')) {
+                      $dependencies[$name] = [ordered]@{
+                          path = (Join-Path (Join-Path $group 'node_modules') $name)
+                      }
+                  }
+                  $payload = [ordered]@{ dependencies = $dependencies } | ConvertTo-Json -Depth 6 -Compress
+                  Write-Output ('[' + $payload + ']')
+                  exit 0
+              }
+              '^add -g --force --save-exact (?<selectors>.+)$' {
+                  $selectors = @($Matches['selectors'] -split '[,\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                  Set-Content -LiteralPath (Join-Path $root 'add-args.txt') -Value ($selectors -join ',') -Encoding Ascii
+                  if ($selectors -notcontains 'global-tool@1.0.0' -or $selectors -notcontains 'sibling-tool@2.0.0') {
+                      Write-Error "selective global reinstall: $($selectors -join ',')"
+                      exit 1
+                  }
+                  Set-Content -LiteralPath (Join-Path $group 'node_modules\global-tool\cli.js') -Value 'RESTORED' -NoNewline
+                  foreach ($name in @('global-tool', 'sibling-tool')) {
+                      Set-Content -LiteralPath (Join-Path $bin ($name + '.cmd')) -Value "@echo off`r`nexit /b 0" -Encoding Ascii
+                  }
+                  exit 0
+              }
+              '^bin -g$' {
+                  Write-Output $bin
+                  exit 0
+              }
+              default {
+                  Write-Error "unexpected pnpm arguments: $argsText"
+                  exit 1
+              }
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $pnpmRepairFixtureDir 'fake-pnpm.ps1') -Encoding UTF8
+                        @'
           @echo off
-          echo %*>%WMT_CI_PNPM_ARGS_FILE%
-          exit /b 0
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0fake-pnpm.ps1" %*
+          exit /b %ERRORLEVEL%
           '@ | Set-Content -LiteralPath (Join-Path $pnpmRepairFixtureDir 'pnpm.cmd') -Encoding Ascii
-              $env:WMT_CI_PNPM_ARGS_FILE = $pnpmRepairArgsFile
               $env:PATH = $pnpmRepairFixtureDir + ';' + $oldPnpmRepairPath
               & $workerBlock $pnpmRepairArgs $pnpmRepairQueue | Out-Null
-              $recordedPnpmArgs = if (Test-Path -LiteralPath $pnpmRepairArgsFile) {
-                  (Get-Content -LiteralPath $pnpmRepairArgsFile -Raw).Trim()
+              $pnpmRepairLines = @($pnpmRepairQueue.ToArray())
+              if (@($pnpmRepairLines | Where-Object { [string]$_ -eq 'RESULT:4:SUCCESS:Global Pnpm Tool' }).Count -ne 1) {
+                  throw 'The production global pnpm repair did not complete successfully.'
+              }
+              $recordedPnpmSelectors = if (Test-Path -LiteralPath (Join-Path $pnpmRepairFixtureDir 'add-args.txt')) {
+                  (Get-Content -LiteralPath (Join-Path $pnpmRepairFixtureDir 'add-args.txt') -Raw).Trim()
               }
               else { '' }
-              if ($recordedPnpmArgs -ne 'update -g global-tool' -or
-                  $recordedPnpmArgs -match 'rebuild|add -g' -or
-                  @($pnpmRepairQueue.ToArray() | Where-Object { [string]$_ -eq 'RESULT:4:SUCCESS:Global Pnpm Tool' }).Count -ne 1) {
-                  throw 'A global pnpm repair did not use the group-preserving global update command.'
+              if ($recordedPnpmSelectors -ne 'global-tool@1.0.0,sibling-tool@2.0.0') {
+                  throw "Global pnpm repair did not re-add the complete isolated group: '$recordedPnpmSelectors'."
+              }
+              if ((Get-Content -LiteralPath (Join-Path $pnpmRepairTargetDir 'cli.js') -Raw) -ne 'RESTORED') {
+                  throw 'Global pnpm repair did not force-reinstall the damaged package.'
+              }
+              if (-not (Test-Path -LiteralPath (Join-Path $pnpmRepairSiblingDir 'package.json') -PathType Leaf)) {
+                  throw 'Global pnpm repair removed a sibling tool from the isolated group.'
+              }
+              foreach ($shimName in @('global-tool.cmd', 'sibling-tool.cmd')) {
+                  if (-not (Test-Path -LiteralPath (Join-Path $pnpmRepairBinDir $shimName) -PathType Leaf)) {
+                      throw "Global pnpm repair did not restore the $shimName global shim."
+                  }
               }
           }
           finally {
               $env:PATH = $oldPnpmRepairPath
-              $env:WMT_CI_PNPM_ARGS_FILE = $oldPnpmRepairArgsFile
               Remove-Item -LiteralPath $pnpmRepairFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
           }
 

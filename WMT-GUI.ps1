@@ -3167,8 +3167,6 @@ foreach ($entry in $entries) {
     if ($null -eq $package) { continue }
     $name = ""
     try { if ($package.PSObject.Properties["name"]) { $name = ([string]$package.name).Trim() } } catch {}
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = ([string]$entry.NameHint).Trim() }
-    if ([string]::IsNullOrWhiteSpace($name)) { continue }
 
     $currentVersion = ""
     $latestVersion = ""
@@ -3184,6 +3182,24 @@ foreach ($entry in $entries) {
         elseif ($package.PSObject.Properties["wanted"]) { $latestVersion = [string]$package.wanted }
     }
     catch {}
+
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        # Current pnpm disambiguates duplicate entries by changing the JSON
+        # property key from "name" to "name@current-version" plus an optional
+        # dependency-type suffix. Treating the whole key as the package name
+        # produces impossible selectors such as "foo@1.0.0 (dev)".
+        $nameHint = ([string]$entry.NameHint).Trim()
+        $nameHint = $nameHint -replace '\s+\((?:dev|optional|peer|github action)\)$', ''
+        if (-not [string]::IsNullOrWhiteSpace($currentVersion) -and
+            $nameHint.Length -gt $currentVersion.Length -and
+            $nameHint.EndsWith('@' + $currentVersion, [StringComparison]::OrdinalIgnoreCase)) {
+            $nameHint = $nameHint.Substring(0, $nameHint.Length - $currentVersion.Length - 1)
+        }
+        if ($nameHint -match '^(?:@[^/@\s]+/)?[^@/\s]+$') {
+            $name = $nameHint
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) { continue }
     if ([string]::IsNullOrWhiteSpace($currentVersion) -and [string]::IsNullOrWhiteSpace($latestVersion)) { continue }
     if ($IgnoreList -contains $name) { continue }
 
@@ -11601,6 +11617,30 @@ catch {}
 return @()
 }
 
+function Get-WmtCustomCommandManagerEntries {
+param($Settings)
+
+# The manager must display and operate on the effective operational scope,
+# not the raw persisted source. bb6dc22 stored some npm/pnpm global commands
+# with the local provider source; their global flag is only visible in the
+# command text, so normalizing here keeps Edit and Remove on the same entry.
+$result = New-Object System.Collections.Generic.List[object]
+foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $Settings)) {
+    if (-not $entry) { continue }
+    $sourceKey = Get-WmtCustomCommandEntrySourceKey -Entry $entry
+    if ([string]::IsNullOrWhiteSpace($sourceKey)) {
+        try { $sourceKey = ([string]$entry.Source).Trim() } catch {}
+    }
+    [void]$result.Add([PSCustomObject]@{
+        Source  = [string]$sourceKey
+        Id      = ([string]$entry.Id).Trim()
+        Name    = ([string]$entry.Name).Trim()
+        Command = ([string]$entry.Command).Trim()
+    })
+}
+return @($result.ToArray())
+}
+
 function Get-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id, $Settings)
 $sourceKey = Get-WmtCustomCommandSourceKey -Source $Source
@@ -11788,7 +11828,7 @@ $dialog.FindName("lblSelectedPackage").Text = if ($canSetPackage) {
 $reload = {
     param($PreferredItem = $null)
     if (-not $PreferredItem) { $PreferredItem = $grid.SelectedItem }
-    $entries = @(Get-WmtCustomUpdateCommands | Sort-Object Source, Name, Id)
+    $entries = @(Get-WmtCustomCommandManagerEntries | Sort-Object Source, Name, Id)
     $grid.ItemsSource = $entries
     $lblEmpty.Visibility = if ($entries.Count -eq 0) { "Visible" } else { "Collapsed" }
     $grid.SelectedItem = $null
@@ -46041,6 +46081,201 @@ $wingetWorkerScript = {
         return (Join-Path $root "$stamp-$safeAction-$safeId")
     }
 
+    # Current pnpm stores each global install in an isolated group. Neither
+    # `pnpm rebuild` (project-scoped) nor `pnpm update -g` (skips an unchanged
+    # lockfile) guarantees a reinstall, and re-adding only the selected
+    # package can discard siblings from the same group. Re-add the complete
+    # group at the installed versions instead, then verify every expected
+    # global shim. A forced group install alone repairs package files but
+    # leaves deleted shims missing.
+    function New-WmtPnpmGlobalRepairCommand {
+        param([string]$PackageId)
+
+        $repairScript = @'
+$ErrorActionPreference = 'Stop'
+$packageId = '__WMT_PNPM_PACKAGE_ID__'
+
+function ConvertTo-WmtPlainPath {
+    param([string]$Value)
+    $text = ([string]$Value).Trim()
+    if ($text.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $text.Substring(8)
+    }
+    if ($text.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        return $text.Substring(4)
+    }
+    return $text
+}
+
+function Get-WmtPnpmGroups {
+    $lines = @(& pnpm list -g --json --long 2>$null)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -notin @(0, 1)) {
+        throw "pnpm list -g failed with exit code $exitCode."
+    }
+    $text = ($lines -join [Environment]::NewLine).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'pnpm list -g returned no JSON.'
+    }
+    $parsedValue = $text | ConvertFrom-Json -ErrorAction Stop
+    $parsed = @($parsedValue)
+    if ($parsed.Count -eq 0) {
+        throw 'pnpm list -g returned no global groups.'
+    }
+    return $parsed
+}
+
+function Find-WmtPnpmGroupForPackage {
+    param([object[]]$Groups, [string]$Id)
+    foreach ($group in @($Groups)) {
+        if ($null -eq $group) { continue }
+        $dependenciesProperty = $group.PSObject.Properties['dependencies']
+        if (-not $dependenciesProperty -or $null -eq $dependenciesProperty.Value) { continue }
+        $dependencyProperty = $dependenciesProperty.Value.PSObject.Properties[$Id]
+        if (-not $dependencyProperty -or $null -eq $dependencyProperty.Value) { continue }
+        $packagePathProperty = $dependencyProperty.Value.PSObject.Properties['path']
+        if (-not $packagePathProperty) { continue }
+        $packagePath = ConvertTo-WmtPlainPath -Value ([string]$packagePathProperty.Value)
+        if ([string]::IsNullOrWhiteSpace($packagePath)) { continue }
+        $nodeModulesPath = Split-Path -Parent $packagePath
+        if ([string]::IsNullOrWhiteSpace($nodeModulesPath)) { continue }
+        $groupPath = Split-Path -Parent $nodeModulesPath
+        if ([string]::IsNullOrWhiteSpace($groupPath)) { continue }
+        return [PSCustomObject]@{
+            GroupPath   = $groupPath
+            PackagePath = $packagePath
+        }
+    }
+    return $null
+}
+
+function Get-WmtPnpmRepairSelector {
+    param([string]$Alias, [string]$Spec, [string]$GroupPath)
+    $specText = ([string]$Spec).Trim()
+    if ($specText -match '^(?i)(?:file|link|git|git\+|https?|npm|jsr|workspace|catalog|patch):' -or
+        $specText -match '[/\\]') {
+        return "$Alias@$specText"
+    }
+    $installedManifestPath = Join-Path (Join-Path (Join-Path $GroupPath 'node_modules') $Alias) 'package.json'
+    if (Test-Path -LiteralPath $installedManifestPath -PathType Leaf) {
+        try {
+            $installedManifest = Get-Content -LiteralPath $installedManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $installedVersion = ([string]$installedManifest.version).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($installedVersion)) {
+                return "$Alias@$installedVersion"
+            }
+        }
+        catch {}
+    }
+    return "$Alias@$specText"
+}
+
+function Test-WmtPnpmRepairShims {
+    param([object[]]$Groups, [string]$Id, [string]$GlobalBinDir)
+    $match = Find-WmtPnpmGroupForPackage -Groups $Groups -Id $Id
+    if (-not $match) {
+        throw "The repaired pnpm group no longer contains $Id."
+    }
+    $manifestPath = Join-Path $match.GroupPath 'package.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $dependenciesProperty = $manifest.PSObject.Properties['dependencies']
+    if (-not $dependenciesProperty -or $null -eq $dependenciesProperty.Value) {
+        throw 'The repaired pnpm group has no dependency manifest.'
+    }
+    foreach ($dependencyProperty in @($dependenciesProperty.Value.PSObject.Properties)) {
+        $alias = [string]$dependencyProperty.Name
+        $installedPath = Join-Path (Join-Path (Join-Path $match.GroupPath 'node_modules') $alias) 'package.json'
+        if (-not (Test-Path -LiteralPath $installedPath -PathType Leaf)) {
+            throw "The repaired pnpm group is missing $alias."
+        }
+        $installedManifest = Get-Content -LiteralPath $installedPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $binProperty = $installedManifest.PSObject.Properties['bin']
+        if (-not $binProperty -or $null -eq $binProperty.Value) { continue }
+        $binNames = @()
+        if ($binProperty.Value -is [string]) {
+            $binNames = @($alias)
+        }
+        else {
+            $binNames = @($binProperty.Value.PSObject.Properties.Name)
+        }
+        foreach ($binName in $binNames) {
+            if ([string]::IsNullOrWhiteSpace([string]$binName)) { continue }
+            $found = $false
+            foreach ($extension in @('', '.cmd', '.ps1', '.exe', '.bat')) {
+                if (Test-Path -LiteralPath (Join-Path $GlobalBinDir ($binName + $extension)) -PathType Leaf) {
+                    $found = $true
+                    break
+                }
+            }
+            if (-not $found) {
+                throw "The repaired pnpm group is missing the global shim for $binName."
+            }
+        }
+    }
+}
+
+try {
+    $groups = @(Get-WmtPnpmGroups)
+    $match = Find-WmtPnpmGroupForPackage -Groups $groups -Id $packageId
+    if (-not $match) {
+        throw "The global pnpm group for $packageId could not be found."
+    }
+    $manifestPath = Join-Path $match.GroupPath 'package.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $dependenciesProperty = $manifest.PSObject.Properties['dependencies']
+    if (-not $dependenciesProperty -or $null -eq $dependenciesProperty.Value) {
+        throw 'The pnpm global group has no dependency manifest.'
+    }
+    $selectors = [System.Collections.Generic.List[string]]::new()
+    foreach ($dependencyProperty in @($dependenciesProperty.Value.PSObject.Properties)) {
+        $alias = ([string]$dependencyProperty.Name).Trim()
+        if ([string]::IsNullOrWhiteSpace($alias)) { continue }
+        if ($alias -in @('pnpm', '@pnpm/exe')) {
+            throw 'pnpm itself must be updated with "pnpm self-update", not through a global package repair.'
+        }
+        $selector = Get-WmtPnpmRepairSelector -Alias $alias -Spec ([string]$dependencyProperty.Value) -GroupPath $match.GroupPath
+        if ([string]::IsNullOrWhiteSpace($selector)) {
+            throw "The installed version for $alias could not be resolved."
+        }
+        [void]$selectors.Add($selector)
+    }
+    if ($selectors.Count -eq 0) {
+        throw 'The pnpm global group has no packages to repair.'
+    }
+    $selectorArgs = $selectors.ToArray()
+    Write-Host "WMT pnpm repair: reinstalling the complete global group at installed versions: $($selectorArgs -join ', ')"
+    & pnpm add -g --force --save-exact @selectorArgs
+    $addExitCode = $LASTEXITCODE
+    if ($addExitCode -ne 0) {
+        throw "pnpm add -g failed with exit code $addExitCode."
+    }
+
+    $verifyGroups = @(Get-WmtPnpmGroups)
+    $binLines = @(& pnpm bin -g 2>$null)
+    $binExitCode = $LASTEXITCODE
+    if ($binExitCode -ne 0) {
+        throw "pnpm bin -g failed with exit code $binExitCode."
+    }
+    $globalBinDir = ConvertTo-WmtPlainPath -Value (($binLines -join [Environment]::NewLine).Trim())
+    if ([string]::IsNullOrWhiteSpace($globalBinDir)) {
+        throw 'pnpm bin -g did not return a global bin directory.'
+    }
+    Test-WmtPnpmRepairShims -Groups $verifyGroups -Id $packageId -GlobalBinDir $globalBinDir
+    Write-Host 'WMT pnpm repair: verified the package and its global shims.'
+    exit 0
+}
+catch {
+    Write-Host "WMT pnpm repair failed: $($_.Exception.Message)"
+    exit 1
+}
+'@
+
+        $escapedPackageId = ([string]$PackageId).Replace("'", "''")
+        $repairScript = $repairScript.Replace('__WMT_PNPM_PACKAGE_ID__', $escapedPackageId)
+        $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($repairScript))
+        return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
+    }
+
     function Add-WmtPackageTranscriptLine {
         param(
             [string]$Path,
@@ -49508,13 +49743,17 @@ exit /b %WMT_EXIT%
                 if ($act -eq "Install") { $cmd = "pnpm add -g `"$id`"" }
                 if ($act -eq "Update") { $cmd = "pnpm update -g `"$id`"" }
                 if ($act -eq "Uninstall") { $cmd = "pnpm remove -g `"$id`"" }
-                # pnpm rebuild is project-scoped and does not support global
-                # packages. `pnpm add -g` would replace the package's whole
-                # isolated install group and remove sibling global tools. A
-                # global update re-resolves the selected package while keeping
-                # that group and its unrelated packages intact.
-                if ($act -eq "Repair") { $cmd = "pnpm update -g `"$id`"" }
-                $userCmd = $cmd
+                # pnpm rebuild is project-scoped, while a global update skips
+                # an unchanged lockfile and can report success without
+                # reinstalling anything. Repair with a forced reinstall of
+                # the complete isolated group at the installed versions, then
+                # verify the package files and every expected global shim.
+                if ($act -eq "Repair") {
+                    $cmd = New-WmtPnpmGlobalRepairCommand -PackageId $id
+                    $displayCmd = "Repair pnpm global group for $id (preserve exact installed group)"
+                    $userCmd = $displayCmd
+                }
+                else { $userCmd = $cmd }
             }
             # --- CHOCOLATEY ---
             elseif ($src -eq "chocolatey" -or $src -eq "choco") {
