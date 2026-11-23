@@ -3099,8 +3099,8 @@ foreach ($line in ($Output -split "`r?`n")) {
 }
 }
 
-# Provider workers use a typed status object so the aggregate scan can report
-# an incomplete result instead of treating a failed provider as "up to date".
+# Provider workers use a typed status object so each provider can report its
+# own failure without making successful providers look empty or blocking them.
 function New-WmtProviderScanStatus {
 param(
     [string]$Provider,
@@ -3115,9 +3115,38 @@ param(
 }
 }
 
-# Build the user-visible outcome of a package scan. A provider failure makes
-# the scan incomplete and suppresses automatic installation because the list
-# cannot be trusted as complete.
+# Canonical provider keys are used at every scan, policy, row, and action
+# boundary. Keep this helper near the other provider primitives so settings
+# normalization and background workers can all resolve aliases consistently.
+function Get-WmtCanonicalProviderKey {
+param([string]$ProviderOrSource)
+
+$sourceKey = ([string]$ProviderOrSource).Trim().ToLowerInvariant()
+switch ($sourceKey) {
+    "pip3" { return "pip" }
+    "python (pip)" { return "pip" }
+    "npm (global)" { return "npm" }
+    "npm-global" { return "npm" }
+    "pnpm (global)" { return "pnpm" }
+    "pnpm-global" { return "pnpm" }
+    "choco" { return "chocolatey" }
+    "comet" { return "gogdl" }
+    "ruby" { return "gem" }
+    "rubygems" { return "gem" }
+    "rust" { return "cargo" }
+    "windows update" { return "windowsupdate" }
+    "windows-update" { return "windowsupdate" }
+    "microsoft store" { return "msstore" }
+    "store cli" { return "msstore" }
+    "power shell modules" { return "psmodule" }
+    "powershell modules" { return "psmodule" }
+    default { return $sourceKey }
+}
+}
+
+# Build the user-visible outcome of a package scan. Providers are independent:
+# a failed provider is reported on its own, but it does not invalidate updates
+# discovered by providers that completed successfully.
 function Get-WmtUpdateScanCompletion {
 param(
     [int]$UpdateCount = 0,
@@ -3127,13 +3156,13 @@ $failedProviders = [System.Collections.Generic.List[string]]::new()
 try {
     if ($ProviderFailures -is [System.Collections.IDictionary]) {
         foreach ($provider in @($ProviderFailures.Keys)) {
-            $providerText = ([string]$provider).Trim()
+            $providerText = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider)
             if (-not [string]::IsNullOrWhiteSpace($providerText)) { [void]$failedProviders.Add($providerText) }
         }
     }
     elseif ($null -ne $ProviderFailures) {
         foreach ($provider in @($ProviderFailures)) {
-            $providerText = ([string]$provider).Trim()
+            $providerText = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider)
             if (-not [string]::IsNullOrWhiteSpace($providerText)) { [void]$failedProviders.Add($providerText) }
         }
     }
@@ -3144,33 +3173,35 @@ if ($failedProviders.Count -gt 0) {
     $providerText = $failedProviders -join ', '
     $noun = if ($failedProviders.Count -eq 1) { "provider" } else { "providers" }
     $message = if ($UpdateCount -gt 0) {
-        "Scan incomplete. Found $UpdateCount update(s), but $noun failed: $providerText."
+        "Scan complete. Found $UpdateCount update(s). $noun failed independently: $providerText."
     }
     else {
-        "Scan incomplete. $noun failed: $providerText."
+        "Scan complete. No updates were found by providers that completed. $noun failed independently: $providerText."
     }
     return [PSCustomObject]@{
-        IsComplete        = $false
-        StatusText        = "Scan incomplete - provider error"
-        LogMessage        = $message
-        AutoInstallAllowed = $false
-        FailedProviders   = $failedProviders
+        IsComplete         = $true
+        HasProviderFailures = $true
+        StatusText         = "Scan complete - provider errors"
+        LogMessage         = $message
+        AutoInstallAllowed = $true
+        FailedProviders    = $failedProviders
     }
 }
-$message = if ($UpdateCount -gt 0) { "Scan Complete. Found $UpdateCount updates." } else { "System is up to date." }
+$message = if ($UpdateCount -gt 0) { "Scan complete. Found $UpdateCount updates." } else { "System is up to date." }
 return [PSCustomObject]@{
-    IsComplete        = $true
-    StatusText        = ""
-    LogMessage        = $message
+    IsComplete         = $true
+    HasProviderFailures = $false
+    StatusText         = ""
+    LogMessage         = $message
     AutoInstallAllowed = $true
-    FailedProviders   = @()
+    FailedProviders    = @()
 }
 }
 
 function Get-WmtUpdateScanAutoInstallDecision {
-# Decide what the scan-completion path should do after an update scan. Provider
-# failures are relevant only when automatic installation is actually enabled;
-# otherwise they belong solely to the incomplete-scan diagnostic.
+# Decide what the scan-completion path should do after an update scan. A
+# provider failure is isolated to that provider; it must not suppress updates
+# from providers that completed successfully.
 param(
     $ScanCompletion,
     [bool]$AutoInstallEnabled = $false,
@@ -3201,7 +3232,7 @@ if ($autoInstallAllowed) {
 
 return [PSCustomObject]@{
     ShouldInvoke = $false
-    LogMessage   = "Auto install skipped because one or more package providers failed."
+    LogMessage   = "Auto install skipped because the update scan could not complete."
 }
 }
 
@@ -9033,16 +9064,34 @@ if (-not $SkipCrashWrite) {
 $autoInstallWasActive = [bool]$script:WmtAutoInstallActive
 
 try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
-$failedWingetPs = $script:WingetJob
-$failedWingetAsync = $script:WingetAsyncResult
+$failedActionJobs = @($script:WingetActionJobs)
+if ($script:WingetActionJobs) { $script:WingetActionJobs.Clear() }
+foreach ($failedActionJob in $failedActionJobs) {
+    if (-not $failedActionJob -or -not $failedActionJob.Job) { continue }
+    try {
+        Stop-WmtPowerShellInvocationAsync `
+            -PowerShell $failedActionJob.Job `
+            -Invocation $failedActionJob.Invocation `
+            -Name "$($failedActionJob.ProviderKey) update monitor recovery"
+    }
+    catch {
+        try {
+            Start-WmtPowerShellCleanupDetached `
+                -PowerShell $failedActionJob.Job `
+                -Invocation $failedActionJob.Invocation `
+                -Name "$($failedActionJob.ProviderKey) update monitor recovery"
+        }
+        catch {}
+    }
+}
 $script:WingetJob = $null
 $script:WingetAsyncResult = $null
-if ($failedWingetPs) {
-    try { Start-WmtPowerShellCleanupDetached -PowerShell $failedWingetPs -Invocation $failedWingetAsync -Name "Update monitor recovery" } catch {}
-}
 $script:WingetOutputQueue = $null
 $script:WingetActiveAction = $null
 $script:WingetActionItems = @()
+$script:WingetActionProviderGroups = @()
+$script:WingetActionProviderKey = ""
+$script:WingetActionFinalized = $true
 $script:WingetActionStoreUpdateOnly = $false
 $script:WmtAutoInstallActive = $false
 $script:WingetCurrentIndex = 0
@@ -11359,8 +11408,12 @@ if ($json) {
     }
 }
 $normalizedProviders = New-Object System.Collections.Generic.List[string]
+# Winget is locked on in the Provider dialog. Keep it in normalized settings
+# even when an older or hand-edited settings file omitted it from a non-empty
+# provider list.
+[void]$normalizedProviders.Add("winget")
 foreach ($provider in @($defaults.EnabledProviders)) {
-    $providerKey = ([string]$provider).Trim().ToLowerInvariant()
+    $providerKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider)
     if ([string]::IsNullOrWhiteSpace($providerKey)) { continue }
     if ($providerKey -eq "comet") { $providerKey = "gogdl" }
     if (-not $normalizedProviders.Contains($providerKey)) {
@@ -11422,13 +11475,14 @@ return @()
 
 function Get-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id, $Settings)
-$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
+$sourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource $Source
 $idKey = ([string]$Id).Trim().ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($sourceKey) -or [string]::IsNullOrWhiteSpace($idKey)) { return "" }
 
 foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $Settings)) {
     if (-not $entry) { continue }
-    if (([string]$entry.Source).Trim().ToLowerInvariant() -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) {
+    $entrySourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry.Source)
+    if ($entrySourceKey -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) {
         return ([string]$entry.Command).Trim()
     }
 }
@@ -11437,7 +11491,7 @@ return ""
 
 function Set-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id, [string]$Name, [string]$Command)
-$sourceValue = ([string]$Source).Trim()
+$sourceValue = Get-WmtCanonicalProviderKey -ProviderOrSource $Source
 $idValue = ([string]$Id).Trim()
 $commandValue = ([string]$Command).Trim()
 if ([string]::IsNullOrWhiteSpace($sourceValue) -or [string]::IsNullOrWhiteSpace($idValue)) { throw "A package source and ID are required." }
@@ -11447,7 +11501,8 @@ $settings = Get-WmtSettings
 $updated = New-Object System.Collections.Generic.List[object]
 foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $settings)) {
     if (-not $entry) { continue }
-    if (([string]$entry.Source).Trim().ToLowerInvariant() -eq $sourceValue.ToLowerInvariant() -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idValue.ToLowerInvariant()) { continue }
+    $entrySourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry.Source)
+    if ($entrySourceKey -eq $sourceValue -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idValue.ToLowerInvariant()) { continue }
     [void]$updated.Add($entry)
 }
 [void]$updated.Add([PSCustomObject]@{ Source = $sourceValue; Id = $idValue; Name = ([string]$Name).Trim(); Command = $commandValue })
@@ -11458,7 +11513,7 @@ Save-WmtSettings -Settings $settings
 
 function Remove-WmtCustomUpdateCommand {
 param([string]$Source, [string]$Id)
-$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
+$sourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource $Source
 $idKey = ([string]$Id).Trim().ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($sourceKey) -or [string]::IsNullOrWhiteSpace($idKey)) { return }
 
@@ -11466,7 +11521,8 @@ $settings = Get-WmtSettings
 $updated = New-Object System.Collections.Generic.List[object]
 foreach ($entry in @(Get-WmtCustomUpdateCommands -Settings $settings)) {
     if (-not $entry) { continue }
-    if (([string]$entry.Source).Trim().ToLowerInvariant() -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) { continue }
+    $entrySourceKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry.Source)
+    if ($entrySourceKey -eq $sourceKey -and ([string]$entry.Id).Trim().ToLowerInvariant() -eq $idKey) { continue }
     [void]$updated.Add($entry)
 }
 if ($settings -is [System.Collections.IDictionary]) { $settings["CustomUpdateCommands"] = $updated.ToArray() }
@@ -45274,11 +45330,294 @@ $btnWingetClearSearch.Add_Click({
 $txtWingetSearch.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, "TextMuted")
 
 # 2. HELPER TO START JOB
+function Get-WmtUpdateActionTimeoutSeconds {
+param([string]$ProviderKey)
+
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
+switch ($key) {
+    "pip" { return 600 }
+    "msstore" { return 900 }
+    "windowsupdate" { return 1800 }
+    "steam" { return 14400 }
+    "legendary" { return 43200 }
+    "gogdl" { return 43200 }
+    default { return 7200 }
+}
+}
+
+function Initialize-WmtUpdateActionItems {
+param([object[]]$Items)
+
+# Preserve each row's operational Source exactly. Some source variants carry
+# command semantics (for example, "npm (global)" must run "npm update -g").
+# Keep the canonical provider identity separately for grouping, policy lookup,
+# custom-command matching, and failure attribution.
+$uniqueItems = @($Items | Select-Object -Property Source, Name, Id, Version, Available, VersionSort, AvailableSort, IsChecked, LibraryPath, InstallDir, ManifestPath, ExecutablePath, Platform, RawAvailable, WUIsOptional, WmtProviderKey -Unique)
+for ($actionIndex = 0; $actionIndex -lt $uniqueItems.Count; $actionIndex++) {
+    $uniqueItems[$actionIndex] | Add-Member -MemberType NoteProperty -Name "WmtActionIndex" -Value ($actionIndex + 1) -Force
+}
+return $uniqueItems
+}
+
+function Group-WmtUpdateActionItemsByProvider {
+param([object[]]$Items)
+
+$groups = [ordered]@{}
+foreach ($item in @($Items)) {
+    if ($null -eq $item) { continue }
+    $providerKey = ""
+    try {
+        if ($item.PSObject.Properties["WmtProviderKey"] -and $item.WmtProviderKey) {
+            $providerKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$item.WmtProviderKey)
+        }
+        else {
+            $providerKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$item.Source)
+        }
+    }
+    catch {}
+    if ([string]::IsNullOrWhiteSpace($providerKey)) { $providerKey = "provider" }
+    if (-not $groups.Contains($providerKey)) {
+        $groups[$providerKey] = [System.Collections.Generic.List[object]]::new()
+    }
+    $groups[$providerKey].Add($item)
+}
+
+$result = [System.Collections.Generic.List[object]]::new()
+foreach ($providerKey in @($groups.Keys)) {
+    [void]$result.Add([PSCustomObject]@{
+        ProviderKey = [string]$providerKey
+        Items = @($groups[$providerKey].ToArray())
+    })
+}
+return $result.ToArray()
+}
+
+function Complete-WmtUpdateActionProviderFailure {
+param(
+    [string]$ProviderKey,
+    [object[]]$Items,
+    [string]$Message = "Provider action failed."
+)
+
+$provider = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
+if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "provider" }
+$detail = ([string]$Message).Trim()
+if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "Provider action failed." }
+
+$failedCount = 0
+foreach ($item in @($Items)) {
+    if ($null -eq $item) { continue }
+    $actionIndex = 0
+    try {
+        if ($item.PSObject.Properties["WmtActionIndex"]) { $actionIndex = [int]$item.WmtActionIndex }
+    }
+    catch {}
+    if ($actionIndex -le 0) { continue }
+    if (-not ($script:WingetCompletedIndexes -is [System.Collections.IDictionary])) {
+        $script:WingetCompletedIndexes = @{}
+    }
+    if ($script:WingetCompletedIndexes.ContainsKey($actionIndex)) { continue }
+
+    $script:WingetCompletedIndexes[$actionIndex] = $true
+    $script:WingetProgressDone = [int]$script:WingetProgressDone + 1
+    $script:WingetProgressFailed = [int]$script:WingetProgressFailed + 1
+    $failedCount++
+
+    $itemName = "item $actionIndex"
+    try {
+        if ($item.PSObject.Properties["Name"]) {
+            $candidateName = [string]$item.Name
+            if (-not [string]::IsNullOrWhiteSpace($candidateName)) { $itemName = $candidateName }
+        }
+    }
+    catch {}
+    Write-GuiLog "[$($script:WingetActiveAction)][$provider] FAILED: $itemName ($detail)"
+    try { & $script:SetWingetLastResultUi "FAILED" $itemName $actionIndex $script:WingetProgressTotal } catch {}
+}
+
+try { & $script:RefreshWingetProgressUi } catch {}
+return $failedCount
+}
+
+function Drain-WmtUpdateActionProviderOutput {
+param(
+    [Parameter(Mandatory = $true)]$ActionJob,
+    [scriptblock]$ProcessLines
+)
+
+if (-not $ActionJob -or -not $ActionJob.Queue) { return $false }
+$batch = [System.Collections.Generic.List[object]]::new()
+$queuedItem = $null
+while ($ActionJob.Queue.TryDequeue([ref]$queuedItem)) {
+    [void]$batch.Add($queuedItem)
+    $queuedItem = $null
+}
+if ($batch.Count -eq 0 -or -not $ProcessLines) { return $true }
+
+try {
+    & $ProcessLines $batch.ToArray() $ActionJob
+    return $true
+}
+catch {
+    $providerKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$ActionJob.ProviderKey)
+    $detail = "Action output could not be processed: $($_.Exception.Message)"
+    Write-GuiLog "[$($script:WingetActiveAction)][$providerKey] $detail"
+    [void](Complete-WmtUpdateActionProviderFailure -ProviderKey $providerKey -Items @($ActionJob.Items) -Message $detail)
+    return $false
+}
+}
+
+function Receive-WmtUpdateActionProviderWorker {
+param(
+    [Parameter(Mandatory = $true)]$ActionJob,
+    [scriptblock]$ProcessLines,
+    [switch]$ForceTimeout
+)
+
+$providerKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$ActionJob.ProviderKey)
+if ([string]::IsNullOrWhiteSpace($providerKey)) { $providerKey = "provider" }
+$items = @($ActionJob.Items)
+
+# Drain once before deciding whether the provider is complete. A result may
+# have been queued in the small interval between the previous UI tick and the
+# invocation's completion signal.
+[void](Drain-WmtUpdateActionProviderOutput -ActionJob $ActionJob -ProcessLines $ProcessLines)
+
+$isCompleted = $false
+try { $isCompleted = [bool]$ActionJob.Invocation.IsCompleted } catch {}
+if (-not $isCompleted -and -not $ForceTimeout) {
+    $providerStarted = $false
+    try {
+        if ($ActionJob.PSObject.Properties["Started"]) { $providerStarted = [bool]$ActionJob.Started }
+        elseif ($ActionJob.PSObject.Properties["StartedAt"] -and $ActionJob.StartedAt) { $providerStarted = $true }
+    }
+    catch {}
+    if (-not $providerStarted) {
+        # The invocation may still be queued behind another provider. Do not
+        # charge that queue wait against this provider's execution timeout.
+        return "Running"
+    }
+    $deadlineReached = $false
+    try { $deadlineReached = ([DateTime]::UtcNow -ge [DateTime]$ActionJob.DeadlineUtc) } catch {}
+    if (-not $deadlineReached) { return "Running" }
+}
+
+if (-not $isCompleted) {
+    $ActionJob.TimedOut = $true
+    $timeoutMessage = "Provider action timed out after $([int]$ActionJob.TimeoutSeconds) seconds."
+    Write-GuiLog "[$($script:WingetActiveAction)][$providerKey] $timeoutMessage"
+    [void](Complete-WmtUpdateActionProviderFailure -ProviderKey $providerKey -Items $items -Message $timeoutMessage)
+    try {
+        Stop-WmtPowerShellInvocationAsync -PowerShell $ActionJob.Job -Invocation $ActionJob.Invocation -Name "$providerKey action timeout"
+    }
+    catch {
+        try { Start-WmtPowerShellCleanupDetached -PowerShell $ActionJob.Job -Invocation $ActionJob.Invocation -Name "$providerKey action timeout" } catch {}
+    }
+    return "TimedOut"
+}
+
+$workerError = ""
+$finalOutput = @()
+try {
+    $finalOutput = @($ActionJob.Job.EndInvoke($ActionJob.Invocation))
+}
+catch {
+    $workerError = $_.Exception.Message
+}
+finally {
+    try { $ActionJob.Job.Dispose() } catch {}
+}
+
+if (-not [string]::IsNullOrWhiteSpace($workerError)) {
+    $failureMessage = "Provider action worker failed: $workerError"
+    Write-GuiLog "[$($script:WingetActiveAction)][$providerKey] $failureMessage"
+    [void](Complete-WmtUpdateActionProviderFailure -ProviderKey $providerKey -Items $items -Message $failureMessage)
+    $ActionJob.Completed = $true
+    return "Failed"
+}
+
+if ($finalOutput.Count -gt 0 -and $ProcessLines) {
+    try { & $ProcessLines $finalOutput $ActionJob }
+    catch {
+        $failureMessage = "Provider action output could not be processed: $($_.Exception.Message)"
+        Write-GuiLog "[$($script:WingetActiveAction)][$providerKey] $failureMessage"
+        [void](Complete-WmtUpdateActionProviderFailure -ProviderKey $providerKey -Items $items -Message $failureMessage)
+    }
+}
+[void](Drain-WmtUpdateActionProviderOutput -ActionJob $ActionJob -ProcessLines $ProcessLines)
+$ActionJob.Completed = $true
+
+# A provider worker must account for every item it owns. If it exited without
+# a RESULT line, fail only its remaining items; sibling providers stay active.
+$missingItems = @($items | Where-Object {
+        $actionIndex = 0
+        try {
+            if ($_.PSObject.Properties["WmtActionIndex"]) { $actionIndex = [int]$_.WmtActionIndex }
+        }
+        catch {}
+        $actionIndex -gt 0 -and -not $script:WingetCompletedIndexes.ContainsKey($actionIndex)
+    })
+if ($missingItems.Count -gt 0) {
+    $failureMessage = "Provider action ended without a result for $($missingItems.Count) item(s)."
+    Write-GuiLog "[$($script:WingetActiveAction)][$providerKey] $failureMessage"
+    [void](Complete-WmtUpdateActionProviderFailure -ProviderKey $providerKey -Items $missingItems -Message $failureMessage)
+}
+
+return "Completed"
+}
+
+function Complete-WmtUpdateActionFinalization {
+# Reconcile every grouped action item exactly once. Provider workers normally
+# account for their own items; this final pass attributes any remaining item
+# to its provider without allowing a repeated monitor tick to count it twice.
+if ($script:WingetActionFinalized) { return $false }
+$script:WingetActionFinalized = $true
+
+$providerGroups = @($script:WingetActionProviderGroups)
+if ($providerGroups.Count -eq 0 -and @($script:WingetActionItems).Count -gt 0) {
+    try { $providerGroups = @(Group-WmtUpdateActionItemsByProvider -Items @($script:WingetActionItems)) } catch { $providerGroups = @() }
+}
+
+foreach ($providerGroup in @($providerGroups)) {
+    if (-not $providerGroup) { continue }
+    $providerKey = ""
+    try { $providerKey = [string]$providerGroup.ProviderKey } catch {}
+    if ([string]::IsNullOrWhiteSpace($providerKey)) { $providerKey = "provider" }
+    $providerMissingItems = @(@($providerGroup.Items) | Where-Object {
+            $actionIndex = 0
+            try {
+                if ($_.PSObject.Properties["WmtActionIndex"]) { $actionIndex = [int]$_.WmtActionIndex }
+            }
+            catch {}
+            $actionIndex -gt 0 -and -not $script:WingetCompletedIndexes.ContainsKey($actionIndex)
+        })
+    if ($providerMissingItems.Count -gt 0) {
+        [void](Complete-WmtUpdateActionProviderFailure `
+                -ProviderKey $providerKey `
+                -Items $providerMissingItems `
+                -Message "Provider action ended without a result.")
+    }
+}
+
+# Defensive reconciliation for an item that was not present in any provider
+# group. It is still counted only if the provider-local pass did not account
+# for it, so progress and failure totals cannot be incremented twice.
+$remainingMissing = [Math]::Max(0, [int]$script:WingetProgressTotal - [int]$script:WingetProgressDone)
+if ($remainingMissing -gt 0) {
+    $script:WingetProgressFailed += $remainingMissing
+    $script:WingetProgressDone = $script:WingetProgressTotal
+    Write-GuiLog "[$($script:WingetActiveAction)] FAILED: $remainingMissing action item(s) ended without a provider result."
+}
+
+return $true
+}
+
 $Script:StartWingetAction = {
 param($ListItems, $ActionName, $CmdTemplate)
 if (-not $ListItems -or $ListItems.Count -eq 0) { return }
 
-$uniqueItems = @($ListItems | Select-Object -Property Source, Name, Id, Version, Available, VersionSort, AvailableSort, IsChecked, LibraryPath, InstallDir, ManifestPath, ExecutablePath, Platform, RawAvailable, WUIsOptional -Unique)
+$uniqueItems = @(Initialize-WmtUpdateActionItems -Items @($ListItems))
+$providerActionGroups = @(Group-WmtUpdateActionItemsByProvider -Items $uniqueItems)
 $actionSettings = Get-WmtSettings
 $providerCapsForAction = Get-WmtProviderCapabilities
 $globalHeadlessEnabled = [bool](Get-WmtUpdateSilentInstallEnabled -Settings $actionSettings)
@@ -45325,11 +45664,15 @@ $script:WingetCurrentItemName = ""
 $script:WingetCurrentItemSource = ""
 $script:WingetCurrentItemStartedAt = $null
 $script:WingetActionForcedTimeout = $false
+$script:WingetActionFinalized = $false
+$script:WingetActionProviderKey = ""
 $script:WingetCompletedIndexes = @{}
 # Preserve the exact action-order package identities so RESULT:<index> can
 # update only the row that actually completed instead of forcing a provider
 # rescan while uninstall registry/provider state may still be settling.
 $script:WingetActionItems = @($uniqueItems)
+$script:WingetActionProviderGroups = @($providerActionGroups)
+$script:WingetActionJobs = [System.Collections.Generic.List[object]]::new()
 $script:WingetActionStoreUpdateOnly = (
     $ActionName -eq "Update" -and
     $totalItems -gt 0 -and
@@ -45431,6 +45774,8 @@ if ($needsPackageInstallLogRoot) {
 
 $jobArgs = @{
     Items                      = $uniqueItems
+    TotalItems                 = $totalItems
+    ProviderKey                = ""
     ActionName                 = $ActionName
     CmdTemplate                = $CmdTemplate
     TempPath                   = $env:TEMP
@@ -45492,6 +45837,9 @@ $wingetWorkerScript = {
             }
         }
     }
+    # The provider timeout starts when this worker actually begins, not while
+    # it is queued behind another provider in the shared runspace pool.
+    Write-Output "ACTION_PROVIDER_STARTED:$($ArgsDict.ProviderKey)"
     $items = $ArgsDict.Items
     $act = $ArgsDict.ActionName
     $tmpl = $ArgsDict.CmdTemplate
@@ -48459,14 +48807,32 @@ exit /b %WMT_EXIT%
         Write-Output "LOG:[Store] Microsoft Store updates will be invoked and monitored through the Store GUI."
     }
 
-    $total = @($items).Count
+    $groupTotal = @($items).Count
+    $total = [int]$ArgsDict.TotalItems
+    if ($total -le 0) { $total = $groupTotal }
     $index = 0
+    $groupIndex = 0
     foreach ($item in $items) {
-        $index++
-        $id = $item.Id
-        $name = $item.Name
-        $src = $item.Source
-        $srcKey = ([string]$src).ToLowerInvariant()
+        $groupIndex++
+        $index = $groupIndex
+        $id = ""
+        $name = ""
+        $src = ""
+        try {
+            # Resolve the global action index before reading any package
+            # properties. A property getter failure must still report the
+            # item's global index rather than a provider-local fallback.
+            try {
+                if ($item.PSObject.Properties["WmtActionIndex"]) {
+                    $globalActionIndex = [int]$item.WmtActionIndex
+                    if ($globalActionIndex -gt 0) { $index = $globalActionIndex }
+                }
+            }
+            catch {}
+            $id = [string]$item.Id
+            $name = [string]$item.Name
+            $src = [string]$item.Source
+            $srcKey = ([string]$src).ToLowerInvariant()
         $providerLogFilesEnabled = $true
         if ($item.PSObject.Properties["ProviderLogFilesEnabled"]) {
             $providerLogFilesEnabled = [bool]$item.ProviderLogFilesEnabled
@@ -49284,12 +49650,19 @@ exit /b %WMT_EXIT%
                     if ($terminationFailed) {
                         Write-Output "LOG:[$act][$index/$total] FAILED: $name ($timeoutReason; Winget could not be confirmed terminated)"
                         Write-Output "RESULT:${index}:FAILED:$name"
-                        Write-Output "LOG:[$act] Aborting the remaining batch so another package action cannot overlap the surviving Winget process."
-                        for ($remainingIndex = $index + 1; $remainingIndex -le $total; $remainingIndex++) {
-                            $remainingItem = @($items)[$remainingIndex - 1]
-                            $remainingName = if ($remainingItem -and $remainingItem.Name) { [string]$remainingItem.Name } else { "Unstarted item $remainingIndex" }
-                            Write-Output "LOG:[$act][$remainingIndex/$total] FAILED: $remainingName (not started because the previous Winget process may still be running)"
-                            Write-Output "RESULT:${remainingIndex}:FAILED:$remainingName"
+                        Write-Output "LOG:[$act] Aborting the remaining Winget batch so another package action cannot overlap the surviving Winget process."
+                        for ($remainingGroupIndex = $groupIndex + 1; $remainingGroupIndex -le $groupTotal; $remainingGroupIndex++) {
+                            $remainingItem = @($items)[$remainingGroupIndex - 1]
+                            $remainingActionIndex = $remainingGroupIndex
+                            try {
+                                if ($remainingItem -and $remainingItem.PSObject.Properties["WmtActionIndex"] -and [int]$remainingItem.WmtActionIndex -gt 0) {
+                                    $remainingActionIndex = [int]$remainingItem.WmtActionIndex
+                                }
+                            }
+                            catch {}
+                            $remainingName = if ($remainingItem -and $remainingItem.Name) { [string]$remainingItem.Name } else { "Unstarted item $remainingGroupIndex" }
+                            Write-Output "LOG:[$act][$remainingActionIndex/$total] FAILED: $remainingName (not started because the previous Winget process may still be running)"
+                            Write-Output "RESULT:${remainingActionIndex}:FAILED:$remainingName"
                         }
                         break
                     }
@@ -49392,20 +49765,88 @@ exit /b %WMT_EXIT%
             Write-Output "LOG:[$act][$index/$total] SKIPPED: No command generated for source '$src' ($name)"
             Write-Output "RESULT:${index}:SKIPPED:$name"
         }
+        }
+        catch {
+            $itemError = $_.Exception.Message
+            $failedItemName = if ([string]::IsNullOrWhiteSpace($name)) { "item $index" } else { $name }
+            Write-Output "LOG:[$act][$index/$total] FAILED: $failedItemName ($itemError)"
+            Write-Output "RESULT:${index}:FAILED:$failedItemName"
+        }
     }
 }
 
-$script:WingetOutputQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-$script:WingetJob = New-WmtPooledPowerShell
-[void]$script:WingetJob.AddScript($wingetWorkerScript.ToString()).AddArgument($jobArgs).AddArgument($script:WingetOutputQueue)
-$script:WingetAsyncResult = $script:WingetJob.BeginInvoke()
+$script:WingetJob = $null
+$script:WingetAsyncResult = $null
+$script:WingetOutputQueue = $null
+
+# Each provider gets an independent worker. A startup failure or runtime fault
+# is confined to that provider group; sibling providers continue concurrently.
+foreach ($providerGroup in @($providerActionGroups)) {
+    $providerGroupItems = @($providerGroup.Items)
+    if ($providerGroupItems.Count -eq 0) { continue }
+    $groupQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $groupArgs = $jobArgs.Clone()
+    $groupArgs["Items"] = $providerGroupItems
+    $groupArgs["ProviderKey"] = [string]$providerGroup.ProviderKey
+    $groupJob = $null
+    $groupInvocation = $null
+    try {
+        $groupJob = New-WmtPooledPowerShell
+        [void]$groupJob.AddScript($wingetWorkerScript.ToString()).AddArgument($groupArgs).AddArgument($groupQueue)
+        $groupInvocation = $groupJob.BeginInvoke()
+        $timeoutSeconds = Get-WmtUpdateActionTimeoutSeconds -ProviderKey ([string]$providerGroup.ProviderKey)
+        [void]$script:WingetActionJobs.Add([PSCustomObject]@{
+            ProviderKey = [string]$providerGroup.ProviderKey
+            Items = $providerGroupItems
+            Job = $groupJob
+            Invocation = $groupInvocation
+            Queue = $groupQueue
+            SubmittedAt = [DateTime]::UtcNow
+            Started = $false
+            StartedAt = $null
+            DeadlineUtc = [DateTime]::MaxValue
+            TimeoutSeconds = $timeoutSeconds
+            CurrentItemName = ""
+            CurrentItemSource = ""
+            CurrentIndex = 0
+            Completed = $false
+            TimedOut = $false
+        })
+    }
+    catch {
+        $startupError = $_.Exception.Message
+        try { if ($groupJob) { $groupJob.Dispose() } } catch {}
+        Write-GuiLog "[$($script:WingetActiveAction)][$($providerGroup.ProviderKey)] Provider action worker could not start: $startupError"
+        [void](Complete-WmtUpdateActionProviderFailure `
+                -ProviderKey ([string]$providerGroup.ProviderKey) `
+                -Items $providerGroupItems `
+                -Message $startupError)
+    }
+}
 
 # 3. Shared UI monitor for live update output and completion
 try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
 $script:WingetTimer = $null
 $script:ProcessWingetLines = {
-    param($lines)
+    param($lines, $ActionJob = $null)
     foreach ($line in $lines) {
+        if ($line -match "^ACTION_PROVIDER_STARTED:(.+)$") {
+            if ($ActionJob) {
+                $providerStarted = $false
+                try { if ($ActionJob.PSObject.Properties["Started"]) { $providerStarted = [bool]$ActionJob.Started } } catch {}
+                if (-not $providerStarted) {
+                    try {
+                        $timeoutSeconds = 7200
+                        if ($ActionJob.PSObject.Properties["TimeoutSeconds"]) { $timeoutSeconds = [int]$ActionJob.TimeoutSeconds }
+                        $ActionJob.Started = $true
+                        $ActionJob.StartedAt = [DateTime]::UtcNow
+                        $ActionJob.DeadlineUtc = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+                    }
+                    catch {}
+                }
+            }
+            continue
+        }
         if ($line -match "^STEAM_OPEN:(.+)$") {
             $payload = $null
             try {
@@ -49418,7 +49859,7 @@ $script:ProcessWingetLines = {
 
             $steamUri = "steam://open/downloads"
             $steamRunUri = ""
-            $packageName = $script:WingetCurrentItemName
+            $packageName = if ($ActionJob -and -not [string]::IsNullOrWhiteSpace([string]$ActionJob.CurrentItemName)) { [string]$ActionJob.CurrentItemName } else { $script:WingetCurrentItemName }
             $appId = ""
             if ($payload) {
                 if (-not [string]::IsNullOrWhiteSpace([string]$payload.Uri)) { $steamUri = [string]$payload.Uri }
@@ -49551,7 +49992,7 @@ $script:ProcessWingetLines = {
             $fallbackId = ""
             $reason = ""
             $reasonText = ""
-            $packageName = $script:WingetCurrentItemName
+            $packageName = if ($ActionJob -and -not [string]::IsNullOrWhiteSpace([string]$ActionJob.CurrentItemName)) { [string]$ActionJob.CurrentItemName } else { $script:WingetCurrentItemName }
             if ($payload) {
                 $storeUri = ([string]$payload.StoreUri).Trim()
                 $webUri = ([string]$payload.WebUri).Trim()
@@ -49716,6 +50157,7 @@ $script:ProcessWingetLines = {
         }
         if ($line -match "^ITEM_SOURCE:(.*)$") {
             $script:WingetCurrentItemSource = ([string]$matches[1]).Trim().ToLowerInvariant()
+            if ($ActionJob) { $ActionJob.CurrentItemSource = $script:WingetCurrentItemSource }
             $script:WingetCurrentItemStartedAt = Get-Date
             continue
         }
@@ -49723,6 +50165,10 @@ $script:ProcessWingetLines = {
             $i = [int]$matches[1]
             $t = [int]$matches[2]
             $n = $matches[3]
+            if ($ActionJob) {
+                $ActionJob.CurrentIndex = $i
+                $ActionJob.CurrentItemName = $n
+            }
             $script:WingetCurrentIndex = $i
             $script:WingetCurrentPercent = 0
             $script:WingetCurrentItemName = $n
@@ -49752,96 +50198,54 @@ $script:ProcessWingetLines = {
 }
 
 $script:DrainWingetOutputQueue = {
-    $batch = [System.Collections.Generic.List[object]]::new()
-    if ($script:WingetOutputQueue) {
-        $queuedItem = $null
-        while ($script:WingetOutputQueue.TryDequeue([ref]$queuedItem)) {
-            [void]$batch.Add($queuedItem)
-            $queuedItem = $null
-        }
+    foreach ($actionJob in @($script:WingetActionJobs)) {
+        if (-not $actionJob -or -not $actionJob.Queue) { continue }
+        [void](Drain-WmtUpdateActionProviderOutput -ActionJob $actionJob -ProcessLines $script:ProcessWingetLines)
     }
-    if ($batch.Count -gt 0) { & $script:ProcessWingetLines $batch.ToArray() }
 }
 
 Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTick {
         try {
-            if (-not $script:WingetJob) {
+            if (-not $script:WingetActiveAction) {
                 Unregister-WmtUiPollOperation -Name "WingetAction"
                 return
             }
             & $script:DrainWingetOutputQueue
-            if ($script:WingetAsyncResult -and -not $script:WingetAsyncResult.IsCompleted -and $script:WingetActionStartedAt -and $script:WingetCurrentItemName) {
+            $runningActionJob = @($script:WingetActionJobs | Where-Object { $_ -and -not $_.Completed -and -not $_.TimedOut } | Select-Object -First 1)[0]
+            if ($runningActionJob -and $runningActionJob.StartedAt -and $runningActionJob.CurrentItemName) {
                 try {
-                    $elapsed = (Get-Date) - $script:WingetActionStartedAt
+                    $elapsed = (Get-Date) - [DateTime]$runningActionJob.StartedAt
                     $elapsedText = $elapsed.ToString("mm\:ss", [System.Globalization.CultureInfo]::InvariantCulture)
-                    $curIdx = [Math]::Max(1, $script:WingetCurrentIndex)
-                    $lblWingetStatus.Text = "$($script:WingetActiveAction) ${curIdx}/$($script:WingetProgressTotal): $($script:WingetCurrentItemName)  (${elapsedText})"
+                    $curIdx = [Math]::Max(1, [int]$runningActionJob.CurrentIndex)
+                    $lblWingetStatus.Text = "$($script:WingetActiveAction) [$($runningActionJob.ProviderKey)] ${curIdx}/$($script:WingetProgressTotal): $($runningActionJob.CurrentItemName)  (${elapsedText})"
                 }
                 catch {}
             }
-            if ($script:WingetAsyncResult -and $script:WingetAsyncResult.IsCompleted) {
-                try {
-                    $finalOutput = @($script:WingetJob.EndInvoke($script:WingetAsyncResult))
-                    if ($finalOutput.Count -gt 0) { & $script:ProcessWingetLines $finalOutput }
+            # Settle each provider independently. A completed, failed, or
+            # timed-out provider is removed from the active list while sibling
+            # providers continue running.
+            for ($actionJobIndex = $script:WingetActionJobs.Count - 1; $actionJobIndex -ge 0; $actionJobIndex--) {
+                $actionJob = $script:WingetActionJobs[$actionJobIndex]
+                if (-not $actionJob) {
+                    $script:WingetActionJobs.RemoveAt($actionJobIndex)
+                    continue
                 }
-                catch {
-                    if (-not $script:WingetActionForcedTimeout) { throw }
+                $actionOutcome = Receive-WmtUpdateActionProviderWorker `
+                    -ActionJob $actionJob `
+                    -ProcessLines $script:ProcessWingetLines
+                if ([string]$actionOutcome -ne "Running") {
+                    $script:WingetActionJobs.RemoveAt($actionJobIndex)
                 }
-                & $script:DrainWingetOutputQueue
-                try { $script:WingetJob.Dispose() } catch {}
-                $script:WingetJob = $null
-                $script:WingetAsyncResult = $null
-                $script:WingetOutputQueue = $null
+            }
+
+            if ($script:WingetActionJobs.Count -eq 0) {
+                $finalizedNow = [bool](Complete-WmtUpdateActionFinalization)
+                if (-not $finalizedNow) {
+                    Unregister-WmtUiPollOperation -Name "WingetAction"
+                    return
+                }
                 Unregister-WmtUiPollOperation -Name "WingetAction"
                 if ($script:WingetActiveAction) {
-                    if ($script:WingetProgressDone -lt $script:WingetProgressTotal) {
-                        $missing = $script:WingetProgressTotal - $script:WingetProgressDone
-                        $script:WingetProgressDone = $script:WingetProgressTotal
-                        if ($script:WingetActionForcedTimeout) {
-                            $script:WingetProgressFailed += $missing
-                            $missingName = if ([string]::IsNullOrWhiteSpace($script:WingetCurrentItemName)) { "Pip item" } else { $script:WingetCurrentItemName }
-                            & $script:SetWingetLastResultUi "FAILED" $missingName $script:WingetProgressTotal $script:WingetProgressTotal
-                            Write-GuiLog "[$($script:WingetActiveAction)] FAILED: $missing item(s) stopped after the pip action timeout."
-                        }
-                        elseif ($script:WingetActionHasStoreCli) {
-                            $script:WingetProgressFailed += $missing
-                            $missingName = if ([string]::IsNullOrWhiteSpace($script:WingetCurrentItemName)) { "Microsoft Store item" } else { $script:WingetCurrentItemName }
-                            & $script:SetWingetLastResultUi "FAILED" $missingName $script:WingetProgressTotal $script:WingetProgressTotal
-                            if (-not $script:WingetStoreResourcesInUseSeen) {
-                                try {
-                                    $cutoff = if ($script:WingetActionStartedAt) { $script:WingetActionStartedAt.AddSeconds(-5) } else { (Get-Date).AddMinutes(-10) }
-                                    $storeTempFiles = @(
-                                        Get-ChildItem -Path $env:TEMP -Filter "WMT_StoreCLI_*.resources" -File -ErrorAction SilentlyContinue
-                                        Get-ChildItem -Path $env:TEMP -Filter "WMT_StoreCLI_*.screen" -File -ErrorAction SilentlyContinue
-                                        Get-ChildItem -Path $env:TEMP -Filter "WMT_StoreCLI_*.transcript" -File -ErrorAction SilentlyContinue
-                                    ) | Where-Object { $_.LastWriteTime -ge $cutoff }
-                                    foreach ($storeTempFile in $storeTempFiles) {
-                                        $storeTempText = Get-Content -Path $storeTempFile.FullName -Raw -ErrorAction SilentlyContinue
-                                        if ($storeTempText -match '(?is)(0x80073d02|resources\s+(?:it\s+)?modifies\s+are\s+currently\s+in\s+use|resources[\s\S]{0,240}currently\s+in\s+use)') {
-                                            $script:WingetStoreResourcesInUseSeen = $true
-                                            $resourcesInUseLog = "[Store CLI] Error 0x80073d02: The package could not be installed because resources it modifies are currently in use. Close the app and related Store/Xbox windows, then try again."
-                                            if (-not $script:WingetStoreErrorLogSeen.ContainsKey($resourcesInUseLog)) {
-                                                $script:WingetStoreErrorLogSeen[$resourcesInUseLog] = $true
-                                                Write-GuiLog $resourcesInUseLog
-                                            }
-                                            break
-                                        }
-                                    }
-                                }
-                                catch {}
-                            }
-                            if ($script:WingetStoreResourcesInUseSeen) {
-                                Write-GuiLog "[$($script:WingetActiveAction)] FAILED: $missing Store CLI item(s) ended after Microsoft Store reported 0x80073d02 resources currently in use."
-                            }
-                            else {
-                                Write-GuiLog "[$($script:WingetActiveAction)] FAILED: $missing Store CLI item(s) ended without a result. This usually means Store CLI was stopped after a stalled or cancelled update."
-                            }
-                        }
-                        else {
-                            # Some non-Store installers close their consoles without a reliable exit event.
-                            Write-GuiLog "[$($script:WingetActiveAction)] Notice: $missing item(s) completed silently without a standard success flag."
-                        }
-                    }
                     if ($script:WingetProgressFailed -gt 0) {
                         $lblWingetStatus.Text = "$($script:WingetActiveAction) completed with failures. $($script:WingetProgressDone)/$($script:WingetProgressTotal) done."
                         Write-GuiLog "[$($script:WingetActiveAction)] Completed with $($script:WingetProgressFailed) failure(s)."
@@ -49910,6 +50314,10 @@ Register-WmtUiPollOperation -Name "WingetAction" -TestComplete { $false } -OnTic
                 $script:WmtAutoInstallActive = $false
                 $script:WingetActiveAction = $null
                 $script:WingetActionItems = @()
+                $script:WingetActionProviderGroups = @()
+                if ($script:WingetActionJobs) { $script:WingetActionJobs.Clear() }
+                $script:WingetActionProviderKey = ""
+                $script:WingetActionFinalized = $true
                 $script:WingetActionStoreUpdateOnly = $false
                 $script:WingetActionForcedTimeout = $false
 
@@ -49963,7 +50371,7 @@ function Get-WmtProviderToggleDefaults {
 param([string]$ProviderKey)
 
 $caps = Get-WmtProviderCapabilities
-$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
 $cap = if ($caps.Contains($key)) { $caps[$key] } else { @{ Search = $false; Library = $false } }
 return [ordered]@{
     Search = [bool]$cap.Search
@@ -50027,7 +50435,7 @@ try {
 
     if ($raw) {
         foreach ($entry_item in (Get-WmtToggleEntries $raw)) {
-            $k = ([string]$entry_item.Name).Trim().ToLowerInvariant()
+            $k = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$entry_item.Name)
             if ([string]::IsNullOrWhiteSpace($k)) { continue }
             $defaults = Get-WmtProviderToggleDefaults -ProviderKey $k
             $t = [ordered]@{
@@ -50110,7 +50518,7 @@ if ($Toggles) {
     }
 
     foreach ($toggleEntry in $toggleEntries) {
-        $k = ([string]$toggleEntry.Name).Trim().ToLowerInvariant()
+        $k = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$toggleEntry.Name)
         if ([string]::IsNullOrWhiteSpace($k)) { continue }
         $val = $toggleEntry.Value
         $defaults = Get-WmtProviderToggleDefaults -ProviderKey $k
@@ -50140,7 +50548,7 @@ param($Settings, [string]$ProviderKey, [string]$ToggleName)
 
 if (-not $Settings) { $Settings = Get-WmtSettings }
 $toggles = Get-WmtProviderToggles -Settings $Settings
-$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
 $name = ([string]$ToggleName).Trim()
 if (-not $toggles.Contains($key)) { return $false }
 $entry = $toggles[$key]
@@ -50160,7 +50568,7 @@ param(
 )
 
 if (-not $Settings) { $Settings = Get-WmtSettings }
-$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
 $name = ([string]$ToggleName).Trim()
 $result = [PSCustomObject]@{ IsSet = $false; Value = $false }
 if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($name)) { return $result }
@@ -50169,12 +50577,20 @@ $raw = Get-WmtSettingsMember -Settings $Settings -Name "ProviderExecutionOverrid
 if (-not $raw) { return $result }
 
 $entry = $null
+$requestedKey = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$candidateKeys = @($key, $requestedKey) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
 if ($raw -is [System.Collections.IDictionary]) {
-    if ($raw.Contains($key)) { $entry = $raw[$key] }
-    else {
-        foreach ($candidateKey in @($raw.Keys)) {
-            if ([string]::Equals([string]$candidateKey, $key, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $entry = $raw[$candidateKey]
+    foreach ($candidateKey in @($candidateKeys)) {
+        if ($raw.Contains($candidateKey)) {
+            $entry = $raw[$candidateKey]
+            break
+        }
+    }
+    if (-not $entry) {
+        foreach ($rawKey in @($raw.Keys)) {
+            $canonicalRawKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$rawKey)
+            if ($candidateKeys -contains $canonicalRawKey) {
+                $entry = $raw[$rawKey]
                 break
             }
         }
@@ -50182,8 +50598,13 @@ if ($raw -is [System.Collections.IDictionary]) {
 }
 else {
     try {
-        $property = @($raw.PSObject.Properties | Where-Object { [string]::Equals($_.Name, $key, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
-        if ($property.Count -gt 0) { $entry = $property[0].Value }
+        foreach ($rawProperty in @($raw.PSObject.Properties)) {
+            $canonicalRawKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$rawProperty.Name)
+            if ($candidateKeys -contains $canonicalRawKey) {
+                $entry = $rawProperty.Value
+                break
+            }
+        }
     }
     catch {}
 }
@@ -50212,7 +50633,7 @@ function Get-WmtEffectiveProviderHeadless {
 param($Settings, [string]$ProviderKey)
 
 if (-not $Settings) { $Settings = Get-WmtSettings }
-$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
 
 # Headless is a scan/update execution preference. A provider excluded from scans
 # is effectively not headless, even if it has a saved override.
@@ -50233,7 +50654,7 @@ function Get-WmtEffectiveProviderAutoUpdate {
 param($Settings, [string]$ProviderKey)
 
 if (-not $Settings) { $Settings = Get-WmtSettings }
-$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
 if (-not (Get-WmtProviderToggle -Settings $Settings -ProviderKey $key -ToggleName "Scan")) { return $false }
 
 $fallback = [bool](Get-WmtUpdateAutoInstallEnabled -Settings $Settings)
@@ -50250,24 +50671,15 @@ $providerKeys = @(Get-WmtSettingsMember -Settings $Settings -Name "EnabledProvid
 if ($providerKeys.Count -eq 0) { $providerKeys = @((Get-WmtProviderCapabilities).Keys) }
 
 foreach ($providerKey in @($providerKeys | Select-Object -Unique)) {
-    if (Get-WmtEffectiveProviderAutoUpdate -Settings $Settings -ProviderKey ([string]$providerKey)) { return $true }
+    $canonicalProviderKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$providerKey)
+    if (Get-WmtEffectiveProviderAutoUpdate -Settings $Settings -ProviderKey $canonicalProviderKey) { return $true }
 }
 return $false
 }
 
 function Get-WmtProviderKeyForPackageSource {
 param([string]$Source)
-
-$sourceKey = ([string]$Source).Trim().ToLowerInvariant()
-switch ($sourceKey) {
-    "pip3" { return "pip" }
-    "npm (global)" { return "npm" }
-    "pnpm (global)" { return "pnpm" }
-    "choco" { return "chocolatey" }
-    "ruby" { return "gem" }
-    "rust" { return "cargo" }
-    default { return $sourceKey }
-}
+return (Get-WmtCanonicalProviderKey -ProviderOrSource $Source)
 }
 
 # ==========================================
@@ -50935,7 +51347,7 @@ return $result.ToArray()
 function Get-WmtProviderCatalogSearch {
 param([string]$ProviderKey, [string]$Query, [int]$TimeoutSeconds = 15)
 
-$key = ([string]$ProviderKey).Trim().ToLowerInvariant()
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
 $query = ([string]$Query).Trim()
 if ([string]::IsNullOrWhiteSpace($query)) { return @() }
 
@@ -51015,13 +51427,129 @@ function Update-WmtProviderPathEnvironment {
     catch {}
 }
 
+function Close-WmtProviderSettingsDialog {
+param(
+    [Parameter(Mandatory = $true)]$Dialog,
+    [Parameter(Mandatory = $true)]$State
+)
+
+if ($null -eq $Dialog) {
+    throw "Captured provider settings dialog reference is null."
+}
+
+$hasClosedState = $false
+$hasDialogState = $false
+$alreadyClosed = $false
+$stateDialog = $null
+if ($State -is [System.Collections.IDictionary]) {
+    $hasClosedState = $State.Contains("DialogClosed")
+    if ($hasClosedState) { $alreadyClosed = [bool]$State["DialogClosed"] }
+    $hasDialogState = $State.Contains("Dialog")
+    if ($hasDialogState) { $stateDialog = $State["Dialog"] }
+}
+else {
+    $hasClosedState = [bool]$State.PSObject.Properties["DialogClosed"]
+    if ($hasClosedState) { $alreadyClosed = [bool]$State.DialogClosed }
+    $hasDialogState = [bool]$State.PSObject.Properties["Dialog"]
+    if ($hasDialogState) { $stateDialog = $State.Dialog }
+}
+
+if (-not $hasClosedState) {
+    throw "Provider settings dialog state is missing its Closed lifecycle signal."
+}
+if (-not $hasDialogState -or $null -eq $stateDialog) {
+    throw "Provider settings dialog state is missing its registered dialog reference."
+}
+if (-not [object]::ReferenceEquals($stateDialog, $Dialog)) {
+    throw "Provider settings dialog reference does not match the registered dialog."
+}
+
+try {
+    if (-not $alreadyClosed) {
+        # Close the exact captured window even if a transient Hide made
+        # IsVisible false. Hiding a modal WPF window does not end ShowDialog().
+        $Dialog.Close()
+    }
+}
+catch {
+    $closeError = $_.Exception.Message
+    throw "Provider settings dialog close failed: $closeError"
+}
+
+$stillVisible = $false
+try { $stillVisible = [bool]$Dialog.IsVisible } catch {}
+if ($stillVisible) {
+    throw "Provider settings dialog remained visible after Close() was called."
+}
+
+if ($State -is [System.Collections.IDictionary]) {
+    $alreadyClosed = [bool]$State["DialogClosed"]
+}
+else {
+    $alreadyClosed = [bool]$State.DialogClosed
+}
+if (-not $alreadyClosed) {
+    throw "Provider settings dialog did not report its Closed event."
+}
+
+return $true
+}
+
+function Get-WmtProviderEnabledIntent {
+param(
+    [object[]]$ProviderDefinitions,
+    $ProviderControls
+)
+
+$enabled = [System.Collections.Generic.List[string]]::new()
+$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# Winget is locked on in the Provider dialog and must remain in the persisted
+# enabled-provider intent even though its checkbox cannot be changed.
+[void]$enabled.Add("winget")
+[void]$seen.Add("winget")
+
+foreach ($provider in @($ProviderDefinitions)) {
+    if (-not $provider) { continue }
+    $key = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$provider.Key)
+    if ([string]::IsNullOrWhiteSpace($key)) { continue }
+    if ($provider.PSObject.Properties["LockedOn"] -and [bool]$provider.LockedOn) { continue }
+    $controls = $null
+    if ($ProviderControls -is [System.Collections.IDictionary] -and $ProviderControls.Contains($key)) {
+        $controls = $ProviderControls[$key]
+    }
+    elseif ($ProviderControls -and $ProviderControls.PSObject.Properties[$key]) {
+        $controls = $ProviderControls.PSObject.Properties[$key].Value
+    }
+    $mainControl = $null
+    if ($controls) {
+        if ($controls -is [System.Collections.IDictionary] -and $controls.Contains("Main")) {
+            $mainControl = $controls["Main"]
+        }
+        elseif ($controls.PSObject.Properties["Main"]) {
+            $mainControl = $controls.PSObject.Properties["Main"].Value
+        }
+    }
+    if (-not $mainControl) { continue }
+    try {
+        if ([bool]$mainControl.IsChecked -and $seen.Add($key)) {
+            [void]$enabled.Add($key)
+        }
+    }
+    catch {}
+}
+
+return $enabled.ToArray()
+}
+
 function Show-ProviderManager {
 # 1. Load Current Settings
 $settings = Get-WmtSettings
 if (-not $settings.EnabledProviders) {
     $settings | Add-Member -MemberType NoteProperty -Name "EnabledProviders" -Value @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl") -Force
 }
-$enabled = $settings.EnabledProviders
+$enabled = @($settings.EnabledProviders | ForEach-Object {
+        Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$_)
+    } | Select-Object -Unique)
 $providerToggles = Get-WmtProviderToggles -Settings $settings
 $providerCapabilities = Get-WmtProviderCapabilities
 
@@ -51222,6 +51750,31 @@ foreach ($p in $providerDefinitions) {
 </Window>
 "@
 $win = New-WmtWindowFromFullXaml -Xaml $pXaml
+
+# Keep exact dialog/control references in a script-level registry. Async save
+# completion must never resolve a different Provider window through mutable
+# outer-scope variables.
+if (-not $script:WmtProviderSettingsUiStates) { $script:WmtProviderSettingsUiStates = @{} }
+$providerSettingsUiStates = $script:WmtProviderSettingsUiStates
+foreach ($staleStateId in @($providerSettingsUiStates.Keys)) {
+    $staleState = $providerSettingsUiStates[$staleStateId]
+    if ($staleState -and $staleState.Dialog) {
+        try { [void](Close-WmtProviderSettingsDialog -Dialog $staleState.Dialog -State $staleState) } catch { try { Write-GuiLog "[Providers] Stale provider settings dialog cleanup failed: $($_.Exception.Message)" } catch {} }
+    }
+    [void]$providerSettingsUiStates.Remove($staleStateId)
+}
+$providerSettingsStateId = [guid]::NewGuid().ToString("N")
+$providerSettingsState = @{
+    Dialog            = $win
+    SaveButton        = $win.FindName("btnSave")
+    SavePending       = $false
+    SettingsPersisted = $false
+    CloseRequested    = $false
+    DialogClosed      = $false
+    CloseError        = ""
+}
+$providerSettingsUiStates[$providerSettingsStateId] = $providerSettingsState
+$win.Add_Closed({ $providerSettingsState.DialogClosed = $true }.GetNewClosure())
 
 function Get-WinCtrl($name) { $win.FindName($name) }
 
@@ -52564,10 +53117,14 @@ $updateProviderToggleState = {
     $autoTip = "Three-state: On forces auto-update, Off disables it, mixed inherits global Auto-install (currently $globalAutoState). Requires Scan."
 
     if (-not $isInstalled) {
-        # Provider not installed: disable main + all toggles.
-        $notInstalledMsg = "$dispName is not installed. Click the Install button to set it up."
+        # Availability is separate from user intent. Keep an enabled provider
+        # checked when its command is temporarily unavailable; its scan will
+        # report an attributable failure instead of silently removing it from
+        # EnabledProviders. The main checkbox remains interactive so the user
+        # can explicitly disable the missing provider.
+        $notInstalledMsg = "$dispName is not installed. It will remain enabled and fail independently during scans until it is installed. Click Install to set it up, or uncheck it to disable it."
         if ($controls.Main) {
-            $controls.Main.IsEnabled = $false
+            $controls.Main.IsEnabled = $true
             $controls.Main.ToolTip = $notInstalledMsg
         }
         if ($controls.Search) { $controls.Search.IsEnabled = $false; $controls.Search.ToolTip = $notInstalledMsg }
@@ -52576,11 +53133,12 @@ $updateProviderToggleState = {
         if ($controls.Headless) { $controls.Headless.IsEnabled = $false; $controls.Headless.ToolTip = $notInstalledMsg }
         if ($controls.AutoUpdate) { $controls.AutoUpdate.IsEnabled = $false; $controls.AutoUpdate.ToolTip = $notInstalledMsg }
 
-        # Slash out the name.
+        # Mark the unavailable provider visually without changing its enabled
+        # state. The tooltip explains the independent scan failure behavior.
         $nameCtrl = & $getWinCtrl "lbl${ProviderKey}Name"
         if ($nameCtrl) {
             $nameCtrl.TextDecorations = [System.Windows.TextDecorations]::Strikethrough
-            $nameCtrl.Opacity = 0.35
+            $nameCtrl.Opacity = 0.55
             $nameCtrl.ToolTip = $notInstalledMsg
         }
         return
@@ -52923,14 +53481,44 @@ foreach ($provider in $providerDefinitions) {
 # thread would hang the window for up to 30+ seconds.
 
 # Save Event
-(Get-WinCtrl "btnSave").Add_Click({
-        $newEnabled = @("winget")
-        foreach ($provider in $providerDefinitions) {
-            $key = [string]$provider.Key
-            if ($provider.PSObject.Properties["LockedOn"] -and [bool]$provider.LockedOn) { continue }
-            $chkMain = & $getWinCtrl "chk$key"
-            if ($chkMain -and [bool]$chkMain.IsChecked) { $newEnabled += $key }
+$providerSettingsSaveButton = Get-WinCtrl "btnSave"
+$providerSettingsSaveButton.Add_Click({
+        if ($providerSettingsState.SavePending) { return }
+        if ($providerSettingsState.SettingsPersisted) {
+            if ($providerSettingsState.CloseRequested) { return }
+            $providerSettingsState.CloseRequested = $true
+            try {
+                [void](Close-WmtProviderSettingsDialog -Dialog $providerSettingsState.Dialog -State $providerSettingsState)
+                $providerSettingsState.DialogClosed = $true
+                [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
+            }
+            catch {
+                $providerSettingsState.CloseRequested = $false
+                $providerSettingsState.CloseError = $_.Exception.Message
+                Write-GuiLog "[$providerSettingsStateId] Provider settings were saved, but the Provider Settings window could not be closed: $($providerSettingsState.CloseError)"
+                try {
+                    Show-WmtMessageBox `
+                        -Message "Provider settings were saved, but the Provider Settings window could not be closed:`n$($providerSettingsState.CloseError)" `
+                        -Title "Provider Settings" `
+                        -Image Warning | Out-Null
+                }
+                catch {}
+            }
+            return
         }
+        $providerSettingsState.SavePending = $true
+        if ($providerSettingsSaveButton) {
+            $providerSettingsSaveButton.IsEnabled = $false
+            $providerSettingsSaveButton.Content = "Saving..."
+        }
+
+        # Preserve explicit user intent for enabled providers even when the
+        # provider executable is temporarily unavailable. Missing providers stay
+        # checked and fail independently during scans until the user disables
+        # them or installs them.
+        $newEnabled = @(Get-WmtProviderEnabledIntent `
+                -ProviderDefinitions $providerDefinitions `
+                -ProviderControls $providerControls)
 
         # Build a small patch from the live controls. Reading/merging the
         # settings file and writing it are disk I/O, so do that off-dispatcher.
@@ -53071,7 +53659,6 @@ foreach ($provider in $providerDefinitions) {
         # shared WPF DispatcherTimer. Capture the exact window, dispatcher,
         # and controls used by the completion path; do not resolve them later
         # through mutable outer-scope variables.
-        $providerSettingsDialog = $win
         $providerSettingsDispatcher = $win.Dispatcher
         $providerSettingsOperationId = "ProviderSettings_" + [guid]::NewGuid().ToString("N")
         $providerSettingsAutoScanEnabled = -not (Get-WmtUpdateScansDisabled -Settings $settingsPatch)
@@ -53104,20 +53691,34 @@ foreach ($provider in $providerDefinitions) {
                 # Closing and optional refreshes are independent post-save work.
                 $stage = 'CloseDialog'
                 try {
+                    $providerSettingsState.SettingsPersisted = $true
+                    $providerSettingsState.CloseRequested = $true
                     Write-GuiLog "[$providerSettingsOperationId] Provider completion stage: closing dialog."
-                    if ($null -eq $providerSettingsDialog) {
-                        throw "Captured provider settings dialog reference is null."
-                    }
-                    if ($providerSettingsDialog.IsVisible) { $providerSettingsDialog.Close() }
-                    if ($providerSettingsDialog.IsVisible) {
-                        Write-GuiLog "[$providerSettingsOperationId] Settings saved; dialog close returned but window remains visible."
-                    }
-                    else {
-                        Write-GuiLog "[$providerSettingsOperationId] Provider settings dialog closed."
-                    }
+                    [void](Close-WmtProviderSettingsDialog -Dialog $providerSettingsState.Dialog -State $providerSettingsState)
+                    $providerSettingsState.DialogClosed = $true
+                    Write-GuiLog "[$providerSettingsOperationId] Provider settings dialog closed."
                 }
                 catch {
-                    Write-GuiLog "[$providerSettingsOperationId] Settings saved successfully; dialog close failed: $($_.Exception.Message)"
+                    $providerSettingsState.CloseError = $_.Exception.Message
+                    $providerSettingsState.CloseRequested = $false
+                    if ($providerSettingsSaveButton) {
+                        $providerSettingsSaveButton.IsEnabled = $true
+                        $providerSettingsSaveButton.Content = "Retry Close"
+                    }
+                    Write-GuiLog "[$providerSettingsOperationId] Settings saved successfully; dialog close failed: $($providerSettingsState.CloseError)"
+                    try {
+                        Show-WmtMessageBox `
+                            -Message "Provider settings were saved, but the Provider Settings window could not be closed:`n$($providerSettingsState.CloseError)" `
+                            -Title "Provider Settings" `
+                            -Image Warning | Out-Null
+                    }
+                    catch {}
+                }
+                finally {
+                    $providerSettingsState.SavePending = $false
+                    if ($providerSettingsState.DialogClosed) {
+                        [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
+                    }
                 }
 
                 $stage = 'RefreshAutoScan'
@@ -53151,12 +53752,28 @@ foreach ($provider in $providerDefinitions) {
         }.GetNewClosure()
         Invoke-WmtSettingsPatchSave -Patch $settingsPatch -Name $providerSettingsOperationId -Message 'Saving provider settings...' -OnComplete $settingsSaved -OnError {
             param($errorRecord)
+            $providerSettingsState.SavePending = $false
+            $providerSettingsState.SettingsPersisted = $false
+            $providerSettingsState.CloseRequested = $false
+            # If the user closed the modal while persistence was pending, the
+            # failed save can no longer retry in that window. Do not retain the
+            # closed window and its closures in the script-level registry.
+            if ($providerSettingsState.DialogClosed) {
+                [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
+            }
+            if ($providerSettingsSaveButton) {
+                $providerSettingsSaveButton.IsEnabled = $true
+                $providerSettingsSaveButton.Content = "Save & Close"
+            }
             $message = if ($errorRecord -and $errorRecord.Exception) { $errorRecord.Exception.Message } else { [string]$errorRecord }
             Show-WmtMessageBox -Owner $win -Message "Could not save provider settings:`n$message" -Title "Provider Settings" -Image Error | Out-Null
         }.GetNewClosure()
     })
 
 $win.ShowDialog() | Out-Null
+if (-not $providerSettingsState.SavePending) {
+    [void]$providerSettingsUiStates.Remove($providerSettingsStateId)
+}
 if ($providerDetectionTimer) { $providerDetectionTimer.Stop() }
 if ($providerDetectionState.PowerShell -and $providerDetectionState.Invocation) {
     try { Stop-WmtPowerShellInvocationAsync -PowerShell $providerDetectionState.PowerShell -Invocation $providerDetectionState.Invocation -Name "Provider status detection after dialog close" } catch {}
@@ -53909,7 +54526,9 @@ function Start-WmtDeferredWingetScan {
         }
     }
     catch {
-        Write-GuiLog "Winget scan could not start after the source refresh: $($_.Exception.Message)"
+        $deferredError = $_.Exception.Message
+        Write-GuiLog "Winget scan could not start after the source refresh: $deferredError"
+        Set-WmtProviderScanFailure -ProviderKey "winget" -Message $deferredError
     }
     finally {
         $script:WmtDeferredWingetScanPending = $false
@@ -54072,6 +54691,23 @@ $script:ScanTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 $script:ActiveScans = [System.Collections.ArrayList]::new()
 $script:WmtScanProviderFailures = @{}
 
+function Set-WmtProviderScanFailure {
+param(
+    [Parameter(Mandatory = $true)][string]$ProviderKey,
+    [string]$Message = "Provider scan failed."
+)
+
+$key = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderKey
+if ([string]::IsNullOrWhiteSpace($key)) { return }
+$detail = ([string]$Message).Trim()
+if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "Provider scan failed." }
+if (-not ($script:WmtScanProviderFailures -is [System.Collections.IDictionary])) {
+    $script:WmtScanProviderFailures = @{}
+}
+$script:WmtScanProviderFailures[$key] = $detail
+try { Write-GuiLog "[$key] Provider scan failed independently: $detail" } catch {}
+}
+
 function Start-WmtActiveScanWorker {
 param(
     [Parameter(Mandatory = $true)][System.Management.Automation.PowerShell]$PowerShell,
@@ -54094,6 +54730,180 @@ catch {
 }
 }
 
+function Start-WmtProviderScanWorker {
+param(
+    [Parameter(Mandatory = $true)][string]$ProviderName,
+    [Parameter(Mandatory = $true)][scriptblock]$WorkerFactory
+)
+
+$providerKey = Get-WmtCanonicalProviderKey -ProviderOrSource $ProviderName
+$workerPowerShell = $null
+try {
+    # Provider creation and invocation are one isolated operation. A failure in
+    # this provider is recorded and the next provider is still allowed to start.
+    $workerPowerShell = & $WorkerFactory
+    if ($workerPowerShell -isnot [System.Management.Automation.PowerShell]) {
+        throw "Provider worker factory did not return a PowerShell instance."
+    }
+    return (Start-WmtActiveScanWorker -PowerShell $workerPowerShell -Name $providerKey)
+}
+catch {
+    $failureMessage = $_.Exception.Message
+    if ($workerPowerShell) { try { $workerPowerShell.Dispose() } catch {} }
+    Set-WmtProviderScanFailure -ProviderKey $providerKey -Message $failureMessage
+    return $null
+}
+}
+
+function Receive-WmtProviderScanWorker {
+param(
+    [Parameter(Mandatory = $true)]$Task
+)
+
+$providerName = ""
+try { if ($Task.PSObject.Properties["Name"]) { $providerName = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$Task.Name) } } catch {}
+$results = @()
+try {
+    $results = @($Task.PowerShell.EndInvoke($Task.AsyncResult))
+}
+catch {
+    $scanErrorMessage = $_.Exception.Message
+    Write-GuiLog "Scan Error: $scanErrorMessage"
+    if (-not [string]::IsNullOrWhiteSpace($providerName) -and $providerName -ne "provider scan") {
+        Set-WmtProviderScanFailure -ProviderKey $providerName -Message $scanErrorMessage
+    }
+    return
+}
+finally {
+    try { $Task.PowerShell.Dispose() } catch {}
+}
+
+foreach ($item in $results) {
+    if ($null -eq $item) { continue }
+    try {
+        # Background PowerShell EndInvoke() returns PSObject wrappers.
+        # Use a typed state object for Steam ownership rather than relying
+        # on string type tests, which can miss wrapped string output.
+        if ($item.PSObject.Properties["WmtStateType"] -and ([string]$item.WmtStateType) -eq "ProviderOwnership") {
+            $provider = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$item.Provider)
+            $ownedName = ([string]$item.Name).Trim()
+            $ownedId = ([string]$item.Id).Trim()
+            $ownedPath = ([string]$item.InstallDir).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($ownedName)) {
+                $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+                if (-not [string]::IsNullOrWhiteSpace($nameKey)) {
+                    $script:WmtProviderOwnershipIndex.Name[$nameKey] = [PSCustomObject]@{ Provider = $provider; Id = $ownedId; Path = $ownedPath; Name = $ownedName }
+                    if ($provider -eq "steam") { $script:WmtSteamInstalledNameKeys[$nameKey] = $ownedId }
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ownedId)) {
+                $script:WmtProviderOwnershipIndex.Id["$provider|$($ownedId.ToLowerInvariant())"] = $true
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ownedPath)) {
+                try {
+                    $pathKey = [System.IO.Path]::GetFullPath($ownedPath).TrimEnd('\').ToLowerInvariant()
+                    if (-not [string]::IsNullOrWhiteSpace($pathKey)) {
+                        $script:WmtProviderOwnershipIndex.Path[$pathKey] = [PSCustomObject]@{ Provider = $provider; Id = $ownedId; Name = $ownedName }
+                    }
+                }
+                catch {}
+            }
+        }
+        elseif ($item.PSObject.Properties["WmtStateType"] -and
+            ([string]$item.WmtStateType) -eq "ProviderScanStatus") {
+            $statusProvider = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$item.Provider)
+            $providerSucceeded = $false
+            try { $providerSucceeded = [bool]$item.Success } catch {}
+            if (-not [string]::IsNullOrWhiteSpace($statusProvider) -and -not $providerSucceeded) {
+                $providerMessage = ([string]$item.Message).Trim()
+                if ([string]::IsNullOrWhiteSpace($providerMessage)) { $providerMessage = "Provider scan failed." }
+                Set-WmtProviderScanFailure -ProviderKey $statusProvider -Message $providerMessage
+            }
+        }
+        elseif ($item -is [string] -and $item -match "^STATE:WINDOWS_UPDATE_REBOOT_REQUIRED:(\d+)$") {
+            $script:WmtWindowsUpdateRebootPendingCount = [Math]::Max(
+                [int]$script:WmtWindowsUpdateRebootPendingCount,
+                [int]$matches[1]
+            )
+        }
+        elseif ($item -is [string] -and $item.StartsWith("LOG:")) {
+            Write-GuiLog ($item.Substring(4))
+        }
+        elseif ($item.PSObject.Properties["Name"]) {
+            # Keep Source unchanged because it can encode command semantics
+            # such as "npm (global)". Store the canonical provider identity
+            # separately for action grouping, policy lookup, and diagnostics.
+            if ($item.PSObject.Properties["Source"]) {
+                try {
+                    $canonicalSource = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$item.Source)
+                    if (-not [string]::IsNullOrWhiteSpace($canonicalSource)) {
+                        $item | Add-Member -MemberType NoteProperty -Name "WmtProviderKey" -Value $canonicalSource -Force
+                    }
+                }
+                catch {}
+            }
+
+            # --- STRICT GARBAGE FILTER ---
+            # Rejects headers, separators, and empty dashed lines
+            if ($item.Name -match "^-+$" -or $item.Id -match "^-+$") { continue }
+            if ($item.Name -eq "Name" -and $item.Id -eq "Id") { continue }
+            if ($item.Name -eq "Source" -and $item.Id -eq "Name") { continue }
+            if ($item.Version -eq "Version" -or $item.Available -eq "Available") { continue }
+
+            # Add to UI
+            [void](Set-WmtUpdateListItemCheckState -Item $item -DefaultChecked:$false)
+            [void]$lstWinget.Items.Add($item)
+        }
+    }
+    catch {
+        Write-GuiLog "Provider result could not be added for $providerName`: $($_.Exception.Message)"
+    }
+}
+}
+
+function Complete-WmtTimedOutProviderScanWorkers {
+param([int]$TimeoutSeconds = 120)
+
+# Collect providers that completed at the deadline, then attribute the
+# timeout only to providers that were still running. Rows from providers that
+# completed remain actionable.
+for ($i = $script:ActiveScans.Count - 1; $i -ge 0; $i--) {
+    $task = $script:ActiveScans[$i]
+    $providerName = "provider scan"
+    try {
+        if ($task -and $task.PSObject.Properties["Name"] -and $task.Name) {
+            $providerName = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$task.Name)
+        }
+    }
+    catch {}
+
+    $completed = $false
+    try { $completed = [bool]$task.AsyncResult.IsCompleted } catch {}
+    if ($completed) {
+        Receive-WmtProviderScanWorker -Task $task
+    }
+    else {
+        Set-WmtProviderScanFailure -ProviderKey $providerName -Message "Provider scan timed out after $TimeoutSeconds seconds."
+        try {
+            Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$providerName scan timeout"
+        }
+        catch {
+            try {
+                Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$providerName scan timeout"
+            }
+            catch {}
+        }
+    }
+    $script:ActiveScans.RemoveAt($i)
+}
+
+if ($script:WmtDeferredWingetScanPending) {
+    Set-WmtProviderScanFailure -ProviderKey "winget" -Message "Provider scan timed out after $TimeoutSeconds seconds."
+}
+$script:WmtDeferredWingetScan = $null
+$script:WmtDeferredWingetScanPending = $false
+}
+
 $script:WmtAutoInstallSuppressNextScan = $false
 $script:WmtAutoInstallActive = $false
 $script:WmtCompletedWindowsUpdateIds = @{}
@@ -54104,211 +54914,134 @@ $script:WmtProviderOwnershipIndex = @{
     Id   = @{}
     Path = @{}
 }
+$script:WmtScanFinalized = $false
 
-$script:ScanTimer.Add_Tick({
-    if ($script:ActiveScans.Count -gt 0) {
+function Complete-WmtUpdateScan {
+if ($script:WmtScanFinalized) { return }
+$script:WmtScanFinalized = $true
 
-        # Iterate backwards so we can remove completed tasks safely
-        for ($i = $script:ActiveScans.Count - 1; $i -ge 0; $i--) {
-            $task = $script:ActiveScans[$i]
+try { if ($script:ScanTimer) { $script:ScanTimer.Stop() } } catch {}
+try { if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() } } catch {}
 
-            if ($task.AsyncResult.IsCompleted) {
-                try {
-                    $results = $task.PowerShell.EndInvoke($task.AsyncResult)
-                    $task.PowerShell.Dispose()
+$rebootPendingCount = [Math]::Max(0, [int]$script:WmtWindowsUpdateRebootPendingCount)
+if ($pbWingetProgress) { $pbWingetProgress.Visibility = "Collapsed"; $pbWingetProgress.Value = 0 }
+if ($lblWingetProgress) { $lblWingetProgress.Visibility = "Collapsed"; $lblWingetProgress.Text = "" }
+$btnWingetScan.IsEnabled = $true
+$txtWingetSearch.IsEnabled = $true
+$txtWingetSearch.ToolTip = ""
+if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
+$btnWingetUpdateSel.IsEnabled = $true
 
-                    # Process Results
-                    foreach ($item in $results) {
-                        if ($null -eq $item) { continue }
+# --include-unknown can surface false updates for games owned by another
+# provider. Suppression is optional and applies only to unresolved versions.
+$hideCrossProviderDuplicates = $false
+try { $hideCrossProviderDuplicates = [bool](Get-WmtSettingsMember -Settings (Get-WmtSettings) -Name "HideCrossProviderDuplicates" -Default $false) } catch {}
+$providerOwnedWingetRowsSuppressed = 0
+if ($hideCrossProviderDuplicates -and $script:WmtProviderOwnershipIndex -and $script:WmtProviderOwnershipIndex.Name.Count -gt 0) {
+    for ($rowIndex = $lstWinget.Items.Count - 1; $rowIndex -ge 0; $rowIndex--) {
+        $candidate = $lstWinget.Items[$rowIndex]
+        if (-not $candidate) { continue }
+        if (([string]$candidate.Source).ToLowerInvariant() -ne "winget") { continue }
 
-                        # Background PowerShell EndInvoke() returns PSObject wrappers.
-                        # Use a typed state object for Steam ownership rather than relying
-                        # on string type tests, which can miss wrapped string output.
-                        if ($item.PSObject.Properties["WmtStateType"] -and ([string]$item.WmtStateType) -eq "ProviderOwnership") {
-                            $provider = ([string]$item.Provider).Trim().ToLowerInvariant()
-                            $ownedName = ([string]$item.Name).Trim()
-                            $ownedId = ([string]$item.Id).Trim()
-                            $ownedPath = ([string]$item.InstallDir).Trim()
-                            if (-not [string]::IsNullOrWhiteSpace($ownedName)) {
-                                $nameKey = ($ownedName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
-                                if (-not [string]::IsNullOrWhiteSpace($nameKey)) {
-                                    $script:WmtProviderOwnershipIndex.Name[$nameKey] = [PSCustomObject]@{ Provider = $provider; Id = $ownedId; Path = $ownedPath; Name = $ownedName }
-                                    if ($provider -eq "steam") { $script:WmtSteamInstalledNameKeys[$nameKey] = $ownedId }
-                                }
-                            }
-                            if (-not [string]::IsNullOrWhiteSpace($ownedId)) {
-                                $script:WmtProviderOwnershipIndex.Id["$provider|$($ownedId.ToLowerInvariant())"] = $true
-                            }
-                            if (-not [string]::IsNullOrWhiteSpace($ownedPath)) {
-                                try {
-                                    $pathKey = [System.IO.Path]::GetFullPath($ownedPath).TrimEnd('\').ToLowerInvariant()
-                                    if (-not [string]::IsNullOrWhiteSpace($pathKey)) {
-                                        $script:WmtProviderOwnershipIndex.Path[$pathKey] = [PSCustomObject]@{ Provider = $provider; Id = $ownedId; Name = $ownedName }
-                                    }
-                                }
-                                catch {}
-                            }
-                        }
-                        elseif ($item.PSObject.Properties["WmtStateType"] -and
-                            ([string]$item.WmtStateType) -eq "ProviderScanStatus") {
-                            $providerName = ([string]$item.Provider).Trim()
-                            $providerSucceeded = $false
-                            try { $providerSucceeded = [bool]$item.Success } catch {}
-                            if (-not [string]::IsNullOrWhiteSpace($providerName) -and -not $providerSucceeded) {
-                                $providerMessage = ([string]$item.Message).Trim()
-                                if ([string]::IsNullOrWhiteSpace($providerMessage)) { $providerMessage = "Provider scan failed." }
-                                $script:WmtScanProviderFailures[$providerName] = $providerMessage
-                            }
-                        }
-                        elseif ($item -is [string] -and $item -match "^STATE:WINDOWS_UPDATE_REBOOT_REQUIRED:(\d+)$") {
-                            $script:WmtWindowsUpdateRebootPendingCount = [Math]::Max(
-                                [int]$script:WmtWindowsUpdateRebootPendingCount,
-                                [int]$matches[1]
-                            )
-                        }
-                        elseif ($item -is [string] -and $item.StartsWith("LOG:")) {
-                            Write-GuiLog ($item.Substring(4))
-                        }
-                        elseif ($item.PSObject.Properties["Name"]) {
-                            # --- STRICT GARBAGE FILTER ---
-                            # Rejects headers, separators, and empty dashed lines
-                            if ($item.Name -match "^-+$" -or $item.Id -match "^-+$") { continue }
-                            if ($item.Name -eq "Name" -and $item.Id -eq "Id") { continue }
-                            if ($item.Name -eq "Source" -and $item.Id -eq "Name") { continue }
-                            if ($item.Version -eq "Version" -or $item.Available -eq "Available") { continue }
+        # Only suppress unresolved-version winget rows. Verified winget
+        # upgrades remain visible even when another provider owns an app
+        # with the same display name.
+        $candidateVersion = ([string]$candidate.Version).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($candidateVersion) -and $candidateVersion -notmatch '^(?i:\?|unknown|inconnu)$') { continue }
 
-                            # Add to UI
-                            [void](Set-WmtUpdateListItemCheckState -Item $item -DefaultChecked:$false)
-                            [void]$lstWinget.Items.Add($item)
-                        }
-                    }
-                }
-                catch {
-                    $scanErrorMessage = $_.Exception.Message
-                    Write-GuiLog "Scan Error: $scanErrorMessage"
-                    $failedProvider = ""
-                    try { if ($task.PSObject.Properties["Name"]) { $failedProvider = ([string]$task.Name).Trim().ToLowerInvariant() } } catch {}
-                    if (-not [string]::IsNullOrWhiteSpace($failedProvider) -and $failedProvider -ne "provider scan") {
-                        $script:WmtScanProviderFailures[$failedProvider] = $scanErrorMessage
-                    }
-                    try { $task.PowerShell.Dispose() } catch {}
-                }
+        $candidateName = ([string]$candidate.Name).Trim()
+        if ([string]::IsNullOrWhiteSpace($candidateName)) { continue }
+        $candidateKey = ($candidateName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
+        if ([string]::IsNullOrWhiteSpace($candidateKey)) { continue }
 
-                # Remove finished task
-                $script:ActiveScans.RemoveAt($i)
-            }
+        if ($script:WmtProviderOwnershipIndex.Name.ContainsKey($candidateKey)) {
+            $owner = $script:WmtProviderOwnershipIndex.Name[$candidateKey]
+            Write-GuiLog "[Winget] Suppressed unknown-version duplicate for $candidateName ($([string]$candidate.Id)); owned by $($owner.Provider) ($($owner.Id))."
+            $lstWinget.Items.RemoveAt($rowIndex)
+            $providerOwnedWingetRowsSuppressed++
         }
     }
+}
+if ($providerOwnedWingetRowsSuppressed -gt 0) {
+    Write-GuiLog "[Winget] Suppressed $providerOwnedWingetRowsSuppressed cross-provider unknown-version duplicate row(s)."
+}
+
+$lstWinget.Items.Refresh()
+$lstWinget.UpdateLayout()
+
+$scanCompletion = Get-WmtUpdateScanCompletion -UpdateCount $lstWinget.Items.Count -ProviderFailures $script:WmtScanProviderFailures
+$hasProviderFailures = @($scanCompletion.FailedProviders).Count -gt 0
+if (-not $scanCompletion.IsComplete) {
+    $lblWingetStatus.Text = $scanCompletion.StatusText
+    $lblWingetStatus.Visibility = "Visible"
+}
+elseif ($hasProviderFailures) {
+    $lblWingetStatus.Text = $scanCompletion.StatusText
+    $lblWingetStatus.Visibility = "Visible"
+}
+elseif ($rebootPendingCount -gt 0) {
+    $lblWingetStatus.Text = "Restart required - $rebootPendingCount Windows update(s) waiting"
+    $lblWingetStatus.Visibility = "Visible"
+}
+else {
+    $lblWingetStatus.Visibility = "Hidden"
+}
+
+if ($hasProviderFailures -or -not $scanCompletion.IsComplete) {
+    Write-GuiLog $scanCompletion.LogMessage
+    if ($rebootPendingCount -gt 0) {
+        Write-GuiLog "Restart required for $rebootPendingCount installed Windows update(s)."
+    }
+}
+elseif ($lstWinget.Items.Count -eq 0) {
+    if ($rebootPendingCount -gt 0) {
+        Write-GuiLog "No actionable updates found. Restart Windows to finish $rebootPendingCount installed Windows update(s)."
+    }
     else {
-        # All tasks finished (unless the winget scanner is still waiting for its source refresh)
-        if ($script:ScanTimer.IsEnabled -and -not $script:WmtDeferredWingetScanPending) {
-            $script:ScanTimer.Stop()
+        Write-GuiLog $scanCompletion.LogMessage
+    }
+}
+else {
+    Write-GuiLog $scanCompletion.LogMessage
+}
 
-            # Stop the 120s global timeout timer too � the scan finished
-            # before it fired, so leaving it running would falsely report
-            # the engine as busy (Test-WmtUpdateScanEngineBusy checks
-            # $script:GlobalScanTimer.IsEnabled).
-            if ($script:GlobalScanTimer) {
-                try { $script:GlobalScanTimer.Stop() } catch {}
-            }
+# Provider failures are isolated. When auto install is enabled, eligible rows
+# from successful providers remain actionable; failed providers are filtered by
+# the dispatcher. Disabled auto install remains completely silent.
+$autoInstallEnabled = $false
+try { $autoInstallEnabled = [bool](Test-WmtAnyProviderAutoUpdateEnabled -Settings (Get-WmtSettings)) } catch {}
+$suppressNextAutoInstallScan = [bool]$script:WmtAutoInstallSuppressNextScan
+$script:WmtAutoInstallSuppressNextScan = $false
+$autoInstallDecision = Get-WmtUpdateScanAutoInstallDecision `
+    -ScanCompletion $scanCompletion `
+    -AutoInstallEnabled $autoInstallEnabled `
+    -SuppressNextScan $suppressNextAutoInstallScan
+if (-not [string]::IsNullOrWhiteSpace([string]$autoInstallDecision.LogMessage)) {
+    Write-GuiLog ([string]$autoInstallDecision.LogMessage)
+}
+if ([bool]$autoInstallDecision.ShouldInvoke) {
+    Invoke-WmtAutoInstallAvailableUpdates
+}
+}
 
-            $rebootPendingCount = [Math]::Max(0, [int]$script:WmtWindowsUpdateRebootPendingCount)
-            if ($pbWingetProgress) { $pbWingetProgress.Visibility = "Collapsed"; $pbWingetProgress.Value = 0 }
-            if ($lblWingetProgress) { $lblWingetProgress.Visibility = "Collapsed"; $lblWingetProgress.Text = "" }
-            $btnWingetScan.IsEnabled = $true
-            $txtWingetSearch.IsEnabled = $true
-            $txtWingetSearch.ToolTip = ""
-            if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
-            $btnWingetUpdateSel.IsEnabled = $true
+$script:ScanTimer.Add_Tick({
+    # Iterate backwards so completed workers can be removed safely. A worker
+    # failure is collected into its own provider diagnostic and never prevents
+    # sibling workers from settling.
+    for ($i = $script:ActiveScans.Count - 1; $i -ge 0; $i--) {
+        $task = $script:ActiveScans[$i]
+        if (-not $task.AsyncResult.IsCompleted) { continue }
+        Receive-WmtProviderScanWorker -Task $task
+        $script:ActiveScans.RemoveAt($i)
+    }
 
-            # --include-unknown can surface false updates for games owned by another
-            # provider. Suppression is optional and applies only to unresolved versions.
-            $hideCrossProviderDuplicates = [bool](Get-WmtSettingsMember -Settings $settings -Name "HideCrossProviderDuplicates" -Default $false)
-            $providerOwnedWingetRowsSuppressed = 0
-            if ($hideCrossProviderDuplicates -and $script:WmtProviderOwnershipIndex -and $script:WmtProviderOwnershipIndex.Name.Count -gt 0) {
-                for ($rowIndex = $lstWinget.Items.Count - 1; $rowIndex -ge 0; $rowIndex--) {
-                    $candidate = $lstWinget.Items[$rowIndex]
-                    if (-not $candidate) { continue }
-                    if (([string]$candidate.Source).ToLowerInvariant() -ne "winget") { continue }
-
-                    # Only suppress unresolved-version winget rows. Verified winget
-                    # upgrades remain visible even when another provider owns an app
-                    # with the same display name.
-                    $candidateVersion = ([string]$candidate.Version).Trim()
-                    if (-not [string]::IsNullOrWhiteSpace($candidateVersion) -and $candidateVersion -notmatch '^(?i:\?|unknown|inconnu)$') { continue }
-
-                    $candidateName = ([string]$candidate.Name).Trim()
-                    if ([string]::IsNullOrWhiteSpace($candidateName)) { continue }
-                    $candidateKey = ($candidateName.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]', '')
-                    if ([string]::IsNullOrWhiteSpace($candidateKey)) { continue }
-
-                    if ($script:WmtProviderOwnershipIndex.Name.ContainsKey($candidateKey)) {
-                        $owner = $script:WmtProviderOwnershipIndex.Name[$candidateKey]
-                        Write-GuiLog "[Winget] Suppressed unknown-version duplicate for $candidateName ($([string]$candidate.Id)); owned by $($owner.Provider) ($($owner.Id))."
-                        $lstWinget.Items.RemoveAt($rowIndex)
-                        $providerOwnedWingetRowsSuppressed++
-                    }
-                }
-            }
-            if ($providerOwnedWingetRowsSuppressed -gt 0) {
-                Write-GuiLog "[Winget] Suppressed $providerOwnedWingetRowsSuppressed cross-provider unknown-version duplicate row(s)."
-            }
-
-            $lstWinget.Items.Refresh()
-            $lstWinget.UpdateLayout()
-
-            $scanCompletion = Get-WmtUpdateScanCompletion -UpdateCount $lstWinget.Items.Count -ProviderFailures $script:WmtScanProviderFailures
-            if (-not $scanCompletion.IsComplete) {
-                $lblWingetStatus.Text = $scanCompletion.StatusText
-                $lblWingetStatus.Visibility = "Visible"
-            }
-            elseif ($rebootPendingCount -gt 0) {
-                $lblWingetStatus.Text = "Restart required - $rebootPendingCount Windows update(s) waiting"
-                $lblWingetStatus.Visibility = "Visible"
-            }
-            else {
-                $lblWingetStatus.Visibility = "Hidden"
-            }
-
-            if (-not $scanCompletion.IsComplete) {
-                Write-GuiLog $scanCompletion.LogMessage
-                if ($rebootPendingCount -gt 0) {
-                    Write-GuiLog "Restart required for $rebootPendingCount installed Windows update(s)."
-                }
-            }
-            elseif ($lstWinget.Items.Count -eq 0) {
-                if ($rebootPendingCount -gt 0) {
-                    Write-GuiLog "No actionable updates found. Restart Windows to finish $rebootPendingCount installed update(s)."
-                }
-                else {
-                    Write-GuiLog $scanCompletion.LogMessage
-                }
-            }
-            else {
-                Write-GuiLog $scanCompletion.LogMessage
-            }
-
-            # A provider failure only affects auto install when auto install is
-            # enabled. Otherwise the incomplete-scan diagnostic is sufficient,
-            # and an auto-install skip message would be misleading.
-            $autoInstallEnabled = $false
-            try {
-                $autoInstallEnabled = [bool](Test-WmtAnyProviderAutoUpdateEnabled -Settings (Get-WmtSettings))
-            }
-            catch {}
-            $suppressNextAutoInstallScan = [bool]$script:WmtAutoInstallSuppressNextScan
-            $script:WmtAutoInstallSuppressNextScan = $false
-            $autoInstallDecision = Get-WmtUpdateScanAutoInstallDecision `
-                -ScanCompletion $scanCompletion `
-                -AutoInstallEnabled $autoInstallEnabled `
-                -SuppressNextScan $suppressNextAutoInstallScan
-            if (-not [string]::IsNullOrWhiteSpace([string]$autoInstallDecision.LogMessage)) {
-                Write-GuiLog ([string]$autoInstallDecision.LogMessage)
-            }
-            if ([bool]$autoInstallDecision.ShouldInvoke) {
-                Invoke-WmtAutoInstallAvailableUpdates
-            }
-        }
+    # All workers have settled (unless Winget is still waiting for its source
+    # refresh). Use the same finalization path for normal completion and the
+    # global deadline so successful providers always remain actionable.
+    if ($script:ActiveScans.Count -eq 0 -and
+        $script:ScanTimer.IsEnabled -and
+        -not $script:WmtDeferredWingetScanPending) {
+        Complete-WmtUpdateScan
     }
 })
 
@@ -54513,10 +55246,12 @@ $btnWingetScan.Add_Click({
 
     # --- Load Settings ---
     $settings = $scanPrepared.ScanSettings
-    $enabled = if ($settings.EnabledProviders -and $settings.EnabledProviders.Count -gt 0) { 
-        $settings.EnabledProviders 
+    $enabled = if ($settings.EnabledProviders -and $settings.EnabledProviders.Count -gt 0) {
+        @($settings.EnabledProviders | ForEach-Object {
+                Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$_)
+            } | Select-Object -Unique)
     }
-    else { 
+    else {
         @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     }
     $ignoreList = if ($settings.WingetIgnore) { $settings.WingetIgnore } else { @() }
@@ -54560,6 +55295,7 @@ $btnWingetScan.Add_Click({
     # --- Reset scan tracking ---
     $script:ActiveScans.Clear()
     $script:WmtScanProviderFailures = @{}
+    $script:WmtScanFinalized = $false
     $script:ScanCancelled = $false
     $script:WmtDeferredWingetScan = $null
     $script:WmtDeferredWingetScanPending = $false
@@ -54581,39 +55317,25 @@ $btnWingetScan.Add_Click({
     $script:GlobalScanTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:GlobalScanTimer.Interval = [TimeSpan]::FromSeconds(120)
     $script:GlobalScanTimer.Add_Tick({
-            if ($script:ActiveScans.Count -gt 0 -and -not $script:ScanCancelled) {
+            if (-not $script:WmtScanFinalized -and -not $script:ScanCancelled) {
                 $script:ScanCancelled = $true
-                Write-GuiLog "Global scan timeout reached (120s). Cancelling remaining provider scans."
-                # Stop all still-running workers without dropping their async handles.
-                foreach ($task in @($script:ActiveScans)) {
-                    try {
-                        Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan timeout"
-                    }
-                    catch {
-                        try { Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "Provider scan timeout" } catch {}
-                    }
-                }
-                $script:ActiveScans.Clear()
-                $script:WmtDeferredWingetScan = $null
-                $script:WmtDeferredWingetScanPending = $false
-                # Stop result collection timer
-                if ($script:ScanTimer.IsEnabled) { $script:ScanTimer.Stop() }
-                $lblWingetStatus.Text = "Scan timeout - some providers did not respond."
-                $lblWingetStatus.Visibility = "Visible"
-                $btnWingetScan.IsEnabled = $true
-                $txtWingetSearch.IsEnabled = $true
-                $txtWingetSearch.ToolTip = ""
-                if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
-                $btnWingetUpdateSel.IsEnabled = $true
-                Show-WmtMessageBox -Message ("Scan timed out after 120 seconds.`n`nOne of the enabled package providers did not respond.`nTry disabling slow providers and scan again.") -Title ("Scan Timeout") -Button ("OK") -Image ("Warning") | Out-Null
+                Write-GuiLog "Global scan timeout reached (120s). Timing out only providers that are still running."
+
+                # Collect workers that completed at the deadline before stopping
+                # the remaining workers. Their successful rows stay actionable.
+                Complete-WmtTimedOutProviderScanWorkers -TimeoutSeconds 120
+
+                # Use the normal aggregate finalizer. It restores the UI and may
+                # auto-install eligible rows from providers that completed.
+                Complete-WmtUpdateScan
             }
             $script:GlobalScanTimer.Stop()
         })
     $script:GlobalScanTimer.Start()
 
     # --- Provider Workers ---
-    # Provider startup is atomic: if any worker cannot be created/started, cancel
-    # and finalize every worker already started for this scan and restore the UI.
+    # Each provider has its own startup boundary. A coordinator error must not
+    # roll back providers that are already running.
     try {
 
     # A. WINGET - kept in a scriptblock so it can start immediately or, on the first scan after launch,
@@ -54623,8 +55345,9 @@ $btnWingetScan.Add_Click({
     foreach ($wingetSource in @("winget")) {
         if ($wingetSource -notin $enabled) { continue }
 
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "winget" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($SourceName, $IgnoreList, $IncludeUnknown)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
@@ -54706,6 +55429,7 @@ $btnWingetScan.Add_Click({
 
                     if (-not $p.WaitForExit($timeoutMs)) {
                         Write-Output "LOG:$SourceName scan timed out after $((ConvertTo-Int ($timeoutMs / 1000) 0)) seconds."
+                        Write-Output (New-WmtProviderScanStatus -Provider "winget" -Success $false -Message "$SourceName scan timed out.")
                         try { $p.Kill() } catch { }
                         try { [void]$p.WaitForExit(2000) } catch { }
                         return
@@ -54737,6 +55461,7 @@ $btnWingetScan.Add_Click({
                         $outTask = $p.StandardOutput.ReadToEndAsync()
                         if (-not $p.WaitForExit($timeoutMs)) {
                             Write-Output "LOG:$SourceName retry scan timed out after $((ConvertTo-Int ($timeoutMs / 1000) 0)) seconds."
+                            Write-Output (New-WmtProviderScanStatus -Provider "winget" -Success $false -Message "$SourceName retry scan timed out.")
                             try { $p.Kill() } catch { }
                             try { [void]$p.WaitForExit(2000) } catch { }
                             return
@@ -54746,6 +55471,7 @@ $btnWingetScan.Add_Click({
 
                     if ($p.ExitCode -ne 0) {
                         Write-Output "LOG:$SourceName scan exited with code $($p.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "winget" -Success $false -Message "$SourceName scan exited with code $($p.ExitCode).")
                     }
 
                     if (-not [string]::IsNullOrWhiteSpace($out)) {
@@ -54776,17 +55502,19 @@ $btnWingetScan.Add_Click({
                 }
                 catch {
                     Write-Output "LOG:$SourceName check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "winget" -Success $false -Message $_.Exception.Message)
                 }
             }).AddArgument($wingetSource).AddArgument($ignoreList).AddArgument([bool]$includeUnknown)
-
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
     }
     if (-not $deferWingetScan) { & $startWingetScan $enabled $ignoreList $includeUnknown }
 
     if ("msstore" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "msstore" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
@@ -54912,6 +55640,7 @@ $btnWingetScan.Add_Click({
                 try {
                     if (-not (Get-Command "store" -ErrorAction SilentlyContinue)) {
                         Write-Output "LOG:Store CLI was not found. Update Microsoft Store, then scan again."
+                        Write-Output (New-WmtProviderScanStatus -Provider "msstore" -Success $false -Message "Store CLI was not found.")
                         return
                     }
 
@@ -54937,6 +55666,7 @@ $btnWingetScan.Add_Click({
 
                     if (-not $p.WaitForExit(60000)) {
                         Write-Output "LOG:Store CLI scan timed out after 60 seconds."
+                        Write-Output (New-WmtProviderScanStatus -Provider "msstore" -Success $false -Message "Store CLI scan timed out.")
                         try { $p.Kill() } catch {}
                         try { [void]$p.WaitForExit(2000) } catch {}
                         return
@@ -54948,6 +55678,7 @@ $btnWingetScan.Add_Click({
 
                     if ($p.ExitCode -ne 0) {
                         Write-Output "LOG:Store CLI scan exited with code $($p.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "msstore" -Success $false -Message "Store CLI scan exited with code $($p.ExitCode).")
                         if (-not [string]::IsNullOrWhiteSpace($err)) {
                             foreach ($errLine in ($err -split "`r?`n")) {
                                 if (-not [string]::IsNullOrWhiteSpace($errLine)) { Write-Output "LOG:Store CLI: $errLine" }
@@ -54963,10 +55694,11 @@ $btnWingetScan.Add_Click({
                 }
                 catch {
                     Write-Output "LOG:Store CLI check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "msstore" -Success $false -Message $_.Exception.Message)
                 }
             }).AddArgument($ignoreList)
-
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # Resolve WU category toggles in main scope (can't call functions inside runspace).
@@ -54974,8 +55706,9 @@ $btnWingetScan.Add_Click({
 
     # WINDOWS UPDATE WORKER - includes optional updates.
     if ("windowsupdate" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "windowsupdate" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList, $CompletedUpdateIds, $WuCategoryToggles)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
@@ -55166,16 +55899,18 @@ $btnWingetScan.Add_Click({
                 }
                 catch {
                     Write-Output "LOG:Windows Update scan failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "windowsupdate" -Success $false -Message $_.Exception.Message)
                 }
             }).AddArgument($ignoreList).AddArgument($completedWindowsUpdateIds).AddArgument($wuCategoryTogglesForScan)
-
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # B. PIP WORKER
     if ("pip" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "pip" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Pip..."
                 try {
@@ -55194,6 +55929,7 @@ $btnWingetScan.Add_Click({
                     $errTask = $pipProcess.StandardError.ReadToEndAsync()
                     if (-not $pipProcess.WaitForExit(60000)) {
                         Write-Output "LOG:Pip scan timed out after 60 seconds. Stopping its process tree."
+                        Write-Output (New-WmtProviderScanStatus -Provider "pip" -Success $false -Message "Pip scan timed out.")
                         try {
                             $killInfo = New-Object System.Diagnostics.ProcessStartInfo
                             $killInfo.FileName = "taskkill.exe"
@@ -55218,6 +55954,7 @@ $btnWingetScan.Add_Click({
                     if ($pipProcess.ExitCode -ne 0) {
                         $detail = if ([string]::IsNullOrWhiteSpace($pipError)) { "exit code $($pipProcess.ExitCode)" } else { $pipError.Trim() }
                         Write-Output "LOG:Pip scan failed: $detail"
+                        Write-Output (New-WmtProviderScanStatus -Provider "pip" -Success $false -Message $detail)
                         return
                     }
                     if ($json.Trim().StartsWith("[")) { 
@@ -55227,16 +55964,25 @@ $btnWingetScan.Add_Click({
                             [PSCustomObject]@{Source = "pip"; Name = $pkg.name; Id = $pkg.name; Version = $pkg.version; Available = $pkg.latest_version }
                         }
                     }
+                    else {
+                        Write-Output "LOG:Pip scan returned invalid JSON."
+                        Write-Output (New-WmtProviderScanStatus -Provider "pip" -Success $false -Message "Pip scan returned invalid JSON.")
+                    }
                 }
-                catch { Write-Output "LOG:Pip check failed: $($_.Exception.Message)" }
+                catch {
+                    Write-Output "LOG:Pip check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "pip" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # C. NPM WORKER
     if ("npm" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "npm" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Npm..."
                 try {
@@ -55246,20 +55992,32 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if ($p.WaitForExit(30000)) { 
+                    if ($p.WaitForExit(30000)) {
                         $json = $outTask.GetAwaiter().GetResult().Trim()
-                        if ($json -and $json.StartsWith("{")) { 
+                        # npm exits with code 1 when outdated packages are found.
+                        # Parse valid JSON first and treat that documented exit
+                        # code as a successful provider scan.
+                        if ($json -and $json.StartsWith("{")) {
                             $pkgs = $json | ConvertFrom-Json
                             foreach ($k in $pkgs.PSObject.Properties.Name) {
                                 if ($IgnoreList -contains $k) { continue }
                                 $o = $pkgs.$k
                                 [PSCustomObject]@{Source = "npm"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
                             }
+                            if ($p.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Npm local scan exited with code $($p.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan exited with code $($p.ExitCode).")
+                            }
+                        }
+                        else {
+                            Write-Output "LOG:Npm local scan returned invalid JSON."
+                            Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan returned invalid JSON.")
                         }
                     }
                     else {
                         try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
                         Write-Output "LOG:Npm local scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan timed out.")
                     }
 
                     # Global packages
@@ -55268,31 +56026,45 @@ $btnWingetScan.Add_Click({
                     $pInfoG.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $pg = [System.Diagnostics.Process]::Start($pInfoG)
                     $outTaskG = $pg.StandardOutput.ReadToEndAsync()
-                    if ($pg.WaitForExit(30000)) { 
+                    if ($pg.WaitForExit(30000)) {
                         $jsonG = $outTaskG.GetAwaiter().GetResult().Trim()
-                        if ($jsonG -and $jsonG.StartsWith("{")) { 
+                        if ($jsonG -and $jsonG.StartsWith("{")) {
                             $pkgsG = $jsonG | ConvertFrom-Json
                             foreach ($k in $pkgsG.PSObject.Properties.Name) {
                                 if ($IgnoreList -contains $k) { continue }
                                 $o = $pkgsG.$k
                                 [PSCustomObject]@{Source = "npm (global)"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
                             }
+                            if ($pg.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Npm global scan exited with code $($pg.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan exited with code $($pg.ExitCode).")
+                            }
+                        }
+                        else {
+                            Write-Output "LOG:Npm global scan returned invalid JSON."
+                            Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan returned invalid JSON.")
                         }
                     }
                     else {
                         try { & "$env:SystemRoot\System32\taskkill.exe" /PID $pg.Id /T /F 2>$null | Out-Null } catch { try { $pg.Kill() } catch {} }
                         Write-Output "LOG:Npm global scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan timed out.")
                     }
                 }
-                catch { Write-Output "LOG:Npm check failed." }
+                catch {
+                    Write-Output "LOG:Npm check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # D. CHOCOLATEY WORKER (unchanged)
     if ("chocolatey" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "chocolatey" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Chocolatey..."
                 try {
@@ -55301,8 +56073,18 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if (-not $p.WaitForExit(60000)) { try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }; Write-Output "LOG:Chocolatey scan timed out."; return }
+                    if (-not $p.WaitForExit(60000)) {
+                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
+                        Write-Output "LOG:Chocolatey scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "chocolatey" -Success $false -Message "Chocolatey scan timed out.")
+                        return
+                    }
                     $out = $outTask.GetAwaiter().GetResult()
+                    if ($p.ExitCode -ne 0) {
+                        Write-Output "LOG:Chocolatey scan exited with code $($p.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "chocolatey" -Success $false -Message "Chocolatey scan exited with code $($p.ExitCode).")
+                        return
+                    }
                     $lines = $out -split "`r`n"
                     foreach ($l in $lines) { 
                         if (!$l) { continue }
@@ -55314,19 +56096,29 @@ $btnWingetScan.Add_Click({
                         }
                     }
                 }
-                catch { Write-Output "LOG:Choco check failed." }
+                catch {
+                    Write-Output "LOG:Choco check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "chocolatey" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # E. SCOOP WORKER
     if ("scoop" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "scoop" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList, [int]$TimeoutMs = 30000)
                 Write-Output "LOG:Scanning Scoop..."
                 $p = $null
                 try {
+                    if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+                        Write-Output "LOG:Scoop was not found; this enabled provider scan failed independently."
+                        Write-Output (New-WmtProviderScanStatus -Provider "scoop" -Success $false -Message "Scoop was not found.")
+                        return
+                    }
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c scoop status")
                     $pInfo.RedirectStandardOutput = $true
                     $pInfo.RedirectStandardError = $true
@@ -55364,13 +56156,15 @@ $btnWingetScan.Add_Click({
                 }
                 finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps -Name "scoop")
+            $ps
+        })
     }
 
     # F. RUBY GEMS WORKER (unchanged)
     if ("gem" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "gem" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Ruby Gems..."
                 $p = $null
@@ -55380,8 +56174,18 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if (-not $p.WaitForExit(30000)) { try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }; Write-Output "LOG:Gem scan timed out."; return }
+                    if (-not $p.WaitForExit(30000)) {
+                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
+                        Write-Output "LOG:Gem scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "gem" -Success $false -Message "Gem scan timed out.")
+                        return
+                    }
                     $out = $outTask.GetAwaiter().GetResult()
+                    if ($p.ExitCode -ne 0) {
+                        Write-Output "LOG:Gem scan exited with code $($p.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "gem" -Success $false -Message "Gem scan exited with code $($p.ExitCode).")
+                        return
+                    }
                     $lines = $out -split "`r`n"
                     foreach ($line in $lines) {
                         if ($line -match '^(\S+)\s+\(([\d\.]+)\s+<\s+([\d\.]+)\)') {
@@ -55391,16 +56195,21 @@ $btnWingetScan.Add_Click({
                         }
                     }
                 }
-                catch { Write-Output "LOG:Gem check failed." }
+                catch {
+                    Write-Output "LOG:Gem check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "gem" -Success $false -Message $_.Exception.Message)
+                }
                 finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # G. CARGO WORKER (unchanged)
     if ("cargo" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "cargo" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Cargo..."
                 $p = $null
@@ -55410,27 +56219,43 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if (-not $p.WaitForExit(30000)) { try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }; Write-Output "LOG:Cargo scan timed out."; return }
+                    if (-not $p.WaitForExit(30000)) {
+                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
+                        Write-Output "LOG:Cargo scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "cargo" -Success $false -Message "Cargo scan timed out.")
+                        return
+                    }
                     $out = $outTask.GetAwaiter().GetResult()
+                    if ($p.ExitCode -ne 0) {
+                        Write-Output "LOG:Cargo scan exited with code $($p.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "cargo" -Success $false -Message "Cargo scan exited with code $($p.ExitCode).")
+                        return
+                    }
                     $lines = $out -split "`r`n"
                     foreach ($line in $lines) {
                         if ($line -match '^([a-zA-Z0-9_\-]+)\s+v([\d\.]+):') {
                             $n = $matches[1]; $v = $matches[2]
                             if ($IgnoreList -contains $n) { continue }
+
                             [PSCustomObject]@{Source = "cargo"; Name = $n; Id = $n; Version = $v; Available = "?" }
                         }
                     }
                 }
-                catch { Write-Output "LOG:Cargo check failed." }
+                catch {
+                    Write-Output "LOG:Cargo check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "cargo" -Success $false -Message $_.Exception.Message)
+                }
                 finally { if ($p) { try { $p.Dispose() } catch {} } }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # H. .NET GLOBAL TOOLS WORKER
     if ("dotnet" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "dotnet" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
                 Write-Output "LOG:Scanning .NET global tools..."
@@ -55474,11 +56299,21 @@ $btnWingetScan.Add_Click({
                 try {
                     if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
                         Write-Output "LOG:.NET SDK was not found."
+                        Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET SDK was not found.")
                         return
                     }
 
                     $listResult = Invoke-DotnetToolCommand -Arguments "tool list --global" -TimeoutMs 20000
-                    if ($listResult.TimedOut) { Write-Output "LOG:.NET tool list timed out."; return }
+                    if ($listResult.TimedOut) {
+                        Write-Output "LOG:.NET tool list timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET tool list timed out.")
+                        return
+                    }
+                    if ([int]$listResult.ExitCode -ne 0) {
+                        Write-Output "LOG:.NET tool list exited with code $($listResult.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET tool list exited with code $($listResult.ExitCode).")
+                        return
+                    }
                     $installed = @()
                     foreach ($line in ($listResult.Out -split "`r?`n")) {
                         $trimmed = ([string]$line).Trim()
@@ -55502,7 +56337,16 @@ $btnWingetScan.Add_Click({
                         $pkgId = [string]$tool.Id
                         $currentVersion = [string]$tool.Version
                         $searchResult = Invoke-DotnetToolCommand -Arguments "tool search `"$pkgId`" --take 5" -TimeoutMs 12000
-                        if ($searchResult.TimedOut) { Write-Output "LOG:.NET search timed out for $pkgId."; continue }
+                        if ($searchResult.TimedOut) {
+                            Write-Output "LOG:.NET search timed out for $pkgId."
+                            Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search timed out for $pkgId.")
+                            continue
+                        }
+                        if ([int]$searchResult.ExitCode -ne 0) {
+                            Write-Output "LOG:.NET search exited with code $($searchResult.ExitCode) for $pkgId."
+                            Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message ".NET search exited with code $($searchResult.ExitCode) for $pkgId.")
+                            continue
+                        }
                         $latestVersion = ""
                         foreach ($line in ($searchResult.Out -split "`r?`n")) {
                             $trimmed = ([string]$line).Trim()
@@ -55520,15 +56364,20 @@ $btnWingetScan.Add_Click({
                         }
                     }
                 }
-                catch { Write-Output "LOG:.NET tools check failed: $($_.Exception.Message)" }
+                catch {
+                    Write-Output "LOG:.NET tools check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "dotnet" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # I. POWERSHELL MODULES WORKER
     if ("psmodule" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "psmodule" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
                 Write-Output "LOG:Scanning PowerShell modules..."
@@ -55542,6 +56391,7 @@ $btnWingetScan.Add_Click({
                 try {
                     if (-not (Get-Command Get-InstalledModule -ErrorAction SilentlyContinue) -or -not (Get-Command Find-Module -ErrorAction SilentlyContinue)) {
                         Write-Output "LOG:PowerShellGet cmdlets were not found."
+                        Write-Output (New-WmtProviderScanStatus -Provider "psmodule" -Success $false -Message "PowerShellGet cmdlets were not found.")
                         return
                     }
 
@@ -55604,6 +56454,7 @@ $btnWingetScan.Add_Click({
                         }
                         catch {
                             Write-Output "LOG:PSGallery lookup failed: $($_.Exception.Message)"
+                            Write-Output (New-WmtProviderScanStatus -Provider "psmodule" -Success $false -Message $_.Exception.Message)
                         }
                     }
                     $lookupTimer.Stop()
@@ -55622,21 +56473,27 @@ $btnWingetScan.Add_Click({
                         }
                     }
                 }
-                catch { Write-Output "LOG:PowerShell module check failed: $($_.Exception.Message)" }
+                catch {
+                    Write-Output "LOG:PowerShell module check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "psmodule" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # J. COMPOSER WORKER
     if ("composer" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "composer" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
                 Write-Output "LOG:Scanning Composer global packages..."
                 try {
                     if (-not (Get-Command composer -ErrorAction SilentlyContinue)) {
                         Write-Output "LOG:Composer was not found."
+                        Write-Output (New-WmtProviderScanStatus -Provider "composer" -Success $false -Message "Composer was not found.")
                         return
                     }
                     $pInfo = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c composer global outdated --format=json --no-interaction 2>nul")
@@ -55646,10 +56503,21 @@ $btnWingetScan.Add_Click({
                     $pInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
                     $p = [System.Diagnostics.Process]::Start($pInfo)
                     $outTask = $p.StandardOutput.ReadToEndAsync()
-                    if (-not $p.WaitForExit(45000)) { try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }; Write-Output "LOG:Composer scan timed out."; return }
+                    if (-not $p.WaitForExit(45000)) {
+                        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
+                        Write-Output "LOG:Composer scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "composer" -Success $false -Message "Composer scan timed out.")
+                        return
+                    }
                     $json = $outTask.GetAwaiter().GetResult().Trim()
+                    if ($p.ExitCode -ne 0) {
+                        Write-Output "LOG:Composer scan exited with code $($p.ExitCode)."
+                        Write-Output (New-WmtProviderScanStatus -Provider "composer" -Success $false -Message "Composer scan exited with code $($p.ExitCode).")
+                        return
+                    }
                     if ([string]::IsNullOrWhiteSpace($json) -or -not $json.StartsWith("{")) {
-                        Write-Output "LOG:Composer reported no outdated global packages."
+                        Write-Output "LOG:Composer scan returned invalid JSON."
+                        Write-Output (New-WmtProviderScanStatus -Provider "composer" -Success $false -Message "Composer scan returned invalid JSON.")
                         return
                     }
                     $data = $json | ConvertFrom-Json
@@ -55665,15 +56533,20 @@ $btnWingetScan.Add_Click({
                         [PSCustomObject]@{ Source = "composer"; Name = $name; Id = $name; Version = $currentVersion; Available = $latestVersion }
                     }
                 }
-                catch { Write-Output "LOG:Composer check failed: $($_.Exception.Message)" }
+                catch {
+                    Write-Output "LOG:Composer check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "composer" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # H. PNPM WORKER (unchanged)
     if ("pnpm" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "pnpm" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Pnpm..."
                 try {
@@ -55685,17 +56558,28 @@ $btnWingetScan.Add_Click({
                     $outTask = $p.StandardOutput.ReadToEndAsync()
                     if ($p.WaitForExit(35000)) {
                         $json = $outTask.GetAwaiter().GetResult().Trim()
+                        # pnpm uses exit code 1 to report that outdated packages
+                        # exist. Valid JSON is authoritative in that case.
                         if ($json -and $json.StartsWith("[")) {
                             $pkgs = $json | ConvertFrom-Json
                             foreach ($pkg in $pkgs) {
                                 if ($IgnoreList -contains $pkg.name) { continue }
                                 [PSCustomObject]@{Source = "pnpm"; Name = $pkg.name; Id = $pkg.name; Version = $pkg.current; Available = $pkg.latest }
                             }
+                            if ($p.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Pnpm local scan exited with code $($p.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan exited with code $($p.ExitCode).")
+                            }
+                        }
+                        else {
+                            Write-Output "LOG:Pnpm local scan returned invalid JSON."
+                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan returned invalid JSON.")
                         }
                     }
                     else {
                         try { & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F 2>$null | Out-Null } catch { try { $p.Kill() } catch {} }
                         Write-Output "LOG:Pnpm local scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan timed out.")
                     }
                     # Global packages
                     $pInfoG = New-Object System.Diagnostics.ProcessStartInfo("cmd", "/c pnpm outdated -g --format json 2>nul")
@@ -55711,22 +56595,36 @@ $btnWingetScan.Add_Click({
                                 if ($IgnoreList -contains $pkg.name) { continue }
                                 [PSCustomObject]@{Source = "pnpm (global)"; Name = $pkg.name; Id = $pkg.name; Version = $pkg.current; Available = $pkg.latest }
                             }
+                            if ($pg.ExitCode -notin @(0, 1)) {
+                                Write-Output "LOG:Pnpm global scan exited with code $($pg.ExitCode)."
+                                Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan exited with code $($pg.ExitCode).")
+                            }
+                        }
+                        else {
+                            Write-Output "LOG:Pnpm global scan returned invalid JSON."
+                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan returned invalid JSON.")
                         }
                     }
                     else {
                         try { & "$env:SystemRoot\System32\taskkill.exe" /PID $pg.Id /T /F 2>$null | Out-Null } catch { try { $pg.Kill() } catch {} }
                         Write-Output "LOG:Pnpm global scan timed out."
+                        Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan timed out.")
                     }
                 }
-                catch { Write-Output "LOG:Pnpm check failed or pnpm not installed." }
+                catch {
+                    Write-Output "LOG:Pnpm check failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message $_.Exception.Message)
+                }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # I. LEGENDARY / EPIC GAMES WORKER
     if ("legendary" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "legendary" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList, $LegendaryExePath)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
                 Write-Output "LOG:Scanning Legendary Epic Games updates..."
@@ -55772,7 +56670,8 @@ $btnWingetScan.Add_Click({
                             $legendaryCommand = [string]$cmd.Source
                         }
                         else {
-                            Write-Output "LOG:Legendary scan skipped: legendary.exe was not found in WMT data or PATH."
+                            Write-Output "LOG:Legendary scan failed independently: legendary.exe was not found in WMT data or PATH."
+                            Write-Output (New-WmtProviderScanStatus -Provider "legendary" -Success $false -Message "legendary.exe was not found.")
                             return
                         }
                     }
@@ -55812,6 +56711,7 @@ $btnWingetScan.Add_Click({
                         $errTask = $p.StandardError.ReadToEndAsync()
                         if (-not $p.WaitForExit(90000)) {
                             Write-Output "LOG:Legendary scan timed out after 90 seconds."
+                            Write-Output (New-WmtProviderScanStatus -Provider "legendary" -Success $false -Message "Legendary scan timed out.")
                             try { $p.Kill() } catch {}
                             try { [void]$p.WaitForExit(2000) } catch {}
                             $timedOut = $true
@@ -55845,6 +56745,7 @@ $btnWingetScan.Add_Click({
 
                     if ($exitCode -ne 0) {
                         Write-Output "LOG:Legendary scan exited with code $exitCode."
+                        Write-Output (New-WmtProviderScanStatus -Provider "legendary" -Success $false -Message "Legendary scan exited with code $exitCode.")
                         if (-not [string]::IsNullOrWhiteSpace($err)) {
                             # Python tracebacks are dozens of stack frames; keep the GUI
                             # log readable by showing the first few and the last lines.
@@ -55893,14 +56794,17 @@ $btnWingetScan.Add_Click({
                     }
 
                     if ([string]::IsNullOrWhiteSpace($out)) {
+                        $failureDetail = "Legendary returned no CSV output."
                         if (-not [string]::IsNullOrWhiteSpace($err)) {
                             if (([string]$err) -match '(?i)ReadTimeout|Read timed out|socket\.timeout|ConnectTimeout|ConnectionError|Connection reset|Connection aborted|NewConnectionError|MaxRetryError|HTTPSConnectionPool|getaddrinfo failed|Temporary failure in name resolution|timed out') {
                                 Write-Output "LOG:Legendary could not reach Epic servers (network timeout). Check the connection and run the scan again."
+                                $failureDetail = "Legendary could not reach Epic servers."
                             }
                             else {
                                 Write-Output "LOG:Legendary returned no CSV output. Run 'legendary auth' if Epic login is not configured."
                             }
                         }
+                        Write-Output (New-WmtProviderScanStatus -Provider "legendary" -Success $false -Message $failureDetail)
                         return
                     }
 
@@ -55965,15 +56869,18 @@ $btnWingetScan.Add_Click({
                 }
                 catch {
                     Write-Output "LOG:Legendary scan failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "legendary" -Success $false -Message $_.Exception.Message)
                 }
             }).AddArgument($ignoreList).AddArgument((Get-WmtLegendaryExePath))
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # J. GOGDL / GOG GAMES WORKER
     if ("gogdl" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "gogdl" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList, $GogdlExePath)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
                 Write-Output "LOG:Scanning installed GOG games with GOGDL metadata..."
@@ -56132,7 +57039,8 @@ $btnWingetScan.Add_Click({
                 try {
                     $gogdlCommand = Get-WmtGogdlCommand -LocalPath $GogdlExePath
                     if ([string]::IsNullOrWhiteSpace($gogdlCommand)) {
-                        Write-Output "LOG:GOGDL scan skipped: gogdl was not found in WMT data or PATH."
+                        Write-Output "LOG:GOGDL scan failed independently: gogdl was not found in WMT data or PATH."
+                        Write-Output (New-WmtProviderScanStatus -Provider "gogdl" -Success $false -Message "gogdl was not found.")
                         return
                     }
 
@@ -56170,6 +57078,7 @@ $btnWingetScan.Add_Click({
                         }
                         catch {
                             Write-Output "LOG:GOGDL could not query latest build for $title ($gameId): $($_.Exception.Message)"
+                            Write-Output (New-WmtProviderScanStatus -Provider "gogdl" -Success $false -Message $_.Exception.Message)
                             continue
                         }
 
@@ -56218,9 +57127,11 @@ $btnWingetScan.Add_Click({
                 }
                 catch {
                     Write-Output "LOG:GOGDL scan failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "gogdl" -Success $false -Message $_.Exception.Message)
                 }
             }).AddArgument($ignoreList).AddArgument((Get-WmtGogdlExePath))
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # K. PORTABLE PROVIDER SELF-UPDATE WORKER
@@ -56254,8 +57165,10 @@ $btnWingetScan.Add_Click({
     }
 
     if ($portableProviderChecks.Count -gt 0) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+      foreach ($providerCheck in $portableProviderChecks) {
+        [void](Start-WmtProviderScanWorker -ProviderName ([string]$providerCheck.Source) -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($ProviderChecks, $IgnoreList)
                 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
@@ -56315,7 +57228,8 @@ $btnWingetScan.Add_Click({
                     try {
                         $installedVersion = Get-PortableProviderVersion -ExePath $exePath
                         if ([string]::IsNullOrWhiteSpace($installedVersion)) {
-                            Write-Output "LOG:$name version check skipped: --version did not return a parseable version."
+                            Write-Output "LOG:$name version check failed: --version did not return a parseable version."
+                            Write-Output (New-WmtProviderScanStatus -Provider $source -Success $false -Message "$name --version did not return a parseable version.")
                             continue
                         }
 
@@ -56324,7 +57238,8 @@ $btnWingetScan.Add_Click({
                         $installedComparable = ConvertTo-ComparableProviderVersion -VersionText $installedVersion
                         $latestComparable = ConvertTo-ComparableProviderVersion -VersionText $latestVersion
                         if ($null -eq $installedComparable -or $null -eq $latestComparable) {
-                            Write-Output "LOG:$name version check skipped: installed '$installedVersion', latest '$latestVersion' could not be compared safely."
+                            Write-Output "LOG:$name version check failed: installed '$installedVersion', latest '$latestVersion' could not be compared safely."
+                            Write-Output (New-WmtProviderScanStatus -Provider $source -Success $false -Message "$name versions could not be compared safely.")
                             continue
                         }
 
@@ -56347,16 +57262,20 @@ $btnWingetScan.Add_Click({
                     }
                     catch {
                         Write-Output "LOG:$name update check failed: $($_.Exception.Message)"
+                        Write-Output (New-WmtProviderScanStatus -Provider $source -Success $false -Message $_.Exception.Message)
                     }
                 }
-            }).AddArgument($portableProviderChecks).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            }).AddArgument(@($providerCheck)).AddArgument($ignoreList)
+            $ps
+        })
+      }
     }
 
     # L. STEAM WORKER
     if ("steam" -in $enabled) {
-        $ps = New-WmtPooledPowerShell
-        [void]$ps.AddScript({
+        [void](Start-WmtProviderScanWorker -ProviderName "steam" -WorkerFactory {
+            $ps = New-WmtPooledPowerShell
+            [void]$ps.AddScript({
                 param($IgnoreList)
                 Write-Output "LOG:Scanning Steam game manifests..."
 
@@ -56437,9 +57356,11 @@ $btnWingetScan.Add_Click({
                 }
                 catch {
                     Write-Output "LOG:Steam scan failed: $($_.Exception.Message)"
+                    Write-Output (New-WmtProviderScanStatus -Provider "steam" -Success $false -Message $_.Exception.Message)
                 }
             }).AddArgument($ignoreList)
-        [void](Start-WmtActiveScanWorker -PowerShell $ps)
+            $ps
+        })
     }
 
     # --- Winget joins the running scan once its source refresh has finished ---
@@ -56455,32 +57376,23 @@ $btnWingetScan.Add_Click({
     }
     catch {
         $scanSetupError = $_.Exception.Message
-        Write-GuiLog "Scan setup failed: $scanSetupError"
+        Write-GuiLog "Scan setup warning: $scanSetupError. Already-started provider scans will continue independently."
+
+        # A coordinator/setup error must not roll back providers that are
+        # already running. Provider factories have their own local boundary;
+        # this catch only decides whether there is still work to collect.
+        if ($script:WmtDeferredWingetScanPending) {
+            Set-WmtProviderScanFailure -ProviderKey "winget" -Message "Provider scan setup failed before Winget could start: $scanSetupError"
+        }
         $script:WmtDeferredWingetScan = $null
         $script:WmtDeferredWingetScanPending = $false
-
-        try { if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() } } catch {}
-        try { if ($script:ScanTimer -and $script:ScanTimer.IsEnabled) { $script:ScanTimer.Stop() } } catch {}
-
-        foreach ($task in @($script:ActiveScans)) {
-            try {
-                $taskName = if ($task.PSObject.Properties["Name"] -and $task.Name) { [string]$task.Name } else { "Provider scan" }
-                Stop-WmtPowerShellInvocationAsync -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$taskName setup rollback"
-            }
-            catch {
-                try { Start-WmtPowerShellCleanupDetached -PowerShell $task.PowerShell -Invocation $task.AsyncResult -Name "$taskName setup rollback" } catch {}
-            }
+        if ($script:ActiveScans.Count -gt 0) {
+            try { if (-not $script:ScanTimer.IsEnabled) { $script:ScanTimer.Start() } } catch {}
         }
-        $script:ActiveScans.Clear()
-
-        $lblWingetStatus.Text = "Scan failed to start"
-        $lblWingetStatus.Visibility = "Visible"
-        $btnWingetScan.IsEnabled = $true
-        $txtWingetSearch.IsEnabled = $true
-        $txtWingetSearch.ToolTip = ""
-        if ($btnWingetUpdateAll) { $btnWingetUpdateAll.IsEnabled = $true }
-        $btnWingetUpdateSel.IsEnabled = $true
-        return
+        else {
+            try { if ($script:GlobalScanTimer) { $script:GlobalScanTimer.Stop() } } catch {}
+            Complete-WmtUpdateScan
+        }
     }
 })
 
@@ -56605,7 +57517,7 @@ $btnWingetUnignore.Add_Click({
 "@
     # Package display names can include long Windows Update titles and GUIDs.
     # Give the list enough room to show them without truncating the useful part.
-    $dialog = New-WmtWindowFromXaml -Title "Manage Ignored Updates" -ContentXaml $content -Width 1200 -Height 420 -MinWidth 800 -MinHeight 340
+    $dialog = New-WmtWindowFromXaml -Title "Manage Ignored Updates" -ContentXaml $content -Width 1200 -Height 420 -MinWidth 440 -MinHeight 340
     $lb = $dialog.FindName("lbIgnored")
     $btnRestore = $dialog.FindName("btnRestore")
     $btnClose = $dialog.FindName("btnClose")
@@ -57256,10 +58168,12 @@ $script:InvokeWingetSearch = {
     # Get Settings
     $settings = Get-WmtSettings
 
-    $enabled = if ($settings.EnabledProviders -and $settings.EnabledProviders.Count -gt 0) { 
-        $settings.EnabledProviders 
+    $enabled = if ($settings.EnabledProviders -and $settings.EnabledProviders.Count -gt 0) {
+        @($settings.EnabledProviders | ForEach-Object {
+                Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$_)
+            } | Select-Object -Unique)
     }
-    else { 
+    else {
         @("winget", "msstore", "windowsupdate", "pip", "npm", "pnpm", "dotnet", "psmodule", "composer", "chocolatey", "scoop", "gem", "cargo", "steam", "legendary", "gogdl")
     }
 
@@ -58655,11 +59569,31 @@ if ($listedItems.Count -eq 0) {
 
 # Global auto-install is the default. An explicitly saved per-provider Auto-update
 # value overrides it, so individual providers can opt in or out independently.
+# A provider that failed during this scan is excluded, but its failure must not
+# suppress eligible rows discovered by providers that completed successfully.
+$failedProviderKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+try {
+    if ($script:WmtScanProviderFailures) {
+        foreach ($failedProvider in @($script:WmtScanProviderFailures.Keys)) {
+            $failedProviderKey = Get-WmtCanonicalProviderKey -ProviderOrSource ([string]$failedProvider)
+            if (-not [string]::IsNullOrWhiteSpace($failedProviderKey)) { [void]$failedProviderKeys.Add($failedProviderKey) }
+        }
+    }
+}
+catch {}
+$excludedFailedProviderItems = 0
 $items = @($listedItems | Where-Object {
         $providerKey = Get-WmtProviderKeyForPackageSource -Source ([string]$_.Source)
+        if ($failedProviderKeys.Contains($providerKey)) {
+            $excludedFailedProviderItems++
+            return $false
+        }
         Get-WmtEffectiveProviderAutoUpdate -Settings $settings -ProviderKey $providerKey
     })
 if ($items.Count -eq 0) { return }
+if ($excludedFailedProviderItems -gt 0) {
+    Write-GuiLog "Auto install excluded $excludedFailedProviderItems update(s) from providers that failed during the scan."
+}
 
 # Filter for restart risks only; game providers are no longer excluded
 $restartRiskItems = @($items | Where-Object { Test-WingetRestartRiskItem $_ })
@@ -75590,11 +76524,20 @@ Stop-WmtCleanerAutoCleanTimer
 Remove-WmtTrayIcon
 Stop-WmtNotificationFallbackTimers
 try { Unregister-WmtUiPollOperation -Name "WingetAction" } catch {}
-$closingWingetPs = $script:WingetJob
-$closingWingetAsync = $script:WingetAsyncResult
+$closingActionJobs = @($script:WingetActionJobs)
+if ($script:WingetActionJobs) { $script:WingetActionJobs.Clear() }
+foreach ($closingActionJob in $closingActionJobs) {
+    if (-not $closingActionJob -or -not $closingActionJob.Job) { continue }
+    try {
+        Start-WmtPowerShellCleanupDetached `
+            -PowerShell $closingActionJob.Job `
+            -Invocation $closingActionJob.Invocation `
+            -Name "$($closingActionJob.ProviderKey) package action shutdown"
+    }
+    catch {}
+}
 $script:WingetJob = $null
 $script:WingetAsyncResult = $null
-if ($closingWingetPs) { try { Start-WmtPowerShellCleanupDetached -PowerShell $closingWingetPs -Invocation $closingWingetAsync -Name "Package action shutdown" } catch {} }
 $script:WingetOutputQueue = $null
 Stop-WmtStartupBackgroundPreload
 try { Unregister-WmtUiPollOperation -Name "WingetSourcePreflight" } catch {}
@@ -75763,7 +76706,7 @@ $script:WmtDispatcherUnhandledHandler = [System.Windows.Threading.DispatcherUnha
     try { $e.Handled = $true } catch {}
     try {
         Write-WmtLastCrash -Context "Unhandled WPF dispatcher exception" -Exception $e.Exception
-        if ($script:WingetJob -or $script:WingetActiveAction) {
+        if (($script:WingetActionJobs -and $script:WingetActionJobs.Count -gt 0) -or $script:WingetActiveAction) {
             Reset-WmtUpdateUiAfterMonitorError -Context "Unhandled WPF dispatcher exception" -Exception $e.Exception -SkipCrashWrite
         }
     }

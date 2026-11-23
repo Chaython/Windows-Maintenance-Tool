@@ -1997,6 +1997,11 @@ jobs:
               'Get-WmtUpdateAutoInstallEnabled',
               'Get-WmtEffectiveProviderAutoUpdate',
               'Test-WmtAnyProviderAutoUpdateEnabled',
+              'Get-WmtCanonicalProviderKey',
+              'Get-WmtProviderKeyForPackageSource',
+              'Get-WingetListedUpdateItems',
+              'ConvertTo-WmtUpdateAllActionItems',
+              'Invoke-WmtAutoInstallAvailableUpdates',
               'Get-WmtUpdateScanCompletion',
               'Get-WmtUpdateScanAutoInstallDecision'
           )) {
@@ -2098,34 +2103,40 @@ jobs:
               throw 'The production Scoop conversion treated scoop list output as an update.'
           }
 
-          # A failed provider must produce an incomplete aggregate outcome and
-          # suppress automatic installation instead of reporting success.
+          # Provider failures are isolated diagnostics. The aggregate scan is
+          # still complete, and eligible updates from successful providers stay
+          # actionable.
           $complete = Get-WmtUpdateScanCompletion -UpdateCount 0 -ProviderFailures @{}
           if (-not $complete.IsComplete -or -not $complete.AutoInstallAllowed -or
+              $complete.HasProviderFailures -or
               $complete.LogMessage -ne 'System is up to date.') {
               throw 'A successful package scan did not retain its complete outcome.'
           }
-          $incomplete = Get-WmtUpdateScanCompletion -UpdateCount 3 -ProviderFailures @{ scoop = 'exit code 7' }
-          if ($incomplete.IsComplete -or $incomplete.AutoInstallAllowed -or
-              $incomplete.LogMessage -notmatch '^Scan incomplete' -or
-              $incomplete.LogMessage -match 'Scan Complete' -or
-              $incomplete.LogMessage -match 'System is up to date') {
-              throw 'A failed package provider did not make the aggregate scan incomplete.'
+          $partial = Get-WmtUpdateScanCompletion -UpdateCount 3 -ProviderFailures @{ scoop = 'exit code 7' }
+          if (-not $partial.IsComplete -or -not $partial.AutoInstallAllowed -or
+              -not $partial.HasProviderFailures -or
+              $partial.LogMessage -notmatch '^Scan complete' -or
+              $partial.LogMessage -notmatch 'provider failed independently: scoop' -or
+              $partial.LogMessage -match '^Scan incomplete') {
+              throw 'A failed package provider did not remain isolated from successful providers.'
           }
 
           # Exercise the production auto-update setting resolver with the
           # global switch off. This is the value used by the scan-completion
           # gate to decide whether an auto-install message is meaningful.
           $script:ciAutoInstallSettings = [pscustomobject]@{
-              EnabledProviders = @('winget')
+              EnabledProviders = @('winget', 'windowsupdate', 'pip')
               UpdateAutoInstallEnabled = $false
               ProviderToggles = [pscustomobject]@{
                   winget = [pscustomobject]@{ Search = $true; Scan = $true; Logs = $true }
+                  windowsupdate = [pscustomobject]@{ Search = $false; Scan = $true; Logs = $true }
+                  pip = [pscustomobject]@{ Search = $true; Scan = $true; Logs = $true }
               }
               ProviderExecutionOverrides = [pscustomobject]@{}
           }
+          $script:ciGuiLog = [System.Collections.Generic.List[string]]::new()
           function Get-WmtSettings { return $script:ciAutoInstallSettings }
-          function Write-GuiLog { param($Message) }
+          function Write-GuiLog { param($Message) [void]$script:ciGuiLog.Add([string]$Message) }
           if (Test-WmtAnyProviderAutoUpdateEnabled -Settings $script:ciAutoInstallSettings) {
               throw 'The production resolver enabled auto install while the global switch was off.'
           }
@@ -2142,21 +2153,20 @@ jobs:
           }
 
           # Provider failures must not produce an auto-install skip diagnostic
-          # when automatic installation is disabled. The incomplete-scan
-          # diagnostic remains visible, but there is nothing to skip.
+          # when automatic installation is disabled. There is nothing to skip.
           $disabledDecision = Get-WmtUpdateScanAutoInstallDecision `
-              -ScanCompletion $incomplete `
+              -ScanCompletion $partial `
               -AutoInstallEnabled $false
           if ($disabledDecision.ShouldInvoke -or
               -not [string]::IsNullOrWhiteSpace([string]$disabledDecision.LogMessage)) {
               throw 'A provider failure reported an auto-install skip while auto install was disabled.'
           }
           $enabledFailureDecision = Get-WmtUpdateScanAutoInstallDecision `
-              -ScanCompletion $incomplete `
+              -ScanCompletion $partial `
               -AutoInstallEnabled $true
-          if ($enabledFailureDecision.ShouldInvoke -or
-              $enabledFailureDecision.LogMessage -ne 'Auto install skipped because one or more package providers failed.') {
-              throw 'An enabled auto install did not report the provider failure that blocked it.'
+          if (-not $enabledFailureDecision.ShouldInvoke -or
+              -not [string]::IsNullOrWhiteSpace([string]$enabledFailureDecision.LogMessage)) {
+              throw 'An enabled auto install did not continue after an unrelated provider failed.'
           }
           $enabledCompleteDecision = Get-WmtUpdateScanAutoInstallDecision `
               -ScanCompletion $complete `
@@ -2173,6 +2183,87 @@ jobs:
               $verificationDecision.LogMessage -ne 'Auto install skipped for this verification scan.') {
               throw 'The post-action verification scan did not suppress the enabled auto install.'
           }
+
+          # Exercise the production auto-install dispatcher with representative
+          # list rows. Global auto-install is on, Windows Update explicitly
+          # opts out, Pip inherits the global value, and an unrelated failed
+          # Scoop provider must not block Pip.
+          $script:ciAutoInstallAction = $null
+          $Script:StartWingetAction = {
+              param($ListItems, $ActionName, $CmdTemplate)
+              $script:ciAutoInstallAction = [pscustomobject]@{
+                  Items = @($ListItems)
+                  ActionName = [string]$ActionName
+              }
+          }
+          function Test-WingetRestartRiskItem { param($Item) return $false }
+          function Show-WmtBackgroundInstallNotification {
+              param(
+                  [ValidateSet('Started', 'Completed', 'Interrupted')][string]$Status,
+                  [int]$TotalCount = 0,
+                  [int]$SuccessCount = 0,
+                  [int]$SkippedCount = 0,
+                  [int]$FailedCount = 0
+              )
+          }
+          $lstWinget = [pscustomobject]@{
+              Items = @(
+                  [pscustomobject]@{
+                      Source = 'windowsupdate'
+                      Name = 'Simulated Windows Update'
+                      Id = '00000000-0000-0000-0000-000000000000|1'
+                      Version = '1.0'
+                      Available = '2.0'
+                  },
+                  [pscustomobject]@{
+                      Source = 'pip'
+                      Name = 'Simulated Pip Update'
+                      Id = 'simulated-pip-update'
+                      Version = '1.0'
+                      Available = '2.0'
+                  },
+                  [pscustomobject]@{
+                      Source = 'scoop'
+                      Name = 'Simulated Scoop Update'
+                      Id = 'simulated-scoop-update'
+                      Version = '1.0'
+                      Available = '2.0'
+                  }
+              )
+          }
+          $script:ciAutoInstallSettings.UpdateAutoInstallEnabled = $true
+          $script:ciAutoInstallSettings.ProviderExecutionOverrides = [pscustomobject]@{
+              windowsupdate = [pscustomobject]@{ AutoUpdate = $false }
+          }
+          $script:WmtScanProviderFailures = @{ scoop = 'simulated provider failure' }
+          $script:WmtAutoInstallActive = $false
+          $script:WingetActiveAction = $null
+          $script:ciGuiLog.Clear()
+          Invoke-WmtAutoInstallAvailableUpdates
+          if ($null -eq $script:ciAutoInstallAction -or
+              $script:ciAutoInstallAction.ActionName -ne 'Update' -or
+              @($script:ciAutoInstallAction.Items).Count -ne 1 -or
+              [string]$script:ciAutoInstallAction.Items[0].Id -ne 'simulated-pip-update') {
+              throw 'The enabled production auto-install path did not dispatch the eligible Pip update while excluding Windows Update and failed Scoop.'
+          }
+          if (@($script:ciGuiLog | Where-Object { $_ -eq 'Auto install starting 1 available update(s).' }).Count -ne 1) {
+              throw 'The enabled production auto-install path did not report that it started an update.'
+          }
+
+          # Repeat with the global switch off. The production dispatcher must
+          # remain silent and must not enqueue any update action.
+          $script:ciAutoInstallSettings.UpdateAutoInstallEnabled = $false
+          $script:ciAutoInstallSettings.ProviderExecutionOverrides = [pscustomobject]@{}
+          $script:ciAutoInstallAction = $null
+          $script:WmtAutoInstallActive = $false
+          $script:WingetActiveAction = $null
+          $script:ciGuiLog.Clear()
+          Invoke-WmtAutoInstallAvailableUpdates
+          if ($null -ne $script:ciAutoInstallAction -or
+              @($script:ciGuiLog | Where-Object { $_ -match '^Auto install' }).Count -ne 0) {
+              throw 'The disabled production auto-install path started an update or emitted an auto-install message.'
+          }
+
           # The pooled scan worker must use the shared production converter.
           $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
           $scoopEnd = $source.IndexOf('# F. RUBY GEMS WORKER', $scoopStart)
@@ -2200,6 +2291,19 @@ jobs:
           [void][IO.Directory]::CreateDirectory($scoopFixtureDir)
           $oldScoopPath = $env:PATH
           try {
+              # With no Scoop executable on PATH, the production worker must
+              # report one attributable typed failure and no package rows.
+              $env:PATH = $scoopFixtureDir
+              $missingScoopOutput = @(& $scoopWorkerBlock @())
+              $missingScoopRows = @($missingScoopOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -eq 'scoop' })
+              $missingScoopStatuses = @($missingScoopOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($missingScoopRows.Count -ne 0 -or $missingScoopStatuses.Count -ne 1 -or
+                  $missingScoopStatuses[0].Provider -ne 'scoop' -or $missingScoopStatuses[0].Success -or
+                  $missingScoopStatuses[0].Message -notmatch 'not found' -or
+                  @($missingScoopOutput | Where-Object { [string]$_ -match 'Scoop was not found; this enabled provider scan failed independently' }).Count -ne 1) {
+                  throw 'A missing Scoop executable was not reported as an attributable provider failure.'
+              }
+
               @'
           @echo off
           echo WARN  Scoop bucket(s) out of date.
@@ -2261,6 +2365,631 @@ jobs:
           Write-Host 'PASS: current and legacy arrow Scoop output produce only real package update rows.'
           Write-Host 'PASS: missing dependencies and scoop list rows never fabricate package updates.'
           Write-Host 'PASS: the production Scoop worker surfaces command failures and timeouts as incomplete scans.'
+
+      - name: Smoke test provider isolation and action recovery
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = [System.IO.File]::ReadAllText((Resolve-Path '.\WMT-GUI.ps1').Path)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+              $source,
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors -and $parseErrors.Count -gt 0) {
+              throw ($parseErrors.Message -join '; ')
+          }
+
+          foreach ($name in @(
+              'Get-WmtCanonicalProviderKey',
+              'New-WmtProviderScanStatus',
+              'Set-WmtProviderScanFailure',
+              'Start-WmtActiveScanWorker',
+              'Start-WmtProviderScanWorker',
+              'Receive-WmtProviderScanWorker',
+              'Complete-WmtTimedOutProviderScanWorkers',
+              'Get-WmtUpdateActionTimeoutSeconds',
+              'Initialize-WmtUpdateActionItems',
+              'Group-WmtUpdateActionItemsByProvider',
+              'Complete-WmtUpdateActionProviderFailure',
+              'Drain-WmtUpdateActionProviderOutput',
+              'Receive-WmtUpdateActionProviderWorker',
+              'Complete-WmtUpdateActionFinalization',
+              'Get-WmtProviderEnabledIntent',
+              'Close-WmtProviderSettingsDialog'
+          )) {
+              $fn = $ast.Find({
+                      param($node)
+                      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $node.Name -eq $name
+                  }, $true)
+              if (-not $fn) { throw "Required provider-isolation function is missing: $name" }
+              Invoke-Expression $fn.Extent.Text
+          }
+
+          $script:ciGuiLog = [System.Collections.Generic.List[string]]::new()
+          function Write-GuiLog { param([string]$Message) [void]$script:ciGuiLog.Add([string]$Message) }
+          function Set-WmtUpdateListItemCheckState {
+              param($Item, [switch]$DefaultChecked)
+              return $Item
+          }
+          function Stop-WmtPowerShellInvocationAsync {
+              param($PowerShell, $Invocation, [string]$Name = 'PowerShell invocation')
+              try {
+                  if ($PowerShell -is [System.Management.Automation.PowerShell]) {
+                      $PowerShell.Stop()
+                  }
+                  $script:ciGuiLog.Add("STOPPED:$Name")
+              }
+              catch {
+                  throw "simulated stop failure: $($_.Exception.Message)"
+              }
+          }
+          function Start-WmtPowerShellCleanupDetached {
+              param($PowerShell, $Invocation, [string]$Name = 'PowerShell invocation')
+              $script:ciGuiLog.Add("CLEANUP:$Name")
+          }
+
+          $lstWinget = [pscustomobject]@{ Items = [System.Collections.Generic.List[object]]::new() }
+          $script:ActiveScans = [System.Collections.Generic.List[object]]::new()
+          $script:WmtScanProviderFailures = @{}
+          $script:WmtDeferredWingetScanPending = $false
+          $script:WmtDeferredWingetScan = $null
+          $script:WmtProviderOwnershipIndex = @{ Name = @{}; Id = @{}; Path = @{} }
+          $script:WmtSteamInstalledNameKeys = @{}
+          $script:WmtWindowsUpdateRebootPendingCount = 0
+
+          # A provider factory failure is local: the next provider still starts,
+          # completes, and publishes its row.
+          $badAsync = Start-WmtProviderScanWorker -ProviderName 'choco' -WorkerFactory {
+              throw 'simulated provider startup failure'
+          }
+          if ($null -ne $badAsync) {
+              throw 'A failed provider startup unexpectedly returned an invocation.'
+          }
+          if (-not $script:WmtScanProviderFailures.ContainsKey('chocolatey')) {
+              throw 'The failed provider startup was not attributed to its canonical provider key.'
+          }
+
+          $goodAsync = Start-WmtProviderScanWorker -ProviderName 'good' -WorkerFactory {
+              $ps = [System.Management.Automation.PowerShell]::Create()
+              [void]$ps.AddScript({
+                      [pscustomobject]@{
+                          Source = 'good'
+                          Name = 'Good Provider Package'
+                          Id = 'good-package'
+                          Version = '1.0'
+                          Available = '2.0'
+                      }
+                  })
+              $ps
+          }
+          if ($null -eq $goodAsync) {
+              throw 'A provider after the failed startup was not allowed to start.'
+          }
+          $goodTask = @($script:ActiveScans | Where-Object { $_.Name -eq 'good' })[0]
+          $goodDeadline = [DateTime]::UtcNow.AddSeconds(5)
+          while ($goodTask -and -not $goodTask.AsyncResult.IsCompleted -and [DateTime]::UtcNow -lt $goodDeadline) {
+              Start-Sleep -Milliseconds 10
+          }
+          if (-not $goodTask -or -not $goodTask.AsyncResult.IsCompleted) {
+              throw 'The provider started after the isolated startup failure did not complete.'
+          }
+          Receive-WmtProviderScanWorker -Task $goodTask
+          [void]$script:ActiveScans.Remove($goodTask)
+          if (@($lstWinget.Items | Where-Object { $_.Id -eq 'good-package' }).Count -ne 1) {
+              throw 'The successful provider row was lost after another provider startup failed.'
+          }
+          if ($script:WmtScanProviderFailures.ContainsKey('good')) {
+              throw 'The successful provider was incorrectly marked as failed.'
+          }
+
+          # Canonical provider identity must not overwrite an operational source
+          # variant. "npm (global)" still needs the global npm update command.
+          $npmGlobalPs = [System.Management.Automation.PowerShell]::Create()
+          [void]$npmGlobalPs.AddScript({
+                  [pscustomobject]@{
+                      Source = 'npm (global)'
+                      Name = 'Global Npm Package'
+                      Id = 'global-npm-package'
+                      Version = '1.0'
+                      Available = '2.0'
+                  }
+              })
+          $npmGlobalAsync = $npmGlobalPs.BeginInvoke()
+          $npmGlobalDeadline = [DateTime]::UtcNow.AddSeconds(5)
+          while (-not $npmGlobalAsync.IsCompleted -and [DateTime]::UtcNow -lt $npmGlobalDeadline) {
+              Start-Sleep -Milliseconds 10
+          }
+          if (-not $npmGlobalAsync.IsCompleted) {
+              throw 'The npm global provider fixture did not complete.'
+          }
+          Receive-WmtProviderScanWorker -Task ([pscustomobject]@{
+                  PowerShell = $npmGlobalPs
+                  AsyncResult = $npmGlobalAsync
+                  Name = 'npm'
+              })
+          $npmGlobalRow = @($lstWinget.Items | Where-Object { $_.Id -eq 'global-npm-package' })[0]
+          if (-not $npmGlobalRow -or [string]$npmGlobalRow.Source -ne 'npm (global)' -or
+              [string]$npmGlobalRow.WmtProviderKey -ne 'npm') {
+              throw 'Canonical provider identity overwrote the operational npm global source.'
+          }
+
+          $pnpmGlobalPs = [System.Management.Automation.PowerShell]::Create()
+          [void]$pnpmGlobalPs.AddScript({
+                  [pscustomobject]@{
+                      Source = 'pnpm (global)'
+                      Name = 'Global Pnpm Package'
+                      Id = 'global-pnpm-package'
+                      Version = '1.0'
+                      Available = '2.0'
+                  }
+              })
+          $pnpmGlobalAsync = $pnpmGlobalPs.BeginInvoke()
+          $pnpmGlobalDeadline = [DateTime]::UtcNow.AddSeconds(5)
+          while (-not $pnpmGlobalAsync.IsCompleted -and [DateTime]::UtcNow -lt $pnpmGlobalDeadline) {
+              Start-Sleep -Milliseconds 10
+          }
+          if (-not $pnpmGlobalAsync.IsCompleted) {
+              throw 'The pnpm global provider fixture did not complete.'
+          }
+          Receive-WmtProviderScanWorker -Task ([pscustomobject]@{
+                  PowerShell = $pnpmGlobalPs
+                  AsyncResult = $pnpmGlobalAsync
+                  Name = 'pnpm'
+              })
+          $pnpmGlobalRow = @($lstWinget.Items | Where-Object { $_.Id -eq 'global-pnpm-package' })[0]
+          if (-not $pnpmGlobalRow -or [string]$pnpmGlobalRow.Source -ne 'pnpm (global)' -or
+              [string]$pnpmGlobalRow.WmtProviderKey -ne 'pnpm') {
+              throw 'Canonical provider identity overwrote the operational pnpm global source.'
+          }
+
+          # Typed provider failures are canonicalized by the production collector.
+          $statusPs = [System.Management.Automation.PowerShell]::Create()
+          [void]$statusPs.AddScript({
+                  [pscustomobject]@{
+                      WmtStateType = 'ProviderScanStatus'
+                      Provider = 'choco'
+                      Success = $false
+                      Message = 'simulated typed provider failure'
+                  }
+              })
+          $statusAsync = $statusPs.BeginInvoke()
+          $statusTask = [pscustomobject]@{
+              PowerShell = $statusPs
+              AsyncResult = $statusAsync
+              Name = 'choco'
+          }
+          $statusDeadline = [DateTime]::UtcNow.AddSeconds(5)
+          while (-not $statusAsync.IsCompleted -and [DateTime]::UtcNow -lt $statusDeadline) {
+              Start-Sleep -Milliseconds 10
+          }
+          Receive-WmtProviderScanWorker -Task $statusTask
+          if (-not $script:WmtScanProviderFailures.ContainsKey('chocolatey') -or
+              [string]$script:WmtScanProviderFailures['chocolatey'] -notmatch 'typed provider failure') {
+              throw 'A typed provider failure was not attributed to the canonical provider key.'
+          }
+
+          # The global scan timeout keeps a completed provider's row, fails only
+          # providers still running, and separately attributes a deferred Winget
+          # timeout.
+          $pipPs = [System.Management.Automation.PowerShell]::Create()
+          [void]$pipPs.AddScript({
+                  [pscustomobject]@{
+                      Source = 'pip'
+                      Name = 'Completed Pip Package'
+                      Id = 'completed-pip-package'
+                      Version = '1.0'
+                      Available = '2.0'
+                  }
+              })
+          $pipAsync = $pipPs.BeginInvoke()
+          $pipDeadline = [DateTime]::UtcNow.AddSeconds(5)
+          while (-not $pipAsync.IsCompleted -and [DateTime]::UtcNow -lt $pipDeadline) {
+              Start-Sleep -Milliseconds 10
+          }
+          if (-not $pipAsync.IsCompleted) {
+              throw 'The completed timeout fixture did not finish.'
+          }
+
+          $scoopPs = [System.Management.Automation.PowerShell]::Create()
+          [void]$scoopPs.AddScript({ Start-Sleep -Seconds 30 })
+          $scoopAsync = $scoopPs.BeginInvoke()
+          $script:WmtScanProviderFailures = @{}
+          $script:ActiveScans.Clear()
+          [void]$script:ActiveScans.Add([pscustomobject]@{
+                  PowerShell = $pipPs
+                  AsyncResult = $pipAsync
+                  Name = 'pip'
+              })
+          [void]$script:ActiveScans.Add([pscustomobject]@{
+                  PowerShell = $scoopPs
+                  AsyncResult = $scoopAsync
+                  Name = 'scoop'
+              })
+          $script:WmtDeferredWingetScanPending = $true
+          $script:ciGuiLog.Clear()
+          Complete-WmtTimedOutProviderScanWorkers -TimeoutSeconds 120
+          if ($script:ActiveScans.Count -ne 0) {
+              throw 'The scan timeout did not settle every provider worker.'
+          }
+          if (@($lstWinget.Items | Where-Object { $_.Id -eq 'completed-pip-package' }).Count -ne 1) {
+              throw 'The scan timeout discarded a row from a provider that completed successfully.'
+          }
+          if (-not $script:WmtScanProviderFailures.ContainsKey('scoop') -or
+              -not $script:WmtScanProviderFailures.ContainsKey('winget') -or
+              $script:WmtScanProviderFailures.ContainsKey('pip') -or
+              $script:WmtScanProviderFailures.Count -ne 2) {
+              throw 'The scan timeout did not attribute failures to exactly the running and deferred providers.'
+          }
+          if (@($script:ciGuiLog | Where-Object { $_ -eq 'STOPPED:scoop scan timeout' }).Count -ne 1) {
+              throw 'The scan timeout did not stop only the provider that was still running.'
+          }
+
+          # The production action initializer assigns global indexes before
+          # provider grouping and preserves operational source variants.
+          $npmActionRow = [pscustomobject]@{
+              Source = 'npm (global)'
+              Name = 'Global Npm Action'
+              Id = 'global-npm-action'
+              Version = '1.0'
+              Available = '2.0'
+              WmtProviderKey = 'npm'
+          }
+          $pipActionRow = [pscustomobject]@{
+              Source = 'pip'
+              Name = 'Pip Action'
+              Id = 'pip-action'
+              Version = '1.0'
+              Available = '2.0'
+              WmtProviderKey = 'pip'
+          }
+          $initializedActionItems = @(Initialize-WmtUpdateActionItems -Items @($npmActionRow, $pipActionRow, $npmActionRow))
+          if ($initializedActionItems.Count -ne 2 -or
+              [int]$initializedActionItems[0].WmtActionIndex -ne 1 -or
+              [int]$initializedActionItems[1].WmtActionIndex -ne 2 -or
+              [string]$initializedActionItems[0].Source -ne 'npm (global)' -or
+              [string]$initializedActionItems[0].WmtProviderKey -ne 'npm') {
+              throw 'The production action initializer did not retain global indexes and operational source identity.'
+          }
+          $initializedActionGroups = @(Group-WmtUpdateActionItemsByProvider -Items $initializedActionItems)
+          if ($initializedActionGroups.Count -ne 2 -or
+              @($initializedActionGroups | Where-Object { $_.ProviderKey -eq 'npm' }).Count -ne 1 -or
+              @($initializedActionGroups | Where-Object { $_.ProviderKey -eq 'pip' }).Count -ne 1) {
+              throw 'The production action initializer did not group canonical provider identities independently.'
+          }
+
+          # Provider aliases collapse to one action group.
+          $groupedItems = @(
+              [pscustomobject]@{ Source = 'choco'; Name = 'Chocolatey A'; Id = 'a'; WmtActionIndex = 1 },
+              [pscustomobject]@{ Source = 'chocolatey'; Name = 'Chocolatey B'; Id = 'b'; WmtActionIndex = 2 },
+              [pscustomobject]@{ Source = 'npm (global)'; Name = 'Npm A'; Id = 'c'; WmtActionIndex = 3 }
+          )
+          $providerGroups = @(Group-WmtUpdateActionItemsByProvider -Items $groupedItems)
+          if ($providerGroups.Count -ne 2) {
+              throw 'Provider aliases were not collapsed into canonical action groups.'
+          }
+          $chocolateyGroup = @($providerGroups | Where-Object { $_.ProviderKey -eq 'chocolatey' })[0]
+          $npmGroup = @($providerGroups | Where-Object { $_.ProviderKey -eq 'npm' })[0]
+          if (-not $chocolateyGroup -or @($chocolateyGroup.Items).Count -ne 2 -or
+              -not $npmGroup -or @($npmGroup.Items).Count -ne 1) {
+              throw 'Provider action grouping did not preserve every canonical provider item.'
+          }
+
+          # A Winget timeout and a separate worker exception fail only their own
+          # provider items; a successful Pip provider remains successful.
+          $script:WingetActiveAction = 'Update'
+          $script:WingetProgressTotal = 3
+          $script:WingetProgressDone = 0
+          $script:WingetProgressSuccess = 0
+          $script:WingetProgressSkipped = 0
+          $script:WingetProgressFailed = 0
+          $script:WingetCompletedIndexes = @{}
+          $script:SetWingetLastResultUi = { param($ResultCode, $PackageName, $DoneIndex, $TotalCount) }
+          $script:RefreshWingetProgressUi = { }
+          $processActionLines = {
+              param($lines, $ActionJob)
+              foreach ($line in @($lines)) {
+                  if ([string]$line -match '^RESULT:(\d+):(SUCCESS|SKIPPED|FAILED|CANCELLED):(.*)$') {
+                      $doneIndex = [int]$matches[1]
+                      $result = $matches[2]
+                      if (-not $script:WingetCompletedIndexes.ContainsKey($doneIndex)) {
+                          $script:WingetCompletedIndexes[$doneIndex] = $true
+                          $script:WingetProgressDone++
+                          if ($result -eq 'SUCCESS') { $script:WingetProgressSuccess++ }
+                          elseif ($result -eq 'SKIPPED') { $script:WingetProgressSkipped++ }
+                          else { $script:WingetProgressFailed++ }
+                      }
+                  }
+              }
+          }
+          function New-CiFakeActionJob {
+              param(
+                  [string]$ProviderKey,
+                  [object[]]$Items,
+                  [bool]$Completed,
+                  [object[]]$Output = @(),
+                  [bool]$ThrowOnEnd = $false
+              )
+              $queue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+              $handle = [pscustomobject]@{
+                  Output = [object[]]$Output
+                  ThrowOnEnd = [bool]$ThrowOnEnd
+                  Disposed = $false
+              }
+              $handle | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value {
+                  param($Invocation)
+                  if ($this.ThrowOnEnd) { throw 'simulated provider worker failure' }
+                  return @($this.Output)
+              }
+              $handle | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+                  $this.Disposed = $true
+              }
+              return [pscustomobject]@{
+                  ProviderKey = $ProviderKey
+                  Items = [object[]]$Items
+                  Job = $handle
+                  Invocation = [pscustomobject]@{ IsCompleted = [bool]$Completed }
+                  Queue = $queue
+                  Started = $true
+                  StartedAt = [DateTime]::UtcNow.AddSeconds(-5)
+                  DeadlineUtc = [DateTime]::UtcNow.AddSeconds(3600)
+                  TimeoutSeconds = 3600
+                  Completed = $false
+                  TimedOut = $false
+              }
+          }
+
+          $wingetActionItem = [pscustomobject]@{ Source = 'winget'; Name = 'Winget Item'; Id = 'winget-item'; WmtActionIndex = 1 }
+          $pipActionItem = [pscustomobject]@{ Source = 'pip'; Name = 'Pip Item'; Id = 'pip-item'; WmtActionIndex = 2 }
+          $gemActionItem = [pscustomobject]@{ Source = 'gem'; Name = 'Gem Item'; Id = 'gem-item'; WmtActionIndex = 3 }
+          $pipActionJob = New-CiFakeActionJob -ProviderKey 'pip' -Items @($pipActionItem) -Completed $true -Output @('RESULT:2:SUCCESS:Pip Item')
+          $gemActionJob = New-CiFakeActionJob -ProviderKey 'gem' -Items @($gemActionItem) -Completed $true -ThrowOnEnd $true
+          $wingetActionJob = New-CiFakeActionJob -ProviderKey 'winget' -Items @($wingetActionItem) -Completed $false
+          $wingetActionJob.DeadlineUtc = [DateTime]::UtcNow.AddSeconds(-1)
+          $script:ciGuiLog.Clear()
+
+          $pipOutcome = Receive-WmtUpdateActionProviderWorker -ActionJob $pipActionJob -ProcessLines $processActionLines
+          $wingetOutcome = Receive-WmtUpdateActionProviderWorker -ActionJob $wingetActionJob -ProcessLines $processActionLines
+          $gemOutcome = Receive-WmtUpdateActionProviderWorker -ActionJob $gemActionJob -ProcessLines $processActionLines
+          if ($pipOutcome -ne 'Completed' -or $wingetOutcome -ne 'TimedOut' -or $gemOutcome -ne 'Failed') {
+              throw 'Provider action timeout or runtime failure was not settled independently.'
+          }
+          if ($script:WingetProgressDone -ne 3 -or $script:WingetProgressSuccess -ne 1 -or
+              $script:WingetProgressFailed -ne 2) {
+              throw 'Provider action isolation did not preserve the successful provider result.'
+          }
+          if (@($script:ciGuiLog | Where-Object { $_ -match '^\[Update\]\[pip\] FAILED' }).Count -ne 0 -or
+              @($script:ciGuiLog | Where-Object { $_ -match '^\[Update\]\[winget\] FAILED' }).Count -ne 1 -or
+              @($script:ciGuiLog | Where-Object { $_ -match '^\[Update\]\[gem\] FAILED' }).Count -ne 1) {
+              throw 'Provider action failure attribution crossed provider boundaries.'
+          }
+
+          # Final reconciliation is exactly once. It attributes an unaccounted
+          # item to its provider and cannot double-count progress on a repeated
+          # monitor tick.
+          $finalSuccessItem = [pscustomobject]@{ Source = 'winget'; Name = 'Final Success Item'; Id = 'final-success'; WmtActionIndex = 1 }
+          $finalMissingItem = [pscustomobject]@{ Source = 'gem'; Name = 'Final Missing Item'; Id = 'final-missing'; WmtActionIndex = 2 }
+          $script:WingetActionItems = @($finalSuccessItem, $finalMissingItem)
+          $script:WingetActionProviderGroups = @(Group-WmtUpdateActionItemsByProvider -Items $script:WingetActionItems)
+          $script:WingetActionFinalized = $false
+          $script:WingetActiveAction = 'Update'
+          $script:WingetProgressTotal = 2
+          $script:WingetProgressDone = 1
+          $script:WingetProgressSuccess = 1
+          $script:WingetProgressSkipped = 0
+          $script:WingetProgressFailed = 0
+          $script:WingetCompletedIndexes = @{ 1 = $true }
+          $script:ciGuiLog.Clear()
+          $firstFinalization = [bool](Complete-WmtUpdateActionFinalization)
+          $secondFinalization = [bool](Complete-WmtUpdateActionFinalization)
+          if (-not $firstFinalization -or $secondFinalization) {
+              throw 'Action finalization was not guarded exactly once.'
+          }
+          if ($script:WingetProgressDone -ne 2 -or $script:WingetProgressSuccess -ne 1 -or
+              $script:WingetProgressFailed -ne 1 -or $script:WingetCompletedIndexes.Count -ne 2) {
+              throw 'Action finalization did not reconcile every grouped item exactly once.'
+          }
+          if (@($script:ciGuiLog | Where-Object { $_ -match '^\[Update\]\[gem\] FAILED' }).Count -ne 1) {
+              throw 'Action finalization did not attribute the missing item to its provider.'
+          }
+
+          # Execute the production worker with one item whose Id conversion throws.
+          # The item fails, and the following item in the same provider still runs.
+          $workerAssignment = $ast.Find({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                  $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                  $node.Left.VariablePath.UserPath -eq 'wingetWorkerScript'
+              }, $true)
+          if (-not $workerAssignment) {
+              throw 'The production package action worker could not be extracted.'
+          }
+          # Use the parser's ScriptBlockAst rather than recreating the brace
+          # text as a nested scriptblock expression. The latter returns the
+          # nested block instead of executing the production worker.
+          $workerBlock = $workerAssignment.Right.Expression.ScriptBlock.GetScriptBlock()
+          Add-Type -TypeDefinition @'
+          using System;
+          public class WmtCiThrowingToString {
+              public override string ToString() {
+                  throw new InvalidOperationException("simulated package item exception");
+              }
+          }
+          '@
+          $badActionItem = [pscustomobject]@{
+              Source = 'test'
+              Id = (New-Object WmtCiThrowingToString)
+              Version = '1.0'
+              Available = '2.0'
+              # Use a non-local global index so a provider-local fallback would
+              # collide with another provider's result.
+              WmtActionIndex = 2
+              ProviderLogFilesEnabled = $false
+              ProviderHeadlessEnabled = $false
+          }
+          $goodActionItem = [pscustomobject]@{
+              Source = 'test'
+              Name = 'Good Action Item'
+              Id = 'good-action-item'
+              Version = '1.0'
+              Available = '2.0'
+              WmtActionIndex = 3
+              ProviderLogFilesEnabled = $false
+              ProviderHeadlessEnabled = $false
+          }
+          $actionQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+          $workerArgs = @{
+              Items = [object[]]@($badActionItem, $goodActionItem)
+              TotalItems = 3
+              ProviderKey = 'test'
+              ActionName = 'Update'
+              CmdTemplate = ''
+              TempPath = $env:TEMP
+              PackageInstallLogRoot = $env:TEMP
+              WingetIncludeUnknown = $false
+              SilentUpdateInstallEnabled = $false
+              PythonExePath = 'python.exe'
+              LegendaryExePath = ''
+              GogdlExePath = ''
+              GogdlAuthConfigPath = ''
+          }
+          & $workerBlock $workerArgs $actionQueue | Out-Null
+          $workerLines = @($actionQueue.ToArray())
+          if (@($workerLines | Where-Object { [string]$_ -eq 'RESULT:2:FAILED:item 2' }).Count -ne 1 -or
+              @($workerLines | Where-Object { [string]$_ -eq 'RESULT:3:SKIPPED:Good Action Item' }).Count -ne 1) {
+              throw 'A package item exception did not remain isolated or retain its global action index.'
+          }
+          if (@($workerLines | Where-Object { [string]$_ -eq 'ACTION_PROVIDER_STARTED:test' }).Count -ne 1) {
+              throw 'The production action worker did not emit its provider-start lifecycle signal.'
+          }
+
+          # Missing providers remain enabled by explicit user intent. They fail
+          # independently during scans until the user disables or installs them.
+          $enabledIntent = @(Get-WmtProviderEnabledIntent `
+                  -ProviderDefinitions @(
+                      [pscustomobject]@{ Key = 'winget'; LockedOn = $true }
+                      [pscustomobject]@{ Key = 'scoop'; LockedOn = $false }
+                  ) `
+                  -ProviderControls @{ scoop = @{ Main = [pscustomobject]@{ IsChecked = $true } } })
+          if ($enabledIntent -notcontains 'winget' -or $enabledIntent -notcontains 'scoop') {
+              throw 'Provider intent removed locked Winget or an enabled missing provider.'
+          }
+          if ($source -notmatch 'Get-WmtProviderEnabledIntent\s+`\r?\n\s*-ProviderDefinitions') {
+              throw 'The production Provider settings save does not preserve enabled-provider intent.'
+          }
+          $scoopStart = $source.IndexOf('# E. SCOOP WORKER')
+          $scoopEnd = $source.IndexOf('# F. RUBY GEMS WORKER', $scoopStart)
+          if ($scoopStart -lt 0 -or $scoopEnd -le $scoopStart) {
+              throw 'The production Scoop worker could not be located.'
+          }
+          $scoopWorkerSource = $source.Substring($scoopStart, $scoopEnd - $scoopStart)
+          if ($scoopWorkerSource -notmatch 'Get-Command scoop' -or
+              $scoopWorkerSource -notmatch 'ProviderScanStatus') {
+              throw 'A missing Scoop provider is not reported as an attributable scan failure.'
+          }
+
+          # Provider-dialog close verification uses the exact registered window
+          # and its Closed lifecycle signal; a hidden but still-open modal window
+          # is not considered closed.
+          $dialogState = @{ Dialog = $null; DialogClosed = $false }
+          $dialog = [pscustomobject]@{ IsVisible = $true; CloseCalls = 0 }
+          $dialogState.Dialog = $dialog
+          $dialog | Add-Member -MemberType ScriptMethod -Name Close -Value ({
+                  $this.CloseCalls++
+                  $this.IsVisible = $false
+                  $dialogState.DialogClosed = $true
+              }).GetNewClosure()
+          [void](Close-WmtProviderSettingsDialog -Dialog $dialog -State $dialogState)
+          if (-not $dialogState.DialogClosed -or $dialog.CloseCalls -ne 1) {
+              throw 'The Provider settings dialog did not close through its exact registered reference.'
+          }
+
+          $hiddenState = @{ Dialog = $null; DialogClosed = $false }
+          $hiddenDialog = [pscustomobject]@{ IsVisible = $false; CloseCalls = 0 }
+          $hiddenState.Dialog = $hiddenDialog
+          $hiddenDialog | Add-Member -MemberType ScriptMethod -Name Close -Value ({
+                  $this.CloseCalls++
+              }).GetNewClosure()
+          $hiddenRejected = $false
+          try { [void](Close-WmtProviderSettingsDialog -Dialog $hiddenDialog -State $hiddenState) }
+          catch { $hiddenRejected = $_.Exception.Message -match 'Closed event' }
+          if (-not $hiddenRejected -or $hiddenState.DialogClosed) {
+              throw 'A hidden but still-open Provider settings dialog was treated as closed.'
+          }
+
+          $failureState = @{ Dialog = $null; DialogClosed = $false }
+          $failureDialog = [pscustomobject]@{ IsVisible = $true }
+          $failureState.Dialog = $failureDialog
+          $failureDialog | Add-Member -MemberType ScriptMethod -Name Close -Value {
+              throw 'simulated close failure'
+          }
+          $closeFailureReported = $false
+          try { [void](Close-WmtProviderSettingsDialog -Dialog $failureDialog -State $failureState) }
+          catch { $closeFailureReported = $_.Exception.Message -match 'close failed' }
+          if (-not $closeFailureReported) {
+              throw 'A Provider settings dialog close failure was not surfaced.'
+          }
+
+          $wrongState = @{ Dialog = [pscustomobject]@{ IsVisible = $true }; DialogClosed = $false }
+          $wrongTarget = [pscustomobject]@{ IsVisible = $true; CloseCalls = 0 }
+          $wrongTarget | Add-Member -MemberType ScriptMethod -Name Close -Value {
+              $this.CloseCalls++
+          }
+          $wrongRejected = $false
+          try { [void](Close-WmtProviderSettingsDialog -Dialog $wrongTarget -State $wrongState) }
+          catch { $wrongRejected = $_.Exception.Message -match 'does not match' }
+          if (-not $wrongRejected -or $wrongTarget.CloseCalls -ne 0) {
+              throw 'Provider settings close did not enforce the exact registered dialog reference.'
+          }
+
+          $unregisteredTarget = [pscustomobject]@{ IsVisible = $true; CloseCalls = 0 }
+          $unregisteredTarget | Add-Member -MemberType ScriptMethod -Name Close -Value {
+              $this.CloseCalls++
+          }
+          $unregisteredRejected = $false
+          try { [void](Close-WmtProviderSettingsDialog -Dialog $unregisteredTarget -State @{ DialogClosed = $false }) }
+          catch { $unregisteredRejected = $_.Exception.Message -match 'registered dialog reference' }
+          if (-not $unregisteredRejected -or $unregisteredTarget.CloseCalls -ne 0) {
+              throw 'Provider settings close accepted a dialog without a registered reference.'
+          }
+
+          # If persistence fails after the modal was closed, its registry entry
+          # must not retain the closed window and its closures.
+          $errorCallbackCandidates = @($ast.FindAll({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+                      $node.Extent.Text -match 'Could not save provider settings'
+              }, $true) | Sort-Object { $_.Extent.Text.Length })
+          if (-not $errorCallbackCandidates -or $errorCallbackCandidates.Count -eq 0) {
+              throw 'The production Provider settings save-error callback could not be extracted.'
+          }
+          $providerSettingsStateId = 'ci-closed-provider-state'
+          $providerSettingsState = [pscustomobject]@{
+              SavePending = $true
+              SettingsPersisted = $false
+              CloseRequested = $false
+              DialogClosed = $true
+          }
+          $providerSettingsUiStates = @{ $providerSettingsStateId = $providerSettingsState }
+          $providerSettingsSaveButton = $null
+          function Show-WmtMessageBox { param($Message, $Title, $Image, $Owner) }
+          $errorCallbackScript = $errorCallbackCandidates[0].ScriptBlock.GetScriptBlock()
+          & $errorCallbackScript ([pscustomobject]@{
+                  Exception = [System.Exception]::new('simulated persistence failure')
+              })
+          if ($providerSettingsUiStates.ContainsKey($providerSettingsStateId) -or
+              $providerSettingsState.SavePending) {
+              throw 'A failed save retained a closed Provider settings dialog in the UI-state registry.'
+          }
+
+          Write-Host 'PASS: provider startup failures, typed failures, and scan timeouts remain provider-local.'
+          Write-Host 'PASS: provider-grouped action timeouts and worker errors do not cancel successful providers.'
+          Write-Host 'PASS: one package-item exception does not terminate the remaining items in that provider.'
+          Write-Host 'PASS: missing Scoop remains enabled and reports an attributable scan failure.'
+          Write-Host 'PASS: Provider Save & Close verifies the exact dialog and Closed lifecycle signal.'
 
       - name: Smoke test model-ID driver supersedence
         shell: powershell
@@ -4614,6 +5343,7 @@ jobs:
           Invoke-Expression $source.Substring($acceleratorStart, $acceleratorEnd - $acceleratorStart)
 
           $needed = @(
+              "Get-WmtCanonicalProviderKey",
               "Get-WmtSettingsFileStamp",
               "Test-WmtSettingsMember",
               "Get-WmtSettingsMember",
@@ -4832,7 +5562,29 @@ jobs:
                   throw "A legacy settings file without WingetIgnoreNames did not recover the built-in ignored-package name."
               }
 
-              Write-Host "OK: settings persistence, interval retention, DebugMode persistence, backup recovery, cache invalidation, and legacy ignored-name loading."
+              # Winget is locked on, so a hand-edited or legacy non-empty
+              # provider list must not silently disable it. Provider aliases
+              # must also normalize to their canonical identity.
+              $providerSettings = [pscustomobject]@{
+                  EnabledProviders = @('choco', 'scoop')
+              }
+              [System.IO.File]::WriteAllText(
+                  $settingsPath,
+                  ($providerSettings | ConvertTo-Json -Depth 4),
+                  [System.Text.UTF8Encoding]::new($false)
+              )
+              $script:WmtSettingsCache = $null
+              $script:WmtSettingsCacheStamp = $null
+              $providerLoaded = Get-WmtSettings
+              $normalizedProviders = @($providerLoaded.EnabledProviders)
+              if ($normalizedProviders -notcontains 'winget' -or
+                  $normalizedProviders -notcontains 'chocolatey' -or
+                  $normalizedProviders -notcontains 'scoop' -or
+                  $normalizedProviders -contains 'choco') {
+                  throw "Provider settings normalization removed locked Winget or failed to canonicalize provider aliases."
+              }
+
+              Write-Host "OK: settings persistence, interval retention, DebugMode persistence, backup recovery, cache invalidation, provider normalization, and legacy ignored-name loading."
           }
           finally {
               try { Remove-Item -LiteralPath $script:SettingsTestDataPath -Recurse -Force -ErrorAction SilentlyContinue } catch {}
@@ -4873,8 +5625,19 @@ jobs:
           }
           $manageDialogWidth = [double]$manageDialogWidthMatch.Groups[1].Value
           $manageDialogMinWidth = [double]$manageDialogMinWidthMatch.Groups[1].Value
-          if ($manageDialogWidth -lt 1000 -or $manageDialogMinWidth -lt 700) {
-              throw "The Manage Ignored dialog is too narrow: width=$manageDialogWidth minWidth=$manageDialogMinWidth."
+          $wmtDefaultWidthMatch = [regex]::Match(
+              $source,
+              '(?s)WindowBounds\s*=\s*@\{.*?Width\s*=\s*([0-9.]+)'
+          )
+          if (-not $wmtDefaultWidthMatch.Success) {
+              throw 'The WMT main-window default width could not be verified.'
+          }
+          $wmtDefaultWidth = [double]$wmtDefaultWidthMatch.Groups[1].Value
+          if ($manageDialogWidth -lt 1000 -or $manageDialogWidth -gt $wmtDefaultWidth) {
+              throw "The Manage Ignored dialog width is outside WMT's default-width range: width=$manageDialogWidth default=$wmtDefaultWidth."
+          }
+          if ([Math]::Abs($manageDialogMinWidth - 440) -gt 0.1) {
+              throw "The Manage Ignored dialog minimum width changed unexpectedly: minWidth=$manageDialogMinWidth."
           }
           $manageDialogContextStart = [Math]::Max(0, $manageDialogCommand.Extent.StartOffset - 1600)
           $manageDialogContextLength = [Math]::Min(1600, $source.Length - $manageDialogContextStart)
