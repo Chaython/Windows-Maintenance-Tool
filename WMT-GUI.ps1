@@ -46920,6 +46920,7 @@ $wingetWorkerScript = {
         "0x8a150012" = "WinGet source name does not exist"
         "0x8a150013" = "WinGet source location is already configured"
         "0x8a150014" = "No packages found"
+        "0x8a15007d" = "Administrator context is not permitted for a user-scoped package"
         "0x8a15008e" = "Upgrade uses a different install technology than the current installation"
         "0x80070002" = "File Not Found"; "0x80070003" = "Path Not Found"; "0x80070005" = "Access Denied"
         "0x80070490" = "Element Not Found"; "0x80072ee7" = "DNS Lookup Fail"; "0x80072f8f" = "SSL Cert Error"
@@ -50847,6 +50848,10 @@ exit /b %WMT_EXIT%
                 # --- FAILURE HANDLING ---
                 $dec = "$($p.ExitCode)"
                 $errDesc = "Unknown Error"
+                # WinGet rejects user-scoped packages before starting their installer
+                # when invoked from WMT's elevated context. This exact error is
+                # recoverable through the existing non-elevated interactive retry.
+                $isWingetUserScopeError = ($srcKey -eq "winget" -and $hex -eq "0x8a15007d")
 
                 if ($ErrorCodes.ContainsKey($hex)) { $errDesc = $ErrorCodes[$hex] }
                 elseif ($ErrorCodes.ContainsKey($dec)) { $errDesc = $ErrorCodes[$dec] }
@@ -50911,7 +50916,7 @@ exit /b %WMT_EXIT%
                     continue
                 }
 
-                if ($useVisibleWindow) {
+                if ($useVisibleWindow -and -not $isWingetUserScopeError) {
                     Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (see visible window output)"
                     Write-Output "RESULT:${index}:FAILED:$name"
                     continue
@@ -50955,7 +50960,10 @@ exit /b %WMT_EXIT%
                     continue
                 }
 
-                if ($dec -eq "1603") {
+                if ($isWingetUserScopeError) {
+                    Write-Output "LOG:[$act][$index/$total] FAILED [$hex] ${errDesc} - $name (retrying in non-elevated user context)"
+                }
+                elseif ($dec -eq "1603") {
                     Write-Output "LOG:[$act] Initial attempt failed (1603) for $name. Retrying in interactive user mode..."
                 }
                 else {

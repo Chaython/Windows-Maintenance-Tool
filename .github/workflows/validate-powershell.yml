@@ -3096,6 +3096,103 @@ jobs:
               throw 'The production action worker did not emit its provider-start lifecycle signal.'
           }
 
+          # WinGet rejects user-scoped packages in an elevated context before
+          # starting their installer. Exercise the production visible-window worker
+          # with fake processes: the exact HRESULT must reach the Explorer-hosted
+          # non-elevated retry instead of stopping at the generic visible-window exit.
+          $userScopeFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-winget-user-scope-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($userScopeFixtureDir)
+          $userScopeItem = [pscustomobject]@{
+              Source = 'winget'
+              Name = 'pnpm'
+              Id = 'pnpm.pnpm'
+              Version = '12.18.0'
+              Available = '12.23.0'
+              WmtActionIndex = 5
+              ProviderLogFilesEnabled = $false
+              ProviderHeadlessEnabled = $false
+          }
+          $script:ciVisibleExitCode = -1978335107
+          $script:ciVisibleLaunchCount = 0
+          $script:ciUserRetryLaunchCount = 0
+          $script:ciUserScopeBatchText = ''
+          function Start-Process {
+              param(
+                  [Parameter(Position = 0)][string]$FilePath,
+                  [object]$ArgumentList,
+                  [switch]$PassThru,
+                  [string]$WindowStyle
+              )
+              if ($FilePath -eq 'cmd.exe') {
+                  $script:ciVisibleLaunchCount++
+                  $fakeProcess = [pscustomobject]@{
+                      HasExited = $true
+                      ExitCode = $script:ciVisibleExitCode
+                  }
+                  $fakeProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+                  return $fakeProcess
+              }
+              if ($FilePath -eq 'explorer.exe') {
+                  $script:ciUserRetryLaunchCount++
+                  $batchPath = ([string]$ArgumentList).Trim('"')
+                  $script:ciUserScopeBatchText = [IO.File]::ReadAllText($batchPath)
+                  $resultMatch = [regex]::Match($script:ciUserScopeBatchText, '(?m)^> "([^"]+\.exit)" echo')
+                  if (-not $resultMatch.Success) { throw 'The user-retry result path was not generated.' }
+                  Set-Content -LiteralPath $resultMatch.Groups[1].Value -Value '0' -Encoding Ascii
+                  return
+              }
+              throw "Unexpected process launch in user-scope retry test: $FilePath"
+          }
+          try {
+              $userScopeQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+              $userScopeWorkerArgs = $workerArgs.Clone()
+              $userScopeWorkerArgs.Items = [object[]]@($userScopeItem)
+              $userScopeWorkerArgs.TotalItems = 5
+              $userScopeWorkerArgs.ProviderKey = 'winget'
+              $userScopeWorkerArgs.ActionName = 'Update'
+              $userScopeWorkerArgs.TempPath = $userScopeFixtureDir
+              $userScopeWorkerArgs.PackageInstallLogRoot = $userScopeFixtureDir
+              & $workerBlock $userScopeWorkerArgs $userScopeQueue | Out-Null
+              $userScopeLines = @($userScopeQueue.ToArray())
+              if ($script:ciVisibleLaunchCount -ne 1 -or $script:ciUserRetryLaunchCount -ne 1) {
+                  throw 'The WinGet user-scope HRESULT did not reach exactly one non-elevated retry.'
+              }
+              if ($script:ciUserScopeBatchText -notmatch 'upgrade --id "?pnpm\.pnpm"?' -or
+                  $script:ciUserScopeBatchText -match '--disable-interactivity') {
+                  throw 'The user-mode retry did not preserve the interactive WinGet upgrade command.'
+              }
+              if (@($userScopeLines | Where-Object { [string]$_ -eq 'RESULT:5:SUCCESS:pnpm' }).Count -ne 1 -or
+                  @($userScopeLines | Where-Object { [string]$_ -match '0x8a15007d.*Administrator context' }).Count -lt 1 -or
+                  @($userScopeLines | Where-Object { [string]$_ -match 'see visible window output' }).Count -ne 0) {
+                  throw ('The user-scope retry did not report its specific error and successful retry result. Output: ' + ($userScopeLines -join ' | '))
+              }
+
+              # An unrelated visible-window error must retain the existing early exit.
+              $script:ciVisibleExitCode = 1
+              $script:ciVisibleLaunchCount = 0
+              $script:ciUserRetryLaunchCount = 0
+              $ordinaryFailureItem = [pscustomobject]@{
+                  Source = 'winget'; Name = 'Ordinary Failure'; Id = 'ordinary.failure'
+                  Version = '1.0'; Available = '2.0'; WmtActionIndex = 6
+                  ProviderLogFilesEnabled = $false; ProviderHeadlessEnabled = $false
+              }
+              $ordinaryFailureQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+              $ordinaryFailureArgs = $userScopeWorkerArgs.Clone()
+              $ordinaryFailureArgs.Items = [object[]]@($ordinaryFailureItem)
+              $ordinaryFailureArgs.TotalItems = 6
+              & $workerBlock $ordinaryFailureArgs $ordinaryFailureQueue | Out-Null
+              $ordinaryFailureLines = @($ordinaryFailureQueue.ToArray())
+              if ($script:ciVisibleLaunchCount -ne 1 -or $script:ciUserRetryLaunchCount -ne 0 -or
+                  @($ordinaryFailureLines | Where-Object { [string]$_ -eq 'RESULT:6:FAILED:Ordinary Failure' }).Count -ne 1 -or
+                  @($ordinaryFailureLines | Where-Object { [string]$_ -match 'see visible window output' }).Count -ne 1) {
+                  throw 'An unrelated visible-window failure incorrectly opened a user-mode retry.'
+              }
+          }
+          finally {
+              Remove-Item -LiteralPath 'Function:\Start-Process' -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath $userScopeFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           # A global pnpm repair must force-reinstall the package's complete
           # isolated global group. `pnpm rebuild` is project-scoped, while a
           # selective `pnpm add -g` can replace the group and remove sibling
