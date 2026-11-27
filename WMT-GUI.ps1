@@ -5347,6 +5347,73 @@ return [pscustomobject]@{
 }
 }
 
+function Resolve-WmtProviderCommandPath {
+param([Parameter(Mandatory = $true)][string]$Name)
+
+# PowerShell and cmd.exe do not parse a malformed PATH entry in the same way.
+# Resolve the shim here, then pass its absolute path to cmd.exe so a stray quote
+# elsewhere in PATH cannot turn a working npm/pnpm installation into a failure.
+foreach ($extension in @(".cmd", ".bat", ".exe")) {
+    $command = Get-Command ($Name + $extension) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command -and -not [string]::IsNullOrWhiteSpace([string]$command.Path)) {
+        return [string]$command.Path
+    }
+}
+throw "Provider command '$Name' was not found."
+}
+
+function Get-WmtProviderActionPath {
+param(
+    [Parameter(Mandatory = $true)][string]$Command,
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path
+)
+
+# npm lifecycle scripts spawn a fresh cmd.exe and expect to find node by name.
+# Put the resolved shim and Node directories first for this child process only;
+# a malformed entry later in the user's PATH is then never consulted for either.
+if ($Command -notmatch '^(npm|pnpm)(?=\s|$)') { return $Path }
+$name = $Matches[1].ToLowerInvariant()
+$commandPath = Resolve-WmtProviderCommandPath -Name $name
+$directories = @()
+foreach ($directory in @(
+    [System.IO.Path]::GetDirectoryName($commandPath),
+    [System.IO.Path]::GetDirectoryName([string](Get-Command "node.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Path)
+)) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$directory) -and $directories -notcontains $directory) {
+        $directories += [string]$directory
+    }
+}
+$prefix = $directories -join ";"
+if ([string]::IsNullOrEmpty($Path)) { return $prefix }
+return $prefix + ";" + $Path
+}
+
+function Start-WmtProviderCommand {
+param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [string]$Arguments = "",
+    [switch]$CaptureError
+)
+
+$commandPath = Resolve-WmtProviderCommandPath -Name $Name
+if ([System.IO.Path]::GetExtension($commandPath) -ieq ".exe") {
+    return Start-WmtProviderProcess -FileName $commandPath -Arguments $Arguments -CaptureError:$CaptureError
+}
+
+$cmdArguments = "/d /s /c `"`"$commandPath`""
+if (-not [string]::IsNullOrWhiteSpace($Arguments)) { $cmdArguments += " $Arguments" }
+$cmdArguments += "`""
+return Start-WmtProviderProcess -FileName "cmd" -Arguments $cmdArguments -CaptureError:$CaptureError
+}
+
+function Get-WmtProviderProcessFailureDetail {
+param([Parameter(Mandatory = $true)]$Result)
+
+$errorLines = @(([string]$Result.Err) -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($errorLines.Count -gt 0) { return $errorLines[0] }
+return "The command returned no valid JSON (exit code $($Result.ExitCode))."
+}
+
 # ============================================================================
 # Shared runspace pools
 # Fast UI-support work is isolated from long-running provider/network jobs so
@@ -5401,7 +5468,7 @@ foreach ($helperBlock in @($script:MyDeviceCommonHelpers, $script:WmtSteamCommon
     }
 }
 
-foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson", "New-WmtSteamOwnershipSeed", "Start-WmtProviderProcess", "Complete-WmtProviderProcess")) {
+foreach ($helperName in @("ConvertTo-Int", "ConvertTo-Str", "Invoke-WmtProcess", "Invoke-WmtCliText", "Get-WmtDriverCleanupUsage", "Invoke-WmtDriverCleanupBatch", "Get-WmtLegendaryCachedLibrary", "Merge-WmtLegendaryCachedDetails", "Get-WmtLegendaryGameVersion", "Test-WmtLegendaryUeAsset", "Test-WmtLegendaryGameIsUe", "Invoke-WmtLegendaryLibraryJson", "Invoke-WmtLegendaryInstalledData", "Get-WmtGogInstalledMap", "Set-WmtJsonCacheFile", "Get-WmtCapabilityStateInfo", "Get-WmtOptionalFeatureStateInfo", "Test-WmtScoopVersionText", "Get-WmtScoopStatusTableColumns", "ConvertFrom-WmtScoopCurrentStatusRow", "ConvertFrom-WmtScoopStatusLine", "ConvertFrom-WmtScoopStatus", "New-WmtProviderScanStatus", "ConvertFrom-WmtPnpmOutdatedJson", "New-WmtSteamOwnershipSeed", "Start-WmtProviderProcess", "Complete-WmtProviderProcess", "Resolve-WmtProviderCommandPath", "Get-WmtProviderActionPath", "Start-WmtProviderCommand", "Get-WmtProviderProcessFailureDetail")) {
     try {
         $helper = Get-Command $helperName -CommandType Function -ErrorAction SilentlyContinue
         if ($helper) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($helperName, $helper.Definition)) }
@@ -50690,6 +50757,8 @@ exit /b %WMT_EXIT%
                 elseif ($isChocoUpdate) { $windowTag = "Chocolatey" }
                 elseif ($isPythonUpdate) { $windowTag = "Python" }
                 Write-Output "LOG:[$act] Launching visible $windowTag window for: $name"
+                $previousProviderActionPath = $null
+                $providerActionPathChanged = $false
                 try {
                     $holdSeconds = if ($src -eq "msstore") { 5 } else { 0 }
                     # Custom overrides use a native stdout/stderr reader that mirrors
@@ -50703,6 +50772,11 @@ exit /b %WMT_EXIT%
                         $customCaptureRunnerPath = [string]$nativeCapture.RunnerPath
                     }
                     $visibleTranscriptPath = if ($isCustomUpdateCommand -or $srcKey -eq "legendary") { "" } elseif ($srcKey -eq "winget") { $wingetConsoleTranscriptPath } else { $providerTranscriptPath }
+                    if ($providerLogKey -in @("npm", "pnpm")) {
+                        $previousProviderActionPath = [string]$env:PATH
+                        $env:PATH = Get-WmtProviderActionPath -Command $visibleCommand -Path $previousProviderActionPath
+                        $providerActionPathChanged = $true
+                    }
                     $p = Invoke-VisibleCmd $visibleCommand "WMT $windowTag $act - $name" -HoldSeconds $holdSeconds -TranscriptPath $visibleTranscriptPath
 
                     # Preserve TimedOut and TerminationFailed on failed installers.
@@ -50722,6 +50796,7 @@ exit /b %WMT_EXIT%
                     }
                 }
                 finally {
+                    if ($providerActionPathChanged) { $env:PATH = $previousProviderActionPath }
                     # The generated runner carries the encoded custom command.
                     # Never leave it behind in the user's TEMP folder.
                     if (-not [string]::IsNullOrWhiteSpace($customCaptureRunnerPath)) {
@@ -50780,7 +50855,19 @@ exit /b %WMT_EXIT%
                 }
                 $p = $null
                 $headlessTranscriptPath = if ($commandOwnsProviderTranscript) { "" } else { $providerTranscriptPath }
-                Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -TranscriptPath $headlessTranscriptPath -SuppressActiveTranscriptMirror:$commandOwnsProviderTranscript -Result ([ref]$p)
+                $previousProviderActionPath = $null
+                $providerActionPathChanged = $false
+                try {
+                    if ($providerLogKey -in @("npm", "pnpm")) {
+                        $previousProviderActionPath = [string]$env:PATH
+                        $env:PATH = Get-WmtProviderActionPath -Command $cmd -Path $previousProviderActionPath
+                        $providerActionPathChanged = $true
+                    }
+                    Invoke-WingetCmd -Command $cmd -TimeoutSeconds $commandTimeoutSeconds -IdleTimeoutSeconds $commandIdleTimeoutSeconds -ActivityProcessNamePattern $activityProcessNamePattern -CommandLabel $commandLabel -TranscriptPath $headlessTranscriptPath -SuppressActiveTranscriptMirror:$commandOwnsProviderTranscript -Result ([ref]$p)
+                }
+                finally {
+                    if ($providerActionPathChanged) { $env:PATH = $previousProviderActionPath }
+                }
             }
             if (-not $wingetArgs) { Write-Output "LOG:[$act][$index/$total] Process completed with exit code: $($p.ExitCode)" }
             if (-not [string]::IsNullOrWhiteSpace($providerTranscriptPath) -and (Test-Path -LiteralPath $providerTranscriptPath -PathType Leaf)) {
@@ -57717,8 +57804,8 @@ $btnWingetScan.Add_Click({
                     # Local and global checks are independent read-only queries.
                     # Start both before waiting so the global query cannot add its
                     # timeout to the local query's budget.
-                    $localEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c npm outdated --json 2>nul"
-                    $globalEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c npm outdated -g --json 2>nul"
+                    $localEntry = Start-WmtProviderCommand -Name "npm" -Arguments "outdated --json" -CaptureError
+                    $globalEntry = Start-WmtProviderCommand -Name "npm" -Arguments "outdated -g --json" -CaptureError
 
                     $localResult = Complete-WmtProviderProcess -Entry $localEntry -TimeoutMs 30000 -KillTree
                     if ($localResult.TimedOut) {
@@ -57732,19 +57819,28 @@ $btnWingetScan.Add_Click({
                         # code as a successful provider scan.
                         if ($json -and $json.StartsWith("{")) {
                             $pkgs = $json | ConvertFrom-Json
-                            foreach ($k in $pkgs.PSObject.Properties.Name) {
-                                if ($IgnoreList -contains $k) { continue }
-                                $o = $pkgs.$k
-                                [PSCustomObject]@{Source = "npm"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
+                            if ($localResult.ExitCode -ne 0 -and $pkgs.PSObject.Properties["error"] -and
+                                $pkgs.error.PSObject.Properties["code"] -and $pkgs.error.PSObject.Properties["summary"]) {
+                                $detail = Get-WmtProviderProcessFailureDetail -Result $localResult
+                                Write-Output "LOG:Npm local scan failed: $detail"
+                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan failed: $detail")
                             }
-                            if ($localResult.ExitCode -notin @(0, 1)) {
-                                Write-Output "LOG:Npm local scan exited with code $($localResult.ExitCode)."
-                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan exited with code $($localResult.ExitCode).")
+                            else {
+                                foreach ($k in $pkgs.PSObject.Properties.Name) {
+                                    if ($IgnoreList -contains $k) { continue }
+                                    $o = $pkgs.$k
+                                    [PSCustomObject]@{Source = "npm"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
+                                }
+                                if ($localResult.ExitCode -notin @(0, 1)) {
+                                    Write-Output "LOG:Npm local scan exited with code $($localResult.ExitCode)."
+                                    Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan exited with code $($localResult.ExitCode).")
+                                }
                             }
                         }
                         else {
-                            Write-Output "LOG:Npm local scan returned invalid JSON."
-                            Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan returned invalid JSON.")
+                            $detail = Get-WmtProviderProcessFailureDetail -Result $localResult
+                            Write-Output "LOG:Npm local scan failed: $detail"
+                            Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm local scan failed: $detail")
                         }
                     }
 
@@ -57757,19 +57853,28 @@ $btnWingetScan.Add_Click({
                         $jsonG = ([string]$globalResult.Out).Trim()
                         if ($jsonG -and $jsonG.StartsWith("{")) {
                             $pkgsG = $jsonG | ConvertFrom-Json
-                            foreach ($k in $pkgsG.PSObject.Properties.Name) {
-                                if ($IgnoreList -contains $k) { continue }
-                                $o = $pkgsG.$k
-                                [PSCustomObject]@{Source = "npm (global)"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
+                            if ($globalResult.ExitCode -ne 0 -and $pkgsG.PSObject.Properties["error"] -and
+                                $pkgsG.error.PSObject.Properties["code"] -and $pkgsG.error.PSObject.Properties["summary"]) {
+                                $detail = Get-WmtProviderProcessFailureDetail -Result $globalResult
+                                Write-Output "LOG:Npm global scan failed: $detail"
+                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan failed: $detail")
                             }
-                            if ($globalResult.ExitCode -notin @(0, 1)) {
-                                Write-Output "LOG:Npm global scan exited with code $($globalResult.ExitCode)."
-                                Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan exited with code $($globalResult.ExitCode).")
+                            else {
+                                foreach ($k in $pkgsG.PSObject.Properties.Name) {
+                                    if ($IgnoreList -contains $k) { continue }
+                                    $o = $pkgsG.$k
+                                    [PSCustomObject]@{Source = "npm (global)"; Name = $k; Id = $k; Version = $o.current; Available = $o.latest }
+                                }
+                                if ($globalResult.ExitCode -notin @(0, 1)) {
+                                    Write-Output "LOG:Npm global scan exited with code $($globalResult.ExitCode)."
+                                    Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan exited with code $($globalResult.ExitCode).")
+                                }
                             }
                         }
                         else {
-                            Write-Output "LOG:Npm global scan returned invalid JSON."
-                            Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan returned invalid JSON.")
+                            $detail = Get-WmtProviderProcessFailureDetail -Result $globalResult
+                            Write-Output "LOG:Npm global scan failed: $detail"
+                            Write-Output (New-WmtProviderScanStatus -Provider "npm" -Success $false -Message "Npm global scan failed: $detail")
                         }
                     }
                 }
@@ -58368,8 +58473,8 @@ $btnWingetScan.Add_Click({
                 try {
                     # Both checks are independent. Start them together while
                     # keeping each command's own timeout budget.
-                    $localEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c pnpm outdated --format json 2>nul"
-                    $globalEntry = Start-WmtProviderProcess -FileName "cmd" -Arguments "/c pnpm outdated -g --format json 2>nul"
+                    $localEntry = Start-WmtProviderCommand -Name "pnpm" -Arguments "outdated --format json" -CaptureError
+                    $globalEntry = Start-WmtProviderCommand -Name "pnpm" -Arguments "outdated -g --format json" -CaptureError
 
                     $localResult = Complete-WmtProviderProcess -Entry $localEntry -TimeoutMs 35000 -KillTree
                     if ($localResult.TimedOut) {
@@ -58384,9 +58489,14 @@ $btnWingetScan.Add_Click({
                         # older releases returned an array. Valid JSON is
                         # authoritative in either shape.
                         $parsed = ConvertFrom-WmtPnpmOutdatedJson -Output $json -IgnoreList $IgnoreList -Source "pnpm"
-                        if (-not $parsed.Valid) {
-                            Write-Output "LOG:Pnpm local scan returned invalid JSON."
-                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan returned invalid JSON.")
+                        if ($localResult.ExitCode -eq 1 -and [string]::IsNullOrWhiteSpace($json) -and
+                            ([string]$localResult.Err) -match 'ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND') {
+                            Write-Output "LOG:Pnpm local scan skipped: no package manifest was found."
+                        }
+                        elseif (-not $parsed.Valid) {
+                            $detail = Get-WmtProviderProcessFailureDetail -Result $localResult
+                            Write-Output "LOG:Pnpm local scan failed: $detail"
+                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm local scan failed: $detail")
                         }
                         else {
                             foreach ($pkg in @($parsed.Rows)) {
@@ -58408,8 +58518,9 @@ $btnWingetScan.Add_Click({
                         $jsonG = ([string]$globalResult.Out).Trim()
                         $parsedG = ConvertFrom-WmtPnpmOutdatedJson -Output $jsonG -IgnoreList $IgnoreList -Source "pnpm (global)"
                         if (-not $parsedG.Valid) {
-                            Write-Output "LOG:Pnpm global scan returned invalid JSON."
-                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan returned invalid JSON.")
+                            $detail = Get-WmtProviderProcessFailureDetail -Result $globalResult
+                            Write-Output "LOG:Pnpm global scan failed: $detail"
+                            Write-Output (New-WmtProviderScanStatus -Provider "pnpm" -Success $false -Message "Pnpm global scan failed: $detail")
                         }
                         else {
                             foreach ($pkg in @($parsedG.Rows)) {

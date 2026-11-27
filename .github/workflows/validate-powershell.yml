@@ -1990,6 +1990,10 @@ jobs:
               'ConvertFrom-WmtPnpmOutdatedJson',
               'Start-WmtProviderProcess',
               'Complete-WmtProviderProcess',
+              'Resolve-WmtProviderCommandPath',
+              'Get-WmtProviderActionPath',
+              'Start-WmtProviderCommand',
+              'Get-WmtProviderProcessFailureDetail',
               'Test-WmtSettingsMember',
               'Get-WmtSettingsMember',
               'Get-WmtProviderCapabilities',
@@ -2438,7 +2442,9 @@ jobs:
           )
           exit /b 0
           '@ | Set-Content -LiteralPath (Join-Path $pnpmFixtureDir 'pnpm.cmd') -Encoding Ascii
-              $env:PATH = $pnpmFixtureDir + ';' + $oldPnpmPath
+              # A quoted malformed entry breaks bare cmd.exe lookup but must not
+              # prevent PowerShell from resolving the absolute shim used by WMT.
+              $env:PATH = 'C:\WmtMissing Dir";' + $pnpmFixtureDir + ';' + $env:SystemRoot + '\System32;' + $env:SystemRoot
               $pnpmWorkerOutput = @(& $pnpmWorkerBlock @())
               $pnpmWorkerRows = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'pnpm*' })
               $pnpmWorkerStatuses = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
@@ -2482,10 +2488,97 @@ jobs:
               Remove-Item -LiteralPath $pnpmFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
           }
 
+          # A missing local manifest is a successful empty local pnpm scan, not
+          # a provider failure. A real global failure must retain its stderr.
+          $pnpmFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-pnpm-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($pnpmFixtureDir)
+          $oldPnpmPath = $env:PATH
+          try {
+              @'
+          @echo off
+          if "%~2"=="-g" (
+            echo ERROR simulated global failure 1>&2
+            exit /b 1
+          )
+          echo ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND No package.json was found. 1>&2
+          exit /b 1
+          '@ | Set-Content -LiteralPath (Join-Path $pnpmFixtureDir 'pnpm.cmd') -Encoding Ascii
+              $env:PATH = 'C:\WmtMissing Dir";' + $pnpmFixtureDir + ';' + $env:SystemRoot + '\System32;' + $env:SystemRoot
+              $pnpmWorkerOutput = @(& $pnpmWorkerBlock @())
+              $pnpmWorkerStatuses = @($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if (@($pnpmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'pnpm*' }).Count -ne 0 -or
+                  $pnpmWorkerStatuses.Count -ne 1 -or $pnpmWorkerStatuses[0].Message -notmatch 'simulated global failure' -or
+                  $pnpmWorkerStatuses[0].Message -match 'invalid JSON' -or
+                  @($pnpmWorkerOutput | Where-Object { [string]$_ -match 'Pnpm local scan skipped: no package manifest' }).Count -ne 1) {
+                  throw 'The pnpm worker did not distinguish a missing local manifest from a real global command failure.'
+              }
+          }
+          finally {
+              $env:PATH = $oldPnpmPath
+              Remove-Item -LiteralPath $pnpmFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          # Execute the production npm worker through the same malformed PATH.
+          # Exit code 1 remains successful for real updates, while npm's JSON
+          # error object must never become a fabricated package named "error".
+          $npmAddScript = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                  $node.Member.Value -eq 'AddScript' -and
+                  $node.Extent.Text -match 'Scanning Npm'
+          }, $true)
+          if (-not $npmAddScript -or $npmAddScript.Arguments.Count -ne 1) {
+              throw 'Could not extract the production npm worker.'
+          }
+          $npmWorkerText = $npmAddScript.Arguments[0].Extent.Text
+          $npmWorkerBlock = [scriptblock]::Create($npmWorkerText.Substring(1, $npmWorkerText.Length - 2))
+          $npmFixtureDir = Join-Path $env:RUNNER_TEMP ('wmt-npm-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($npmFixtureDir)
+          $oldNpmPath = $env:PATH
+          try {
+              @'
+          @echo off
+          if "%~2"=="-g" (
+            echo {"global-npm":{"current":"1.0.0","latest":"2.0.0"}}
+            exit /b 1
+          )
+          echo {}
+          exit /b 0
+          '@ | Set-Content -LiteralPath (Join-Path $npmFixtureDir 'npm.cmd') -Encoding Ascii
+              $env:PATH = 'C:\WmtMissing Dir";' + $npmFixtureDir + ';' + $env:SystemRoot + '\System32;' + $env:SystemRoot
+              $npmWorkerOutput = @(& $npmWorkerBlock @())
+              $npmWorkerRows = @($npmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'npm*' })
+              $npmWorkerStatuses = @($npmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($npmWorkerRows.Count -ne 1 -or $npmWorkerRows[0].Name -ne 'global-npm' -or
+                  $npmWorkerRows[0].Source -ne 'npm (global)' -or $npmWorkerStatuses.Count -ne 0) {
+                  throw 'The npm worker did not resolve an absolute shim and accept documented exit code 1 update JSON.'
+              }
+
+              @'
+          @echo off
+          echo npm error code EPERM 1>&2
+          echo npm error summary simulated registry failure 1>&2
+          echo {"error":{"code":"EPERM","summary":"simulated registry failure","detail":"detail"}}
+          exit /b 1
+          '@ | Set-Content -LiteralPath (Join-Path $npmFixtureDir 'npm.cmd') -Encoding Ascii
+              $npmWorkerOutput = @(& $npmWorkerBlock @())
+              $npmWorkerRows = @($npmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.Source -like 'npm*' })
+              $npmWorkerStatuses = @($npmWorkerOutput | Where-Object { $_ -is [pscustomobject] -and $_.WmtStateType -eq 'ProviderScanStatus' })
+              if ($npmWorkerRows.Count -ne 0 -or $npmWorkerStatuses.Count -ne 2 -or
+                  @($npmWorkerStatuses | Where-Object { $_.Message -match 'npm error code EPERM' -and $_.Message -notmatch 'invalid JSON' }).Count -ne 2) {
+                  throw 'The npm worker fabricated an error package or discarded the underlying command error.'
+              }
+          }
+          finally {
+              $env:PATH = $oldNpmPath
+              Remove-Item -LiteralPath $npmFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           Write-Host 'PASS: current and legacy arrow Scoop output produce only real package update rows.'
           Write-Host 'PASS: missing dependencies and scoop list rows never fabricate package updates.'
           Write-Host 'PASS: the production Scoop worker surfaces command failures and timeouts as incomplete scans.'
           Write-Host 'PASS: current object-shaped and legacy array-shaped pnpm JSON produce package rows without false failures.'
+          Write-Host 'PASS: npm/pnpm scans survive malformed PATH entries and report real command failures.'
 
       - name: Smoke test provider isolation and action recovery
         shell: powershell
@@ -4096,6 +4189,114 @@ jobs:
           # Otherwise GitHub Actions inherits native LASTEXITCODE=7.
           exit 0
 
+      - name: Test npm and pnpm lifecycle child PATH
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourcePath = (Resolve-Path '.\WMT-GUI.ps1').Path
+          $source = [IO.File]::ReadAllText($sourcePath)
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors.Message -join '; ') }
+          foreach ($name in @('Resolve-WmtProviderCommandPath', 'Get-WmtProviderActionPath', 'ConvertTo-WmtTranscriptCommand')) {
+              $function = $ast.Find({ param($node)
+                  $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+              }, $true)
+              if (-not $function) { throw "Missing provider action helper: $name" }
+              Invoke-Expression $function.Extent.Text
+          }
+          if ([regex]::Matches($source, '\$env:PATH\s*=\s*Get-WmtProviderActionPath').Count -lt 2) {
+              throw 'Both visible and headless provider actions must prepare the inherited PATH.'
+          }
+          if ([regex]::Matches($source, 'if \(\$providerActionPathChanged\) \{ \$env:PATH = \$previousProviderActionPath \}').Count -lt 2) {
+              throw 'Both visible and headless provider actions must restore the worker PATH.'
+          }
+
+          $repoRoot = (Get-Location).Path
+          $fixtureDir = Join-Path $repoRoot ('.wmt provider action ' + [guid]::NewGuid().ToString('N'))
+          $savedPath = [string]$env:PATH
+          $savedPreference = $ErrorActionPreference
+          New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+          try {
+              [IO.File]::WriteAllText((Join-Path $fixtureDir 'install.js'), "console.log('NPM_LIFECYCLE_OK');" + [Environment]::NewLine)
+              $shim = @'
+          @echo off
+          pushd "%~dp0"
+          %ComSpec% /d /s /c node install.js
+          set "lifecycleExit=%errorlevel%"
+          popd
+          exit /b %lifecycleExit%
+          '@
+              foreach ($name in @('npm.cmd', 'pnpm.cmd')) {
+                  [IO.File]::WriteAllText((Join-Path $fixtureDir $name), $shim + [Environment]::NewLine, [Text.Encoding]::ASCII)
+              }
+
+              # Exactly one unmatched quote reproduces CMD's truncated PATH search.
+              # The fixture shim is before it, proving that npm starts while its
+              # lifecycle child cannot find the real Node later in the original PATH.
+              $malformedPath = $fixtureDir + ';C:\Invalid\GitHub CLI";' + $savedPath.Replace('"', '')
+              $env:PATH = $malformedPath
+              $controlLog = Join-Path $fixtureDir 'control.log'
+              $controlCommand = ConvertTo-WmtTranscriptCommand -Command 'npm update -g "pnpm"' -TranscriptPath $controlLog
+              $ErrorActionPreference = 'Continue'
+              $controlOutput = @(Invoke-Expression $controlCommand 2>&1)
+              $controlExit = $LASTEXITCODE
+              $ErrorActionPreference = 'Stop'
+              if ($controlExit -eq 0) { throw 'The malformed-PATH lifecycle control unexpectedly passed.' }
+              if (Select-String -LiteralPath $controlLog -Pattern 'NPM_LIFECYCLE_OK' -Quiet) {
+                  throw 'The malformed-PATH control unexpectedly ran the lifecycle script.'
+              }
+
+              $preparedPath = Get-WmtProviderActionPath -Command 'npm update -g "pnpm"' -Path $env:PATH
+              if ($preparedPath -eq $env:PATH -or -not $preparedPath.StartsWith($fixtureDir + ';', [StringComparison]::OrdinalIgnoreCase)) {
+                  throw 'The npm action did not prioritize its resolved shim directory.'
+              }
+              if ((Get-WmtProviderActionPath -Command 'winget update' -Path $env:PATH) -cne $env:PATH) {
+                  throw 'An unrelated provider PATH was changed.'
+              }
+              $env:PATH = $preparedPath
+              $visibleLog = Join-Path $fixtureDir 'visible.log'
+              $visibleCommand = ConvertTo-WmtTranscriptCommand -Command 'npm update -g "pnpm"' -TranscriptPath $visibleLog
+              $ErrorActionPreference = 'Continue'
+              $visibleOutput = @(Invoke-Expression $visibleCommand 2>&1)
+              $visibleExit = $LASTEXITCODE
+              $ErrorActionPreference = 'Stop'
+              if ($visibleExit -ne 0 -or -not (Select-String -LiteralPath $visibleLog -Pattern 'NPM_LIFECYCLE_OK' -Quiet)) {
+                  throw "Transcript-wrapped npm lifecycle failed: $($visibleOutput -join ' ')"
+              }
+
+              # The non-transcript visible path starts cmd.exe directly. The
+              # headless path starts PowerShell with the same inherited PATH.
+              $pnpmPath = Get-WmtProviderActionPath -Command 'pnpm update -g "example"' -Path $malformedPath
+              $env:PATH = $pnpmPath
+              $ErrorActionPreference = 'Continue'
+              $directOutput = @(& cmd.exe /d /c 'pnpm update -g "example"' 2>&1)
+              $directExit = $LASTEXITCODE
+              $ErrorActionPreference = 'Stop'
+              if ($directExit -ne 0 -or $directOutput -notcontains 'NPM_LIFECYCLE_OK') {
+                  throw "Direct-CMD pnpm lifecycle failed: $($directOutput -join ' ')"
+              }
+              $ErrorActionPreference = 'Continue'
+              $headlessOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command 'pnpm update -g "example"' 2>&1)
+              $headlessExit = $LASTEXITCODE
+              $ErrorActionPreference = 'Stop'
+              if ($headlessExit -ne 0 -or $headlessOutput -notcontains 'NPM_LIFECYCLE_OK') {
+                  throw "Headless PowerShell pnpm lifecycle failed: $($headlessOutput -join ' ')"
+              }
+              Write-Host 'PASS: npm/pnpm lifecycle children inherit a working Node PATH in visible, transcript, and headless modes.'
+          }
+          finally {
+              $env:PATH = $savedPath
+              $ErrorActionPreference = $savedPreference
+              $resolvedFixture = [IO.Path]::GetFullPath($fixtureDir)
+              if ($resolvedFixture.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+                  [IO.Path]::GetFileName($resolvedFixture).StartsWith('.wmt provider action ', [StringComparison]::Ordinal)) {
+                  Remove-Item -LiteralPath $resolvedFixture -Recurse -Force -ErrorAction SilentlyContinue
+              }
+          }
+          exit 0
+
       - name: Test Legendary library recovery
         shell: powershell
         run: |
@@ -5671,7 +5872,11 @@ jobs:
               'New-WmtProviderScanStatus',
               'ConvertFrom-WmtPnpmOutdatedJson',
               'Start-WmtProviderProcess',
-              'Complete-WmtProviderProcess'
+              'Complete-WmtProviderProcess',
+              'Resolve-WmtProviderCommandPath',
+              'Get-WmtProviderActionPath',
+              'Start-WmtProviderCommand',
+              'Get-WmtProviderProcessFailureDetail'
           )
           foreach ($helperName in $requiredPoolHelpers) {
               $helperAst = $ast.Find({
